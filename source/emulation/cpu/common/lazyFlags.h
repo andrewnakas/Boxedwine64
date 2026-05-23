@@ -37,9 +37,9 @@ public:
     U32 width;
 };
 
-extern const LazyFlags* lazyFlags[52];
+extern const LazyFlags* lazyFlags[];
 
-enum LazyFlagType : unsigned char {    
+enum LazyFlagType : unsigned char {
     FLAGS_NONE,
     FLAGS_ADD8,
     FLAGS_ADD16,
@@ -91,6 +91,24 @@ enum LazyFlagType : unsigned char {
     FLAGS_NEG16,
     FLAGS_NEG32,
     FLAGS_CFOF,
+    // 64-bit guest lazy-flag slots. Wired to stubs in Phase 0; real
+    // implementations land in Phase 2. Position before FLAGS_NULL is
+    // load-bearing — calculateCF[FLAGS_NULL]-sized arrays depend on it.
+    FLAGS_ADD64,
+    FLAGS_OR64,
+    FLAGS_ADC64,
+    FLAGS_SBB64,
+    FLAGS_AND64,
+    FLAGS_SUB64,
+    FLAGS_XOR64,
+    FLAGS_INC64,
+    FLAGS_DEC64,
+    FLAGS_SHL64,
+    FLAGS_SHR64,
+    FLAGS_SAR64,
+    FLAGS_CMP64,
+    FLAGS_TEST64,
+    FLAGS_NEG64,
     FLAGS_NULL
 };
 

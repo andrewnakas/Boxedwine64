@@ -79,7 +79,7 @@ static U8 XMMtmps[] = { 12, 13, 14, 15 };
 static bool isVolitile[] = { true, true, true, false, false, false, false, false, true, true, true, true, false, false, false, false };
 static bool isSseVolitile[] = { true, true, true, true, true, false, false, false, false, false, false, false, false, false, false, false };
 #else
-// RBX, RBP, RSP, and R12–R15 are non volitile
+// RBX, RBP, RSP, and R12ï¿½R15 are non volitile
 static bool isVolitile[] = { true, true, true, false, false, false, true, true, true, true, true, true, false, false, false, false };
 static bool isSseVolitile[] = { true, true, true, true, true, true, true, true, true, false, false, false, false, false, false, false };
 #endif
@@ -5667,7 +5667,7 @@ U8* JitX86CodeGen::createStartJITCode() {
 void JitX86CodeGen::loadCache() {
     for (int i = 0; i < 8; i++) {
         if (regCache[i] != INVALID_REG) {
-            compiler.mov(R32(regCache[i]), Mem(HOST_CPU, offsetof(CPU, reg[0].u32) + sizeof(U32) * i));
+            compiler.mov(R32(regCache[i]), Mem(HOST_CPU, offsetof(CPU, reg[0].u32) + sizeof(Reg) * i));
         }
     }
     for (int i = 0; i < 8; i++) {
@@ -5681,9 +5681,9 @@ void JitX86CodeGen::loadCache() {
 void JitX86CodeGen::writeCache() {
     for (int i = 0; i < 8; i++) {
         if (regCache[i] != INVALID_REG) {
-            compiler.mov(Mem(HOST_CPU, offsetof(CPU, reg[0].u32) + sizeof(U32) * i), R32(regCache[i]));
+            compiler.mov(Mem(HOST_CPU, offsetof(CPU, reg[0].u32) + sizeof(Reg) * i), R32(regCache[i]));
         }
-    }    
+    }
     for (int i = 0; i < 8; i++) {
         if (xmmCache[i] != INVALID_REG) {
             compiler.movaps(Mem(HOST_CPU, i * 16 + offsetof(CPU, xmm)), XMM(xmmCache[i]));

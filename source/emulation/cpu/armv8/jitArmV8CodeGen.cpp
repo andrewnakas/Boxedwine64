@@ -6715,7 +6715,7 @@ void JitArmV8CodeGen::direct_cmp(JitWidth width, RegPtr left, U32 right) {
 void JitArmV8CodeGen::direct_test(JitWidth width, RegPtr left, RegPtr right) {
     cfInverted = false;
 
-    // The OF and CF flags are set to 0. The SF, ZF, and PF flags are set according to the result(see the “Operation” section above).The state of the AF flag is undefined.
+    // The OF and CF flags are set to 0. The SF, ZF, and PF flags are set according to the result(see the ï¿½Operationï¿½ section above).The state of the AF flag is undefined.
     if (width == JitWidth::b32) {        
         // sets Z if the result is zero and N if the highest bit is set, while C and V are cleared.
         compiler.ands(asmjit::a64::wzr, R32(left), R32(right));
@@ -6949,7 +6949,7 @@ U8* JitArmV8CodeGen::createStartJITCode() {
 void JitArmV8CodeGen::loadCacheFromCPU() {
     for (int i = 0; i < 8; i++) {
         if (regCache[i] != INVALID_REG) {
-            compiler.ldr(R32(regCache[i]), Mem(xCPU, (U32)(offsetof(CPU, reg[0].u32) + sizeof(U32) * i)));
+            compiler.ldr(R32(regCache[i]), Mem(xCPU, (U32)(offsetof(CPU, reg[0].u32) + sizeof(Reg) * i)));
         }
     }
     static_assert(offsetof(CPU, flags) + 4 == offsetof(CPU, src));
@@ -6969,7 +6969,7 @@ void JitArmV8CodeGen::loadCacheFromCPU() {
 void JitArmV8CodeGen::writeCacheToCPU() {
     for (int i = 0; i < 8; i++) {
         if (regCache[i] != INVALID_REG) {
-            compiler.str(R32(regCache[i]), Mem(xCPU, (U32)(offsetof(CPU, reg[0].u32) + sizeof(U32) * i)));
+            compiler.str(R32(regCache[i]), Mem(xCPU, (U32)(offsetof(CPU, reg[0].u32) + sizeof(Reg) * i)));
         }
     }
     static_assert(offsetof(CPU, flags) + 4 == offsetof(CPU, src));

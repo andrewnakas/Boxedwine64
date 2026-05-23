@@ -19,7 +19,9 @@
 #include "boxedwine.h"
 
 #include "kelf.h"
+#include "kelf64.h"
 #include "loader.h"
+#include "loader64.h"
 
 #include <string.h>
 
@@ -31,20 +33,31 @@
 #define SHT_NOBITS 8
 
 #define PT_LOAD 1
-#define PT_INTERP 3 
+#define PT_INTERP 3
 
 #ifdef __ARMEB__
 #  error "Big-Endian Arch is not supported"
 #endif
 
+// Both 32 and 64-bit ELF headers share their first 5 bytes (magic + class).
+// We can identify the class without committing to a specific Ehdr layout.
+static inline bool isElfMagic(const unsigned char* ident) {
+    return ident[0] == 0x7F && ident[1] == 'E' && ident[2] == 'L' && ident[3] == 'F';
+}
+
+static inline bool isElf32Ident(const unsigned char* ident) {
+    return isElfMagic(ident) && ident[4] == k_ELFCLASS32 && ident[5] == 1; // ELFDATA2LSB
+}
+
+static inline bool isElf64Ident(const unsigned char* ident) {
+    return isElfMagic(ident) && ident[4] == k_ELFCLASS64 && ident[5] == 1;
+}
+
 bool isValidElf(struct k_Elf32_Ehdr* hdr) {
-    if (hdr->e_ident[0] != 0x7F || hdr->e_ident[1] != 'E' || hdr->e_ident[2] != 'L' || hdr->e_ident[3] != 'F') {
-        return false;
-    }
-    if (hdr->e_ident[4] != 1) {
-        return false;
-    }
-    if (hdr->e_ident[5] != 1) {
+    // Preserved 32-bit-only validity check. The general bitness-aware check
+    // lives in isElf32Ident / isElf64Ident above. Callers that don't care
+    // about bitness should use isElfMagic + class inspection directly.
+    if (!isElf32Ident(hdr->e_ident)) {
         return false;
     }
     return true;
@@ -60,8 +73,12 @@ BString ElfLoader::getInterpreter(FsOpenNode* openNode, bool* isElf) {
     if (len!=sizeof(buffer)) {
         *isElf=true;
     }
-    if (*isElf) {		
-        *isElf = isValidElf(hdr);
+    if (*isElf) {
+        // Treat both 32 and 64-bit ELFs as ELFs here so the shell-script
+        // fallback path below does not try to parse a binary header.
+        // loadProgram will reject ELF64 with a clear error if 64-bit guest
+        // support is not compiled in.
+        *isElf = isElf32Ident(buffer) || isElf64Ident(buffer);
     }
     if (!*isElf) {
         if (buffer[0]=='#') {
@@ -231,17 +248,40 @@ U32 getPELoadAddress(struct FsOpenNode* openNode, U32* section, U32* numberOfSec
 }
 #endif
 bool ElfLoader::loadProgram(KThread* thread, FsOpenNode* openNode, U32* eip) {
-    U8 buffer[sizeof(struct k_Elf32_Ehdr)] = { 0 };
+    // Read enough of the file header to discriminate ELF32 from ELF64.
+    // sizeof(Elf64_Ehdr) > sizeof(Elf32_Ehdr) so size the buffer to the
+    // larger; we only access the leading fields shared by both classes
+    // (e_ident, e_type, e_machine) before dispatching.
+    U8 buffer[sizeof(struct k_Elf64_Ehdr)] = { 0 };
+    U32 len = openNode->readNative(buffer, sizeof(struct k_Elf32_Ehdr));
+    if (len != sizeof(struct k_Elf32_Ehdr)) {
+        return false;
+    }
+    if (!isElfMagic(buffer)) {
+        return false;
+    }
+    if (isElf64Ident(buffer)) {
+        openNode->seek(0);
+#ifdef BOXEDWINE_GUEST_X64
+        U64 rip = 0;
+        bool ok = ElfLoader64::loadProgram(thread, openNode, &rip);
+        if (ok) {
+            *eip = (U32)rip; // truncated until CPU64/rip slot exists
+        }
+        return ok;
+#else
+        // Still parse so the user sees what was rejected and why.
+        (void)ElfLoader64::parse(openNode);
+        klog("loadProgram: 64-bit ELF detected but BOXEDWINE_GUEST_X64 is not compiled in");
+        return false;
+#endif
+    }
     struct k_Elf32_Ehdr* hdr = (struct k_Elf32_Ehdr*)buffer;
-    U32 len = openNode->readNative(buffer, sizeof(buffer));
     U32 address=0xFFFFFFFF;
     U32 reloc = 0;
 
-    if (len!=sizeof(buffer)) {
-        return false;
-    }
     if (!isValidElf(hdr))
-        return false;    
+        return false;
     len=0;
     openNode->seek(hdr->e_phoff);	
     for (U32 i=0;i<hdr->e_phnum;i++) {

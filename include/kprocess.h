@@ -271,7 +271,21 @@ public:
     bool hasSetStackMask = false;
     bool hasSetSeg[8] = { false }; // 8 just to prevent bounds checking
 
-    BHashTable<U32, U32> glStrings;    
+    // Guest bitness. is64Bit==true means this process runs x86-64 ELF code and
+    // uses the x86-64 syscall ABI. isWow64 is reserved for a future v2 that
+    // supports running 32-bit code inside a 64-bit address space; it must
+    // stay false in v1.
+    bool is64Bit = false;
+    bool isWow64 = false;
+
+#ifdef BOXEDWINE_GUEST_X64
+    // 64-bit guest memory. Only populated when is64Bit==true. The 32-bit
+    // KMemory above stays the working path for ELF32 guests; KMemory64 is
+    // a strictly parallel subsystem in v1, not a replacement.
+    class KMemory64* memory64 = nullptr;
+#endif
+
+    BHashTable<U32, U32> glStrings;
     U32 glStringsiExtensions = 0;
     std::vector<U32> glStringsiExtensionsOffset;
     U32 glxStringExtensions = 0;

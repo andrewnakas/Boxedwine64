@@ -137,6 +137,11 @@ extern U32 int99CallbackSize;
 #define SEG_ZERO 6
 
 
+// 32-bit guest Reg. Kept at sizeof(Reg)==4 so that the existing JIT can
+// continue encoding CPU-struct offsets in a signed 8-bit displacement
+// (see static_asserts in jit/jitCodeGen.cpp). The 64-bit guest path uses
+// Reg64 (include/reg64.h), an entirely separate register file living on
+// CPU64.
 #define u16 word[0]
 #define h16 word[1]
 #define u8 byte[0]

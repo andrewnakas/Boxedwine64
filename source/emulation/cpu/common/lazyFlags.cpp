@@ -623,5 +623,23 @@ const LazyFlags* lazyFlags[] = {
     flagsNEG16,
     flagsNEG32,
     &flagsCFOF,
+    // Phase 0 stubs for 64-bit guest lazy flags. flagsNONE returns zero for
+    // every flag query — semantically wrong, but won't crash. Replaced with
+    // real implementations in Phase 2 before any 64-bit guest code executes.
+    flagsNONE, // FLAGS_ADD64
+    flagsNONE, // FLAGS_OR64
+    flagsNONE, // FLAGS_ADC64
+    flagsNONE, // FLAGS_SBB64
+    flagsNONE, // FLAGS_AND64
+    flagsNONE, // FLAGS_SUB64
+    flagsNONE, // FLAGS_XOR64
+    flagsNONE, // FLAGS_INC64
+    flagsNONE, // FLAGS_DEC64
+    flagsNONE, // FLAGS_SHL64
+    flagsNONE, // FLAGS_SHR64
+    flagsNONE, // FLAGS_SAR64
+    flagsNONE, // FLAGS_CMP64
+    flagsNONE, // FLAGS_TEST64
+    flagsNONE, // FLAGS_NEG64
     nullptr
 };
