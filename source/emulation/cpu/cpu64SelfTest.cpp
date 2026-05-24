@@ -807,6 +807,58 @@ int runX64SelfTest() {
             return c.reg[X64_R15].u64 == 0xE0001000F0000001ULL;
         });
     }
+    // Test 41: PMINUB. xmm0.lo = 0x10_20_30_40_50_60_70_80,
+    //                   xmm1.lo = 0x80_70_60_50_40_30_20_10.
+    // Per-byte min → 0x10_20_30_40_40_30_20_10.
+    {
+        std::vector<U8> code = {
+            0x48, 0xB8, 0x80, 0x70, 0x60, 0x50, 0x40, 0x30, 0x20, 0x10,
+            0x66, 0x48, 0x0F, 0x6E, 0xC0,                                // movq xmm0, rax
+            0x48, 0xB8, 0x10, 0x20, 0x30, 0x40, 0x50, 0x60, 0x70, 0x80,
+            0x66, 0x48, 0x0F, 0x6E, 0xC8,                                // movq xmm1, rax
+            0x66, 0x0F, 0xDA, 0xC1,                                       // pminub xmm0, xmm1
+            0x66, 0x48, 0x0F, 0x7E, 0xC0,                                 // movq rax, xmm0
+        };
+        runAndCheck(r, "pminub picks per-byte minimum", withExit(code), [](CPU64& c) {
+            return c.reg[X64_R15].u64 == 0x1020304040302010ULL;
+        });
+    }
+    // Test 42: PMAXSW. Words in xmm0 = {0x0001, 0xFFFF (-1), 0x7FFF, 0x8000 (-32768)}.
+    //          Words in xmm1 = {0x0000, 0x0000, 0x0000, 0x0000}.
+    // Per-word signed max → {0x0001, 0x0000, 0x7FFF, 0x0000}.
+    // Stored little-endian as 0x0000_7FFF_0000_0001.
+    {
+        std::vector<U8> code = {
+            0x48, 0xB8, 0x01, 0x00, 0xFF, 0xFF, 0xFF, 0x7F, 0x00, 0x80,
+            0x66, 0x48, 0x0F, 0x6E, 0xC0,                                // movq xmm0, rax
+            0x66, 0x0F, 0xEF, 0xC9,                                       // pxor xmm1, xmm1
+            0x66, 0x0F, 0xEE, 0xC1,                                       // pmaxsw xmm0, xmm1
+            0x66, 0x48, 0x0F, 0x7E, 0xC0,                                 // movq rax, xmm0
+        };
+        runAndCheck(r, "pmaxsw signed-word max with zero clamps negatives", withExit(code), [](CPU64& c) {
+            return c.reg[X64_R15].u64 == 0x00007FFF00000001ULL;
+        });
+    }
+    // Test 43: PSADBW. xmm0 = 16×0xFF, xmm1 = 16×0x00.
+    // SAD low half = 8 × 255 = 2040 = 0x7F8. Result.lo = 0x7F8, .hi = 0x7F8.
+    // We only read the low qword back into rax — expect 0x7F8.
+    {
+        std::vector<U8> code = {
+            0x48, 0xB8, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+            0x66, 0x48, 0x0F, 0x6E, 0xC0,                                // movq xmm0, rax (lo)
+            0x66, 0x48, 0x0F, 0x6E, 0xC8,                                // movq xmm1, rax (we'll zero this next)
+            // pxor xmm1, xmm1 (zero xmm1 entirely so both lo+hi are 0).
+            0x66, 0x0F, 0xEF, 0xC9,
+            // pshufd xmm0, xmm0, 0x44 = 01_00_01_00 — copy low 64 bits to both
+            // halves so xmm0 = 16 × 0xFF.
+            0x66, 0x0F, 0x70, 0xC0, 0x44,
+            0x66, 0x0F, 0xF6, 0xC1,                                       // psadbw xmm0, xmm1
+            0x66, 0x48, 0x0F, 0x7E, 0xC0,                                 // movq rax, xmm0 (low qword)
+        };
+        runAndCheck(r, "psadbw 16×0xFF vs 0 → 2040 per half", withExit(code), [](CPU64& c) {
+            return c.reg[X64_R15].u64 == 0x7F8ULL;
+        });
+    }
     printf("=== self-test summary: %d passed, %d failed ===\n\n", r.passed, r.failed);
     return r.failed == 0 ? 0 : 1;
 }

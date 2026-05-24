@@ -2245,6 +2245,122 @@ U32 CPU64::step() {
             rip += used;
             return used;
         }
+        // PMINUB/PMAXUB — 66 0F DA/DE /r. Unsigned byte min/max across 16
+        // lanes. Used by glibc's strlen/memchr fast paths.
+        if ((op2 == 0xDA || op2 == 0xDE) && osize66) {
+            ModRM m = decodeModRM(rip + opOff + 2, p, 0);
+            U64 srcLo, srcHi;
+            if (m.isReg) {
+                srcLo = xmm[m.rmIndex].lo;
+                srcHi = xmm[m.rmIndex].hi;
+            } else {
+                srcLo = memory->readq(m.effAddr);
+                srcHi = memory->readq(m.effAddr + 8);
+            }
+            U64 dLo = xmm[m.regField].lo;
+            U64 dHi = xmm[m.regField].hi;
+            U64 oLo = 0, oHi = 0;
+            for (int i = 0; i < 8; i++) {
+                U8 a = (dLo  >> (i*8)) & 0xFF; U8 b = (srcLo >> (i*8)) & 0xFF;
+                U8 c = (dHi  >> (i*8)) & 0xFF; U8 d = (srcHi >> (i*8)) & 0xFF;
+                U8 lo8 = (op2 == 0xDA) ? (a < b ? a : b) : (a > b ? a : b);
+                U8 hi8 = (op2 == 0xDA) ? (c < d ? c : d) : (c > d ? c : d);
+                oLo |= (U64)lo8 << (i*8);
+                oHi |= (U64)hi8 << (i*8);
+            }
+            xmm[m.regField].lo = oLo;
+            xmm[m.regField].hi = oHi;
+            U32 used = opOff + 2 + m.length;
+            rip += used;
+            return used;
+        }
+        // PMINSW/PMAXSW — 66 0F EA/EE /r. Signed word min/max across 8 lanes.
+        if ((op2 == 0xEA || op2 == 0xEE) && osize66) {
+            ModRM m = decodeModRM(rip + opOff + 2, p, 0);
+            U64 srcLo, srcHi;
+            if (m.isReg) {
+                srcLo = xmm[m.rmIndex].lo;
+                srcHi = xmm[m.rmIndex].hi;
+            } else {
+                srcLo = memory->readq(m.effAddr);
+                srcHi = memory->readq(m.effAddr + 8);
+            }
+            U64 dLo = xmm[m.regField].lo;
+            U64 dHi = xmm[m.regField].hi;
+            U64 oLo = 0, oHi = 0;
+            for (int i = 0; i < 4; i++) {
+                S16 a = (S16)((dLo  >> (i*16)) & 0xFFFF);
+                S16 b = (S16)((srcLo >> (i*16)) & 0xFFFF);
+                S16 c = (S16)((dHi  >> (i*16)) & 0xFFFF);
+                S16 d = (S16)((srcHi >> (i*16)) & 0xFFFF);
+                S16 lo16 = (op2 == 0xEA) ? (a < b ? a : b) : (a > b ? a : b);
+                S16 hi16 = (op2 == 0xEA) ? (c < d ? c : d) : (c > d ? c : d);
+                oLo |= ((U64)(U16)lo16) << (i*16);
+                oHi |= ((U64)(U16)hi16) << (i*16);
+            }
+            xmm[m.regField].lo = oLo;
+            xmm[m.regField].hi = oHi;
+            U32 used = opOff + 2 + m.length;
+            rip += used;
+            return used;
+        }
+        // PAVGB — 66 0F E0 /r. Unsigned byte average with rounding:
+        // dst[i] = (dst[i] + src[i] + 1) >> 1.
+        if (op2 == 0xE0 && osize66) {
+            ModRM m = decodeModRM(rip + opOff + 2, p, 0);
+            U64 srcLo, srcHi;
+            if (m.isReg) {
+                srcLo = xmm[m.rmIndex].lo;
+                srcHi = xmm[m.rmIndex].hi;
+            } else {
+                srcLo = memory->readq(m.effAddr);
+                srcHi = memory->readq(m.effAddr + 8);
+            }
+            U64 dLo = xmm[m.regField].lo;
+            U64 dHi = xmm[m.regField].hi;
+            U64 oLo = 0, oHi = 0;
+            for (int i = 0; i < 8; i++) {
+                U16 a = (dLo  >> (i*8)) & 0xFF; U16 b = (srcLo >> (i*8)) & 0xFF;
+                U16 c = (dHi  >> (i*8)) & 0xFF; U16 d = (srcHi >> (i*8)) & 0xFF;
+                oLo |= (U64)((U8)((a + b + 1) >> 1)) << (i*8);
+                oHi |= (U64)((U8)((c + d + 1) >> 1)) << (i*8);
+            }
+            xmm[m.regField].lo = oLo;
+            xmm[m.regField].hi = oHi;
+            U32 used = opOff + 2 + m.length;
+            rip += used;
+            return used;
+        }
+        // PSADBW — 66 0F F6 /r. Sum-of-absolute-differences over each 8-byte
+        // half. Used by glibc memcmp/strncmp. Output: low qword = sum for low
+        // half, high qword = sum for high half.
+        if (op2 == 0xF6 && osize66) {
+            ModRM m = decodeModRM(rip + opOff + 2, p, 0);
+            U64 srcLo, srcHi;
+            if (m.isReg) {
+                srcLo = xmm[m.rmIndex].lo;
+                srcHi = xmm[m.rmIndex].hi;
+            } else {
+                srcLo = memory->readq(m.effAddr);
+                srcHi = memory->readq(m.effAddr + 8);
+            }
+            U64 dLo = xmm[m.regField].lo;
+            U64 dHi = xmm[m.regField].hi;
+            U64 sumLo = 0, sumHi = 0;
+            for (int i = 0; i < 8; i++) {
+                int a = (dLo  >> (i*8)) & 0xFF;
+                int b = (srcLo >> (i*8)) & 0xFF;
+                int c = (dHi  >> (i*8)) & 0xFF;
+                int d = (srcHi >> (i*8)) & 0xFF;
+                sumLo += (U64)(a > b ? a - b : b - a);
+                sumHi += (U64)(c > d ? c - d : d - c);
+            }
+            xmm[m.regField].lo = sumLo;
+            xmm[m.regField].hi = sumHi;
+            U32 used = opOff + 2 + m.length;
+            rip += used;
+            return used;
+        }
         // PREFETCH* — 0F 18 /reg. Treated as a no-op (hint only).
         if (op2 == 0x18) {
             ModRM m = decodeModRM(rip + opOff + 2, p, 0);
