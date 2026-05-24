@@ -171,6 +171,13 @@ CPU64::ModRM CPU64::decodeModRM(U64 modrmAddr, const Prefixes& p, U32 trailingIm
         m.effAddr &= 0xFFFFFFFFULL;
     }
 
+    // FS/GS segment overrides add the per-thread segment base. In long mode
+    // CS/DS/ES/SS bases are always 0 and any prefix for them is a no-op,
+    // but FS and GS keep their MSR-controlled bases — that's how glibc and
+    // ld-linux access TLS (mov rax, fs:[0x28] stack canary, etc.).
+    if (p.seg == 0x64) m.effAddr += fsbase;
+    else if (p.seg == 0x65) m.effAddr += gsbase;
+
     return m;
 }
 
@@ -1067,6 +1074,49 @@ U32 CPU64::step() {
         U32 used = opOff + 1 + m.length + immLen;
         rip += used;
         return used;
+    }
+
+    // String ops — MOVS and STOS. Address size in long mode defaults to 64
+    // (RSI/RDI/RCX); with 0x67 prefix it's ESI/EDI/ECX. Direction flag DF
+    // controls increment vs decrement. With REP (F3), repeat until RCX==0.
+    //
+    // MOVSB/MOVSW/MOVSD/MOVSQ — A4 (byte), A5 (opSize).
+    // STOSB/STOSW/STOSD/STOSQ — AA (byte), AB (opSize). Source is RAX.
+    if (op == 0xA4 || op == 0xA5 || op == 0xAA || op == 0xAB) {
+        U32 size = (op == 0xA4 || op == 0xAA) ? 1 : opSize;
+        bool isStos = (op == 0xAA || op == 0xAB);
+        S64 step = (rflags & X64_DF) ? -(S64)size : (S64)size;
+        U64 count = (p.rep != 0) ? reg[X64_RCX].u64 : 1;
+        if (p.asize32) count &= 0xFFFFFFFFULL;
+        while (count--) {
+            U64 src = reg[X64_RSI].u64;
+            U64 dst = reg[X64_RDI].u64;
+            if (p.asize32) { src &= 0xFFFFFFFFULL; dst &= 0xFFFFFFFFULL; }
+            U64 val;
+            if (isStos) {
+                val = (size == 1) ? reg[X64_RAX].u8
+                    : (size == 2) ? reg[X64_RAX].u16
+                    : (size == 4) ? reg[X64_RAX].u32 : reg[X64_RAX].u64;
+            } else {
+                switch (size) {
+                    case 1: val = memory->readb(src); break;
+                    case 2: val = memory->readw(src); break;
+                    case 4: val = memory->readd(src); break;
+                    default: val = memory->readq(src); break;
+                }
+            }
+            switch (size) {
+                case 1: memory->writeb(dst, (U8)val); break;
+                case 2: memory->writew(dst, (U16)val); break;
+                case 4: memory->writed(dst, (U32)val); break;
+                case 8: memory->writeq(dst, val); break;
+            }
+            if (!isStos) reg[X64_RSI].setU64(reg[X64_RSI].u64 + (U64)step);
+            reg[X64_RDI].setU64(reg[X64_RDI].u64 + (U64)step);
+        }
+        if (p.rep != 0) reg[X64_RCX].setU64(0);
+        rip += opOff + 1;
+        return opOff + 1;
     }
 
     // LEAVE (C9). Equivalent to: RSP = RBP; RBP = pop64().
