@@ -729,6 +729,29 @@ int runX64SelfTest() {
             return c.reg[X64_R15].u64 == 0x4000000020000000ULL;
         });
     }
+    // Test 37: PSUBD then PCMPGTD. xmm0 = [5, 5], xmm1 = [3, 7].
+    // PSUBD xmm0,xmm1 → [2, -2] (i.e. 0xFFFFFFFE in lane 1).
+    // PCMPGTD xmm0, (zeroed xmm2) → lane 0 (2>0)=all 1s, lane 1 (-2>0)=0.
+    // Result.lo = 0x00000000_FFFFFFFF.
+    {
+        std::vector<U8> code = {
+            // xmm0.lo = 0x0000000500000005
+            0x48, 0xB8, 0x05, 0x00, 0x00, 0x00, 0x05, 0x00, 0x00, 0x00,
+            0x66, 0x48, 0x0F, 0x6E, 0xC0,                                // movq xmm0, rax
+            // xmm1.lo = 0x0000000700000003
+            0x48, 0xB8, 0x03, 0x00, 0x00, 0x00, 0x07, 0x00, 0x00, 0x00,
+            0x66, 0x48, 0x0F, 0x6E, 0xC8,                                // movq xmm1, rax
+            0x66, 0x0F, 0xFA, 0xC1,                                       // psubd xmm0, xmm1
+            // xmm2 = 0  (pxor)
+            0x66, 0x0F, 0xEF, 0xD2,
+            0x66, 0x0F, 0x66, 0xC2,                                       // pcmpgtd xmm0, xmm2
+            0x66, 0x48, 0x0F, 0x7E, 0xC0,                                 // movq rax, xmm0
+        };
+        runAndCheck(r, "psubd then pcmpgtd vs zero → 0x00000000_FFFFFFFF",
+            withExit(code), [](CPU64& c) {
+                return c.reg[X64_R15].u64 == 0x00000000FFFFFFFFULL;
+            });
+    }
     printf("=== self-test summary: %d passed, %d failed ===\n\n", r.passed, r.failed);
     return r.failed == 0 ? 0 : 1;
 }

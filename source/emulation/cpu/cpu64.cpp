@@ -1971,6 +1971,101 @@ U32 CPU64::step() {
                 return used;
             }
         }
+        // PSUBB/PSUBW/PSUBD/PSUBQ — 66 0F F8/F9/FA/FB /r. Same shape as PADD.
+        if ((op2 == 0xF8 || op2 == 0xF9 || op2 == 0xFA || op2 == 0xFB) && osize66) {
+            ModRM m = decodeModRM(rip + opOff + 2, p, 0);
+            U64 srcLo, srcHi;
+            if (m.isReg) {
+                srcLo = xmm[m.rmIndex].lo;
+                srcHi = xmm[m.rmIndex].hi;
+            } else {
+                srcLo = memory->readq(m.effAddr);
+                srcHi = memory->readq(m.effAddr + 8);
+            }
+            U64 dLo = xmm[m.regField].lo;
+            U64 dHi = xmm[m.regField].hi;
+            U64 oLo = 0, oHi = 0;
+            if (op2 == 0xF8) { // PSUBB
+                for (int i = 0; i < 8; i++) {
+                    U8 a = (dLo >> (i*8)) & 0xFF; U8 b = (srcLo >> (i*8)) & 0xFF;
+                    oLo |= (U64)((U8)(a - b)) << (i*8);
+                    U8 c = (dHi >> (i*8)) & 0xFF; U8 d = (srcHi >> (i*8)) & 0xFF;
+                    oHi |= (U64)((U8)(c - d)) << (i*8);
+                }
+            } else if (op2 == 0xF9) { // PSUBW
+                for (int i = 0; i < 4; i++) {
+                    U16 a = (dLo >> (i*16)) & 0xFFFF; U16 b = (srcLo >> (i*16)) & 0xFFFF;
+                    oLo |= (U64)((U16)(a - b)) << (i*16);
+                    U16 c = (dHi >> (i*16)) & 0xFFFF; U16 d = (srcHi >> (i*16)) & 0xFFFF;
+                    oHi |= (U64)((U16)(c - d)) << (i*16);
+                }
+            } else if (op2 == 0xFA) { // PSUBD
+                for (int i = 0; i < 2; i++) {
+                    U32 a = (dLo >> (i*32)) & 0xFFFFFFFFu; U32 b = (srcLo >> (i*32)) & 0xFFFFFFFFu;
+                    oLo |= (U64)((U32)(a - b)) << (i*32);
+                    U32 c = (dHi >> (i*32)) & 0xFFFFFFFFu; U32 d = (srcHi >> (i*32)) & 0xFFFFFFFFu;
+                    oHi |= (U64)((U32)(c - d)) << (i*32);
+                }
+            } else { // PSUBQ
+                oLo = dLo - srcLo;
+                oHi = dHi - srcHi;
+            }
+            xmm[m.regField].lo = oLo;
+            xmm[m.regField].hi = oHi;
+            U32 used = opOff + 2 + m.length;
+            rip += used;
+            return used;
+        }
+        // PCMPGTB/W/D xmm, xmm/m128 — 66 0F 64/65/66 /r. Signed greater-than:
+        // each lane of dst becomes all-1s if dst > src, else all-0s. Paired
+        // with PCMPEQB in glibc's classified-character scans.
+        if ((op2 == 0x64 || op2 == 0x65 || op2 == 0x66) && osize66) {
+            ModRM m = decodeModRM(rip + opOff + 2, p, 0);
+            U64 srcLo, srcHi;
+            if (m.isReg) {
+                srcLo = xmm[m.rmIndex].lo;
+                srcHi = xmm[m.rmIndex].hi;
+            } else {
+                srcLo = memory->readq(m.effAddr);
+                srcHi = memory->readq(m.effAddr + 8);
+            }
+            U64 dLo = xmm[m.regField].lo;
+            U64 dHi = xmm[m.regField].hi;
+            U64 oLo = 0, oHi = 0;
+            if (op2 == 0x64) { // PCMPGTB (signed bytes)
+                for (int i = 0; i < 8; i++) {
+                    S8 a = (S8)((dLo >> (i*8)) & 0xFF);
+                    S8 b = (S8)((srcLo >> (i*8)) & 0xFF);
+                    if (a > b) oLo |= 0xFFULL << (i*8);
+                    S8 c = (S8)((dHi >> (i*8)) & 0xFF);
+                    S8 d = (S8)((srcHi >> (i*8)) & 0xFF);
+                    if (c > d) oHi |= 0xFFULL << (i*8);
+                }
+            } else if (op2 == 0x65) { // PCMPGTW
+                for (int i = 0; i < 4; i++) {
+                    S16 a = (S16)((dLo >> (i*16)) & 0xFFFF);
+                    S16 b = (S16)((srcLo >> (i*16)) & 0xFFFF);
+                    if (a > b) oLo |= 0xFFFFULL << (i*16);
+                    S16 c = (S16)((dHi >> (i*16)) & 0xFFFF);
+                    S16 d = (S16)((srcHi >> (i*16)) & 0xFFFF);
+                    if (c > d) oHi |= 0xFFFFULL << (i*16);
+                }
+            } else { // PCMPGTD
+                for (int i = 0; i < 2; i++) {
+                    S32 a = (S32)((dLo >> (i*32)) & 0xFFFFFFFFu);
+                    S32 b = (S32)((srcLo >> (i*32)) & 0xFFFFFFFFu);
+                    if (a > b) oLo |= 0xFFFFFFFFULL << (i*32);
+                    S32 c = (S32)((dHi >> (i*32)) & 0xFFFFFFFFu);
+                    S32 d = (S32)((srcHi >> (i*32)) & 0xFFFFFFFFu);
+                    if (c > d) oHi |= 0xFFFFFFFFULL << (i*32);
+                }
+            }
+            xmm[m.regField].lo = oLo;
+            xmm[m.regField].hi = oHi;
+            U32 used = opOff + 2 + m.length;
+            rip += used;
+            return used;
+        }
         // PADDB/PADDW/PADDD/PADDQ — 66 0F FC/FD/FE/D4 /r. Used by SSE
         // crypto-style mixing in glibc's hash routines.
         if ((op2 == 0xFC || op2 == 0xFD || op2 == 0xFE || op2 == 0xD4) && osize66) {
