@@ -147,6 +147,54 @@ static U32 phdrFlagsToProt(U32 pFlags) {
     return prot;
 }
 
+// Map every PT_LOAD segment of one parsed ELF into guest memory at the
+// given relocation base. Returns true on success. Used for both the main
+// executable and (recursively) PT_INTERP.
+static bool mapSegments(KMemory64* mem, FsOpenNode* openNode,
+                        const Elf64ParseResult& r, U64 reloc,
+                        const char* tag) {
+    for (const Elf64LoadSegment& seg : r.segments) {
+        U64 vaddr = seg.vaddr + reloc;
+        U64 alignedAddr = vaddr & ~K64_PAGE_MASK;
+        U64 trailing = vaddr - alignedAddr;
+        U64 mapLen = (seg.memsz + trailing + K64_PAGE_SIZE - 1) & ~K64_PAGE_MASK;
+        U32 prot = phdrFlagsToProt(seg.flags);
+        U64 mapped = mem->mmapAnonymousFixed(alignedAddr, mapLen, prot);
+        if (mapped != alignedAddr) {
+            klog_fmt("loadProgram64[%s]: mmap failed for segment at 0x%llx (got 0x%llx)",
+                     tag, (unsigned long long)alignedAddr, (unsigned long long)mapped);
+            return false;
+        }
+        if (seg.filesz > 0) {
+            std::vector<U8> buf((size_t)seg.filesz);
+            openNode->seek((U64)seg.offset);
+            U32 read = openNode->readNative(buf.data(), (U32)seg.filesz);
+            if (read != seg.filesz) {
+                klog_fmt("loadProgram64[%s]: short read on segment (got %u of %llu)",
+                         tag, read, (unsigned long long)seg.filesz);
+                return false;
+            }
+            mem->memcpyToGuest(vaddr, buf.data(), seg.filesz);
+        }
+        klog_fmt("loadProgram64[%s]:   mapped seg vaddr=0x%llx len=0x%llx prot=0x%x filesz=0x%llx",
+                 tag,
+                 (unsigned long long)alignedAddr,
+                 (unsigned long long)mapLen,
+                 prot,
+                 (unsigned long long)seg.filesz);
+    }
+    return true;
+}
+
+// Open a guest-rootfs path. The interpreter path in PT_INTERP is an absolute
+// guest path like "/lib64/ld-linux-x86-64.so.2". Resolve via the Fs layer
+// against the empty current directory (which uses the root).
+static FsOpenNode* openGuestPath(BString path) {
+    std::shared_ptr<FsNode> node = Fs::getNodeFromLocalPath(B(""), path, true);
+    if (!node) return nullptr;
+    return node->open(K_O_RDONLY);
+}
+
 bool ElfLoader64::loadProgram(KThread* thread, FsOpenNode* openNode, U64* rip) {
     Elf64ParseResult r = parse(openNode);
     if (!r.ok) {
@@ -176,40 +224,12 @@ bool ElfLoader64::loadProgram(KThread* thread, FsOpenNode* openNode, U64* rip) {
 
     U64 reloc = r.isPie ? X64_PIE_BASE : 0;
 
-    for (const Elf64LoadSegment& seg : r.segments) {
-        U64 vaddr = seg.vaddr + reloc;
-        U64 alignedAddr = vaddr & ~K64_PAGE_MASK;
-        U64 trailing = vaddr - alignedAddr;
-        U64 mapLen = (seg.memsz + trailing + K64_PAGE_SIZE - 1) & ~K64_PAGE_MASK;
-        U32 prot = phdrFlagsToProt(seg.flags);
-        U64 mapped = mem->mmapAnonymousFixed(alignedAddr, mapLen, prot);
-        if (mapped != alignedAddr) {
-            klog_fmt("loadProgram64: mmap failed for segment at 0x%llx (got 0x%llx)",
-                     (unsigned long long)alignedAddr, (unsigned long long)mapped);
-            return false;
-        }
-        if (seg.filesz > 0) {
-            // Copy file bytes through a host buffer (KMemory64 is not host-
-            // backed in v1, so we can't pass an open file directly to it).
-            std::vector<U8> buf((size_t)seg.filesz);
-            openNode->seek((U64)seg.offset);
-            U32 read = openNode->readNative(buf.data(), (U32)seg.filesz);
-            if (read != seg.filesz) {
-                klog_fmt("loadProgram64: short read on segment (got %u of %llu)",
-                         read, (unsigned long long)seg.filesz);
-                return false;
-            }
-            mem->memcpyToGuest(vaddr, buf.data(), seg.filesz);
-        }
-        klog_fmt("loadProgram64:   mapped seg vaddr=0x%llx len=0x%llx prot=0x%x filesz=0x%llx",
-                 (unsigned long long)alignedAddr,
-                 (unsigned long long)mapLen,
-                 prot,
-                 (unsigned long long)seg.filesz);
+    if (!mapSegments(mem, openNode, r, reloc, "exe")) {
+        return false;
     }
 
     *rip = r.entry + reloc;
-    klog_fmt("loadProgram64: RIP set to 0x%llx (pages mapped: %llu)",
+    klog_fmt("loadProgram64: exe RIP=0x%llx (pages mapped: %llu)",
              (unsigned long long)*rip,
              (unsigned long long)mem->mappedPageCount());
 
@@ -221,6 +241,50 @@ bool ElfLoader64::loadProgram(KThread* thread, FsOpenNode* openNode, U64* rip) {
     process->phentsize64 = r.phentsize;
     process->brkEnd64 = (r.baseAddrHigh + reloc + K64_PAGE_SIZE - 1) & ~K64_PAGE_MASK;
     process->is64Bit = true;
+
+    // ---- PT_INTERP: recursively load the dynamic linker. ----
+    //
+    // For a dynamically-linked binary the kernel transfers control to the
+    // interpreter (typically /lib64/ld-linux-x86-64.so.2), not the binary's
+    // own entry. AT_BASE in the auxv tells the interpreter its own load
+    // base; AT_ENTRY tells it where the real program entry is so it can
+    // jump there after resolving relocations.
+    U64 interpBase = 0;
+    bool haveInterp = false;
+    if (r.interpreter.length()) {
+        FsOpenNode* interpNode = openGuestPath(r.interpreter);
+        if (!interpNode) {
+            klog_fmt("loadProgram64: PT_INTERP '%s' not found in guest rootfs",
+                     r.interpreter.c_str());
+            // Fail loudly — a dynamic binary without its loader will crash
+            // on the first PLT call.
+            return false;
+        }
+        Elf64ParseResult interpR = parse(interpNode);
+        if (!interpR.ok) {
+            klog_fmt("loadProgram64: PT_INTERP '%s' parse failed", r.interpreter.c_str());
+            interpNode->close();
+            delete interpNode;
+            return false;
+        }
+        // Pick a base well away from the exe and stack. ld-linux is ET_DYN
+        // and small (~200 KiB), so any free high address is fine.
+        interpBase = 0x7FFFF7FCE000ULL & ~K64_PAGE_MASK;
+        if (!mapSegments(mem, interpNode, interpR, interpBase, "interp")) {
+            interpNode->close();
+            delete interpNode;
+            return false;
+        }
+        // Control transfers to the interpreter, not the exe.
+        *rip = interpR.entry + interpBase;
+        klog_fmt("loadProgram64: interp '%s' mapped at base 0x%llx, RIP=0x%llx",
+                 r.interpreter.c_str(),
+                 (unsigned long long)interpBase,
+                 (unsigned long long)*rip);
+        interpNode->close();
+        delete interpNode;
+        haveInterp = true;
+    }
 
     // -------------------------------------------------------------------
     // Build the initial user-mode stack.
@@ -300,7 +364,7 @@ bool ElfLoader64::loadProgram(KThread* thread, FsOpenNode* openNode, U64* rip) {
         { AT_PHENT,   process->phentsize64 },
         { AT_PHNUM,   process->phnum64 },
         { AT_PAGESZ,  K64_PAGE_SIZE },
-        { AT_BASE,    0 },              // no separate interpreter base in v1
+        { AT_BASE,    haveInterp ? interpBase : 0 },
         { AT_ENTRY,   process->entry64 },
         { AT_UID,     process->userId },
         { AT_EUID,    process->effectiveUserId },
@@ -344,7 +408,9 @@ bool ElfLoader64::loadProgram(KThread* thread, FsOpenNode* openNode, U64* rip) {
         process->cpu64 = new CPU64(mem);
     }
     process->cpu64->thread = thread;
-    process->cpu64->rip = process->entry64;
+    // When an interpreter is present, *rip points at the interpreter entry,
+    // not the executable entry — that's the correct first instruction.
+    process->cpu64->rip = *rip;
     process->cpu64->reg[X64_RSP].setU64(sp);
     // System V calls _start with RDX = pointer to a function to register
     // with atexit, or 0 if none. Linux passes 0.

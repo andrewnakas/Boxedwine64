@@ -20,6 +20,10 @@
 #include "../x11/x11.h"
 #include "knativeaudio.h"
 
+#ifdef BOXEDWINE_GUEST_X64
+#include "cpu64.h"
+#endif
+
 #ifdef BOXEDWINE_MULTI_THREADED
 static KList<KTimerCallback*> timers;
 static BOXEDWINE_MUTEX timerMutex;
@@ -154,6 +158,24 @@ static S32 increaseContextTime(S32 value) {
 }
 
 void runThreadSlice(KThread* thread) {
+#ifdef BOXEDWINE_GUEST_X64
+    // 64-bit guest path: drive CPU64 directly. The 32-bit CPU instance on
+    // the thread is unused for is64Bit processes — we keep it allocated so
+    // pre-existing kthread bookkeeping (cpu->thread, signals, etc.) doesn't
+    // need to be made conditional everywhere yet. A KThread64 split is a
+    // follow-up.
+    if (thread->process && thread->process->is64Bit && thread->process->cpu64) {
+        CPU64* cpu64 = thread->process->cpu64;
+        cpu64->yield = false;
+        try {
+            cpu64->run();
+        } catch (...) {
+            // CPU64 has no nextOp; nothing to clear here.
+        }
+        return;
+    }
+#endif
+
     CPU* cpu;
 
     cpu = thread->cpu;
