@@ -348,6 +348,53 @@ static void writeStatBuf64(KMemory64* mem, U64 addr, U64 size, U32 mode,
     mem->memcpyToGuest(addr, buf, sizeof(buf));
 }
 
+// Forward decl — sys_newfstatat64 may delegate to sys_fstat64 for AT_EMPTY_PATH.
+static U64 sys_fstat64(CPU64* cpu, U64 fd, U64 statbuf);
+
+// Path-based stat shared by stat/lstat/newfstatat. followSymlink controls
+// the lstat vs stat distinction (Fs::getNodeFromLocalPath's third arg).
+static U64 sys_stat_path64(CPU64* cpu, U64 pathAddr, U64 statbuf, bool followSymlink) {
+    if (!cpu->thread || !cpu->thread->process) return (U64)-K_ENOSYS;
+    if (!pathAddr || !statbuf) return (U64)-K_EFAULT;
+    char path[1024] = {0};
+    cpu->memory->memcpyFromGuest(path, pathAddr, sizeof(path) - 1);
+    BString bpath = BString::copy(path);
+    std::shared_ptr<FsNode> node = Fs::getNodeFromLocalPath(
+        cpu->thread->process->currentDirectory, bpath, followSymlink);
+    if (!node) return (U64)-2; // -ENOENT
+    U64 size  = node->length();
+    U32 mode  = node->getMode();
+    U64 ino   = node->id;
+    U64 mtime = node->lastModified() / 1000; // ms → seconds
+    writeStatBuf64(cpu->memory, statbuf, size, mode, ino, 1000, 1000, mtime);
+    return 0;
+}
+
+// newfstatat(dirfd, path, statbuf, flags). AT_EMPTY_PATH (0x1000) means
+// "stat the dirfd itself"; AT_SYMLINK_NOFOLLOW (0x100) makes it lstat.
+#ifndef K_AT_SYMLINK_NOFOLLOW
+#define K_AT_SYMLINK_NOFOLLOW 0x100
+#endif
+#ifndef K_AT_EMPTY_PATH
+#define K_AT_EMPTY_PATH 0x1000
+#endif
+static U64 sys_newfstatat64(CPU64* cpu, U64 dirfd, U64 pathAddr, U64 statbuf, U64 flags) {
+    if (!cpu->thread || !cpu->thread->process) return (U64)-K_ENOSYS;
+    if (!statbuf) return (U64)-K_EFAULT;
+    // AT_EMPTY_PATH with NULL/"" path means stat the fd.
+    if ((flags & K_AT_EMPTY_PATH) && (!pathAddr || cpu->memory->readb(pathAddr) == 0)) {
+        return sys_fstat64(cpu, dirfd, statbuf);
+    }
+    // We only honour AT_FDCWD or absolute paths for now (matches openat).
+    char path[1024] = {0};
+    cpu->memory->memcpyFromGuest(path, pathAddr, sizeof(path) - 1);
+    bool isAbs = (path[0] == '/');
+    if (!isAbs && (S32)dirfd != K_AT_FDCWD) {
+        return (U64)-2;
+    }
+    return sys_stat_path64(cpu, pathAddr, statbuf, !(flags & K_AT_SYMLINK_NOFOLLOW));
+}
+
 static U64 sys_fstat64(CPU64* cpu, U64 fd, U64 statbuf) {
     if (!cpu->thread || !cpu->thread->process) return (U64)-K_ENOSYS;
     if (!statbuf) return (U64)-K_EFAULT;
@@ -429,9 +476,27 @@ static U64 sys_writev64(CPU64* cpu, U64 fd, U64 iov, U64 iovcnt) {
     return total;
 }
 
-// readlink — return -ENOENT so callers fall back; /proc/self/exe etc.
-static U64 sys_readlink64(CPU64* /*cpu*/, U64 /*pathAddr*/, U64 /*buf*/, U64 /*sz*/) {
-    return (U64)-2; // -ENOENT
+// readlink(path, buf, bufsize) — resolve a symlink. /proc/self/exe is the
+// big-ticket caller for glibc startup; everything else falls back to the
+// FsNode link field if present.
+static U64 sys_readlink64(CPU64* cpu, U64 pathAddr, U64 buf, U64 sz) {
+    if (!cpu->thread || !cpu->thread->process) return (U64)-K_ENOSYS;
+    if (!pathAddr || !buf || sz == 0) return (U64)-K_EFAULT;
+    char path[1024] = {0};
+    cpu->memory->memcpyFromGuest(path, pathAddr, sizeof(path) - 1);
+    BString resolved;
+    if (std::strcmp(path, "/proc/self/exe") == 0 || std::strcmp(path, "/proc/thread-self/exe") == 0) {
+        resolved = cpu->thread->process->exe;
+    } else {
+        std::shared_ptr<FsNode> n = Fs::getNodeFromLocalPath(
+            cpu->thread->process->currentDirectory, BString::copy(path), false);
+        if (!n || !n->isLink()) return (U64)-22; // -EINVAL on non-symlink
+        resolved = n->link;
+    }
+    U64 toCopy = (U64)resolved.length();
+    if (toCopy > sz) toCopy = sz;
+    cpu->memory->memcpyToGuest(buf, resolved.c_str(), toCopy);
+    return toCopy;
 }
 
 void ksyscall64(CPU64* cpu) {
@@ -501,9 +566,13 @@ void ksyscall64(CPU64* cpu) {
             ret = sys_fstat64(cpu, a1, a2);
             break;
         case X64_SYS_stat:
+            ret = sys_stat_path64(cpu, a1, a2, true);
+            break;
         case X64_SYS_lstat:
+            ret = sys_stat_path64(cpu, a1, a2, false);
+            break;
         case X64_SYS_newfstatat:
-            ret = (U64)-2; // path-based stat still ENOENT until we wire openFile + stat
+            ret = sys_newfstatat64(cpu, a1, a2, a3, a4);
             break;
         case X64_SYS_lseek:
             ret = sys_lseek64(cpu, a1, a2, a3);
@@ -514,9 +583,16 @@ void ksyscall64(CPU64* cpu) {
         case X64_SYS_readlink:
             ret = sys_readlink64(cpu, a1, a2, a3);
             break;
-        case X64_SYS_access:
-            ret = (U64)-2; // -ENOENT
+        case X64_SYS_access: {
+            // access(path, mode) — resolve path; we don't model EUID perms yet
+            // so existence is the only check (mode bits ignored).
+            char path[1024] = {0};
+            cpu->memory->memcpyFromGuest(path, a1, sizeof(path) - 1);
+            std::shared_ptr<FsNode> n = Fs::getNodeFromLocalPath(
+                cpu->thread->process->currentDirectory, BString::copy(path), true);
+            ret = n ? 0 : (U64)-2;
             break;
+        }
         case X64_SYS_uname:
             ret = sys_uname64(cpu, a1);
             break;
