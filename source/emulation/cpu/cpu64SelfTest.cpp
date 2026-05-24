@@ -752,6 +752,27 @@ int runX64SelfTest() {
                 return c.reg[X64_R15].u64 == 0x00000000FFFFFFFFULL;
             });
     }
+    // Test 38: PUNPCKLBW. xmm0.lo = 0x0807060504030201, xmm1.lo = 0xFFEEDDCCBBAA9988.
+    // After punpcklbw xmm0,xmm1: interleave low 8 bytes of each.
+    // out[i*2]   = d[i] = 01,02,03,04,05,06,07,08
+    // out[i*2+1] = s[i] = 88,99,AA,BB,CC,DD,EE,FF
+    // Result.lo = bytes 0..7: 01 88 02 99 03 AA 04 BB
+    //          = 0xBB04_AA03_9902_8801
+    {
+        std::vector<U8> code = {
+            // xmm0.lo = 0x0807060504030201
+            0x48, 0xB8, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08,
+            0x66, 0x48, 0x0F, 0x6E, 0xC0,                                // movq xmm0, rax
+            // xmm1.lo = 0xFFEEDDCCBBAA9988
+            0x48, 0xB8, 0x88, 0x99, 0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF,
+            0x66, 0x48, 0x0F, 0x6E, 0xC8,                                // movq xmm1, rax
+            0x66, 0x0F, 0x60, 0xC1,                                       // punpcklbw xmm0, xmm1
+            0x66, 0x48, 0x0F, 0x7E, 0xC0,                                 // movq rax, xmm0
+        };
+        runAndCheck(r, "punpcklbw interleaves low bytes", withExit(code), [](CPU64& c) {
+            return c.reg[X64_R15].u64 == 0xBB04AA0399028801ULL;
+        });
+    }
     printf("=== self-test summary: %d passed, %d failed ===\n\n", r.passed, r.failed);
     return r.failed == 0 ? 0 : 1;
 }

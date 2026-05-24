@@ -2016,6 +2016,68 @@ U32 CPU64::step() {
             rip += used;
             return used;
         }
+        // PUNPCKLBW/W/D/Q xmm, xmm/m128 — 66 0F 60/61/62/6C /r.
+        // Interleave low-half lanes of dst and src.
+        //   60 = bytes:  out[0]=d[0] out[1]=s[0] out[2]=d[1] out[3]=s[1] ...
+        //   61 = words, 62 = dwords, 6C = qwords.
+        // PUNPCKH (high half) at 0F 68/69/6A/6D, same interleave on the
+        // upper 8 bytes of each input.
+        if ((op2 == 0x60 || op2 == 0x61 || op2 == 0x62 || op2 == 0x6C ||
+             op2 == 0x68 || op2 == 0x69 || op2 == 0x6A || op2 == 0x6D) && osize66) {
+            ModRM m = decodeModRM(rip + opOff + 2, p, 0);
+            U64 srcLo, srcHi;
+            if (m.isReg) {
+                srcLo = xmm[m.rmIndex].lo;
+                srcHi = xmm[m.rmIndex].hi;
+            } else {
+                srcLo = memory->readq(m.effAddr);
+                srcHi = memory->readq(m.effAddr + 8);
+            }
+            U64 dLo = xmm[m.regField].lo;
+            U64 dHi = xmm[m.regField].hi;
+            // For low forms we read the low 8 bytes of each; for high forms,
+            // the high 8 bytes. Result occupies all 16 bytes.
+            bool isHigh = (op2 >= 0x68);
+            U64 dSrc = isHigh ? dHi : dLo;
+            U64 sSrc = isHigh ? srcHi : srcLo;
+            U64 oLo = 0, oHi = 0;
+            U8 sub = isHigh ? (op2 - 0x68) : (op2 - 0x60);
+            // sub: 0=byte 1=word 2=dword 4=qword (6C/6D); coerce 4 to dword index 3.
+            if (sub == 0) { // byte interleave: 16 bytes out, 8 from each input
+                for (int i = 0; i < 8; i++) {
+                    U64 db = (dSrc >> (i*8)) & 0xFF;
+                    U64 sb = (sSrc >> (i*8)) & 0xFF;
+                    U32 pos = i * 16;
+                    if (pos < 64) oLo |= db << pos;
+                    else          oHi |= db << (pos - 64);
+                    pos += 8;
+                    if (pos < 64) oLo |= sb << pos;
+                    else          oHi |= sb << (pos - 64);
+                }
+            } else if (sub == 1) { // word interleave
+                for (int i = 0; i < 4; i++) {
+                    U64 dw = (dSrc >> (i*16)) & 0xFFFF;
+                    U64 sw = (sSrc >> (i*16)) & 0xFFFF;
+                    U32 pos = i * 32;
+                    if (pos < 64) oLo |= dw << pos;
+                    else          oHi |= dw << (pos - 64);
+                    pos += 16;
+                    if (pos < 64) oLo |= sw << pos;
+                    else          oHi |= sw << (pos - 64);
+                }
+            } else if (sub == 2) { // dword interleave
+                oLo = (U32)dSrc | ((U64)(U32)sSrc << 32);
+                oHi = (U32)(dSrc >> 32) | ((U64)(U32)(sSrc >> 32) << 32);
+            } else { // qword interleave (sub==4)
+                oLo = dSrc;
+                oHi = sSrc;
+            }
+            xmm[m.regField].lo = oLo;
+            xmm[m.regField].hi = oHi;
+            U32 used = opOff + 2 + m.length;
+            rip += used;
+            return used;
+        }
         // PCMPGTB/W/D xmm, xmm/m128 — 66 0F 64/65/66 /r. Signed greater-than:
         // each lane of dst becomes all-1s if dst > src, else all-0s. Paired
         // with PCMPEQB in glibc's classified-character scans.
