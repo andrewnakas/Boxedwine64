@@ -54,6 +54,19 @@
 #define X64_SYS_openat            257
 #define X64_SYS_newfstatat        262
 #define X64_SYS_set_robust_list   273
+#define X64_SYS_madvise           28
+#define X64_SYS_mremap            25
+#define X64_SYS_sigaltstack       131
+#define X64_SYS_rt_sigreturn      15
+#define X64_SYS_dup               32
+#define X64_SYS_dup2              33
+#define X64_SYS_getcwd            79
+#define X64_SYS_chdir             80
+#define X64_SYS_fcntl             72
+#define X64_SYS_pipe              22
+#define X64_SYS_pipe2             293
+#define X64_SYS_getdents64        217
+#define X64_SYS_tgkill            234
 #define X64_SYS_prlimit64         302
 #define X64_SYS_getrandom         318
 
@@ -547,7 +560,72 @@ void ksyscall64(CPU64* cpu) {
         case X64_SYS_rt_sigprocmask:
         case X64_SYS_rt_sigaction:
         case X64_SYS_ioctl:
+        case X64_SYS_madvise:
+        case X64_SYS_sigaltstack:
+        case X64_SYS_chdir:
             // ld-linux makes these calls before main; safe to no-op.
+            ret = 0;
+            break;
+        case X64_SYS_mremap:
+            // mremap(old, oldlen, newlen, flags, newaddr). v1: return old
+            // address — glibc malloc only resizes when MREMAP_MAYMOVE is set
+            // and tolerates a noop if no growth happens. This is wrong but
+            // surfaces obvious failures at the malloc level, not later.
+            ret = a1;
+            break;
+        case X64_SYS_dup:
+            if (cpu->thread && cpu->thread->process) {
+                U32 newFd = cpu->thread->process->dup((U32)a1);
+                ret = (S32)newFd < 0 ? (U64)(S64)(S32)newFd : (U64)newFd;
+            } else {
+                ret = (U64)-K_ENOSYS;
+            }
+            break;
+        case X64_SYS_dup2:
+            if (cpu->thread && cpu->thread->process) {
+                U32 newFd = cpu->thread->process->dup2((FD)a1, (FD)a2);
+                ret = (S32)newFd < 0 ? (U64)(S64)(S32)newFd : (U64)newFd;
+            } else {
+                ret = (U64)-K_ENOSYS;
+            }
+            break;
+        case X64_SYS_getcwd: {
+            // getcwd(buf, size) — copy current directory string out. Returns
+            // a pointer to buf on success, -ERANGE if size is too small.
+            if (!a1 || a2 == 0) { ret = (U64)-K_EFAULT; break; }
+            BString cwd = cpu->thread->process->currentDirectory;
+            if (!cwd.length()) cwd = B("/");
+            U64 need = (U64)cwd.length() + 1;
+            if (need > a2) { ret = (U64)-34; /* -ERANGE */ break; }
+            cpu->memory->memcpyToGuest(a1, cwd.c_str(), need);
+            ret = a1;
+            break;
+        }
+        case X64_SYS_fcntl:
+            // Minimal F_GETFD/F_SETFD/F_GETFL/F_DUPFD handling for ld-linux.
+            // F_GETFD=1, F_SETFD=2, F_GETFL=3, F_SETFL=4, F_DUPFD=0,
+            // F_DUPFD_CLOEXEC=1030. Returning 0 for the get-ops claims "no
+            // flags set, no CLOEXEC", which matches our reality.
+            if (a2 == 0 || a2 == 1030) { // F_DUPFD / F_DUPFD_CLOEXEC
+                U32 newFd = cpu->thread->process->dup((U32)a1);
+                ret = (S32)newFd < 0 ? (U64)(S64)(S32)newFd : (U64)newFd;
+            } else {
+                ret = 0;
+            }
+            break;
+        case X64_SYS_tgkill:
+            // tgkill(tgid, tid, sig) — only used by glibc's abort() path; if
+            // we get here something already failed. Return success so the
+            // caller continues and we can see the next syscall.
+            klog_fmt("ksyscall64: tgkill(tgid=%llu tid=%llu sig=%llu) ignored",
+                     (unsigned long long)a1, (unsigned long long)a2, (unsigned long long)a3);
+            ret = 0;
+            break;
+        case X64_SYS_rt_sigreturn:
+            // Real implementation restores the user-context from the signal
+            // frame at RSP. v1: never delivers signals, so this should be
+            // unreachable. Log and bail.
+            klog("ksyscall64: rt_sigreturn called but no signal delivered");
             ret = 0;
             break;
         case X64_SYS_read:
