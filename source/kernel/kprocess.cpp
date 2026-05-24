@@ -585,7 +585,7 @@ KThread* KProcess::startProcess(BString currentDirectory, const std::vector<BStr
     if (!openNode) {
         return nullptr;
     }    
-    if (ElfLoader::loadProgram(thread, openNode, &thread->cpu->eip.u32)) {        
+    if (ElfLoader::loadProgram(thread, openNode, &thread->cpu->eip.u32)) {
         if (loader.length())
             args.push_back(loader);
         if (interpreter.length()) {
@@ -599,7 +599,13 @@ KThread* KProcess::startProcess(BString currentDirectory, const std::vector<BStr
         for (U32 i=0;i<envValues.size();i++) {
             env.push_back(envValues[i]);
         }
-        setupThreadStack(thread, thread->cpu, this->name, args, env);
+        // 64-bit processes get their stack built inside loadProgram64 (SysV
+        // x86-64 init layout: argc/argv/envp/auxv on a 16B-aligned RSP).
+        // Calling the 32-bit setupThreadStack here would scribble onto the
+        // unused 32-bit CPU's memory and waste cycles.
+        if (!this->is64Bit) {
+            setupThreadStack(thread, thread->cpu, this->name, args, env);
+        }
 
         this->currentDirectory = currentDirectory;
 
@@ -797,9 +803,12 @@ U32 KProcess::execve(KThread* thread, BString path, std::vector<BString>& args, 
     if (!ElfLoader::loadProgram(thread, openNode, &thread->cpu->eip.u32)) {
         // :TODO: maybe alloc a new memory object and keep the old one until we know we are loaded
         kpanic("program failed to load, but memory was already reset");
-    }	
-    // must come after loadProgram because of process->phdr
-    setupThreadStack(thread, thread->cpu, this->name, args, envs);
+    }
+    // must come after loadProgram because of process->phdr.
+    // 64-bit processes already had their SysV stack built by loadProgram64.
+    if (!this->is64Bit) {
+        setupThreadStack(thread, thread->cpu, this->name, args, envs);
+    }
     openNode->close();
     delete openNode;
 
