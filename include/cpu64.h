@@ -56,6 +56,10 @@ public:
     U64  instructionCount = 0;
 
     void run();
+    // Run up to maxInsn instructions or until yield / decode failure.
+    // Returns the number actually executed. Used by the self-test harness
+    // to avoid hanging the host on a buggy test program.
+    U64 runBounded(U64 maxInsn);
 
     void push64(U64 value);
     U64  pop64();

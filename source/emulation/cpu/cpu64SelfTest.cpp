@@ -58,12 +58,11 @@ void runAndCheck(TestResult& r, const char* name,
     cpu.rip = CODE_BASE;
     cpu.reg[X64_RSP].setU64(STACK_TOP - 16);
 
-    // Run up to 10000 outer iterations or until yield.
-    int iters = 0;
-    for (; iters < 10000 && !cpu.yield; iters++) {
-        cpu.run();
-    }
-    bool hung = (iters >= 10000 && !cpu.yield);
+    // runBounded enforces an instruction cap so a buggy test can't
+    // peg the host. cpu.run() has an unbounded while-loop and would hang.
+    const U64 INSN_LIMIT = 200000;
+    cpu.runBounded(INSN_LIMIT);
+    bool hung = (!cpu.yield && cpu.instructionCount >= INSN_LIMIT);
     if (hung) {
         printf("  TIMEOUT: %s  (final RIP=0x%llx instr=%llu RAX=0x%llx R15=0x%llx)\n",
                name,
@@ -448,6 +447,183 @@ int runX64SelfTest() {
         };
         runAndCheck(r, "rdtsc", withExit(code), [](CPU64& c) {
             return c.reg[X64_R15].u64 != 0;
+        });
+    }
+
+    // Test 27: Iterative fibonacci. fib(10+1) = 89, computed with
+    // a/b/swap-via-xchg. Exercises ALU + loop branch + xchg in composition.
+    //   xor  rax, rax            ; a = 0
+    //   mov  rbx, 1              ; b = 1
+    //   mov  rcx, 10             ; n
+    // loop:
+    //   add  rax, rbx
+    //   xchg rax, rbx
+    //   dec  rcx
+    //   jnz  loop                ; rel8 = -10
+    //   mov  rax, rbx            ; result -> rax so it lands in r15
+    {
+        std::vector<U8> code = {
+            0x48, 0x31, 0xC0,                                             // xor rax, rax
+            0x48, 0xC7, 0xC3, 0x01, 0x00, 0x00, 0x00,                     // mov rbx, 1
+            0x48, 0xC7, 0xC1, 0x0A, 0x00, 0x00, 0x00,                     // mov rcx, 10
+            0x48, 0x01, 0xD8,                                             // add rax, rbx
+            0x48, 0x93,                                                   // xchg rax, rbx
+            0x48, 0xFF, 0xC9,                                             // dec rcx
+            0x75, 0xF6,                                                   // jnz -10 → back to add
+            0x48, 0x89, 0xD8,                                             // mov rax, rbx
+        };
+        runAndCheck(r, "fib(10+1)=89", withExit(code), [](CPU64& c) {
+            return c.reg[X64_R15].u64 == 89;
+        });
+    }
+
+    // Test 28: REP MOVSB. Copy 16 bytes from src to dst within the mapped
+    // stack page. Verify byte 7 lands as 0x88.
+    //   Layout (offsets from start of code blob):
+    //     0..6:  lea rsi, [rip + 29]       ; rip_after=7, src target=36
+    //     7..14: lea rdi, [rsp - 0x100]
+    //    15..21: mov rcx, 16
+    //    22..23: rep movsb
+    //    24..26: xor rax, rax
+    //    27..33: mov al, [rsp - 0x100 + 7]
+    //    34..35: jmp +16   (skip over src bytes so exit suffix runs)
+    //    36..51: <16 src bytes>
+    {
+        std::vector<U8> code = {
+            0x48, 0x8D, 0x35, 0x1D, 0x00, 0x00, 0x00,                     //  0..6 lea rsi, [rip+29]
+            0x48, 0x8D, 0xBC, 0x24, 0x00, 0xFF, 0xFF, 0xFF,               //  7..14 lea rdi, [rsp-0x100]
+            0x48, 0xC7, 0xC1, 0x10, 0x00, 0x00, 0x00,                     // 15..21 mov rcx, 16
+            0xF3, 0xA4,                                                   // 22..23 rep movsb
+            0x48, 0x31, 0xC0,                                             // 24..26 xor rax, rax
+            0x8A, 0x84, 0x24, 0x07, 0xFF, 0xFF, 0xFF,                     // 27..33 mov al, [rsp-0x100+7]
+            0xEB, 0x10,                                                   // 34..35 jmp +16 (over src)
+            0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88,               // 36..43 src
+            0x99, 0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF, 0x00,               // 44..51 src
+        };
+        runAndCheck(r, "rep movsb (16B)", withExit(code), [](CPU64& c) {
+            return c.reg[X64_R15].u64 == 0x88;
+        });
+    }
+
+    // Test 29: REPNE SCASB to find byte 0x42 in a sequence.
+    //   Layout:
+    //     0..6:  lea rdi, [rip + 16]      ; rip_after=7, target=23
+    //     7..13: mov rcx, 6
+    //    14..15: mov al, 0x42
+    //    16..17: repne scasb
+    //    18..20: mov rax, rdi
+    //    21..22: jmp +6   (skip src to land on exit suffix)
+    //    23..28: src
+    //   REPNE stops when ZF set. After matching 0x42 at index 3, RDI
+    //   points one past match → src + 4 = CODE_BASE + 27.
+    {
+        std::vector<U8> code = {
+            0x48, 0x8D, 0x3D, 0x10, 0x00, 0x00, 0x00,                     //  0..6 lea rdi, [rip+16]
+            0x48, 0xC7, 0xC1, 0x06, 0x00, 0x00, 0x00,                     //  7..13 mov rcx, 6
+            0xB0, 0x42,                                                   // 14..15 mov al, 0x42
+            0xF2, 0xAE,                                                   // 16..17 repne scasb
+            0x48, 0x89, 0xF8,                                             // 18..20 mov rax, rdi
+            0xEB, 0x06,                                                   // 21..22 jmp +6
+            0x11, 0x22, 0x33, 0x42, 0x55, 0x66,                           // 23..28 src
+        };
+        runAndCheck(r, "repne scasb finds 0x42", withExit(code), [](CPU64& c) {
+            return c.reg[X64_R15].u64 == (CODE_BASE + 27);
+        });
+    }
+
+    // Test 30: Recursive function call. fact(5) = 120.
+    //   _start:
+    //     mov rax, 5
+    //     call fact
+    //     ; result in rax, will be stashed to r15 by exit suffix
+    //     jmp end
+    //   fact:
+    //     cmp rax, 1
+    //     jg .rec
+    //     ret              ; fact(0)=1 or fact(1)=1 (base ≤1)
+    //   .rec:
+    //     push rax
+    //     dec rax
+    //     call fact
+    //     pop rcx          ; rcx = original n
+    //     ; multiply rax by rcx using IMUL (two-operand)
+    //     imul rax, rcx
+    //     ret
+    //   end:
+    //
+    // Build it from layout:
+    //  0:  48 C7 C0 05 00 00 00          mov rax, 5
+    //  7:  E8 09 00 00 00                call rel32 = +9 → 12+9=21? need to retarget
+    //  Let me lay it out so call target is correct.
+    //
+    //  Plan addresses:
+    //   _start at 0
+    //   fact   at 16
+    //   exit code appended after _start return path
+    //
+    //   0:  48 C7 C0 05 00 00 00          mov rax, 5        (7 bytes)
+    //   7:  E8 04 00 00 00                call +4 → 12      WRONG, fact is at 16
+    //
+    //  Recompute: want call at offset 7 (5 bytes), so call rip = 12, want
+    //  target 16, disp = 4.
+    //
+    //  Then continue with EB <jmp over fact>...
+    //
+    //   0:  48 C7 C0 05 00 00 00          mov rax, 5         [0..6]
+    //   7:  E8 09 00 00 00                call rel32 → fact  [7..11], next rip=12, want 16+5=21. disp=9. ✓
+    //  12:  EB 16                          jmp +22 → 36 (end) [12..13]
+    //  Wait, fact starts at 16 so we need to skip from 14 to 16: place 2 nops.
+    //
+    //  Simpler layout — put fact first, then _start:
+    //
+    //  0:  EB 14                          jmp +20 → 22 (_start) [0..1]
+    //  fact at 2:
+    //   2:  48 83 F8 01                   cmp rax, 1                [2..5]
+    //   6:  7F 01                         jg +1 → 9                 [6..7]
+    //   8:  C3                            ret                       [8]
+    //   9:  50                            push rax                  [9]
+    //  10:  48 FF C8                      dec rax                   [10..12]
+    //  13:  E8 EA FF FF FF                call rel32 = -22 → 0+(-22) wait, current rip=18, target=2, disp=-16
+    //         actually E8 takes rel32; disp = target - (rip after instr) = 2 - 18 = -16 = 0xFFFFFFF0
+    //   correct: 0xF0 0xFF 0xFF 0xFF
+    //  13:  E8 F0 FF FF FF                call rel32 = -16 → 2     [13..17]
+    //  18:  59                            pop rcx                   [18]
+    //  19:  48 0F AF C1                   imul rax, rcx             [19..22]  but wait, _start was at 22!
+    //  Need more room.
+    //
+    //  Let me just put fact at offset 2, _start later.
+    //  Recompute with _start at 24:
+    //   0:  EB 16                jmp +22 → 24                       [0..1]
+    //   2:  48 83 F8 01          cmp rax, 1                          [2..5]
+    //   6:  7F 01                jg +1 → 9                           [6..7]
+    //   8:  C3                   ret                                 [8]
+    //   9:  50                   push rax                            [9]
+    //  10:  48 FF C8             dec rax                             [10..12]
+    //  13:  E8 F0 FF FF FF       call rel32 = -16 → 2 (rip_after=18)  [13..17]
+    //  18:  59                   pop rcx                             [18]
+    //  19:  48 0F AF C1          imul rax, rcx                       [19..22]
+    //  23:  C3                   ret                                 [23]
+    //  24:  48 C7 C0 05 00 00 00 mov rax, 5                          [24..30]
+    //  31:  E8 CE FF FF FF       call rel32 = -50 → 2 (rip_after=36, target=2, disp=-34=0xFFFFFFDE)
+    //       wait: 36 + (-34) = 2. ✓. disp bytes: DE FF FF FF
+    //  36:  (withExit appended)
+    {
+        std::vector<U8> code = {
+            0xEB, 0x16,                                                   //  0: jmp +22
+            0x48, 0x83, 0xF8, 0x01,                                       //  2: cmp rax, 1
+            0x7F, 0x01,                                                   //  6: jg +1
+            0xC3,                                                         //  8: ret
+            0x50,                                                         //  9: push rax
+            0x48, 0xFF, 0xC8,                                             // 10: dec rax
+            0xE8, 0xF0, 0xFF, 0xFF, 0xFF,                                 // 13: call -16
+            0x59,                                                         // 18: pop rcx
+            0x48, 0x0F, 0xAF, 0xC1,                                       // 19: imul rax, rcx
+            0xC3,                                                         // 23: ret
+            0x48, 0xC7, 0xC0, 0x05, 0x00, 0x00, 0x00,                     // 24: mov rax, 5
+            0xE8, 0xDE, 0xFF, 0xFF, 0xFF,                                 // 31: call -34 → 2
+        };
+        runAndCheck(r, "fact(5)=120 (recursive)", withExit(code), [](CPU64& c) {
+            return c.reg[X64_R15].u64 == 120;
         });
     }
 

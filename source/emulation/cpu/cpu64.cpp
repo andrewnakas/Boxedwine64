@@ -474,6 +474,16 @@ U32 CPU64::step() {
         return opOff + 1;
     }
 
+    // MOV r8, imm8 (B0+rb). REX.B extends the destination; absence of REX
+    // means AH/BH/CH/DH for indices 4-7, REX present means SPL/BPL/SIL/DIL.
+    if (op >= 0xB0 && op <= 0xB7) {
+        U8 r = (U8)((op - 0xB0) | ((p.rex & 0x01) ? 0x08 : 0));
+        U8 imm = fetchByte(rip + opOff + 1);
+        writeReg8(r, imm, rexPresent);
+        rip += opOff + 2;
+        return opOff + 2;
+    }
+
     // MOV r64, imm64 (B8+rd with REX.W). Without REX.W this would be the
     // 32-bit imm form (also legal; handled in the !rexW branch below).
     if (op >= 0xB8 && op <= 0xBF) {
@@ -1691,6 +1701,17 @@ void CPU64::run() {
         if (n == 0) break;
         instructionCount++;
     }
+}
+
+U64 CPU64::runBounded(U64 maxInsn) {
+    U64 ran = 0;
+    while (!yield && ran < maxInsn) {
+        U32 n = step();
+        if (n == 0) break;
+        instructionCount++;
+        ran++;
+    }
+    return ran;
 }
 
 #endif // BOXEDWINE_GUEST_X64
