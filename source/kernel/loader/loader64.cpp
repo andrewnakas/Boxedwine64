@@ -13,6 +13,7 @@
 #include "kelf64.h"
 #ifdef BOXEDWINE_GUEST_X64
 #include "kmemory64.h"
+#include "cpu64.h"
 #endif
 
 // ELF p_type values reused from loader.cpp. Kept local here to avoid a
@@ -212,10 +213,143 @@ bool ElfLoader64::loadProgram(KThread* thread, FsOpenNode* openNode, U64* rip) {
              (unsigned long long)*rip,
              (unsigned long long)mem->mappedPageCount());
 
-    // TODO(phase-2): create CPU64, set RSP, build x86-64 auxv stack,
-    //                populate KProcess::phdr/phentsize/phnum/entry,
-    //                resolve PT_INTERP recursively.
-    klog("loadProgram64: segment mapping complete; CPU64 + stack + interp wiring still pending");
-    return false; // still returning false because we have no CPU64 to schedule
+    // Populate process bookkeeping. ld-linux reads phdr via AT_PHDR; brk
+    // syscall reads brkEnd64.
+    process->entry64 = r.entry + reloc;
+    process->phdr64 = r.baseAddrLow + reloc + r.phoff;
+    process->phnum64 = r.phnum;
+    process->phentsize64 = r.phentsize;
+    process->brkEnd64 = (r.baseAddrHigh + reloc + K64_PAGE_SIZE - 1) & ~K64_PAGE_MASK;
+    process->is64Bit = true;
+
+    // -------------------------------------------------------------------
+    // Build the initial user-mode stack.
+    //
+    // System V x86-64 init stack layout, top-down:
+    //   <strings>           argv + envp string pool
+    //   <padding to 16B>
+    //   auxv [terminated by AT_NULL=0]
+    //   envp [terminated by NULL]
+    //   argv [terminated by NULL]
+    //   argc (8 bytes)      ← RSP points here on entry
+    //
+    // The ABI requires (RSP & 0xF) == 0 at the *call* to _start, which
+    // means RSP must be 16-byte aligned when _start begins. _start expects
+    // argc at [RSP], argv at [RSP+8], etc.
+    // -------------------------------------------------------------------
+    const U64 STACK_TOP   = 0x7FFFFFFFE000ULL; // well below 0x7FFFFFFFFFFF
+    const U64 STACK_SIZE  = 8ULL * 1024 * 1024;
+    const U64 STACK_BASE  = STACK_TOP - STACK_SIZE;
+    U64 mapped = mem->mmapAnonymousFixed(STACK_BASE, STACK_SIZE,
+                                         K_PROT_READ | K_PROT_WRITE);
+    if (mapped != STACK_BASE) {
+        klog_fmt("loadProgram64: stack mmap failed (got 0x%llx)", (unsigned long long)mapped);
+        return false;
+    }
+
+    // Build a minimal argv/envp: just the exe name. The real path will
+    // come from KProcess::startProcess once we wire that side up; for now
+    // a single-element argv lets us validate _start/_dl_start.
+    const char* exeName = process->name.length() ? process->name.c_str() : "boxedwine64.exe";
+    std::vector<BString> argv;
+    argv.push_back(BString::copy(exeName));
+    std::vector<BString> envp;
+    envp.push_back(BString::copy("PATH=/bin:/usr/bin"));
+
+    // First write all the strings near the top of stack, recording each
+    // string's guest address.
+    U64 sp = STACK_TOP - 16;
+    std::vector<U64> argvPtrs;
+    std::vector<U64> envpPtrs;
+    for (auto it = envp.rbegin(); it != envp.rend(); ++it) {
+        U64 len = it->length() + 1;
+        sp -= len;
+        mem->memcpyToGuest(sp, it->c_str(), len);
+        envpPtrs.insert(envpPtrs.begin(), sp);
+    }
+    for (auto it = argv.rbegin(); it != argv.rend(); ++it) {
+        U64 len = it->length() + 1;
+        sp -= len;
+        mem->memcpyToGuest(sp, it->c_str(), len);
+        argvPtrs.insert(argvPtrs.begin(), sp);
+    }
+
+    // 16-byte random pool for AT_RANDOM (glibc TLS canary). Zero-filled is
+    // fine for early bringup — deterministic and harmless.
+    sp -= 16;
+    U64 randomAddr = sp;
+    mem->memsetGuest(randomAddr, 0, 16);
+
+    // Align sp down to 16B. The vector below pushes pairs of qwords, so
+    // we need (sp - totalSize) to land on a 16-byte boundary.
+    auto pushQ = [&](U64 v) {
+        sp -= 8;
+        mem->writeq(sp, v);
+    };
+
+    // Compute auxv. Minimal viable set for glibc / ld-linux:
+    enum {
+        AT_NULL = 0, AT_PHDR = 3, AT_PHENT = 4, AT_PHNUM = 5,
+        AT_PAGESZ = 6, AT_BASE = 7, AT_ENTRY = 9, AT_UID = 11,
+        AT_EUID = 12, AT_GID = 13, AT_EGID = 14, AT_RANDOM = 25,
+        AT_HWCAP = 16, AT_CLKTCK = 17, AT_PLATFORM = 15, AT_SECURE = 23,
+    };
+    struct Aux { U64 k, v; };
+    std::vector<Aux> aux = {
+        { AT_PHDR,    process->phdr64 },
+        { AT_PHENT,   process->phentsize64 },
+        { AT_PHNUM,   process->phnum64 },
+        { AT_PAGESZ,  K64_PAGE_SIZE },
+        { AT_BASE,    0 },              // no separate interpreter base in v1
+        { AT_ENTRY,   process->entry64 },
+        { AT_UID,     process->userId },
+        { AT_EUID,    process->effectiveUserId },
+        { AT_GID,     process->groupId },
+        { AT_EGID,    process->effectiveGroupId },
+        { AT_RANDOM,  randomAddr },
+        { AT_HWCAP,   0 },
+        { AT_CLKTCK,  100 },
+        { AT_SECURE,  0 },
+        { AT_NULL,    0 },
+    };
+
+    // Total qwords that go onto the stack:
+    //   argc(1) + argvPtrs + NULL + envpPtrs + NULL + 2*aux
+    U64 totalQ = 1 + argvPtrs.size() + 1 + envpPtrs.size() + 1 + 2 * aux.size();
+    // After pushing totalQ*8 bytes from sp, the new sp must be 16-aligned.
+    U64 afterSize = totalQ * 8;
+    U64 targetSp = (sp - afterSize) & ~0xFULL;
+    sp = targetSp + afterSize;
+
+    // Push from top of frame down to argc — meaning we walk in reverse.
+    for (auto it = aux.rbegin(); it != aux.rend(); ++it) {
+        pushQ(it->v);
+        pushQ(it->k);
+    }
+    pushQ(0); // envp terminator
+    for (auto it = envpPtrs.rbegin(); it != envpPtrs.rend(); ++it) pushQ(*it);
+    pushQ(0); // argv terminator
+    for (auto it = argvPtrs.rbegin(); it != argvPtrs.rend(); ++it) pushQ(*it);
+    pushQ((U64)argv.size()); // argc
+
+    // sp now points at argc; this is what RSP should be at _start.
+    klog_fmt("loadProgram64: stack built, RSP=0x%llx argc=%u envc=%u auxc=%u",
+             (unsigned long long)sp, (U32)argv.size(), (U32)envp.size(), (U32)aux.size());
+
+    // Create the CPU64 and seed RIP/RSP. The thread's eip field stays at 0
+    // because ELF64 processes don't use the 32-bit CPU — the schedule path
+    // (when we add it) must branch on KProcess::is64Bit to pick which
+    // run-loop to invoke.
+    if (!process->cpu64) {
+        process->cpu64 = new CPU64(mem);
+    }
+    process->cpu64->thread = thread;
+    process->cpu64->rip = process->entry64;
+    process->cpu64->reg[X64_RSP].setU64(sp);
+    // System V calls _start with RDX = pointer to a function to register
+    // with atexit, or 0 if none. Linux passes 0.
+    process->cpu64->reg[X64_RDX].setU64(0);
+
+    return true;
 }
 #endif

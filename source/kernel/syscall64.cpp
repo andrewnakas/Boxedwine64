@@ -108,7 +108,7 @@ static U64 sys_brk64(CPU64* cpu, U64 newBrk) {
         return 0;
     }
     KProcess* p = cpu->thread->process.get();
-    U64 oldBrk = p->brkEnd;
+    U64 oldBrk = p->brkEnd64;
     if (newBrk == 0 || newBrk < oldBrk) {
         return oldBrk;
     }
@@ -122,7 +122,7 @@ static U64 sys_brk64(CPU64* cpu, U64 newBrk) {
             return oldBrk;
         }
     }
-    p->brkEnd = (U32)newBrk; // NOTE: brkEnd is U32 on KProcess in v1 — will widen alongside other 64-bit kprocess fields
+    p->brkEnd64 = newBrk;
     return newBrk;
 }
 

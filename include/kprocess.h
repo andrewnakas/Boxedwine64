@@ -283,6 +283,18 @@ public:
     // KMemory above stays the working path for ELF32 guests; KMemory64 is
     // a strictly parallel subsystem in v1, not a replacement.
     class KMemory64* memory64 = nullptr;
+    // 64-bit CPU. Set up by ElfLoader64::loadProgram once segments are
+    // mapped and the stack is built. v1 has no 64-bit KThread equivalent;
+    // the test harness drives this CPU's run() loop directly. A KThread64
+    // wrapper is a follow-up once the interpreter is exercised end-to-end.
+    class CPU64* cpu64 = nullptr;
+    // 64-bit equivalents of the loader bookkeeping above. Used by syscall64
+    // (brk, etc.) which would otherwise truncate to the U32 fields.
+    U64 brkEnd64 = 0;
+    U64 entry64 = 0;
+    U64 phdr64 = 0;
+    U32 phnum64 = 0;
+    U32 phentsize64 = 0;
 #endif
 
     BHashTable<U32, U32> glStrings;
