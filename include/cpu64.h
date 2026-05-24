@@ -38,23 +38,6 @@ enum X64Reg : U8 {
 #define X64_OF  0x00000800
 #define X64_IF  0x00000200
 
-// CPU64 is a parallel CPU for x86-64 guest binaries. v1 is interpreter
-// only — no JIT. Lives alongside the existing 32-bit CPU; a process
-// uses exactly one of the two depending on KProcess::is64Bit.
-//
-// Scope of v1:
-//   - 16 GP regs (RAX..R15) with 64/32/16/8-bit aliasing
-//   - RIP, RFLAGS, segment selectors (mostly inert under x86-64 long mode)
-//   - 16 XMM registers (XMM0..XMM15) — declared, not yet operationally wired
-//   - Interpreter loop that reads bytes from KMemory64 and dispatches
-//
-// Out of scope for this initial commit:
-//   - Full instruction set (only a minimal subset wired here; the rest
-//     stubs out to "unimplemented opcode" with a klog)
-//   - Lazy flags (uses eager flag compute for simplicity until the
-//     interpreter is correctness-verified end to end)
-//   - AVX, FS/GS base via WRFSBASE/WRGSBASE (FS base is plumbed via
-//     arch_prctl syscall in Phase 3)
 class CPU64 {
 public:
     explicit CPU64(KMemory64* memory);
@@ -69,28 +52,65 @@ public:
     KThread*   thread = nullptr;
     KMemory64* memory = nullptr;
 
-    // Interpreter entry. Runs until yield is true or an exception. yield
-    // is the same control-flow signal used by the 32-bit CPU::run loop.
     bool yield = false;
     U64  instructionCount = 0;
 
     void run();
 
-    // Stack helpers. RSP grows down; the x86-64 ABI requires 16-byte
-    // alignment at function-call boundaries.
     void push64(U64 value);
     U64  pop64();
 
 private:
-    // Decode + execute one instruction at RIP. Returns the number of
-    // bytes consumed, or 0 to signal "unimplemented / fatal".
     U32 step();
 
-    // Helpers used by step(). Defined out-of-line in cpu64.cpp so this
-    // header stays cheap to include.
     U8  fetchByte(U64 addr);
     U32 fetchDword(U64 addr);
     U64 fetchQword(U64 addr);
+
+    // Decoded prefixes — populated by consumePrefixes() and consumed by the
+    // opcode handler. Reset at the top of each step().
+    struct Prefixes {
+        U8   rex = 0;     // 0 if no REX, else 0x40..0x4F
+        bool osize16 = false;   // 66h: operand size override
+        bool asize32 = false;   // 67h: address size override (truncate to 32)
+        U8   seg = 0;     // 0 none, else 0x64 (FS) or 0x65 (GS); other segs ignored in long mode
+        U8   rep = 0;     // 0 none, 0xF2 REPNE, 0xF3 REP/REPE
+    };
+
+    // Effective operand of a ModR/M byte (excluding the "reg" field — that's
+    // returned separately as regField). length is the count of bytes after
+    // the opcode that the ModR/M+SIB+disp consume.
+    struct ModRM {
+        bool isReg = false;   // mod==11 → register direct
+        U8   rmIndex = 0;     // 0..15 — REX.B extended
+        U64  effAddr = 0;     // valid when !isReg (already finalized for RIP-rel)
+        U8   length = 0;      // bytes consumed (modrm + optional sib + disp)
+        U8   regField = 0;    // top-3-bit "reg" field, REX.R extended (always returned)
+        bool isRipRel = false;// for diagnostic/future use
+    };
+
+    // Read prefixes starting at rip; advance an internal cursor. Returns
+    // the byte index of the primary opcode, relative to rip.
+    U32 consumePrefixes(Prefixes& out);
+
+    // Decode the ModR/M byte at rip+offset using the prefixes. baseAfterImm
+    // is what RIP would be at the end of the *full* instruction — needed for
+    // RIP-relative effective address. Pass 0 if no further immediate; helpers
+    // for common widths sit on top.
+    ModRM decodeModRM(U64 modrmAddr, const Prefixes& p, U32 trailingImmBytes);
+
+    // Read/write the operand using the effective ModR/M, in a given size
+    // (1/2/4/8 bytes). 32-bit writes zero-extend per x86-64. 8-bit access
+    // honours the REX-presence rule (with-REX uses SPL/BPL/SIL/DIL for
+    // indices 4..7; without REX uses AH/CH/DH/BH).
+    U64  loadRM(const ModRM& m, U32 size, bool rexPresent);
+    void storeRM(const ModRM& m, U32 size, U64 value, bool rexPresent);
+
+    // Whole-register 8-bit access (handles the AH/CH/DH/BH vs SPL/BPL/SIL/
+    // DIL split). Used by both ModR/M memory ops (for reg field) and direct
+    // register opcodes.
+    U8   readReg8(U8 index, bool rexPresent);
+    void writeReg8(U8 index, U8 value, bool rexPresent);
 };
 
 #endif // BOXEDWINE_GUEST_X64
