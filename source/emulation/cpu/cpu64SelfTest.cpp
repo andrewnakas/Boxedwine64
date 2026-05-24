@@ -673,6 +673,34 @@ int runX64SelfTest() {
         });
     }
 
+    // Test 34: PCMPEQB + PMOVMSKB. Build xmm0 = 16 bytes alternating
+    // 0x42/0x00, xmm1 = all 0x00. PCMPEQB xmm0,xmm1 → byte i is 0xFF iff
+    // xmm0[i]==0 → bytes 1,3,5,7,9,11,13,15 → mask 0b1010101010101010 = 0xAAAA.
+    {
+        std::vector<U8> code = {
+            // mov rax, 0x0042004200420042
+            0x48, 0xB8, 0x42, 0x00, 0x42, 0x00, 0x42, 0x00, 0x42, 0x00,
+            0x66, 0x48, 0x0F, 0x6E, 0xC0,                                // movq xmm0, rax
+            // duplicate to high qword via pshufd-like trick: use punpcklqdq?
+            // simpler: load same value into xmm0.hi via movq then unpck. But we
+            // don't have unpck. Just set bytes 8..15 too: write via second movq.
+            0x66, 0x0F, 0x6E, 0xC8,                                       // movd xmm1, eax (low 4 bytes only)
+            // pxor xmm1, xmm1 to clear  (66 0F EF /r)
+            0x66, 0x0F, 0xEF, 0xC9,
+            // pcmpeqb xmm0, xmm1  (66 0F 74 /r). Lo will give pattern.
+            0x66, 0x0F, 0x74, 0xC1,
+            // pmovmskb eax, xmm0  (66 0F D7 /r)
+            0x66, 0x0F, 0xD7, 0xC0,
+        };
+        // xmm0.lo = 0x0042004200420042 → bytes 0..7: 42,00,42,00,42,00,42,00
+        // xmm0.hi = 0 (untouched by REX-less movq)
+        // After pcmpeqb against zero: bytes 0..7 mask: 0,FF,0,FF,0,FF,0,FF
+        //                              bytes 8..15: all 0xFF (xmm0.hi was 0)
+        // pmovmskb: bits = 1010 1010 (low 8) | 1111 1111 (high 8) = 0xFFAA
+        runAndCheck(r, "pcmpeqb + pmovmskb → 0xFFAA", withExit(code), [](CPU64& c) {
+            return (c.reg[X64_R15].u64 & 0xFFFFULL) == 0xFFAAULL;
+        });
+    }
     printf("=== self-test summary: %d passed, %d failed ===\n\n", r.passed, r.failed);
     return r.failed == 0 ? 0 : 1;
 }

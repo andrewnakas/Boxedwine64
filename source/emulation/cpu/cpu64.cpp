@@ -1819,6 +1819,90 @@ U32 CPU64::step() {
             rip += used;
             return used;
         }
+        // PCMPEQB xmm, xmm/m128 — 66 0F 74 /r. Compare 16 bytes; each byte
+        // of dst becomes 0xFF if equal, 0x00 if not. glibc's strlen / strchr
+        // / memchr loop on this.
+        if ((op2 == 0x74 || op2 == 0x75 || op2 == 0x76) && osize66) {
+            ModRM m = decodeModRM(rip + opOff + 2, p, 0);
+            U64 srcLo, srcHi;
+            if (m.isReg) {
+                srcLo = xmm[m.rmIndex].lo;
+                srcHi = xmm[m.rmIndex].hi;
+            } else {
+                srcLo = memory->readq(m.effAddr);
+                srcHi = memory->readq(m.effAddr + 8);
+            }
+            U64 dstLo = xmm[m.regField].lo;
+            U64 dstHi = xmm[m.regField].hi;
+            // op2 == 0x74 → bytes, 0x75 → words, 0x76 → dwords.
+            U32 elemBits = (op2 == 0x74) ? 8 : (op2 == 0x75) ? 16 : 32;
+            U32 elemCount = 128 / elemBits;
+            U64 mask = (elemBits == 64) ? ~0ULL : ((1ULL << elemBits) - 1);
+            U64 outLo = 0, outHi = 0;
+            for (U32 i = 0; i < elemCount; i++) {
+                U64 a, b;
+                U64 bitOff;
+                if (i * elemBits < 64) {
+                    bitOff = i * elemBits;
+                    a = (dstLo >> bitOff) & mask;
+                    b = (srcLo >> bitOff) & mask;
+                } else {
+                    bitOff = i * elemBits - 64;
+                    a = (dstHi >> bitOff) & mask;
+                    b = (srcHi >> bitOff) & mask;
+                }
+                U64 r = (a == b) ? mask : 0;
+                if (i * elemBits < 64) outLo |= r << (i * elemBits);
+                else                   outHi |= r << (i * elemBits - 64);
+            }
+            xmm[m.regField].lo = outLo;
+            xmm[m.regField].hi = outHi;
+            U32 used = opOff + 2 + m.length;
+            rip += used;
+            return used;
+        }
+        // PMOVMSKB r32, xmm — 66 0F D7 /r. Extract the high bit of each of
+        // the 16 bytes into the low 16 bits of r32. Paired with PCMPEQB to
+        // turn the 16-byte compare into a 16-bit "any equal?" mask.
+        if (op2 == 0xD7 && osize66) {
+            ModRM m = decodeModRM(rip + opOff + 2, p, 0);
+            U64 lo = xmm[m.rmIndex].lo;
+            U64 hi = xmm[m.rmIndex].hi;
+            U32 mask = 0;
+            for (U32 i = 0; i < 8; i++) {
+                if (lo & (1ULL << (i * 8 + 7))) mask |= (1u << i);
+                if (hi & (1ULL << (i * 8 + 7))) mask |= (1u << (i + 8));
+            }
+            reg[m.regField].setU32(mask);
+            U32 used = opOff + 2 + m.length;
+            rip += used;
+            return used;
+        }
+        // POR / PAND / PANDN — 66 0F EB / DB / DF /r. Same shape as PXOR.
+        if ((op2 == 0xEB || op2 == 0xDB || op2 == 0xDF) && osize66) {
+            ModRM m = decodeModRM(rip + opOff + 2, p, 0);
+            U64 srcLo, srcHi;
+            if (m.isReg) {
+                srcLo = xmm[m.rmIndex].lo;
+                srcHi = xmm[m.rmIndex].hi;
+            } else {
+                srcLo = memory->readq(m.effAddr);
+                srcHi = memory->readq(m.effAddr + 8);
+            }
+            if (op2 == 0xEB) {
+                xmm[m.regField].lo |= srcLo;
+                xmm[m.regField].hi |= srcHi;
+            } else if (op2 == 0xDB) {
+                xmm[m.regField].lo &= srcLo;
+                xmm[m.regField].hi &= srcHi;
+            } else { // PANDN: dst = (~dst) & src
+                xmm[m.regField].lo = (~xmm[m.regField].lo) & srcLo;
+                xmm[m.regField].hi = (~xmm[m.regField].hi) & srcHi;
+            }
+            U32 used = opOff + 2 + m.length;
+            rip += used;
+            return used;
+        }
         // MOVQ xmm/m64, xmm — 66 0F D6 /r. Store low qword.
         if (op2 == 0xD6 && osize66) {
             ModRM m = decodeModRM(rip + opOff + 2, p, 0);
