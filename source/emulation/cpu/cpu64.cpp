@@ -1903,6 +1903,120 @@ U32 CPU64::step() {
             rip += used;
             return used;
         }
+        // PSHUFD xmm, xmm/m128, imm8 — 66 0F 70 /r ib.
+        // imm8 picks four 2-bit indices selecting which source dword goes to
+        // each destination dword position. Common forms: imm=0 (broadcast
+        // low dword), imm=0xFF (broadcast high dword).
+        if (op2 == 0x70 && osize66) {
+            ModRM m = decodeModRM(rip + opOff + 2, p, 1);
+            U64 srcLo, srcHi;
+            if (m.isReg) {
+                srcLo = xmm[m.rmIndex].lo;
+                srcHi = xmm[m.rmIndex].hi;
+            } else {
+                srcLo = memory->readq(m.effAddr);
+                srcHi = memory->readq(m.effAddr + 8);
+            }
+            U8 imm = fetchByte(rip + opOff + 2 + m.length);
+            U32 dwords[4] = {
+                (U32)srcLo, (U32)(srcLo >> 32),
+                (U32)srcHi, (U32)(srcHi >> 32)
+            };
+            U32 out[4];
+            for (int i = 0; i < 4; i++) out[i] = dwords[(imm >> (i * 2)) & 0x3];
+            xmm[m.regField].lo = ((U64)out[1] << 32) | out[0];
+            xmm[m.regField].hi = ((U64)out[3] << 32) | out[2];
+            U32 used = opOff + 2 + m.length + 1;
+            rip += used;
+            return used;
+        }
+        // PSLLDQ/PSRLDQ xmm, imm8 — 66 0F 73 /7 ib (left) or /3 ib (right).
+        // Byte-granularity logical shift of the entire 16-byte register.
+        // Used by glibc memcpy/memset to mask the tail when a copy isn't
+        // 16-byte aligned.
+        if (op2 == 0x73 && osize66) {
+            ModRM m = decodeModRM(rip + opOff + 2, p, 1);
+            U8 sub = m.regField & 0x7;
+            U8 imm = fetchByte(rip + opOff + 2 + m.length);
+            if (sub == 7 || sub == 3) {
+                U64 lo = xmm[m.rmIndex].lo;
+                U64 hi = xmm[m.rmIndex].hi;
+                U32 shift = imm > 16 ? 16 : imm;
+                if (shift == 0) {
+                    // no-op
+                } else if (sub == 7) {
+                    // shift left by `shift` bytes
+                    if (shift >= 8) {
+                        hi = lo << ((shift - 8) * 8);
+                        lo = 0;
+                    } else {
+                        U32 bits = shift * 8;
+                        hi = (hi << bits) | (lo >> (64 - bits));
+                        lo = lo << bits;
+                    }
+                } else { // PSRLDQ
+                    if (shift >= 8) {
+                        lo = hi >> ((shift - 8) * 8);
+                        hi = 0;
+                    } else {
+                        U32 bits = shift * 8;
+                        lo = (lo >> bits) | (hi << (64 - bits));
+                        hi = hi >> bits;
+                    }
+                }
+                xmm[m.rmIndex].lo = lo;
+                xmm[m.rmIndex].hi = hi;
+                U32 used = opOff + 2 + m.length + 1;
+                rip += used;
+                return used;
+            }
+        }
+        // PADDB/PADDW/PADDD/PADDQ — 66 0F FC/FD/FE/D4 /r. Used by SSE
+        // crypto-style mixing in glibc's hash routines.
+        if ((op2 == 0xFC || op2 == 0xFD || op2 == 0xFE || op2 == 0xD4) && osize66) {
+            ModRM m = decodeModRM(rip + opOff + 2, p, 0);
+            U64 srcLo, srcHi;
+            if (m.isReg) {
+                srcLo = xmm[m.rmIndex].lo;
+                srcHi = xmm[m.rmIndex].hi;
+            } else {
+                srcLo = memory->readq(m.effAddr);
+                srcHi = memory->readq(m.effAddr + 8);
+            }
+            U64 dLo = xmm[m.regField].lo;
+            U64 dHi = xmm[m.regField].hi;
+            U64 oLo = 0, oHi = 0;
+            if (op2 == 0xFC) { // PADDB
+                for (int i = 0; i < 8; i++) {
+                    U8 a = (dLo >> (i*8)) & 0xFF; U8 b = (srcLo >> (i*8)) & 0xFF;
+                    oLo |= (U64)((U8)(a + b)) << (i*8);
+                    U8 c = (dHi >> (i*8)) & 0xFF; U8 d = (srcHi >> (i*8)) & 0xFF;
+                    oHi |= (U64)((U8)(c + d)) << (i*8);
+                }
+            } else if (op2 == 0xFD) { // PADDW
+                for (int i = 0; i < 4; i++) {
+                    U16 a = (dLo >> (i*16)) & 0xFFFF; U16 b = (srcLo >> (i*16)) & 0xFFFF;
+                    oLo |= (U64)((U16)(a + b)) << (i*16);
+                    U16 c = (dHi >> (i*16)) & 0xFFFF; U16 d = (srcHi >> (i*16)) & 0xFFFF;
+                    oHi |= (U64)((U16)(c + d)) << (i*16);
+                }
+            } else if (op2 == 0xFE) { // PADDD
+                for (int i = 0; i < 2; i++) {
+                    U32 a = (dLo >> (i*32)) & 0xFFFFFFFFu; U32 b = (srcLo >> (i*32)) & 0xFFFFFFFFu;
+                    oLo |= (U64)((U32)(a + b)) << (i*32);
+                    U32 c = (dHi >> (i*32)) & 0xFFFFFFFFu; U32 d = (srcHi >> (i*32)) & 0xFFFFFFFFu;
+                    oHi |= (U64)((U32)(c + d)) << (i*32);
+                }
+            } else { // PADDQ
+                oLo = dLo + srcLo;
+                oHi = dHi + srcHi;
+            }
+            xmm[m.regField].lo = oLo;
+            xmm[m.regField].hi = oHi;
+            U32 used = opOff + 2 + m.length;
+            rip += used;
+            return used;
+        }
         // MOVQ xmm/m64, xmm — 66 0F D6 /r. Store low qword.
         if (op2 == 0xD6 && osize66) {
             ModRM m = decodeModRM(rip + opOff + 2, p, 0);

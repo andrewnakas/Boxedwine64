@@ -701,6 +701,34 @@ int runX64SelfTest() {
             return (c.reg[X64_R15].u64 & 0xFFFFULL) == 0xFFAAULL;
         });
     }
+    // Test 35: PSHUFD with imm=0 broadcasts low dword to all four positions.
+    // Load xmm0.lo = 0xAAAAAAAA_BBBBBBBB, PSHUFD with 0 → xmm0 all dwords = BBBBBBBB.
+    {
+        std::vector<U8> code = {
+            0x48, 0xB8, 0xBB, 0xBB, 0xBB, 0xBB, 0xAA, 0xAA, 0xAA, 0xAA, // mov rax,...
+            0x66, 0x48, 0x0F, 0x6E, 0xC0,                                // movq xmm0, rax
+            0x66, 0x0F, 0x70, 0xC0, 0x00,                                // pshufd xmm0, xmm0, 0
+            // After: xmm0.lo = 0xBBBBBBBBBBBBBBBB, xmm0.hi = 0xBBBBBBBBBBBBBBBB
+            0x66, 0x48, 0x0F, 0x7E, 0xC0,                                // movq rax, xmm0
+        };
+        runAndCheck(r, "pshufd imm=0 broadcasts low dword", withExit(code), [](CPU64& c) {
+            return c.reg[X64_R15].u64 == 0xBBBBBBBBBBBBBBBBULL;
+        });
+    }
+    // Test 36: PADDD: xmm0 = [0x10000000, 0x20000000, 0, 0]; xmm1 = same;
+    // after PADDD xmm0,xmm1 the low dword = 0x20000000, second = 0x40000000.
+    {
+        std::vector<U8> code = {
+            0x48, 0xB8, 0x00, 0x00, 0x00, 0x10, 0x00, 0x00, 0x00, 0x20, // mov rax, 0x2000000010000000
+            0x66, 0x48, 0x0F, 0x6E, 0xC0,                                // movq xmm0, rax
+            0x66, 0x48, 0x0F, 0x6E, 0xC8,                                // movq xmm1, rax
+            0x66, 0x0F, 0xFE, 0xC1,                                       // paddd xmm0, xmm1
+            0x66, 0x48, 0x0F, 0x7E, 0xC0,                                 // movq rax, xmm0
+        };
+        runAndCheck(r, "paddd doubles each dword", withExit(code), [](CPU64& c) {
+            return c.reg[X64_R15].u64 == 0x4000000020000000ULL;
+        });
+    }
     printf("=== self-test summary: %d passed, %d failed ===\n\n", r.passed, r.failed);
     return r.failed == 0 ? 0 : 1;
 }
