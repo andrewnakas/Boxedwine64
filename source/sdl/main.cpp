@@ -19,6 +19,10 @@
 #include "boxedwine.h"
 
 #include "startupArgs.h"
+
+#ifdef BOXEDWINE_GUEST_X64
+extern int runX64SelfTest();
+#endif
 #ifndef BOXEDWINE_DISABLE_UI
 #include "../ui/mainui.h"
 #include "../ui/data/boxedwineData.h"
@@ -39,9 +43,19 @@ void writeSource();
 #endif
 
 int boxedmain(int argc, const char **argv) {
-    StartUpArgs startupArgs;                  
+    StartUpArgs startupArgs;
 
     klog("Starting ...");
+#ifdef BOXEDWINE_GUEST_X64
+    // --x64-selftest: run the CPU64/KMemory64/syscall64 smoke test and exit.
+    // Checked first, before any argv substitution (Mac args.txt) or startup
+    // parsing, so it stays a pure diagnostic.
+    for (int i = 1; i < argc; i++) {
+        if (argv[i] && std::string(argv[i]) == "--x64-selftest") {
+            return runX64SelfTest();
+        }
+    }
+#endif
 #if defined(__MACH__)
     std::vector<BString> lines;
     std::vector<const char*> args;
