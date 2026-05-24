@@ -117,6 +117,11 @@ private:
     // depending on destIsRM). CMP discards the result.
     void runAlu(U8 aluOp, U32 size, bool destIsRM, U64 lhs, U64 rhs,
                 const ModRM& m, bool rexPresentLocal);
+
+    // Evaluate a 4-bit condition code (Jcc/CMOVcc/SETcc share the same
+    // encoding: 0=O 1=NO 2=B 3=AE 4=E 5=NE 6=BE 7=A 8=S 9=NS A=P B=NP
+    // C=L D=GE E=LE F=G).
+    bool evalCC(U8 cc) const;
 };
 
 #endif // BOXEDWINE_GUEST_X64
