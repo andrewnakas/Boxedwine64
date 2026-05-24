@@ -111,6 +111,12 @@ private:
     // register opcodes.
     U8   readReg8(U8 index, bool rexPresent);
     void writeReg8(U8 index, U8 value, bool rexPresent);
+
+    // Execute one of the 8 ALU operations (0=ADD..7=CMP), update flags,
+    // and store the result back to the chosen destination (r/m or reg-field
+    // depending on destIsRM). CMP discards the result.
+    void runAlu(U8 aluOp, U32 size, bool destIsRM, U64 lhs, U64 rhs,
+                const ModRM& m, bool rexPresentLocal);
 };
 
 #endif // BOXEDWINE_GUEST_X64
