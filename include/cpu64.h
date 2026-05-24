@@ -49,6 +49,13 @@ public:
     U64   fsbase = 0;     // x86-64: set via arch_prctl(ARCH_SET_FS)
     U64   gsbase = 0;
 
+    // XMM register state. 16 × 128-bit slots, accessed as two U64 halves.
+    // SSE2 is the minimum baseline for x86-64; glibc memcpy/memset, the
+    // PIC __x86_get_pc_thunk_bx variants, and TLS init touch these even
+    // before main() runs.
+    struct Xmm { U64 lo = 0; U64 hi = 0; };
+    Xmm   xmm[16] = {};
+
     KThread*   thread = nullptr;
     KMemory64* memory = nullptr;
 

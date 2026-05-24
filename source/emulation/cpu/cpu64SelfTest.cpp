@@ -627,6 +627,52 @@ int runX64SelfTest() {
         });
     }
 
+    // Test 31: CPUID leaf 1. Verify EDX has SSE2 bit set (bit 26).
+    {
+        std::vector<U8> code = {
+            0x48, 0xC7, 0xC0, 0x01, 0x00, 0x00, 0x00,   // mov rax, 1
+            0x48, 0x31, 0xC9,                            // xor rcx, rcx
+            0x0F, 0xA2,                                  // cpuid
+            0x48, 0x89, 0xD0,                            // mov rax, rdx   (so R15 captures EDX after exit)
+        };
+        runAndCheck(r, "cpuid leaf 1 → EDX bit26 (SSE2)", withExit(code), [](CPU64& c) {
+            return (c.reg[X64_R15].u64 & (1ULL << 26)) != 0;
+        });
+    }
+    // Test 32: PXOR xmm0,xmm0 then MOVD eax,xmm0 → 0.
+    // Build: load xmm0 with a known nonzero via memory, pxor it, movd eax.
+    {
+        std::vector<U8> code = {
+            // mov rax, 0xdeadbeef
+            0x48, 0xC7, 0xC0, 0xEF, 0xBE, 0xAD, 0xDE,
+            // movd xmm0, eax           (66 0F 6E /r — xmm0=eax)
+            0x66, 0x0F, 0x6E, 0xC0,
+            // pxor xmm0, xmm0          (66 0F EF /r)
+            0x66, 0x0F, 0xEF, 0xC0,
+            // movd eax, xmm0           (66 0F 7E /r — eax=xmm0)
+            0x66, 0x0F, 0x7E, 0xC0,
+        };
+        runAndCheck(r, "pxor xmm0; movd eax,xmm0 → 0", withExit(code), [](CPU64& c) {
+            return c.reg[X64_R15].u64 == 0;
+        });
+    }
+    // Test 33: MOVQ round-trip rax → xmm1 → rcx via REX.W MOVD.
+    {
+        std::vector<U8> code = {
+            // mov rax, 0x1122334455667788
+            0x48, 0xB8, 0x88, 0x77, 0x66, 0x55, 0x44, 0x33, 0x22, 0x11,
+            // movq xmm1, rax           (66 REX.W 0F 6E /r → xmm1=rax)
+            0x66, 0x48, 0x0F, 0x6E, 0xC8,
+            // movq rcx, xmm1           (66 REX.W 0F 7E /r → rcx=xmm1.lo)
+            0x66, 0x48, 0x0F, 0x7E, 0xC9,
+            // mov rax, rcx
+            0x48, 0x89, 0xC8,
+        };
+        runAndCheck(r, "movq rax↔xmm1 round trip", withExit(code), [](CPU64& c) {
+            return c.reg[X64_R15].u64 == 0x1122334455667788ULL;
+        });
+    }
+
     printf("=== self-test summary: %d passed, %d failed ===\n\n", r.passed, r.failed);
     return r.failed == 0 ? 0 : 1;
 }

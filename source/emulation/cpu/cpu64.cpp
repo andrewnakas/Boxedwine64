@@ -1678,6 +1678,188 @@ U32 CPU64::step() {
         return opOff + 1;
     }
 
+    // CPUID (0F A2). Return a conservative feature set: SSE2 only, no SSE3+,
+    // no AVX. glibc IFUNC dispatchers consult ECX feature bits and select the
+    // simpler implementations when AVX/SSSE3 are clear, which keeps us off
+    // unimplemented vector opcodes during memcpy/strcmp.
+    if (op == 0x0F && fetchByte(rip + opOff + 1) == 0xA2) {
+        U32 leaf = reg[X64_RAX].u32;
+        U32 sub  = reg[X64_RCX].u32;
+        U32 a = 0, b = 0, c = 0, d = 0;
+        switch (leaf) {
+            case 0x0:
+                a = 0x1; // max leaf
+                // "Genu" "ineI" "ntel"
+                b = 0x756E6547; d = 0x49656E69; c = 0x6C65746E;
+                break;
+            case 0x1: {
+                a = (6 << 8) | (15 << 4) | 3; // family 6 stepping 3
+                b = 0;
+                // ECX feature bits: SSE3=0, SSSE3=0, SSE4.1=0, SSE4.2=0,
+                // POPCNT=0 (bit23), XSAVE=0, OSXSAVE=0, AVX=0.
+                c = 0;
+                // EDX bits: FPU=0 PDE=1 TSC=4 MSR=5 PAE=6 MCE=7 CX8=8
+                // APIC=9 SEP=11 MTRR=12 PGE=13 MCA=14 CMOV=15 PAT=16
+                // PSE36=17 CLFSH=19 MMX=23 FXSR=24 SSE=25 SSE2=26.
+                d = (1u<<0)|(1u<<4)|(1u<<5)|(1u<<8)|(1u<<15)|(1u<<23)|(1u<<24)|(1u<<25)|(1u<<26);
+                break;
+            }
+            case 0x80000000:
+                a = 0x80000001;
+                break;
+            case 0x80000001:
+                // EDX bit 29 = LM (long mode), bit 11 = SYSCALL, bit 20 = NX.
+                d = (1u<<29)|(1u<<11)|(1u<<20);
+                break;
+            default:
+                break;
+        }
+        (void)sub;
+        reg[X64_RAX].setU64(a);
+        reg[X64_RBX].setU64(b);
+        reg[X64_RCX].setU64(c);
+        reg[X64_RDX].setU64(d);
+        rip += opOff + 2;
+        return opOff + 2;
+    }
+
+    // ---- SSE2 (minimum-viable subset for ld.so + glibc) ----
+    //
+    // Encodings: 0F xx with optional 0x66 (packed-integer) or 0xF3/0xF2
+    // (scalar/string) prefix. We handle the moves and PXOR — that covers
+    // SSE register zeroing and 16-byte stack-aligned loads/stores used by
+    // ld-linux during relocation.
+    if (op == 0x0F) {
+        U8 op2 = fetchByte(rip + opOff + 1);
+        bool osize66 = p.osize16; // for SSE this means "use packed-integer form"
+        // MOVAPS/MOVAPD xmm, xmm/m128       — 0F 28 (load) / 0F 29 (store)
+        // MOVUPS/MOVUPD                     — 0F 10/11
+        // MOVDQA xmm, xmm/m128              — 66 0F 6F (load) / 66 0F 7F (store)
+        // MOVDQU                            — F3 0F 6F / F3 0F 7F
+        // All do a 16-byte aligned-or-unaligned memcpy. We treat them
+        // identically — no #GP on misalignment.
+        bool isMove128 =
+            (op2 == 0x10 || op2 == 0x11 || op2 == 0x28 || op2 == 0x29) ||
+            ((op2 == 0x6F || op2 == 0x7F) && (osize66 || p.rep == 0xF3));
+        if (isMove128) {
+            bool isStore = (op2 == 0x11 || op2 == 0x29 || op2 == 0x7F);
+            ModRM m = decodeModRM(rip + opOff + 2, p, 0);
+            if (isStore) {
+                // dst = r/m, src = xmm[regField]
+                if (m.isReg) {
+                    xmm[m.rmIndex] = xmm[m.regField];
+                } else {
+                    memory->writeq(m.effAddr,     xmm[m.regField].lo);
+                    memory->writeq(m.effAddr + 8, xmm[m.regField].hi);
+                }
+            } else {
+                // dst = xmm[regField], src = r/m
+                if (m.isReg) {
+                    xmm[m.regField] = xmm[m.rmIndex];
+                } else {
+                    xmm[m.regField].lo = memory->readq(m.effAddr);
+                    xmm[m.regField].hi = memory->readq(m.effAddr + 8);
+                }
+            }
+            U32 used = opOff + 2 + m.length;
+            rip += used;
+            return used;
+        }
+        // PXOR xmm, xmm/m128 — 66 0F EF /r. Used everywhere for register
+        // zeroing (faster than MOV 0).
+        if (op2 == 0xEF && osize66) {
+            ModRM m = decodeModRM(rip + opOff + 2, p, 0);
+            U64 srcLo, srcHi;
+            if (m.isReg) {
+                srcLo = xmm[m.rmIndex].lo;
+                srcHi = xmm[m.rmIndex].hi;
+            } else {
+                srcLo = memory->readq(m.effAddr);
+                srcHi = memory->readq(m.effAddr + 8);
+            }
+            xmm[m.regField].lo ^= srcLo;
+            xmm[m.regField].hi ^= srcHi;
+            U32 used = opOff + 2 + m.length;
+            rip += used;
+            return used;
+        }
+        // MOVD/MOVQ — scalar move between GPR and XMM.
+        //   66 0F 6E /r  MOVD xmm, r/m32     (or MOVQ xmm, r/m64 with REX.W)
+        //   66 0F 7E /r  MOVD r/m32, xmm     (or MOVQ with REX.W)
+        //   F3 0F 7E /r  MOVQ xmm, xmm/m64   (load low qword, zero high)
+        if ((op2 == 0x6E || op2 == 0x7E) && osize66) {
+            ModRM m = decodeModRM(rip + opOff + 2, p, 0);
+            bool isStore = (op2 == 0x7E);
+            bool wide = rexW;
+            U32 width = wide ? 8 : 4;
+            if (isStore) {
+                U64 v = wide ? xmm[m.regField].lo : (xmm[m.regField].lo & 0xFFFFFFFFULL);
+                storeRM(m, width, v, rexPresent);
+            } else {
+                U64 v = loadRM(m, width, rexPresent);
+                if (!wide) v &= 0xFFFFFFFFULL;
+                xmm[m.regField].lo = v;
+                xmm[m.regField].hi = 0;
+            }
+            U32 used = opOff + 2 + m.length;
+            rip += used;
+            return used;
+        }
+        if (op2 == 0x7E && p.rep == 0xF3) {
+            ModRM m = decodeModRM(rip + opOff + 2, p, 0);
+            U64 lo;
+            if (m.isReg) {
+                lo = xmm[m.rmIndex].lo;
+            } else {
+                lo = memory->readq(m.effAddr);
+            }
+            xmm[m.regField].lo = lo;
+            xmm[m.regField].hi = 0;
+            U32 used = opOff + 2 + m.length;
+            rip += used;
+            return used;
+        }
+        // MOVQ xmm/m64, xmm — 66 0F D6 /r. Store low qword.
+        if (op2 == 0xD6 && osize66) {
+            ModRM m = decodeModRM(rip + opOff + 2, p, 0);
+            if (m.isReg) {
+                xmm[m.rmIndex].lo = xmm[m.regField].lo;
+                xmm[m.rmIndex].hi = 0;
+            } else {
+                memory->writeq(m.effAddr, xmm[m.regField].lo);
+            }
+            U32 used = opOff + 2 + m.length;
+            rip += used;
+            return used;
+        }
+        // PREFETCH* — 0F 18 /reg. Treated as a no-op (hint only).
+        if (op2 == 0x18) {
+            ModRM m = decodeModRM(rip + opOff + 2, p, 0);
+            U32 used = opOff + 2 + m.length;
+            rip += used;
+            return used;
+        }
+        // NOP (multi-byte) — 0F 1F /reg with optional operand. Used by glibc
+        // for code alignment; ModR/M absorbs disp/SIB bytes.
+        if (op2 == 0x1F) {
+            ModRM m = decodeModRM(rip + opOff + 2, p, 0);
+            U32 used = opOff + 2 + m.length;
+            rip += used;
+            return used;
+        }
+    }
+
+    // FXSAVE / FXRSTOR (0F AE /0 and /1). v1: no-op — we don't model x87/SSE
+    // state save/restore yet. Programs that rely on FXRSTOR to *initialise*
+    // SSE state (uncommon outside of context-switch code) will see stale
+    // XMM regs, but ld-linux startup itself does not depend on it.
+    if (op == 0x0F && fetchByte(rip + opOff + 1) == 0xAE) {
+        ModRM m = decodeModRM(rip + opOff + 2, p, 0);
+        U32 used = opOff + 2 + m.length;
+        rip += used;
+        return used;
+    }
+
 unhandled:
     // Unimplemented. Print enough leading bytes to identify the opcode
     // in the Intel SDM tables and bail out so we don't silently loop.
