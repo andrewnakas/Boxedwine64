@@ -84,21 +84,30 @@
 #endif
 
 static U64 sys_write64(CPU64* cpu, U64 fd, U64 buf, U64 count) {
-    // For the early-boot phase we only need to honour writes to fd 1/2
-    // (stdout/stderr) so ld-linux's diagnostic messages reach the host
-    // console. Real fd routing comes later via KThread::process.
-    if (fd != 1 && fd != 2) {
-        klog_fmt("sys_write64: fd=%llu not yet routed", (unsigned long long)fd);
-        return (U64)-K_ENOSYS;
-    }
-    // Read bytes out of guest memory in chunks and printf them. count
-    // capped at 64K per call so a hostile binary can't hang us.
-    if (count > 65536) count = 65536;
+    if (count == 0) return 0;
+    if (count > (1ULL << 20)) count = 1ULL << 20;
     std::vector<U8> buffer((size_t)count + 1);
     cpu->memory->memcpyFromGuest(buffer.data(), buf, count);
     buffer[count] = 0;
-    klog_fmt("[guest fd=%llu] %s", (unsigned long long)fd, (const char*)buffer.data());
-    return count;
+    if (fd == 1 || fd == 2) {
+        // Tee stdout/stderr to host console so ld-linux + glibc diagnostics
+        // surface immediately. Also forward to the kobject so anything
+        // tailing the host FS still sees it.
+        klog_fmt("[guest fd=%llu] %s", (unsigned long long)fd, (const char*)buffer.data());
+    }
+    if (!cpu->thread || !cpu->thread->process) {
+        return count;
+    }
+    KFileDescriptorPtr fdesc = cpu->thread->process->getFileDescriptor((FD)fd);
+    if (!fdesc) {
+        if (fd == 1 || fd == 2) return count; // already klog'd
+        return (U64)-9; // -EBADF
+    }
+    if (!fdesc->canWrite()) {
+        return (U64)-K_EINVAL;
+    }
+    U32 wrote = fdesc->kobject->writeNative(buffer.data(), (U32)count);
+    return (S32)wrote < 0 ? (U64)(S64)(S32)wrote : (U64)wrote;
 }
 
 static U64 sys_arch_prctl64(CPU64* cpu, U64 code, U64 addr) {
@@ -228,22 +237,101 @@ static U64 sys_clock_gettime64(CPU64* cpu, U64 /*clk*/, U64 tsAddr) {
     return 0;
 }
 
-// read/write/open/close stubs — until KMemory64 + KThread are wired to the
-// 32-bit FS layer, we return ENOSYS for anything that touches a real file.
-// Reads from fd 0 return 0 (EOF) so apps that probe stdin don't hang.
-static U64 sys_read64(CPU64* /*cpu*/, U64 fd, U64 /*buf*/, U64 /*count*/) {
+// read/write/open/close — wired to the existing 32-bit KProcess FD table via
+// a bounce buffer. The kobject->readNative path is host-pointer, so the
+// 64-bit guest address never has to flow through the 32-bit memory layer.
+// Reads from fd 0 still return 0 (EOF) so apps that probe stdin don't hang.
+static U64 sys_read64(CPU64* cpu, U64 fd, U64 buf, U64 count) {
     if (fd == 0) return 0;
-    klog_fmt("sys_read64: fd=%llu not yet routed", (unsigned long long)fd);
-    return (U64)-K_ENOSYS;
+    if (!cpu->thread || !cpu->thread->process) return (U64)-K_ENOSYS;
+    KFileDescriptorPtr fdesc = cpu->thread->process->getFileDescriptor((FD)fd);
+    if (!fdesc) return (U64)-9; // -EBADF
+    if (!fdesc->canRead()) return (U64)-K_EINVAL;
+    if (count == 0) return 0;
+    // Cap to a reasonable per-call size — ld-linux reads in 4KB-64KB chunks.
+    if (count > (1ULL << 20)) count = 1ULL << 20;
+    std::vector<U8> tmp((size_t)count);
+    U32 got = fdesc->kobject->readNative(tmp.data(), (U32)count);
+    if ((S32)got < 0) {
+        return (U64)(S64)(S32)got; // sign-extend kernel errno
+    }
+    if (got > 0) {
+        cpu->memory->memcpyToGuest(buf, tmp.data(), got);
+    }
+    return (U64)got;
 }
 
-static U64 sys_openat64(CPU64* cpu, U64 /*dirfd*/, U64 pathAddr, U64 /*flags*/, U64 /*mode*/) {
-    char path[256] = {0};
-    if (pathAddr) {
-        cpu->memory->memcpyFromGuest(path, pathAddr, sizeof(path) - 1);
+// openat(dirfd, path, flags, mode). For dirfd we honour AT_FDCWD (-100) and
+// any "absolute" path. Relative paths against a real dirfd aren't supported
+// yet — ld-linux always passes AT_FDCWD or absolute, so this covers the
+// startup path.
+#ifndef K_AT_FDCWD
+#define K_AT_FDCWD (-100)
+#endif
+static U64 sys_openat64(CPU64* cpu, U64 dirfd, U64 pathAddr, U64 flags, U64 /*mode*/) {
+    if (!cpu->thread || !cpu->thread->process) return (U64)-K_ENOSYS;
+    if (!pathAddr) return (U64)-K_EFAULT;
+    char path[1024] = {0};
+    cpu->memory->memcpyFromGuest(path, pathAddr, sizeof(path) - 1);
+    bool isAbs = (path[0] == '/');
+    if (!isAbs && (S32)dirfd != K_AT_FDCWD) {
+        klog_fmt("sys_openat64: relative path '%s' with dirfd=%d not yet supported",
+                 path, (int)(S32)dirfd);
+        return (U64)-2;
     }
-    klog_fmt("sys_openat64: path='%s' not yet routed", path);
-    return (U64)-2; // -ENOENT — pretend file missing rather than crash
+    KProcess* process = cpu->thread->process.get();
+    KFileDescriptorPtr result;
+    U32 rc = process->openFile(process->currentDirectory, BString::copy(path),
+                               (U32)flags, result);
+    if ((S32)rc < 0) {
+        klog_fmt("sys_openat64: open('%s') -> %d", path, (int)(S32)rc);
+        return (U64)(S64)(S32)rc;
+    }
+    return (U64)result->handle;
+}
+
+static U64 sys_close64(CPU64* cpu, U64 fd) {
+    if (!cpu->thread || !cpu->thread->process) return (U64)-K_ENOSYS;
+    return (U64)(S64)(S32)cpu->thread->process->close((FD)fd);
+}
+
+// lseek — wired straight to KObject::seek.
+static U64 sys_lseek64(CPU64* cpu, U64 fd, U64 offset, U64 whence) {
+    if (!cpu->thread || !cpu->thread->process) return (U64)-K_ENOSYS;
+    KFileDescriptorPtr fdesc = cpu->thread->process->getFileDescriptor((FD)fd);
+    if (!fdesc) return (U64)-9;
+    S64 off = (S64)offset;
+    S64 pos;
+    if (whence == 0) { // SEEK_SET
+        pos = fdesc->kobject->seek(off);
+    } else if (whence == 1) { // SEEK_CUR
+        pos = fdesc->kobject->getPos() + off;
+        pos = fdesc->kobject->seek(pos);
+    } else if (whence == 2) { // SEEK_END
+        pos = fdesc->kobject->length() + off;
+        pos = fdesc->kobject->seek(pos);
+    } else {
+        return (U64)-K_EINVAL;
+    }
+    return (U64)pos;
+}
+
+// writev — iterate the iovec array, calling write per segment. Each iovec
+// entry on x86-64 is { u64 base; u64 len }.
+static U64 sys_writev64(CPU64* cpu, U64 fd, U64 iov, U64 iovcnt) {
+    U64 total = 0;
+    for (U64 i = 0; i < iovcnt; i++) {
+        U64 base = cpu->memory->readq(iov + i * 16 + 0);
+        U64 len  = cpu->memory->readq(iov + i * 16 + 8);
+        if (len == 0) continue;
+        S64 wrote = (S64)sys_write64(cpu, fd, base, len);
+        if (wrote < 0) {
+            return total > 0 ? total : (U64)wrote;
+        }
+        total += (U64)wrote;
+        if ((U64)wrote < len) break; // short write
+    }
+    return total;
 }
 
 // readlink — return -ENOENT so callers fall back; /proc/self/exe etc.
@@ -265,6 +353,9 @@ void ksyscall64(CPU64* cpu) {
     switch (nr) {
         case X64_SYS_write:
             ret = sys_write64(cpu, a1, a2, a3);
+            break;
+        case X64_SYS_writev:
+            ret = sys_writev64(cpu, a1, a2, a3);
             break;
         case X64_SYS_arch_prctl:
             ret = sys_arch_prctl64(cpu, a1, a2);
@@ -309,7 +400,7 @@ void ksyscall64(CPU64* cpu) {
             else                    ret = sys_openat64(cpu, a1,    a2, a3, a4);
             break;
         case X64_SYS_close:
-            ret = 0; // pretend success — nothing tracked yet
+            ret = sys_close64(cpu, a1);
             break;
         case X64_SYS_stat:
         case X64_SYS_fstat:
@@ -318,6 +409,8 @@ void ksyscall64(CPU64* cpu) {
             ret = (U64)-2; // -ENOENT for everything; loaders typically cope
             break;
         case X64_SYS_lseek:
+            ret = sys_lseek64(cpu, a1, a2, a3);
+            break;
         case X64_SYS_pread64:
             ret = (U64)-K_ENOSYS;
             break;
