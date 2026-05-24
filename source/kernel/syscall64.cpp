@@ -156,10 +156,13 @@ static U64 sys_brk64(CPU64* cpu, U64 newBrk) {
     return newBrk;
 }
 
+// Forward decl for the file-backed path; defined below.
+static U64 sys_mmap64_file(CPU64* cpu, U64 addr, U64 length, U64 prot,
+                           U64 flags, U64 fd, U64 offset);
+
 static U64 sys_mmap64(CPU64* cpu, U64 addr, U64 length, U64 prot, U64 flags, U64 fd, U64 offset) {
     if (!(flags & K_MAP_ANONYMOUS)) {
-        klog_fmt("sys_mmap64: file-backed mmap fd=%lld not yet implemented", (long long)(S64)fd);
-        return (U64)-K_ENOSYS;
+        return sys_mmap64_file(cpu, addr, length, prot, flags, fd, offset);
     }
     if (addr == 0) {
         // Anonymous mmap without MAP_FIXED: pick a high address. v1 uses
@@ -316,6 +319,98 @@ static U64 sys_lseek64(CPU64* cpu, U64 fd, U64 offset, U64 whence) {
     return (U64)pos;
 }
 
+// writeStatBuf64 — write the x86-64 Linux struct stat (144 bytes) into
+// guest memory. Field offsets match the canonical glibc/kernel layout for
+// __NR_fstat / __NR_newfstatat result buffers on x86-64.
+static void writeStatBuf64(KMemory64* mem, U64 addr, U64 size, U32 mode,
+                            U64 ino, U32 uid, U32 gid, U64 mtime) {
+    U8 buf[144];
+    std::memset(buf, 0, sizeof(buf));
+    auto put64 = [&](U32 off, U64 v) { std::memcpy(buf + off, &v, 8); };
+    auto put32 = [&](U32 off, U32 v) { std::memcpy(buf + off, &v, 4); };
+    put64(0,  1);             // st_dev (fake)
+    put64(8,  ino);           // st_ino
+    put64(16, 1);             // st_nlink
+    put32(24, mode);          // st_mode
+    put32(28, uid);           // st_uid
+    put32(32, gid);           // st_gid
+    put32(36, 0);             // __pad0
+    put64(40, 0);             // st_rdev
+    put64(48, size);          // st_size
+    put64(56, 4096);          // st_blksize
+    put64(64, (size + 511) / 512); // st_blocks (512-byte units)
+    put64(72, mtime);         // st_atime
+    put64(80, 0);
+    put64(88, mtime);         // st_mtime
+    put64(96, 0);
+    put64(104, mtime);        // st_ctime
+    put64(112, 0);
+    mem->memcpyToGuest(addr, buf, sizeof(buf));
+}
+
+static U64 sys_fstat64(CPU64* cpu, U64 fd, U64 statbuf) {
+    if (!cpu->thread || !cpu->thread->process) return (U64)-K_ENOSYS;
+    if (!statbuf) return (U64)-K_EFAULT;
+    KFileDescriptorPtr fdesc = cpu->thread->process->getFileDescriptor((FD)fd);
+    if (!fdesc) return (U64)-9; // -EBADF
+    // Reach for the underlying KFile to ask the FsNode for metadata.
+    std::shared_ptr<KFile> kfile = std::dynamic_pointer_cast<KFile>(fdesc->kobject);
+    U64 size = 0;
+    U32 mode = 0100644; // S_IFREG | 0644
+    U64 ino = 0;
+    U64 mtime = 0;
+    if (kfile && kfile->openFile) {
+        size = (U64)kfile->openFile->length();
+        if (kfile->openFile->node) {
+            mode  = kfile->openFile->node->getMode();
+            ino   = kfile->openFile->node->id;
+            mtime = (U64)kfile->openFile->node->lastModified();
+        }
+    } else {
+        // Non-file kobject (socket/pipe): claim S_IFCHR so callers don't
+        // assume seekable.
+        mode = 0020666;
+    }
+    writeStatBuf64(cpu->memory, statbuf, size, mode, ino, 1000, 1000, mtime);
+    return 0;
+}
+
+// File-backed mmap. Reads the requested file region into freshly mmap'd
+// pages. Not lazy/COW — eager copy is simple and bounded for ld-linux's
+// typical 200 KiB lib mapping.
+static U64 sys_mmap64_file(CPU64* cpu, U64 addr, U64 length, U64 prot,
+                           U64 flags, U64 fd, U64 offset) {
+    if (!cpu->thread || !cpu->thread->process) return (U64)-K_ENOSYS;
+    KFileDescriptorPtr fdesc = cpu->thread->process->getFileDescriptor((FD)fd);
+    if (!fdesc) return (U64)-9; // -EBADF
+    std::shared_ptr<KFile> kfile = std::dynamic_pointer_cast<KFile>(fdesc->kobject);
+    if (!kfile || !kfile->openFile) {
+        return (U64)-K_ENOSYS;
+    }
+    if (addr == 0) {
+        static U64 anonBump = 0x700000000ULL;
+        addr = anonBump;
+        anonBump += (length + 0xFFF) & ~0xFFFULL;
+    }
+    U64 aligned = addr & ~0xFFFULL;
+    U64 mapLen = (length + (addr - aligned) + 0xFFF) & ~0xFFFULL;
+    U64 mapped = cpu->memory->mmapAnonymousFixed(aligned, mapLen, (U32)prot);
+    if ((S64)mapped < 0) {
+        return mapped;
+    }
+    // Read [offset, offset+length) and copy into [addr, addr+length).
+    std::vector<U8> buf((size_t)length);
+    S64 saved = kfile->openFile->getFilePointer();
+    kfile->openFile->seek((S64)offset);
+    U32 got = kfile->openFile->readNative(buf.data(), (U32)length);
+    kfile->openFile->seek(saved);
+    if (got > 0) {
+        cpu->memory->memcpyToGuest(addr, buf.data(), got);
+    }
+    (void)flags;
+    return addr;
+}
+
 // writev — iterate the iovec array, calling write per segment. Each iovec
 // entry on x86-64 is { u64 base; u64 len }.
 static U64 sys_writev64(CPU64* cpu, U64 fd, U64 iov, U64 iovcnt) {
@@ -402,11 +497,13 @@ void ksyscall64(CPU64* cpu) {
         case X64_SYS_close:
             ret = sys_close64(cpu, a1);
             break;
-        case X64_SYS_stat:
         case X64_SYS_fstat:
+            ret = sys_fstat64(cpu, a1, a2);
+            break;
+        case X64_SYS_stat:
         case X64_SYS_lstat:
         case X64_SYS_newfstatat:
-            ret = (U64)-2; // -ENOENT for everything; loaders typically cope
+            ret = (U64)-2; // path-based stat still ENOENT until we wire openFile + stat
             break;
         case X64_SYS_lseek:
             ret = sys_lseek64(cpu, a1, a2, a3);
