@@ -2361,6 +2361,136 @@ U32 CPU64::step() {
             rip += used;
             return used;
         }
+        // PMULLW — 66 0F D5 /r. Per-word signed multiply, store low 16 of
+        // each 32-bit result. PMULHW — 66 0F E5 /r. Same but store high 16.
+        if ((op2 == 0xD5 || op2 == 0xE5) && osize66) {
+            ModRM m = decodeModRM(rip + opOff + 2, p, 0);
+            U64 srcLo, srcHi;
+            if (m.isReg) {
+                srcLo = xmm[m.rmIndex].lo;
+                srcHi = xmm[m.rmIndex].hi;
+            } else {
+                srcLo = memory->readq(m.effAddr);
+                srcHi = memory->readq(m.effAddr + 8);
+            }
+            U64 dLo = xmm[m.regField].lo;
+            U64 dHi = xmm[m.regField].hi;
+            U64 oLo = 0, oHi = 0;
+            bool high = (op2 == 0xE5);
+            for (int i = 0; i < 4; i++) {
+                S16 a = (S16)((dLo  >> (i*16)) & 0xFFFF);
+                S16 b = (S16)((srcLo >> (i*16)) & 0xFFFF);
+                S16 c = (S16)((dHi  >> (i*16)) & 0xFFFF);
+                S16 d = (S16)((srcHi >> (i*16)) & 0xFFFF);
+                S32 p1 = (S32)a * (S32)b;
+                S32 p2 = (S32)c * (S32)d;
+                U16 outLo = high ? (U16)((p1 >> 16) & 0xFFFF) : (U16)(p1 & 0xFFFF);
+                U16 outHi = high ? (U16)((p2 >> 16) & 0xFFFF) : (U16)(p2 & 0xFFFF);
+                oLo |= ((U64)outLo) << (i*16);
+                oHi |= ((U64)outHi) << (i*16);
+            }
+            xmm[m.regField].lo = oLo;
+            xmm[m.regField].hi = oHi;
+            U32 used = opOff + 2 + m.length;
+            rip += used;
+            return used;
+        }
+        // PMULUDQ — 66 0F F4 /r. Multiply unsigned dwords in lanes 0 and 2,
+        // producing two 64-bit results.
+        if (op2 == 0xF4 && osize66) {
+            ModRM m = decodeModRM(rip + opOff + 2, p, 0);
+            U64 srcLo, srcHi;
+            if (m.isReg) {
+                srcLo = xmm[m.rmIndex].lo;
+                srcHi = xmm[m.rmIndex].hi;
+            } else {
+                srcLo = memory->readq(m.effAddr);
+                srcHi = memory->readq(m.effAddr + 8);
+            }
+            U64 dLo = xmm[m.regField].lo;
+            U64 dHi = xmm[m.regField].hi;
+            U64 a = dLo & 0xFFFFFFFFULL;
+            U64 b = srcLo & 0xFFFFFFFFULL;
+            U64 c = dHi & 0xFFFFFFFFULL;
+            U64 d = srcHi & 0xFFFFFFFFULL;
+            xmm[m.regField].lo = a * b;
+            xmm[m.regField].hi = c * d;
+            U32 used = opOff + 2 + m.length;
+            rip += used;
+            return used;
+        }
+        // PACKSSWB / PACKUSWB / PACKSSDW — 66 0F 63 / 67 / 6B /r.
+        // Saturate two source halves down to a smaller element size and
+        // interleave dst-first, src-second.
+        if ((op2 == 0x63 || op2 == 0x67 || op2 == 0x6B) && osize66) {
+            ModRM m = decodeModRM(rip + opOff + 2, p, 0);
+            U64 srcLo, srcHi;
+            if (m.isReg) {
+                srcLo = xmm[m.rmIndex].lo;
+                srcHi = xmm[m.rmIndex].hi;
+            } else {
+                srcLo = memory->readq(m.effAddr);
+                srcHi = memory->readq(m.effAddr + 8);
+            }
+            U64 dLo = xmm[m.regField].lo;
+            U64 dHi = xmm[m.regField].hi;
+            U64 oLo = 0, oHi = 0;
+            if (op2 == 0x6B) {
+                // PACKSSDW: 4 signed dwords → 4 signed words per half.
+                // dst halves produce 4 words → 8 words total. Lanes 0..3 from
+                // dst (lo+hi dwords of dLo/dHi), lanes 4..7 from src.
+                auto satS16 = [](S32 v) -> U16 {
+                    if (v > 32767) v = 32767;
+                    if (v < -32768) v = -32768;
+                    return (U16)(v & 0xFFFF);
+                };
+                U16 w[8];
+                w[0] = satS16((S32)(dLo & 0xFFFFFFFFu));
+                w[1] = satS16((S32)((dLo >> 32) & 0xFFFFFFFFu));
+                w[2] = satS16((S32)(dHi & 0xFFFFFFFFu));
+                w[3] = satS16((S32)((dHi >> 32) & 0xFFFFFFFFu));
+                w[4] = satS16((S32)(srcLo & 0xFFFFFFFFu));
+                w[5] = satS16((S32)((srcLo >> 32) & 0xFFFFFFFFu));
+                w[6] = satS16((S32)(srcHi & 0xFFFFFFFFu));
+                w[7] = satS16((S32)((srcHi >> 32) & 0xFFFFFFFFu));
+                for (int i = 0; i < 4; i++) oLo |= ((U64)w[i]) << (i*16);
+                for (int i = 0; i < 4; i++) oHi |= ((U64)w[i+4]) << (i*16);
+            } else {
+                // PACKSSWB / PACKUSWB: 8 signed words from each input →
+                // 8 bytes per side. Total 16 bytes interleaved dst-then-src.
+                bool sign = (op2 == 0x63);
+                auto satS8 = [](S16 v) -> U8 {
+                    if (v > 127) v = 127;
+                    if (v < -128) v = -128;
+                    return (U8)(v & 0xFF);
+                };
+                auto satU8 = [](S16 v) -> U8 {
+                    if (v > 255) v = 255;
+                    if (v < 0) v = 0;
+                    return (U8)(v & 0xFF);
+                };
+                U8 b[16];
+                for (int i = 0; i < 4; i++) {
+                    S16 a = (S16)((dLo  >> (i*16)) & 0xFFFF);
+                    S16 c = (S16)((dHi  >> (i*16)) & 0xFFFF);
+                    b[i]   = sign ? satS8(a) : satU8(a);
+                    b[i+4] = sign ? satS8(c) : satU8(c);
+                }
+                for (int i = 0; i < 4; i++) {
+                    S16 a = (S16)((srcLo >> (i*16)) & 0xFFFF);
+                    S16 c = (S16)((srcHi >> (i*16)) & 0xFFFF);
+                    b[i+8]  = sign ? satS8(a) : satU8(a);
+                    b[i+12] = sign ? satS8(c) : satU8(c);
+                }
+                for (int i = 0; i < 8; i++) oLo |= ((U64)b[i]) << (i*8);
+                for (int i = 0; i < 8; i++) oHi |= ((U64)b[i+8]) << (i*8);
+            }
+            xmm[m.regField].lo = oLo;
+            xmm[m.regField].hi = oHi;
+            U32 used = opOff + 2 + m.length;
+            rip += used;
+            return used;
+        }
         // PREFETCH* — 0F 18 /reg. Treated as a no-op (hint only).
         if (op2 == 0x18) {
             ModRM m = decodeModRM(rip + opOff + 2, p, 0);

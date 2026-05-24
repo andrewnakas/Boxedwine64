@@ -859,6 +859,54 @@ int runX64SelfTest() {
             return c.reg[X64_R15].u64 == 0x7F8ULL;
         });
     }
+    // Test 44: PMULLW. xmm0 = {3, 4, 5, 6}, xmm1 = {2, 2, 2, 2}.
+    // Low halves of products: {6, 8, 10, 12} → 0x000C_000A_0008_0006.
+    {
+        std::vector<U8> code = {
+            0x48, 0xB8, 0x03, 0x00, 0x04, 0x00, 0x05, 0x00, 0x06, 0x00,
+            0x66, 0x48, 0x0F, 0x6E, 0xC0,                                // movq xmm0, rax
+            0x48, 0xB8, 0x02, 0x00, 0x02, 0x00, 0x02, 0x00, 0x02, 0x00,
+            0x66, 0x48, 0x0F, 0x6E, 0xC8,                                // movq xmm1, rax
+            0x66, 0x0F, 0xD5, 0xC1,                                       // pmullw xmm0, xmm1
+            0x66, 0x48, 0x0F, 0x7E, 0xC0,                                 // movq rax, xmm0
+        };
+        runAndCheck(r, "pmullw multiplies low 16 bits of words", withExit(code), [](CPU64& c) {
+            return c.reg[X64_R15].u64 == 0x000C000A00080006ULL;
+        });
+    }
+    // Test 45: PMULUDQ. xmm0.lo = 0x0000_0001_0000_0007 → dword0 = 7.
+    //                   xmm1.lo = 0x0000_0001_0000_0005 → dword0 = 5.
+    // Result low qword = 7 * 5 = 35 = 0x23.
+    {
+        std::vector<U8> code = {
+            0x48, 0xB8, 0x07, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00,
+            0x66, 0x48, 0x0F, 0x6E, 0xC0,                                // movq xmm0, rax
+            0x48, 0xB8, 0x05, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00,
+            0x66, 0x48, 0x0F, 0x6E, 0xC8,                                // movq xmm1, rax
+            0x66, 0x0F, 0xF4, 0xC1,                                       // pmuludq xmm0, xmm1
+            0x66, 0x48, 0x0F, 0x7E, 0xC0,                                 // movq rax, xmm0
+        };
+        runAndCheck(r, "pmuludq unsigned dword multiply 7*5=35", withExit(code), [](CPU64& c) {
+            return c.reg[X64_R15].u64 == 0x23ULL;
+        });
+    }
+    // Test 46: PACKUSWB. xmm0 words = {0x0050, 0x01FF, 0xFFFE (-2), 0x00FE},
+    //                   xmm1 = 0.
+    // PACKUSWB saturates signed words → unsigned bytes [0..255].
+    // dst low half → bytes [50, FF, 00, FE]; src low half (zero) → [00,00,00,00].
+    // Result.lo = 0x0000_0000_FE00_FF50.
+    {
+        std::vector<U8> code = {
+            0x48, 0xB8, 0x50, 0x00, 0xFF, 0x01, 0xFE, 0xFF, 0xFE, 0x00,
+            0x66, 0x48, 0x0F, 0x6E, 0xC0,                                // movq xmm0, rax
+            0x66, 0x0F, 0xEF, 0xC9,                                       // pxor xmm1, xmm1
+            0x66, 0x0F, 0x67, 0xC1,                                       // packuswb xmm0, xmm1
+            0x66, 0x48, 0x0F, 0x7E, 0xC0,                                 // movq rax, xmm0
+        };
+        runAndCheck(r, "packuswb saturates words to unsigned bytes", withExit(code), [](CPU64& c) {
+            return c.reg[X64_R15].u64 == 0x00000000FE00FF50ULL;
+        });
+    }
     printf("=== self-test summary: %d passed, %d failed ===\n\n", r.passed, r.failed);
     return r.failed == 0 ? 0 : 1;
 }
