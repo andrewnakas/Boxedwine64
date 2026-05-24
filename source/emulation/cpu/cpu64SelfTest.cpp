@@ -256,6 +256,201 @@ int runX64SelfTest() {
         });
     }
 
+    // Test 11: MUL r/m64. RDX:RAX = 7 * 6 = 42. RDX should be 0.
+    {
+        std::vector<U8> code = {
+            0x48, 0xC7, 0xC0, 0x07, 0x00, 0x00, 0x00,             // mov rax, 7
+            0x48, 0xC7, 0xC3, 0x06, 0x00, 0x00, 0x00,             // mov rbx, 6
+            0x48, 0xF7, 0xE3,                                       // mul rbx
+        };
+        runAndCheck(r, "mul rbx (7*6=42)", withExit(code), [](CPU64& c) {
+            return c.reg[X64_R15].u64 == 42 && c.reg[X64_RDX].u64 == 0;
+        });
+    }
+
+    // Test 12: IDIV r/m64. Signed 64-bit divide. -100 / 7 = -14 rem -2.
+    //   CQO sign-extends RAX into RDX:RAX, then IDIV.
+    {
+        std::vector<U8> code = {
+            0x48, 0xC7, 0xC0, 0x9C, 0xFF, 0xFF, 0xFF,             // mov rax, -100 (sign-ext from imm32)
+            0x48, 0xC7, 0xC3, 0x07, 0x00, 0x00, 0x00,             // mov rbx, 7
+            0x48, 0x99,                                             // cqo
+            0x48, 0xF7, 0xFB,                                       // idiv rbx
+        };
+        // After IDIV: RAX = -14 = 0xFFFFFFFFFFFFFFF2, RDX = -2 = 0xFFFFFFFFFFFFFFFE.
+        // We stash RAX into R15 via the exit prologue (which expects RAX to
+        // be set first), so check both.
+        runAndCheck(r, "cqo + idiv (-100/7)", withExit(code), [](CPU64& c) {
+            return c.reg[X64_R15].u64 == (U64)(S64)-14 &&
+                   c.reg[X64_RDX].u64 == (U64)(S64)-2;
+        });
+    }
+
+    // Test 13: XCHG rax, rbx round-trips two values.
+    {
+        std::vector<U8> code = {
+            0x48, 0xC7, 0xC0, 0xAA, 0x00, 0x00, 0x00,             // mov rax, 0xAA
+            0x48, 0xC7, 0xC3, 0xBB, 0x00, 0x00, 0x00,             // mov rbx, 0xBB
+            0x48, 0x87, 0xD8,                                       // xchg rax, rbx
+        };
+        // After XCHG: RAX=0xBB, RBX=0xAA.
+        runAndCheck(r, "xchg rax,rbx", withExit(code), [](CPU64& c) {
+            return c.reg[X64_R15].u64 == 0xBB && c.reg[X64_RBX].u64 == 0xAA;
+        });
+    }
+
+    // Test 14: PUSH imm + POP rax round-trip.
+    {
+        std::vector<U8> code = {
+            0x68, 0x78, 0x56, 0x34, 0x12,                           // push 0x12345678
+            0x58,                                                     // pop rax
+        };
+        runAndCheck(r, "push imm32 / pop rax", withExit(code), [](CPU64& c) {
+            return c.reg[X64_R15].u64 == 0x12345678;
+        });
+    }
+
+    // Test 15: BSWAP rax. 0x0102030405060708 → 0x0807060504030201.
+    {
+        std::vector<U8> code = {
+            0x48, 0xB8, 0x08, 0x07, 0x06, 0x05, 0x04, 0x03, 0x02, 0x01, // mov rax, 0x0102030405060708
+            0x48, 0x0F, 0xC8,                                            // bswap rax
+        };
+        runAndCheck(r, "bswap rax", withExit(code), [](CPU64& c) {
+            return c.reg[X64_R15].u64 == 0x0807060504030201ULL;
+        });
+    }
+
+    // Test 16: CMPXCHG hits. RAX==dest → ZF=1, dest gets r value.
+    //   mov rax, 5; mov rbx, 5; mov rcx, 99; cmpxchg rbx, rcx
+    //   After: ZF=1, RBX=99. R15 holds RAX (still 5).
+    {
+        std::vector<U8> code = {
+            0x48, 0xC7, 0xC0, 0x05, 0x00, 0x00, 0x00,             // mov rax, 5
+            0x48, 0xC7, 0xC3, 0x05, 0x00, 0x00, 0x00,             // mov rbx, 5
+            0x48, 0xC7, 0xC1, 0x63, 0x00, 0x00, 0x00,             // mov rcx, 99
+            0x48, 0x0F, 0xB1, 0xCB,                                 // cmpxchg rbx, rcx
+        };
+        runAndCheck(r, "cmpxchg (match)", withExit(code), [](CPU64& c) {
+            return c.reg[X64_RBX].u64 == 99 && c.reg[X64_R15].u64 == 5;
+        });
+    }
+
+    // Test 17: XADD. After: RBX = old(RBX) + old(RAX) = 13; RAX = old(RBX) = 10.
+    {
+        std::vector<U8> code = {
+            0x48, 0xC7, 0xC0, 0x03, 0x00, 0x00, 0x00,             // mov rax, 3
+            0x48, 0xC7, 0xC3, 0x0A, 0x00, 0x00, 0x00,             // mov rbx, 10
+            0x48, 0x0F, 0xC1, 0xC3,                                 // xadd rbx, rax
+        };
+        runAndCheck(r, "xadd rbx, rax", withExit(code), [](CPU64& c) {
+            return c.reg[X64_RBX].u64 == 13 && c.reg[X64_R15].u64 == 10;
+        });
+    }
+
+    // Test 18: ROL rax, 4. Rotate 0x1234567890ABCDEF left 4 → 0x234567890ABCDEF1.
+    {
+        std::vector<U8> code = {
+            0x48, 0xB8, 0xEF, 0xCD, 0xAB, 0x90, 0x78, 0x56, 0x34, 0x12, // mov rax, 0x1234567890ABCDEF
+            0x48, 0xC1, 0xC0, 0x04,                                       // rol rax, 4
+        };
+        runAndCheck(r, "rol rax, 4", withExit(code), [](CPU64& c) {
+            return c.reg[X64_R15].u64 == 0x234567890ABCDEF1ULL;
+        });
+    }
+
+    // Test 19: ROR rax, 8. Rotate 0x1122334455667788 right 8 → 0x8811223344556677.
+    {
+        std::vector<U8> code = {
+            0x48, 0xB8, 0x88, 0x77, 0x66, 0x55, 0x44, 0x33, 0x22, 0x11, // mov rax, 0x1122334455667788
+            0x48, 0xC1, 0xC8, 0x08,                                       // ror rax, 8
+        };
+        runAndCheck(r, "ror rax, 8", withExit(code), [](CPU64& c) {
+            return c.reg[X64_R15].u64 == 0x8811223344556677ULL;
+        });
+    }
+
+    // Test 20: NOT rax. ~0x00000000FFFFFFFF = 0xFFFFFFFF00000000.
+    {
+        std::vector<U8> code = {
+            0x48, 0xC7, 0xC0, 0xFF, 0xFF, 0xFF, 0xFF,                     // mov rax, -1 (sign-ext) actually 0xFFFFFFFFFFFFFFFF
+            0x48, 0xC1, 0xE8, 0x20,                                       // shr rax, 32  → 0xFFFFFFFF
+            0x48, 0xF7, 0xD0,                                             // not rax
+        };
+        runAndCheck(r, "not rax", withExit(code), [](CPU64& c) {
+            return c.reg[X64_R15].u64 == 0xFFFFFFFF00000000ULL;
+        });
+    }
+
+    // Test 21: NEG rax. -7 in two's complement = 0xFFFFFFFFFFFFFFF9.
+    {
+        std::vector<U8> code = {
+            0x48, 0xC7, 0xC0, 0x07, 0x00, 0x00, 0x00,                     // mov rax, 7
+            0x48, 0xF7, 0xD8,                                             // neg rax
+        };
+        runAndCheck(r, "neg rax", withExit(code), [](CPU64& c) {
+            return c.reg[X64_R15].u64 == 0xFFFFFFFFFFFFFFF9ULL;
+        });
+    }
+
+    // Test 22: BTS rax, 7. Start with 0; set bit 7 → 0x80; CF=0 (was clear).
+    {
+        std::vector<U8> code = {
+            0x48, 0x31, 0xC0,                                             // xor rax, rax
+            0x48, 0x0F, 0xBA, 0xE8, 0x07,                                 // bts rax, 7
+        };
+        runAndCheck(r, "bts rax, 7", withExit(code), [](CPU64& c) {
+            return c.reg[X64_R15].u64 == 0x80ULL;
+        });
+    }
+
+    // Test 23: POPCNT. popcnt(0xFF) = 8.
+    {
+        std::vector<U8> code = {
+            0x48, 0xC7, 0xC3, 0xFF, 0x00, 0x00, 0x00,                     // mov rbx, 0xFF
+            0xF3, 0x48, 0x0F, 0xB8, 0xC3,                                 // popcnt rax, rbx
+        };
+        runAndCheck(r, "popcnt rax, rbx (0xFF→8)", withExit(code), [](CPU64& c) {
+            return c.reg[X64_R15].u64 == 8;
+        });
+    }
+
+    // Test 24: BSF rax, rbx where rbx=0x100 → result 8 (low bit set is bit 8).
+    {
+        std::vector<U8> code = {
+            0x48, 0xC7, 0xC3, 0x00, 0x01, 0x00, 0x00,                     // mov rbx, 0x100
+            0x48, 0x0F, 0xBC, 0xC3,                                       // bsf rax, rbx
+        };
+        runAndCheck(r, "bsf rax, rbx (0x100→8)", withExit(code), [](CPU64& c) {
+            return c.reg[X64_R15].u64 == 8;
+        });
+    }
+
+    // Test 25: SHLD eax, ebx, 4.
+    //   eax = 0xAAAA0000, ebx = 0x0000BBBB
+    //   shld eax, ebx, 4 → eax = (0xAAAA0000 << 4) | (0xBBBB >> 28) = 0xAAA00000 | 0x0 = 0xAAA00000
+    {
+        std::vector<U8> code = {
+            0xB8, 0x00, 0x00, 0xAA, 0xAA,                                 // mov eax, 0xAAAA0000
+            0xBB, 0xBB, 0xBB, 0x00, 0x00,                                 // mov ebx, 0x0000BBBB
+            0x0F, 0xA4, 0xD8, 0x04,                                       // shld eax, ebx, 4
+        };
+        runAndCheck(r, "shld eax, ebx, 4", withExit(code), [](CPU64& c) {
+            return c.reg[X64_R15].u64 == 0xAAA00000ULL;
+        });
+    }
+
+    // Test 26: RDTSC. Just verify EDX:EAX nonzero (host clock should be nonzero).
+    {
+        std::vector<U8> code = {
+            0x0F, 0x31,                                                   // rdtsc
+            0x48, 0x09, 0xD0,                                             // or rax, rdx (collapse into RAX so R15 captures it)
+        };
+        runAndCheck(r, "rdtsc", withExit(code), [](CPU64& c) {
+            return c.reg[X64_R15].u64 != 0;
+        });
+    }
+
     printf("=== self-test summary: %d passed, %d failed ===\n\n", r.passed, r.failed);
     return r.failed == 0 ? 0 : 1;
 }

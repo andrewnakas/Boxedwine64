@@ -22,19 +22,40 @@
 #define X64_SYS_write             1
 #define X64_SYS_open              2
 #define X64_SYS_close             3
+#define X64_SYS_stat              4
+#define X64_SYS_fstat             5
+#define X64_SYS_lstat             6
+#define X64_SYS_poll              7
+#define X64_SYS_lseek             8
 #define X64_SYS_mmap              9
 #define X64_SYS_mprotect          10
 #define X64_SYS_munmap            11
 #define X64_SYS_brk               12
 #define X64_SYS_rt_sigaction      13
 #define X64_SYS_rt_sigprocmask    14
+#define X64_SYS_ioctl             16
+#define X64_SYS_pread64           17
 #define X64_SYS_writev            20
 #define X64_SYS_access            21
+#define X64_SYS_readlink          89
+#define X64_SYS_getpid            39
 #define X64_SYS_exit              60
+#define X64_SYS_uname             63
+#define X64_SYS_getuid            102
+#define X64_SYS_getgid            104
+#define X64_SYS_geteuid           107
+#define X64_SYS_getegid           108
 #define X64_SYS_arch_prctl        158
+#define X64_SYS_gettid            186
+#define X64_SYS_futex             202
 #define X64_SYS_set_tid_address   218
+#define X64_SYS_clock_gettime     228
 #define X64_SYS_exit_group        231
+#define X64_SYS_openat            257
+#define X64_SYS_newfstatat        262
 #define X64_SYS_set_robust_list   273
+#define X64_SYS_prlimit64         302
+#define X64_SYS_getrandom         318
 
 // arch_prctl subfunctions
 #define X64_ARCH_SET_GS  0x1001
@@ -150,6 +171,86 @@ static U64 sys_exit64(CPU64* cpu, U64 status) {
     return 0;
 }
 
+// struct utsname is 6 × 65-byte fixed strings on x86-64 Linux (390 bytes).
+static U64 sys_uname64(CPU64* cpu, U64 bufAddr) {
+    if (!bufAddr) return (U64)-K_EFAULT;
+    char buf[6 * 65];
+    std::memset(buf, 0, sizeof(buf));
+    auto setField = [&](int idx, const char* s) {
+        std::strncpy(buf + idx * 65, s, 64);
+    };
+    setField(0, "Linux");                  // sysname
+    setField(1, "boxedwine64");            // nodename
+    setField(2, "6.1.0-boxedwine");        // release — pretend modern kernel
+    setField(3, "#1 SMP boxedwine64");     // version
+    setField(4, "x86_64");                 // machine
+    setField(5, "(none)");                 // domainname
+    cpu->memory->memcpyToGuest(bufAddr, buf, sizeof(buf));
+    return 0;
+}
+
+// getrandom — fill buffer with pseudo-random bytes. Good enough for ld.so's
+// stack canary; not cryptographically strong, but glibc only needs entropy.
+static U64 sys_getrandom64(CPU64* cpu, U64 bufAddr, U64 buflen, U64 /*flags*/) {
+    if (!bufAddr || buflen == 0) return 0;
+    if (buflen > 256) buflen = 256;
+    U8 tmp[256];
+    static U64 seed = 0x9E3779B97F4A7C15ULL;
+    for (U64 i = 0; i < buflen; i++) {
+        seed = seed * 6364136223846793005ULL + 1442695040888963407ULL;
+        tmp[i] = (U8)(seed >> 33);
+    }
+    cpu->memory->memcpyToGuest(bufAddr, tmp, buflen);
+    return buflen;
+}
+
+// prlimit64(pid, resource, new_limit*, old_limit*) — for v1 we always pretend
+// "no limit" by writing RLIM64_INFINITY to old_limit if requested.
+static U64 sys_prlimit64_64(CPU64* cpu, U64 /*pid*/, U64 /*res*/, U64 newLim, U64 oldLim) {
+    if (oldLim) {
+        // struct rlimit64 { __u64 rlim_cur; __u64 rlim_max; }
+        cpu->memory->writeq(oldLim, ~0ULL);
+        cpu->memory->writeq(oldLim + 8, ~0ULL);
+    }
+    (void)newLim;
+    return 0;
+}
+
+// clock_gettime(clk, struct timespec*). Returns wall-clock from the host so
+// glibc gets monotonically advancing values.
+static U64 sys_clock_gettime64(CPU64* cpu, U64 /*clk*/, U64 tsAddr) {
+    if (!tsAddr) return (U64)-K_EFAULT;
+    U64 us = KSystem::getSystemTimeAsMicroSeconds();
+    U64 sec = us / 1000000ULL;
+    U64 nsec = (us % 1000000ULL) * 1000ULL;
+    cpu->memory->writeq(tsAddr, sec);
+    cpu->memory->writeq(tsAddr + 8, nsec);
+    return 0;
+}
+
+// read/write/open/close stubs — until KMemory64 + KThread are wired to the
+// 32-bit FS layer, we return ENOSYS for anything that touches a real file.
+// Reads from fd 0 return 0 (EOF) so apps that probe stdin don't hang.
+static U64 sys_read64(CPU64* /*cpu*/, U64 fd, U64 /*buf*/, U64 /*count*/) {
+    if (fd == 0) return 0;
+    klog_fmt("sys_read64: fd=%llu not yet routed", (unsigned long long)fd);
+    return (U64)-K_ENOSYS;
+}
+
+static U64 sys_openat64(CPU64* cpu, U64 /*dirfd*/, U64 pathAddr, U64 /*flags*/, U64 /*mode*/) {
+    char path[256] = {0};
+    if (pathAddr) {
+        cpu->memory->memcpyFromGuest(path, pathAddr, sizeof(path) - 1);
+    }
+    klog_fmt("sys_openat64: path='%s' not yet routed", path);
+    return (U64)-2; // -ENOENT — pretend file missing rather than crash
+}
+
+// readlink — return -ENOENT so callers fall back; /proc/self/exe etc.
+static U64 sys_readlink64(CPU64* /*cpu*/, U64 /*pathAddr*/, U64 /*buf*/, U64 /*sz*/) {
+    return (U64)-2; // -ENOENT
+}
+
 void ksyscall64(CPU64* cpu) {
     if (!cpu) return;
     U64 nr   = cpu->reg[X64_RAX].u64;
@@ -194,8 +295,67 @@ void ksyscall64(CPU64* cpu) {
         case X64_SYS_set_robust_list:
         case X64_SYS_rt_sigprocmask:
         case X64_SYS_rt_sigaction:
+        case X64_SYS_ioctl:
             // ld-linux makes these calls before main; safe to no-op.
             ret = 0;
+            break;
+        case X64_SYS_read:
+            ret = sys_read64(cpu, a1, a2, a3);
+            break;
+        case X64_SYS_open:
+        case X64_SYS_openat:
+            // open(path, flags, mode) — same arg layout once we shift one.
+            if (nr == X64_SYS_open) ret = sys_openat64(cpu, ~0ULL, a1, a2, a3);
+            else                    ret = sys_openat64(cpu, a1,    a2, a3, a4);
+            break;
+        case X64_SYS_close:
+            ret = 0; // pretend success — nothing tracked yet
+            break;
+        case X64_SYS_stat:
+        case X64_SYS_fstat:
+        case X64_SYS_lstat:
+        case X64_SYS_newfstatat:
+            ret = (U64)-2; // -ENOENT for everything; loaders typically cope
+            break;
+        case X64_SYS_lseek:
+        case X64_SYS_pread64:
+            ret = (U64)-K_ENOSYS;
+            break;
+        case X64_SYS_readlink:
+            ret = sys_readlink64(cpu, a1, a2, a3);
+            break;
+        case X64_SYS_access:
+            ret = (U64)-2; // -ENOENT
+            break;
+        case X64_SYS_uname:
+            ret = sys_uname64(cpu, a1);
+            break;
+        case X64_SYS_getrandom:
+            ret = sys_getrandom64(cpu, a1, a2, a3);
+            break;
+        case X64_SYS_prlimit64:
+            ret = sys_prlimit64_64(cpu, a1, a2, a3, a4);
+            break;
+        case X64_SYS_clock_gettime:
+            ret = sys_clock_gettime64(cpu, a1, a2);
+            break;
+        case X64_SYS_getuid:
+        case X64_SYS_geteuid:
+        case X64_SYS_getgid:
+        case X64_SYS_getegid:
+            ret = 1000; // pretend uid/gid 1000
+            break;
+        case X64_SYS_getpid:
+        case X64_SYS_gettid:
+            ret = cpu->thread ? cpu->thread->id : 1;
+            break;
+        case X64_SYS_futex:
+            // ld-linux uses futex for lazy init; FUTEX_WAKE on uncontended
+            // mutex returns 0. We'll return success and skip blocking.
+            ret = 0;
+            break;
+        case X64_SYS_poll:
+            ret = 0; // timeout — nothing ready
             break;
         case X64_SYS_exit:
         case X64_SYS_exit_group:

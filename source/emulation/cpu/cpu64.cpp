@@ -350,19 +350,63 @@ bool CPU64::evalCC(U8 cc) const {
     return false;
 }
 
-// Compute SHL/SHR/SAR/ROL/ROR result + flags. count is already masked.
-// Returns the new value; flag effects are applied to rflags.
+// Compute SHL/SHR/SAR/ROL/ROR/RCL/RCR result + flags. count is already masked.
+// Returns the new value; flag effects are applied to rflags. For rotates the
+// SZP flags are not touched (per Intel SDM); only CF (and OF for count==1).
 static U64 doShift(U32& rflags, U8 sub, U64 v, U8 count, U32 width) {
     if (count == 0) return v;
     U64 mask = maskFor(width);
     v &= mask;
     U64 result = v;
     U64 sb = signBitFor(width);
+    U32 wbits = width * 8;
     bool cf = (rflags & X64_CF) != 0;
+    bool isRotate = (sub <= 3);
     switch (sub) {
+        case 0: { // ROL
+            U8 c = count % wbits;
+            if (c == 0) {
+                result = v;
+                // CF still set from low bit of result per Intel
+                cf = (v & 1) != 0;
+            } else {
+                result = ((v << c) | (v >> (wbits - c))) & mask;
+                cf = (result & 1) != 0;
+            }
+            break;
+        }
+        case 1: { // ROR
+            U8 c = count % wbits;
+            if (c == 0) {
+                result = v;
+                cf = (v & sb) != 0;
+            } else {
+                result = ((v >> c) | (v << (wbits - c))) & mask;
+                cf = (result & sb) != 0;
+            }
+            break;
+        }
+        case 2: { // RCL — rotate through carry, (wbits+1)-bit rotation
+            U8 c = count % (wbits + 1);
+            for (U8 i = 0; i < c; i++) {
+                bool newCf = (result & sb) != 0;
+                result = ((result << 1) | (cf ? 1 : 0)) & mask;
+                cf = newCf;
+            }
+            break;
+        }
+        case 3: { // RCR
+            U8 c = count % (wbits + 1);
+            for (U8 i = 0; i < c; i++) {
+                bool newCf = (result & 1) != 0;
+                result = ((result >> 1) | (cf ? sb : 0)) & mask;
+                cf = newCf;
+            }
+            break;
+        }
         case 4: // SHL/SAL
         case 6: // alias
-            cf = (v >> (width * 8 - count)) & 1;
+            cf = (v >> (wbits - count)) & 1;
             result = (v << count) & mask;
             break;
         case 5: // SHR
@@ -380,21 +424,19 @@ static U64 doShift(U32& rflags, U8 sub, U64 v, U8 count, U32 width) {
             }
             break;
         default:
-            // ROL/ROR/RCL/RCR not implemented yet — caller should detect.
             return v;
     }
     rflags &= ~(X64_CF | X64_OF);
     if (cf) rflags |= X64_CF;
-    // OF defined only for count==1; for SHL it's MSB-of-result XOR CF; for
-    // SHR it's the MSB of the original; for SAR it's 0. For count>1 OF is
-    // architecturally undefined — we leave it cleared which is fine.
     if (count == 1) {
         bool of = false;
         if (sub == 4 || sub == 6) of = ((result & sb) != 0) != cf;
         else if (sub == 5) of = (v & sb) != 0;
+        else if (sub == 0 || sub == 2) of = ((result & sb) != 0) != cf;   // ROL/RCL: MSB(result) XOR CF
+        else if (sub == 1 || sub == 3) of = ((result & sb) != 0) != (((result << 1) & sb) != 0); // ROR/RCR: MSB XOR (MSB-1)
         if (of) rflags |= X64_OF;
     }
-    setSZP(rflags, result, width);
+    if (!isRotate) setSZP(rflags, result, width);
     return result;
 }
 
@@ -547,10 +589,85 @@ U32 CPU64::step() {
         }
     }
 
-    // NOP (90). Also 0F 1F /0 multi-byte NOP (handled below in 0F prefix).
-    if (op == 0x90) {
+    // NOP (90). 0x90 without REX prefix is also XCHG RAX,RAX which is a NOP.
+    // With REX.B=1 it becomes XCHG R8,RAX — we fall through to the XCHG block
+    // below in that case. opcode 0x90 with REX.B=0 is the plain NOP.
+    if (op == 0x90 && !(p.rex & 0x01)) {
         rip += opOff + 1;
         return opOff + 1;
+    }
+
+    // XCHG r, RAX (90+rd). XCHG R8-R15 with RAX when REX.B=1. The plain 0x90
+    // case is handled above as NOP. opSize from prefix/REX.W.
+    if (op >= 0x90 && op <= 0x97) {
+        U8 ri = (U8)((op - 0x90) | ((p.rex & 0x01) ? 0x08 : 0));
+        if (ri == X64_RAX) {
+            rip += opOff + 1;
+            return opOff + 1;
+        }
+        U64 a, b;
+        if (opSize == 2) { a = reg[X64_RAX].u16; b = reg[ri].u16; reg[X64_RAX].setU16((U16)b); reg[ri].setU16((U16)a); }
+        else if (opSize == 4) { a = reg[X64_RAX].u32; b = reg[ri].u32; reg[X64_RAX].setU64((U32)b); reg[ri].setU64((U32)a); }
+        else { a = reg[X64_RAX].u64; b = reg[ri].u64; reg[X64_RAX].setU64(b); reg[ri].setU64(a); }
+        rip += opOff + 1;
+        return opOff + 1;
+    }
+
+    // XCHG r/m, r (86 r/m8, 87 r/m). Atomic when used with LOCK; we're
+    // single-threaded so plain swap is correct.
+    if (op == 0x86 || op == 0x87) {
+        U32 size = (op == 0x86) ? 1 : opSize;
+        ModRM m = decodeModRM(rip + opOff + 1, p, 0);
+        U64 a = loadRM(m, size, rexPresent);
+        U64 b = (size == 1) ? readReg8(m.regField, rexPresent)
+              : (size == 2) ? (U64)reg[m.regField].u16
+              : (size == 4) ? (U64)reg[m.regField].u32
+                            : reg[m.regField].u64;
+        storeRM(m, size, b, rexPresent);
+        if (size == 1) writeReg8(m.regField, (U8)a, rexPresent);
+        else if (size == 2) reg[m.regField].setU16((U16)a);
+        else if (size == 4) reg[m.regField].setU64((U32)a);
+        else reg[m.regField].setU64(a);
+        U32 used = opOff + 1 + m.length;
+        rip += used;
+        return used;
+    }
+
+    // CDQ/CQO (99). Sign-extend EAX/RAX into EDX/RDX. 16-bit form (with 66
+    // prefix) is CWD: sign-extend AX into DX.
+    if (op == 0x99) {
+        if (opSize == 2) {
+            reg[X64_RDX].setU16((reg[X64_RAX].u16 & 0x8000) ? 0xFFFFu : 0u);
+        } else if (opSize == 4) {
+            reg[X64_RDX].setU64((reg[X64_RAX].u32 & 0x80000000u) ? 0xFFFFFFFFu : 0u);
+        } else {
+            reg[X64_RDX].setU64((reg[X64_RAX].u64 & 0x8000000000000000ULL) ? ~(U64)0 : 0ULL);
+        }
+        rip += opOff + 1;
+        return opOff + 1;
+    }
+
+    // CBW/CWDE/CDQE (98). Sign-extend AL→AX (16), AX→EAX (32), EAX→RAX (64).
+    if (op == 0x98) {
+        if (opSize == 2) reg[X64_RAX].setU16((U16)(S16)(S8)reg[X64_RAX].u8);
+        else if (opSize == 4) reg[X64_RAX].setU64((U64)(U32)(S32)(S16)reg[X64_RAX].u16);
+        else reg[X64_RAX].setU64((U64)(S64)(S32)reg[X64_RAX].u32);
+        rip += opOff + 1;
+        return opOff + 1;
+    }
+
+    // PUSH imm8 (6A) / PUSH imm32 sign-ext (68). Always 64-bit push in long mode.
+    if (op == 0x6A || op == 0x68) {
+        S64 imm = (op == 0x6A)
+            ? (S64)(S8)fetchByte(rip + opOff + 1)
+            : (S64)(S32)fetchDword(rip + opOff + 1);
+        U32 immLen = (op == 0x6A) ? 1 : 4;
+        U64 sp = reg[X64_RSP].u64 - 8;
+        memory->writeq(sp, (U64)imm);
+        reg[X64_RSP].setU64(sp);
+        U32 used = opOff + 1 + immLen;
+        rip += used;
+        return used;
     }
 
     // SYSCALL (0F 05).
@@ -765,7 +882,151 @@ U32 CPU64::step() {
             rip += used;
             return used;
         }
-        // /4 /5 /6 /7 not yet implemented
+        if (sub == 4 || sub == 5) {
+            // MUL (/4 unsigned) and IMUL (/5 signed) one-operand form.
+            //   byte:  AX        = AL  * r/m8
+            //   word:  DX:AX     = AX  * r/m16
+            //   dword: EDX:EAX   = EAX * r/m32   (RDX/RAX upper bits zeroed)
+            //   qword: RDX:RAX   = RAX * r/m64
+            // CF=OF set when the high half is non-zero (MUL) or doesn't match
+            // sign-extension of the low half (IMUL). SF/ZF/AF/PF undefined.
+            U64 a = loadRM(m, size, rexPresent);
+            bool isSigned = (sub == 5);
+            U64 lo = 0, hi = 0;
+            bool overflow = false;
+            if (size == 1) {
+                if (isSigned) {
+                    S16 prod = (S16)(S8)reg[X64_RAX].u8 * (S16)(S8)a;
+                    reg[X64_RAX].setU16((U16)prod);
+                    overflow = ((S8)(prod & 0xFF) != prod);
+                } else {
+                    U16 prod = (U16)reg[X64_RAX].u8 * (U16)(U8)a;
+                    reg[X64_RAX].setU16(prod);
+                    overflow = (prod >> 8) != 0;
+                }
+            } else if (size == 2) {
+                if (isSigned) {
+                    S32 prod = (S32)(S16)reg[X64_RAX].u16 * (S32)(S16)(U16)a;
+                    lo = (U16)prod;
+                    hi = (U16)(prod >> 16);
+                    overflow = ((S16)lo != prod);
+                } else {
+                    U32 prod = (U32)reg[X64_RAX].u16 * (U32)(U16)a;
+                    lo = (U16)prod;
+                    hi = (U16)(prod >> 16);
+                    overflow = hi != 0;
+                }
+                reg[X64_RAX].setU16((U16)lo);
+                reg[X64_RDX].setU16((U16)hi);
+            } else if (size == 4) {
+                if (isSigned) {
+                    S64 prod = (S64)(S32)reg[X64_RAX].u32 * (S64)(S32)(U32)a;
+                    lo = (U32)prod;
+                    hi = (U32)((U64)prod >> 32);
+                    overflow = ((S32)lo != prod);
+                } else {
+                    U64 prod = (U64)reg[X64_RAX].u32 * (U64)(U32)a;
+                    lo = (U32)prod;
+                    hi = (U32)(prod >> 32);
+                    overflow = hi != 0;
+                }
+                // 32-bit dest writes zero-extend the full 64-bit reg.
+                reg[X64_RAX].setU64(lo);
+                reg[X64_RDX].setU64(hi);
+            } else {
+                __uint128_t prod;
+                if (isSigned) {
+                    __int128 p = (__int128)(S64)reg[X64_RAX].u64 * (__int128)(S64)a;
+                    prod = (__uint128_t)p;
+                    lo = (U64)prod;
+                    hi = (U64)(prod >> 64);
+                    overflow = ((S64)lo != p);
+                } else {
+                    prod = (__uint128_t)reg[X64_RAX].u64 * (__uint128_t)a;
+                    lo = (U64)prod;
+                    hi = (U64)(prod >> 64);
+                    overflow = hi != 0;
+                }
+                reg[X64_RAX].setU64(lo);
+                reg[X64_RDX].setU64(hi);
+            }
+            rflags &= ~(X64_CF | X64_OF);
+            if (overflow) rflags |= (X64_CF | X64_OF);
+            U32 used = opOff + 1 + m.length;
+            rip += used;
+            return used;
+        }
+        if (sub == 6 || sub == 7) {
+            // DIV (/6 unsigned) and IDIV (/7 signed) one-operand form.
+            //   byte:  AL  = AX        / r/m8 ;  AH = remainder
+            //   word:  AX  = DX:AX     / r/m16; DX = remainder
+            //   dword: EAX = EDX:EAX   / r/m32; EDX = remainder
+            //   qword: RAX = RDX:RAX   / r/m64; RDX = remainder
+            // Divide by zero or quotient overflow → #DE. We currently just
+            // skip the write and continue; full #DE delivery is a TODO.
+            U64 a = loadRM(m, size, rexPresent);
+            if (a == 0) {
+                klog_fmt("CPU64: DIV by zero at RIP=0x%llx (TODO: deliver #DE)",
+                         (unsigned long long)rip);
+                yield = true;
+                return 0;
+            }
+            bool isSigned = (sub == 7);
+            if (size == 1) {
+                U16 num = reg[X64_RAX].u16;
+                if (isSigned) {
+                    S16 sn = (S16)num;
+                    S8 d = (S8)a;
+                    S16 q = sn / d;
+                    S16 rem = sn % d;
+                    reg[X64_RAX].setU8((U8)(S8)q);
+                    reg[X64_RAX].setH8((U8)(S8)rem);
+                } else {
+                    U16 q = num / (U8)a;
+                    U16 rem = num % (U8)a;
+                    reg[X64_RAX].setU8((U8)q);
+                    reg[X64_RAX].setH8((U8)rem);
+                }
+            } else if (size == 2) {
+                U32 num = ((U32)reg[X64_RDX].u16 << 16) | reg[X64_RAX].u16;
+                if (isSigned) {
+                    S32 sn = (S32)num;
+                    S16 d = (S16)a;
+                    reg[X64_RAX].setU16((U16)(S16)(sn / d));
+                    reg[X64_RDX].setU16((U16)(S16)(sn % d));
+                } else {
+                    reg[X64_RAX].setU16((U16)(num / (U16)a));
+                    reg[X64_RDX].setU16((U16)(num % (U16)a));
+                }
+            } else if (size == 4) {
+                U64 num = ((U64)reg[X64_RDX].u32 << 32) | reg[X64_RAX].u32;
+                if (isSigned) {
+                    S64 sn = (S64)num;
+                    S32 d = (S32)a;
+                    reg[X64_RAX].setU64((U64)(U32)(sn / d));
+                    reg[X64_RDX].setU64((U64)(U32)(sn % d));
+                } else {
+                    reg[X64_RAX].setU64((U64)(U32)(num / (U32)a));
+                    reg[X64_RDX].setU64((U64)(U32)(num % (U32)a));
+                }
+            } else {
+                // 128/64 -> 64 quotient. Use __int128.
+                __uint128_t num = ((__uint128_t)reg[X64_RDX].u64 << 64) | reg[X64_RAX].u64;
+                if (isSigned) {
+                    __int128 sn = (__int128)num;
+                    S64 d = (S64)a;
+                    reg[X64_RAX].setU64((U64)(sn / d));
+                    reg[X64_RDX].setU64((U64)(sn % d));
+                } else {
+                    reg[X64_RAX].setU64((U64)(num / (__uint128_t)a));
+                    reg[X64_RDX].setU64((U64)(num % (__uint128_t)a));
+                }
+            }
+            // DIV/IDIV leave flags undefined per Intel SDM.
+            U32 used = opOff + 1 + m.length;
+            rip += used;
+            return used;
+        }
         goto unhandled;
     }
 
@@ -984,6 +1245,233 @@ U32 CPU64::step() {
             rip += used;
             return used;
         }
+
+        // 0F C8+rd — BSWAP r32 / r64. Reverses byte order. 16-bit form is
+        // architecturally undefined; we treat it as zero-extend of low byte
+        // swap which matches what most CPUs do (and glibc never emits the 16
+        // form).
+        if (op2 >= 0xC8 && op2 <= 0xCF) {
+            U8 ri = (U8)((op2 - 0xC8) | ((p.rex & 0x01) ? 0x08 : 0));
+            if (opSize == 8) {
+                U64 v = reg[ri].u64;
+                v = __builtin_bswap64(v);
+                reg[ri].setU64(v);
+            } else {
+                U32 v = reg[ri].u32;
+                v = __builtin_bswap32(v);
+                reg[ri].setU64(v);
+            }
+            rip += opOff + 2;
+            return opOff + 2;
+        }
+
+        // 0F B0 /r — CMPXCHG r/m8, r8.  0F B1 /r — CMPXCHG r/m, r.
+        // If AL/AX/EAX/RAX == r/m, store r into r/m and set ZF=1. Otherwise
+        // load r/m into AL/AX/EAX/RAX and clear ZF. Flags follow the implicit
+        // SUB of acc vs r/m.
+        if (op2 == 0xB0 || op2 == 0xB1) {
+            U32 size = (op2 == 0xB0) ? 1 : opSize;
+            ModRM m = decodeModRM(rip + opOff + 2, p, 0);
+            U64 dest = loadRM(m, size, rexPresent);
+            U64 acc = (size == 1) ? reg[X64_RAX].u8
+                    : (size == 2) ? (U64)reg[X64_RAX].u16
+                    : (size == 4) ? (U64)reg[X64_RAX].u32
+                                  : reg[X64_RAX].u64;
+            U64 cmpRes = acc - dest;
+            flagsSub(rflags, acc, dest, cmpRes, size);
+            if (acc == dest) {
+                U64 src = (size == 1) ? readReg8(m.regField, rexPresent)
+                        : (size == 2) ? (U64)reg[m.regField].u16
+                        : (size == 4) ? (U64)reg[m.regField].u32
+                                      : reg[m.regField].u64;
+                storeRM(m, size, src, rexPresent);
+            } else {
+                if (size == 1) reg[X64_RAX].setU8((U8)dest);
+                else if (size == 2) reg[X64_RAX].setU16((U16)dest);
+                else if (size == 4) reg[X64_RAX].setU64((U32)dest);
+                else reg[X64_RAX].setU64(dest);
+            }
+            U32 used = opOff + 2 + m.length;
+            rip += used;
+            return used;
+        }
+
+        // 0F A3 /r — BT  r/m, r       (test bit, no modify)
+        // 0F AB /r — BTS r/m, r       (set bit, return old in CF)
+        // 0F B3 /r — BTR r/m, r       (reset bit)
+        // 0F BB /r — BTC r/m, r       (complement bit)
+        if (op2 == 0xA3 || op2 == 0xAB || op2 == 0xB3 || op2 == 0xBB) {
+            ModRM m = decodeModRM(rip + opOff + 2, p, 0);
+            U64 v = loadRM(m, opSize, rexPresent);
+            U64 idx = (opSize == 8) ? reg[m.regField].u64 :
+                      (opSize == 4) ? (U64)reg[m.regField].u32 :
+                                      (U64)reg[m.regField].u16;
+            U64 bit = idx & (opSize * 8 - 1);
+            U64 mask = 1ULL << bit;
+            bool old = (v & mask) != 0;
+            rflags &= ~X64_CF;
+            if (old) rflags |= X64_CF;
+            if (op2 != 0xA3) {
+                U64 nv = v;
+                if (op2 == 0xAB) nv |= mask;
+                else if (op2 == 0xB3) nv &= ~mask;
+                else nv ^= mask; // BTC
+                storeRM(m, opSize, nv, rexPresent);
+            }
+            U32 used = opOff + 2 + m.length;
+            rip += used;
+            return used;
+        }
+
+        // 0F BA /r — group with imm8: /4 BT  /5 BTS  /6 BTR  /7 BTC
+        if (op2 == 0xBA) {
+            ModRM m = decodeModRM(rip + opOff + 2, p, 1);
+            U8 sub = m.regField & 0x7;
+            if (sub >= 4 && sub <= 7) {
+                U64 v = loadRM(m, opSize, rexPresent);
+                U8 imm = fetchByte(rip + opOff + 2 + m.length);
+                U64 bit = imm & (opSize * 8 - 1);
+                U64 mask = 1ULL << bit;
+                bool old = (v & mask) != 0;
+                rflags &= ~X64_CF;
+                if (old) rflags |= X64_CF;
+                if (sub != 4) {
+                    U64 nv = v;
+                    if (sub == 5) nv |= mask;
+                    else if (sub == 6) nv &= ~mask;
+                    else nv ^= mask;
+                    storeRM(m, opSize, nv, rexPresent);
+                }
+                U32 used = opOff + 2 + m.length + 1;
+                rip += used;
+                return used;
+            }
+        }
+
+        // 0F A4 /r ib — SHLD r/m, r, imm8 (double-precision shift left)
+        // 0F A5 /r    — SHLD r/m, r, CL
+        // 0F AC /r ib — SHRD r/m, r, imm8
+        // 0F AD /r    — SHRD r/m, r, CL
+        if (op2 == 0xA4 || op2 == 0xA5 || op2 == 0xAC || op2 == 0xAD) {
+            bool isLeft = (op2 == 0xA4 || op2 == 0xA5);
+            bool hasImm = (op2 == 0xA4 || op2 == 0xAC);
+            ModRM m = decodeModRM(rip + opOff + 2, p, hasImm ? 1 : 0);
+            U64 dest = loadRM(m, opSize, rexPresent);
+            U64 src = (opSize == 8) ? reg[m.regField].u64 :
+                      (opSize == 4) ? (U64)reg[m.regField].u32 :
+                                      (U64)reg[m.regField].u16;
+            U8 count;
+            U32 immLen = 0;
+            if (hasImm) {
+                count = fetchByte(rip + opOff + 2 + m.length);
+                immLen = 1;
+            } else {
+                count = reg[X64_RCX].u8;
+            }
+            count &= (opSize == 8) ? 0x3F : 0x1F;
+            U64 mask = maskFor(opSize);
+            dest &= mask; src &= mask;
+            if (count != 0) {
+                U64 result;
+                bool cf;
+                if (isLeft) {
+                    cf = (dest >> (opSize * 8 - count)) & 1;
+                    result = ((dest << count) | (src >> (opSize * 8 - count))) & mask;
+                } else {
+                    cf = (dest >> (count - 1)) & 1;
+                    result = ((dest >> count) | (src << (opSize * 8 - count))) & mask;
+                }
+                rflags &= ~(X64_CF | X64_OF);
+                if (cf) rflags |= X64_CF;
+                setSZP(rflags, result, opSize);
+                storeRM(m, opSize, result, rexPresent);
+            }
+            U32 used = opOff + 2 + m.length + immLen;
+            rip += used;
+            return used;
+        }
+
+        // F3 0F B8 — POPCNT r, r/m  (REP prefix selects POPCNT vs BSF)
+        // F3 0F BC — TZCNT (vs 0F BC BSF)
+        // F3 0F BD — LZCNT (vs 0F BD BSR)
+        if ((op2 == 0xB8 && p.rep == 0xF3) ||
+            (op2 == 0xBC && p.rep == 0xF3) ||
+            (op2 == 0xBD && p.rep == 0xF3)) {
+            ModRM m = decodeModRM(rip + opOff + 2, p, 0);
+            U64 src = loadRM(m, opSize, rexPresent) & maskFor(opSize);
+            U64 result;
+            if (op2 == 0xB8) { // POPCNT
+                result = __builtin_popcountll(src);
+            } else if (op2 == 0xBC) { // TZCNT
+                result = src ? __builtin_ctzll(src) : opSize * 8;
+            } else { // LZCNT
+                U32 bits = opSize * 8;
+                result = src ? (__builtin_clzll(src) - (64 - bits)) : bits;
+            }
+            if (opSize == 8) reg[m.regField].setU64(result);
+            else if (opSize == 4) reg[m.regField].setU64((U32)result);
+            else reg[m.regField].setU16((U16)result);
+            rflags &= ~(X64_ZF | X64_CF | X64_OF | X64_SF | X64_PF | X64_AF);
+            if (op2 == 0xB8) { if (result == 0) rflags |= X64_ZF; }
+            else if (op2 == 0xBC) { if (src == 0) rflags |= X64_CF; if ((result & maskFor(opSize)) == 0) rflags |= X64_ZF; }
+            else { if (src == 0) rflags |= X64_CF; if ((result & maskFor(opSize)) == 0) rflags |= X64_ZF; }
+            U32 used = opOff + 2 + m.length;
+            rip += used;
+            return used;
+        }
+
+        // 0F BC — BSF r, r/m  (bit scan forward); 0F BD — BSR (reverse).
+        if (op2 == 0xBC || op2 == 0xBD) {
+            ModRM m = decodeModRM(rip + opOff + 2, p, 0);
+            U64 src = loadRM(m, opSize, rexPresent) & maskFor(opSize);
+            rflags &= ~X64_ZF;
+            if (src == 0) {
+                rflags |= X64_ZF;
+                // dest undefined; leave unchanged
+            } else {
+                U64 idx = (op2 == 0xBC) ? __builtin_ctzll(src)
+                                        : (63 - __builtin_clzll(src));
+                if (opSize == 8) reg[m.regField].setU64(idx);
+                else if (opSize == 4) reg[m.regField].setU64((U32)idx);
+                else reg[m.regField].setU16((U16)idx);
+            }
+            U32 used = opOff + 2 + m.length;
+            rip += used;
+            return used;
+        }
+
+        // 0F 31 — RDTSC. Returns guest "cycles" in EDX:EAX. We just shove the
+        // host microsecond counter in; precision doesn't matter for early boot.
+        if (op2 == 0x31) {
+            U64 tsc = KSystem::getSystemTimeAsMicroSeconds();
+            reg[X64_RAX].setU64((U32)(tsc & 0xFFFFFFFF));
+            reg[X64_RDX].setU64((U32)(tsc >> 32));
+            rip += opOff + 2;
+            return opOff + 2;
+        }
+
+        // 0F C0 /r — XADD r/m8, r8.  0F C1 /r — XADD r/m, r.
+        // tmp = r/m + r;  r = r/m;  r/m = tmp. Flags follow the ADD.
+        if (op2 == 0xC0 || op2 == 0xC1) {
+            U32 size = (op2 == 0xC0) ? 1 : opSize;
+            ModRM m = decodeModRM(rip + opOff + 2, p, 0);
+            U64 d = loadRM(m, size, rexPresent);
+            U64 s = (size == 1) ? readReg8(m.regField, rexPresent)
+                  : (size == 2) ? (U64)reg[m.regField].u16
+                  : (size == 4) ? (U64)reg[m.regField].u32
+                                : reg[m.regField].u64;
+            U64 sum = d + s;
+            flagsAdd(rflags, d, s, sum, size);
+            // src reg <- old r/m
+            if (size == 1) writeReg8(m.regField, (U8)d, rexPresent);
+            else if (size == 2) reg[m.regField].setU16((U16)d);
+            else if (size == 4) reg[m.regField].setU64((U32)d);
+            else reg[m.regField].setU64(d);
+            storeRM(m, size, sum, rexPresent);
+            U32 used = opOff + 2 + m.length;
+            rip += used;
+            return used;
+        }
     }
 
     // 63 /r — MOVSXD r64, r/m32 (with REX.W). Without REX.W it acts like
@@ -1004,7 +1492,7 @@ U32 CPU64::step() {
 
     // Shift group — D0/D1/D2/D3/C0/C1 with /digit selecting the op:
     //   /4 SHL  /5 SHR  /6 alias SHL  /7 SAR
-    //   /0 ROL  /1 ROR  /2 RCL  /3 RCR (not yet implemented)
+    //   /0 ROL  /1 ROR  /2 RCL  /3 RCR
     // D0/C0 = byte form; D1/C1 = opSize form. D0/D1 shift by 1; D2/D3 shift
     // by CL; C0/C1 shift by imm8.
     if (op == 0xD0 || op == 0xD1 || op == 0xD2 || op == 0xD3 ||
@@ -1013,7 +1501,7 @@ U32 CPU64::step() {
         bool hasImm = (op == 0xC0 || op == 0xC1);
         ModRM m = decodeModRM(rip + opOff + 1, p, hasImm ? 1 : 0);
         U8 sub = m.regField & 0x7;
-        if (sub == 4 || sub == 5 || sub == 6 || sub == 7) {
+        if (sub <= 7) {
             U8 count;
             U32 immLen = 0;
             if (op == 0xD0 || op == 0xD1) {
@@ -1037,7 +1525,6 @@ U32 CPU64::step() {
             rip += used;
             return used;
         }
-        // ROL/ROR/RCL/RCR not yet implemented — fall through.
     }
 
     // IMUL r, r/m, imm (69 iz / 6B ib). Three-operand signed multiply.
@@ -1115,6 +1602,60 @@ U32 CPU64::step() {
             reg[X64_RDI].setU64(reg[X64_RDI].u64 + (U64)step);
         }
         if (p.rep != 0) reg[X64_RCX].setU64(0);
+        rip += opOff + 1;
+        return opOff + 1;
+    }
+
+    // CMPS / SCAS — string compare. CMPS compares [RSI] vs [RDI]; SCAS
+    // compares AL/AX/EAX/RAX vs [RDI]. Both update flags as a CMP and step
+    // RSI/RDI by ±size. REPE (F3) repeats while ZF=1; REPNE (F2) while ZF=0;
+    // both also break when RCX reaches 0.
+    //   CMPSB/CMPSW/CMPSD/CMPSQ — A6 / A7
+    //   SCASB/SCASW/SCASD/SCASQ — AE / AF
+    if (op == 0xA6 || op == 0xA7 || op == 0xAE || op == 0xAF) {
+        U32 size = (op == 0xA6 || op == 0xAE) ? 1 : opSize;
+        bool isScas = (op == 0xAE || op == 0xAF);
+        S64 step = (rflags & X64_DF) ? -(S64)size : (S64)size;
+        U64 count = (p.rep != 0) ? reg[X64_RCX].u64 : 1;
+        if (p.asize32) count &= 0xFFFFFFFFULL;
+        bool stopOnZF = (p.rep == 0xF3); // REPE
+        bool stopOnNZ = (p.rep == 0xF2); // REPNE
+        U64 lhs = 0, rhs = 0;
+        while (count > 0) {
+            count--;
+            if (isScas) {
+                lhs = (size == 1) ? reg[X64_RAX].u8
+                    : (size == 2) ? reg[X64_RAX].u16
+                    : (size == 4) ? reg[X64_RAX].u32 : reg[X64_RAX].u64;
+            } else {
+                U64 src = reg[X64_RSI].u64;
+                if (p.asize32) src &= 0xFFFFFFFFULL;
+                switch (size) {
+                    case 1: lhs = memory->readb(src); break;
+                    case 2: lhs = memory->readw(src); break;
+                    case 4: lhs = memory->readd(src); break;
+                    default: lhs = memory->readq(src); break;
+                }
+            }
+            U64 dst = reg[X64_RDI].u64;
+            if (p.asize32) dst &= 0xFFFFFFFFULL;
+            switch (size) {
+                case 1: rhs = memory->readb(dst); break;
+                case 2: rhs = memory->readw(dst); break;
+                case 4: rhs = memory->readd(dst); break;
+                default: rhs = memory->readq(dst); break;
+            }
+            U64 diff = lhs - rhs;
+            flagsSub(rflags, lhs, rhs, diff, size);
+            if (!isScas) reg[X64_RSI].setU64(reg[X64_RSI].u64 + (U64)step);
+            reg[X64_RDI].setU64(reg[X64_RDI].u64 + (U64)step);
+            if (p.rep != 0) {
+                bool zfNow = (rflags & X64_ZF) != 0;
+                if (stopOnZF && !zfNow) break;
+                if (stopOnNZ && zfNow) break;
+            }
+        }
+        if (p.rep != 0) reg[X64_RCX].setU64(count);
         rip += opOff + 1;
         return opOff + 1;
     }
