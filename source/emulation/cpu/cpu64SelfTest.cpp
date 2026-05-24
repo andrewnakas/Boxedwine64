@@ -773,6 +773,40 @@ int runX64SelfTest() {
             return c.reg[X64_R15].u64 == 0xBB04AA0399028801ULL;
         });
     }
+    // Test 39: PSLLD xmm0, 4 — shift each dword left by 4.
+    // xmm0.lo = 0x00000001_00000002 → 0x00000010_00000020.
+    {
+        std::vector<U8> code = {
+            // rax = 0x0000000100000002
+            0x48, 0xB8, 0x02, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00,
+            0x66, 0x48, 0x0F, 0x6E, 0xC0,                                // movq xmm0, rax
+            // pslld xmm0, 4  → 66 0F 72 /6 ib, ModR/M = 11_110_000 = 0xF0
+            0x66, 0x0F, 0x72, 0xF0, 0x04,
+            0x66, 0x48, 0x0F, 0x7E, 0xC0,                                 // movq rax, xmm0
+        };
+        runAndCheck(r, "pslld xmm0,4 doubles dwords by 16", withExit(code), [](CPU64& c) {
+            return c.reg[X64_R15].u64 == 0x0000001000000020ULL;
+        });
+    }
+    // Test 40: PSRAW xmm0, 2 — arithmetic right-shift word lanes by 2.
+    // xmm0.lo = 0x8000_4000_C000_0004 → words: 0x0004, 0xC000, 0x4000, 0x8000.
+    //   0x0004 >> 2 = 0x0001
+    //   0xC000 (signed -16384) >> 2 = 0xF000 (signed -4096)
+    //   0x4000 >> 2 = 0x1000
+    //   0x8000 (signed -32768) >> 2 = 0xE000 (signed -8192)
+    // Result = 0xE000_1000_F000_0001
+    {
+        std::vector<U8> code = {
+            0x48, 0xB8, 0x04, 0x00, 0x00, 0xC0, 0x00, 0x40, 0x00, 0x80,
+            0x66, 0x48, 0x0F, 0x6E, 0xC0,                                // movq xmm0, rax
+            // psraw xmm0, 2  → 66 0F 71 /4 ib, ModR/M = 11_100_000 = 0xE0
+            0x66, 0x0F, 0x71, 0xE0, 0x02,
+            0x66, 0x48, 0x0F, 0x7E, 0xC0,
+        };
+        runAndCheck(r, "psraw xmm0,2 sign-extends negatives", withExit(code), [](CPU64& c) {
+            return c.reg[X64_R15].u64 == 0xE0001000F0000001ULL;
+        });
+    }
     printf("=== self-test summary: %d passed, %d failed ===\n\n", r.passed, r.failed);
     return r.failed == 0 ? 0 : 1;
 }

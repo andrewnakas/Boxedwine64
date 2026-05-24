@@ -1930,6 +1930,64 @@ U32 CPU64::step() {
             rip += used;
             return used;
         }
+        // Per-lane shift with imm8 — 66 0F 71/72/73 /sub ib.
+        //   71 → word lanes, 72 → dword lanes, 73 → qword lanes.
+        //   sub == 6 → shift left logical  (PSLLW/PSLLD/PSLLQ)
+        //   sub == 2 → shift right logical (PSRLW/PSRLD/PSRLQ)
+        //   sub == 4 → shift right arith   (PSRAW/PSRAD; not defined for qwords)
+        //   sub == 7 with 0x73 → PSLLDQ (byte-granular), handled below
+        //   sub == 3 with 0x73 → PSRLDQ
+        if ((op2 == 0x71 || op2 == 0x72 || (op2 == 0x73)) && osize66) {
+            ModRM m = decodeModRM(rip + opOff + 2, p, 1);
+            U8 sub = m.regField & 0x7;
+            // Defer byte-granular forms (73 /7 and 73 /3) to the PSLLDQ block.
+            if (op2 == 0x73 && (sub == 7 || sub == 3)) {
+                // fall through to the existing PSLLDQ handler below
+            } else if (sub == 6 || sub == 2 || sub == 4) {
+                U8 imm = fetchByte(rip + opOff + 2 + m.length);
+                U32 elemBits = (op2 == 0x71) ? 16 : (op2 == 0x72) ? 32 : 64;
+                U32 elemCount = 128 / elemBits;
+                U64 lo = xmm[m.rmIndex].lo;
+                U64 hi = xmm[m.rmIndex].hi;
+                U64 oLo = 0, oHi = 0;
+                U64 mask = (elemBits == 64) ? ~0ULL : ((1ULL << elemBits) - 1);
+                bool saturate = (imm >= elemBits);
+                for (U32 i = 0; i < elemCount; i++) {
+                    U32 bitPos = i * elemBits;
+                    U64 v;
+                    if (bitPos < 64) v = (lo >> bitPos) & mask;
+                    else             v = (hi >> (bitPos - 64)) & mask;
+                    U64 r;
+                    if (saturate) {
+                        if (sub == 4) {
+                            U64 signMask = 1ULL << (elemBits - 1);
+                            r = (v & signMask) ? mask : 0;
+                        } else {
+                            r = 0;
+                        }
+                    } else if (sub == 6) {
+                        r = (v << imm) & mask;
+                    } else if (sub == 2) {
+                        r = v >> imm;
+                    } else { // SRA
+                        U64 signMask = 1ULL << (elemBits - 1);
+                        if (v & signMask) {
+                            U64 fillBits = (~0ULL) << (elemBits - imm);
+                            r = ((v >> imm) | fillBits) & mask;
+                        } else {
+                            r = (v >> imm) & mask;
+                        }
+                    }
+                    if (bitPos < 64) oLo |= r << bitPos;
+                    else             oHi |= r << (bitPos - 64);
+                }
+                xmm[m.rmIndex].lo = oLo;
+                xmm[m.rmIndex].hi = oHi;
+                U32 used = opOff + 2 + m.length + 1;
+                rip += used;
+                return used;
+            }
+        }
         // PSLLDQ/PSRLDQ xmm, imm8 — 66 0F 73 /7 ib (left) or /3 ib (right).
         // Byte-granularity logical shift of the entire 16-byte register.
         // Used by glibc memcpy/memset to mask the tail when a copy isn't
