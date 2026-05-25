@@ -942,6 +942,28 @@ int runX64SelfTest() {
             return c.reg[X64_R15].u64 == 0x0000002000000010ULL;
         });
     }
+    // Test 49: MOVMSKPS. xmm0.lo = 0x80000000_00000000 → lane0 sign=0, lane1 sign=1.
+    //                    xmm0.hi = 0x80000000_80000000 → lane2 sign=1, lane3 sign=1.
+    // Result = 0b1110 = 0xE.
+    {
+        std::vector<U8> code = {
+            // Build xmm0.lo = 0x8000000000000000
+            0x48, 0xB8, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x80,
+            0x66, 0x48, 0x0F, 0x6E, 0xC0,                                // movq xmm0, rax (sets lo, zeros hi)
+            // Build rcx = 0x8000000080000000, then punpcklqdq to set xmm0.hi.
+            0x48, 0xB9, 0x00, 0x00, 0x00, 0x80, 0x00, 0x00, 0x00, 0x80,
+            0x66, 0x48, 0x0F, 0x6E, 0xC9,                                // movq xmm1, rcx
+            // movlhps xmm0, xmm1  — 0F 16 /r — sets xmm0.hi := xmm1.lo.
+            0x0F, 0x16, 0xC1,
+            0x0F, 0x50, 0xC0,                                             // movmskps eax, xmm0
+            0x49, 0x89, 0xC7,                                             // mov r15, rax
+            0x48, 0xC7, 0xC0, 0x3C, 0x00, 0x00, 0x00,                     // mov rax, 60
+            0x0F, 0x05,                                                   // syscall (exit)
+        };
+        runAndCheck(r, "movmskps extracts 4 sign bits", code, [](CPU64& c) {
+            return c.reg[X64_R15].u64 == 0xEULL;
+        });
+    }
     printf("=== self-test summary: %d passed, %d failed ===\n\n", r.passed, r.failed);
     return r.failed == 0 ? 0 : 1;
 }

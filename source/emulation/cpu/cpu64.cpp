@@ -2491,6 +2491,70 @@ U32 CPU64::step() {
             rip += used;
             return used;
         }
+        // MOVMSKPS — 0F 50 /r. Extract sign bits of the 4 single-precision
+        // floats in xmm[rmIndex] into bits 0..3 of the general-purpose
+        // r32/r64 destination, zero the rest. The reg-only form is the
+        // only legal encoding. We don't model FP types — just take bit 31
+        // of each 32-bit lane. MOVMSKPD — 66 0F 50 /r. Same idea but 2
+        // double-precision lanes (bits 63 of each 64-bit half).
+        // MOVLHPS — 0F 16 /r (reg form). xmm[reg].hi := xmm[rm].lo.
+        // MOVHLPS — 0F 12 /r (reg form). xmm[reg].lo := xmm[rm].hi.
+        // Memory forms (MOVLPS/MOVHPS) are also encoded with 0F 12/16 but
+        // with a non-reg ModR/M — keep those simple too.
+        if ((op2 == 0x12 || op2 == 0x16) && !osize66 && p.rep == 0) {
+            ModRM m = decodeModRM(rip + opOff + 2, p, 0);
+            if (m.isReg) {
+                if (op2 == 0x16) {
+                    xmm[m.regField].hi = xmm[m.rmIndex].lo; // MOVLHPS
+                } else {
+                    xmm[m.regField].lo = xmm[m.rmIndex].hi; // MOVHLPS
+                }
+            } else {
+                // Memory form: MOVLPS loads/stores low qword, MOVHPS high.
+                if (op2 == 0x12) {
+                    xmm[m.regField].lo = memory->readq(m.effAddr);
+                } else {
+                    xmm[m.regField].hi = memory->readq(m.effAddr);
+                }
+            }
+            U32 used = opOff + 2 + m.length;
+            rip += used;
+            return used;
+        }
+        // 0F 13 /r — MOVLPS m64, xmm. 0F 17 /r — MOVHPS m64, xmm.
+        if ((op2 == 0x13 || op2 == 0x17) && !osize66 && p.rep == 0) {
+            ModRM m = decodeModRM(rip + opOff + 2, p, 0);
+            if (!m.isReg) {
+                U64 v = (op2 == 0x13) ? xmm[m.regField].lo : xmm[m.regField].hi;
+                memory->writeq(m.effAddr, v);
+            }
+            U32 used = opOff + 2 + m.length;
+            rip += used;
+            return used;
+        }
+        if (op2 == 0x50) {
+            ModRM m = decodeModRM(rip + opOff + 2, p, 0);
+            if (m.isReg) {
+                U64 lo = xmm[m.rmIndex].lo;
+                U64 hi = xmm[m.rmIndex].hi;
+                U32 out = 0;
+                if (osize66) {
+                    // MOVMSKPD — 2 doubles, take bit 63 of each.
+                    if (lo & (1ULL << 63)) out |= 1;
+                    if (hi & (1ULL << 63)) out |= 2;
+                } else {
+                    // MOVMSKPS — 4 floats, take bit 31 of each 32-bit lane.
+                    if ((lo >> 31) & 1) out |= 1;
+                    if ((lo >> 63) & 1) out |= 2;
+                    if ((hi >> 31) & 1) out |= 4;
+                    if ((hi >> 63) & 1) out |= 8;
+                }
+                reg[m.regField].setU64((U64)out);
+                U32 used = opOff + 2 + m.length;
+                rip += used;
+                return used;
+            }
+        }
         // PMULHUW — 66 0F E4 /r. Unsigned word multiply, store high 16 of
         // each product. Glibc's hash mixing uses this.
         if (op2 == 0xE4 && osize66) {
