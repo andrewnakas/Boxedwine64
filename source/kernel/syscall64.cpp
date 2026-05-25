@@ -69,6 +69,20 @@
 #define X64_SYS_tgkill            234
 #define X64_SYS_prlimit64         302
 #define X64_SYS_getrandom         318
+#define X64_SYS_sched_yield       24
+#define X64_SYS_kill              62
+#define X64_SYS_gettimeofday      96
+#define X64_SYS_getrusage         98
+#define X64_SYS_sysinfo           99
+#define X64_SYS_getppid           110
+#define X64_SYS_getpgrp           111
+#define X64_SYS_getpgid           121
+#define X64_SYS_getsid            124
+#define X64_SYS_clock_getres      229
+#define X64_SYS_clock_nanosleep   230
+#define X64_SYS_nanosleep         35
+#define X64_SYS_pipe2_alias       293
+#define X64_SYS_rseq              334
 
 // arch_prctl subfunctions
 #define X64_ARCH_SET_GS  0x1001
@@ -700,6 +714,71 @@ void ksyscall64(CPU64* cpu) {
             break;
         case X64_SYS_poll:
             ret = 0; // timeout — nothing ready
+            break;
+        case X64_SYS_sched_yield:
+            ret = 0;
+            break;
+        case X64_SYS_kill:
+            // For now: silently succeed. glibc's abort() goes here via
+            // tgkill, but exits handle the actual termination elsewhere.
+            ret = 0;
+            break;
+        case X64_SYS_gettimeofday: {
+            // struct timeval { U64 sec; U64 usec; }
+            if (a1) {
+                U64 us = KSystem::getSystemTimeAsMicroSeconds();
+                cpu->memory->writeq(a1,     us / 1000000ULL);
+                cpu->memory->writeq(a1 + 8, us % 1000000ULL);
+            }
+            if (a2) {
+                // struct timezone — minutes_west, dsttime. Zero both.
+                cpu->memory->writed(a2,     0);
+                cpu->memory->writed(a2 + 4, 0);
+            }
+            ret = 0;
+            break;
+        }
+        case X64_SYS_getrusage:
+            // struct rusage is large; for v1 just zero-fill 144 bytes.
+            // glibc only inspects ru_utime and ru_stime on the startup path.
+            if (a2) cpu->memory->memsetGuest(a2, 0, 144);
+            ret = 0;
+            break;
+        case X64_SYS_sysinfo:
+            // struct sysinfo — zero-fill the standard 64-byte layout.
+            // ld-linux doesn't actually read these; some binaries call it
+            // anyway as part of /proc startup probes.
+            if (a1) cpu->memory->memsetGuest(a1, 0, 112);
+            ret = 0;
+            break;
+        case X64_SYS_getppid:
+            ret = cpu->thread && cpu->thread->process ? cpu->thread->process->parentId : 1;
+            break;
+        case X64_SYS_getpgrp:
+        case X64_SYS_getpgid:
+        case X64_SYS_getsid:
+            ret = cpu->thread ? cpu->thread->id : 1;
+            break;
+        case X64_SYS_clock_getres:
+            // 1 ns resolution claim. Some libc time helpers use this to size
+            // a struct timespec field.
+            if (a2) {
+                cpu->memory->writeq(a2,     0);
+                cpu->memory->writeq(a2 + 8, 1);
+            }
+            ret = 0;
+            break;
+        case X64_SYS_nanosleep:
+        case X64_SYS_clock_nanosleep:
+            // No-op sleep. Real Wine workloads will need pacing here, but
+            // for ld.so startup it's fine to return immediately.
+            ret = 0;
+            break;
+        case X64_SYS_rseq:
+            // restartable-sequences registration. glibc 2.35+ calls this on
+            // every thread start. Pretend it's not supported so glibc falls
+            // back to plain mutexes.
+            ret = (U64)-K_ENOSYS;
             break;
         case X64_SYS_exit:
         case X64_SYS_exit_group:
