@@ -907,6 +907,41 @@ int runX64SelfTest() {
             return c.reg[X64_R15].u64 == 0x00000000FE00FF50ULL;
         });
     }
+    // Test 47: PMULHUW. xmm0 = {0x8000, 0x4000, 0x0001, 0x0002}, xmm1 same.
+    // High 16 of (a*b):
+    //   0x8000 * 0x8000 = 0x40000000 → high = 0x4000
+    //   0x4000 * 0x4000 = 0x10000000 → high = 0x1000
+    //   0x0001 * 0x0001 = 0x00000001 → high = 0x0000
+    //   0x0002 * 0x0002 = 0x00000004 → high = 0x0000
+    // Result.lo lanes (LSB-first) = {0x4000, 0x1000, 0x0000, 0x0000}
+    // = 0x0000_0000_1000_4000.
+    {
+        std::vector<U8> code = {
+            0x48, 0xB8, 0x00, 0x80, 0x00, 0x40, 0x01, 0x00, 0x02, 0x00,
+            0x66, 0x48, 0x0F, 0x6E, 0xC0,                                // movq xmm0, rax
+            0x66, 0x48, 0x0F, 0x6E, 0xC8,                                // movq xmm1, rax (same)
+            0x66, 0x0F, 0xE4, 0xC1,                                       // pmulhuw xmm0, xmm1
+            0x66, 0x48, 0x0F, 0x7E, 0xC0,                                 // movq rax, xmm0
+        };
+        runAndCheck(r, "pmulhuw stores high 16 of unsigned word products", withExit(code), [](CPU64& c) {
+            return c.reg[X64_R15].u64 == 0x0000000010004000ULL;
+        });
+    }
+    // Test 48: PSLLD (variable form). xmm0.lo = {1, 2}, xmm1.lo = 4 (count).
+    // After psld xmm0, xmm1: {16, 32} = 0x0000_0020_0000_0010.
+    {
+        std::vector<U8> code = {
+            0x48, 0xB8, 0x01, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00,
+            0x66, 0x48, 0x0F, 0x6E, 0xC0,                                // movq xmm0, rax
+            0x48, 0xB8, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x66, 0x48, 0x0F, 0x6E, 0xC8,                                // movq xmm1, rax (cnt=4)
+            0x66, 0x0F, 0xF2, 0xC1,                                       // pslld xmm0, xmm1
+            0x66, 0x48, 0x0F, 0x7E, 0xC0,                                 // movq rax, xmm0
+        };
+        runAndCheck(r, "pslld variable shift by xmm1 count=4", withExit(code), [](CPU64& c) {
+            return c.reg[X64_R15].u64 == 0x0000002000000010ULL;
+        });
+    }
     printf("=== self-test summary: %d passed, %d failed ===\n\n", r.passed, r.failed);
     return r.failed == 0 ? 0 : 1;
 }

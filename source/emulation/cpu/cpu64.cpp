@@ -2491,6 +2491,112 @@ U32 CPU64::step() {
             rip += used;
             return used;
         }
+        // PMULHUW — 66 0F E4 /r. Unsigned word multiply, store high 16 of
+        // each product. Glibc's hash mixing uses this.
+        if (op2 == 0xE4 && osize66) {
+            ModRM m = decodeModRM(rip + opOff + 2, p, 0);
+            U64 srcLo, srcHi;
+            if (m.isReg) {
+                srcLo = xmm[m.rmIndex].lo;
+                srcHi = xmm[m.rmIndex].hi;
+            } else {
+                srcLo = memory->readq(m.effAddr);
+                srcHi = memory->readq(m.effAddr + 8);
+            }
+            U64 dLo = xmm[m.regField].lo;
+            U64 dHi = xmm[m.regField].hi;
+            U64 oLo = 0, oHi = 0;
+            for (int i = 0; i < 4; i++) {
+                U16 a = (dLo  >> (i*16)) & 0xFFFF;
+                U16 b = (srcLo >> (i*16)) & 0xFFFF;
+                U16 c = (dHi  >> (i*16)) & 0xFFFF;
+                U16 d = (srcHi >> (i*16)) & 0xFFFF;
+                U32 p1 = (U32)a * (U32)b;
+                U32 p2 = (U32)c * (U32)d;
+                oLo |= ((U64)((p1 >> 16) & 0xFFFF)) << (i*16);
+                oHi |= ((U64)((p2 >> 16) & 0xFFFF)) << (i*16);
+            }
+            xmm[m.regField].lo = oLo;
+            xmm[m.regField].hi = oHi;
+            U32 used = opOff + 2 + m.length;
+            rip += used;
+            return used;
+        }
+        // Variable per-lane shifts — 66 0F D1/D2/D3 (right logical W/D/Q),
+        // E1/E2 (right arithmetic W/D), F1/F2/F3 (left W/D/Q). Shift count
+        // comes from the LOW QWORD of the source xmm; if > element width,
+        // the result is zero (logical) or all-sign (arithmetic).
+        bool isVarShift = osize66 &&
+            (op2 == 0xD1 || op2 == 0xD2 || op2 == 0xD3 ||
+             op2 == 0xE1 || op2 == 0xE2 ||
+             op2 == 0xF1 || op2 == 0xF2 || op2 == 0xF3);
+        if (isVarShift) {
+            ModRM m = decodeModRM(rip + opOff + 2, p, 0);
+            U64 srcLo;
+            if (m.isReg) srcLo = xmm[m.rmIndex].lo;
+            else         srcLo = memory->readq(m.effAddr);
+            U64 dLo = xmm[m.regField].lo;
+            U64 dHi = xmm[m.regField].hi;
+            U64 oLo = 0, oHi = 0;
+            // Element size and direction by opcode.
+            int  esize  = (op2 == 0xD1 || op2 == 0xE1 || op2 == 0xF1) ? 16 :
+                          (op2 == 0xD2 || op2 == 0xE2 || op2 == 0xF2) ? 32 : 64;
+            bool isLeft = (op2 >= 0xF1);
+            bool isArith = (op2 == 0xE1 || op2 == 0xE2);
+            U64 cnt = srcLo;
+            // Saturate count: too-large shifts zero everything for logical,
+            // or replicate sign for arithmetic.
+            if (cnt >= (U64)esize) {
+                if (!isArith) {
+                    xmm[m.regField].lo = 0;
+                    xmm[m.regField].hi = 0;
+                } else {
+                    // Per lane, fill with the sign bit replicated.
+                    auto fillSign = [&](U64 v) -> U64 {
+                        U64 out = 0;
+                        for (int i = 0; i < 128 / esize / 2; i++) {
+                            U64 lane = (v >> (i*esize)) & ((esize == 64) ? ~0ULL : ((1ULL << esize) - 1));
+                            U64 signMask = (lane >> (esize - 1)) & 1 ? ((esize == 64) ? ~0ULL : ((1ULL << esize) - 1)) : 0;
+                            out |= signMask << (i*esize);
+                        }
+                        return out;
+                    };
+                    xmm[m.regField].lo = fillSign(dLo);
+                    xmm[m.regField].hi = fillSign(dHi);
+                }
+                U32 used = opOff + 2 + m.length;
+                rip += used;
+                return used;
+            }
+            int n = 64 / esize;
+            U64 mask = (esize == 64) ? ~0ULL : ((1ULL << esize) - 1);
+            for (int i = 0; i < n; i++) {
+                U64 a = (dLo >> (i*esize)) & mask;
+                U64 b = (dHi >> (i*esize)) & mask;
+                U64 ra, rb;
+                if (isLeft) {
+                    ra = (a << cnt) & mask;
+                    rb = (b << cnt) & mask;
+                } else if (isArith) {
+                    S64 sa = (esize == 16) ? (S64)(S16)a :
+                             (esize == 32) ? (S64)(S32)a : (S64)a;
+                    S64 sb = (esize == 16) ? (S64)(S16)b :
+                             (esize == 32) ? (S64)(S32)b : (S64)b;
+                    ra = (U64)(sa >> cnt) & mask;
+                    rb = (U64)(sb >> cnt) & mask;
+                } else {
+                    ra = (a >> cnt) & mask;
+                    rb = (b >> cnt) & mask;
+                }
+                oLo |= ra << (i*esize);
+                oHi |= rb << (i*esize);
+            }
+            xmm[m.regField].lo = oLo;
+            xmm[m.regField].hi = oHi;
+            U32 used = opOff + 2 + m.length;
+            rip += used;
+            return used;
+        }
         // PREFETCH* — 0F 18 /reg. Treated as a no-op (hint only).
         if (op2 == 0x18) {
             ModRM m = decodeModRM(rip + opOff + 2, p, 0);
