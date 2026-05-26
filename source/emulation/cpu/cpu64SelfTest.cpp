@@ -1642,6 +1642,47 @@ int runX64SelfTest() {
         });
     }
 
+    // Test 88 — MOVNTI: store rax (0xDEADBEEFCAFEBABE) to [rsp-8], then load
+    // it back to r15 to verify. We bias on the stack pointer using a small
+    // negative disp so we don't have to manage rsp explicitly.
+    {
+        std::vector<U8> code = {
+            // rax = 0xDEADBEEFCAFEBABE
+            0x48, 0xB8, 0xBE, 0xBA, 0xFE, 0xCA, 0xEF, 0xBE, 0xAD, 0xDE,
+            // movnti [rsp-8], rax    →   REX.W 0F C3 /r with disp8
+            //   ModR/M: mod=01 reg=000 rm=100 (SIB) → 0x44; SIB=0x24 (rsp,no-idx); disp=-8(0xF8)
+            0x48, 0x0F, 0xC3, 0x44, 0x24, 0xF8,
+            // mov r15, [rsp-8]       →  4C 8B 7C 24 F8
+            0x4C, 0x8B, 0x7C, 0x24, 0xF8,
+            // syscall exit(0) via the existing exit prologue (withExit appends
+            // mov r15, rax — but we want the loaded value, so use a direct
+            // raw exit syscall here instead).
+            0xB8, 0x3C, 0x00, 0x00, 0x00,                                 // mov eax, 60 (exit)
+            0x48, 0x31, 0xFF,                                             // xor rdi, rdi
+            0x0F, 0x05,                                                   // syscall
+        };
+        // Use 'code' directly (no withExit) since we already issue the
+        // exit syscall ourselves; the runner checks r15.
+        runAndCheck(r, "movnti store + load roundtrip preserves 64 bits", code, [](CPU64& c) {
+            return c.reg[X64_R15].u64 == 0xDEADBEEFCAFEBABEULL;
+        });
+    }
+
+    // Test 89 — MFENCE/LFENCE/SFENCE: all three are no-ops; verify they
+    // don't disturb register state by setting r15, fencing 3 times, and
+    // reading r15 back.
+    {
+        std::vector<U8> code = {
+            0x48, 0xC7, 0xC0, 0x42, 0x00, 0x00, 0x00,                     // mov rax, 0x42
+            0x0F, 0xAE, 0xE8,                                             // lfence
+            0x0F, 0xAE, 0xF0,                                             // mfence
+            0x0F, 0xAE, 0xF8,                                             // sfence
+        };
+        runAndCheck(r, "lfence/mfence/sfence are no-ops", withExit(code), [](CPU64& c) {
+            return c.reg[X64_R15].u64 == 0x42;
+        });
+    }
+
     printf("=== self-test summary: %d passed, %d failed ===\n\n", r.passed, r.failed);
     return r.failed == 0 ? 0 : 1;
 }

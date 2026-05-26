@@ -3293,6 +3293,24 @@ U32 CPU64::step() {
             return used;
         }
 
+        // MOVNTI m32/m64, r32/r64  0F C3 /r  — non-temporal store of GPR.
+        // glibc's memset/memcpy hot paths use this to bypass cache. We
+        // treat it as a plain mov to memory; the cache-bypass hint is a
+        // perf nicety the interpreter doesn't model.
+        if (op2 == 0xC3) {
+            ModRM m = decodeModRM(rip + opOff + 2, p, 0);
+            if (!m.isReg) {
+                U32 width = rexW ? 8 : 4;
+                U64 v = rexW ? reg[m.regField].u64 : (U64)reg[m.regField].u32;
+                if (width == 8) memory->writeq(m.effAddr, v);
+                else            memory->writed(m.effAddr, (U32)v);
+            }
+            // reg/reg form of 0F C3 is illegal — ignore.
+            U32 used = opOff + 2 + m.length;
+            rip += used;
+            return used;
+        }
+
         // UCOMISS xmm, xmm/m32   0F 2E /r   (no 66, no F2/F3 prefix)
         // COMISS  xmm, xmm/m32   0F 2F /r
         if ((op2 == 0x2E || op2 == 0x2F) && !osize66 && p.rep == 0) {
