@@ -86,6 +86,26 @@ public:
                                         const Elf64DynamicInfo& dyn,
                                         U64 reloc,
                                         const char* tag);
+
+    // Allocate and populate a static TLS block from the PT_TLS template.
+    // Layout (glibc x86-64): [tls image at negative offsets] [TCB] ← FS.
+    // TCB head's first qword is the self-pointer ($fs:0 = $fs).
+    //
+    //   imageBase = guest address from which the TLS template bytes
+    //               (filesz bytes) should be read. For the main exe this
+    //               is r.tls.vaddr + reloc.
+    //   blockBase = guest address where the new TLS block is mapped. Must
+    //               be page-aligned and pre-mapped by the caller (or
+    //               picked from a known free region).
+    //   Returns the FS base (= TCB address) on success, or 0 on failure.
+    //
+    // Public so self-tests can exercise template-copy without an FS
+    // round-trip. Does NOT touch CPU64::fsbase — caller is responsible
+    // for that (typically via arch_prctl(ARCH_SET_FS)).
+    static U64 setupStaticTls(class KMemory64* mem,
+                              const Elf64TlsInfo& tls,
+                              U64 imageBase,
+                              U64 blockBase);
 #endif
 };
 

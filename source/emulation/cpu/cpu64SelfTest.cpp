@@ -1110,6 +1110,74 @@ int runX64SelfTest() {
         fflush(stdout);
     }
 
+    // Test: setupStaticTls copies template image and writes TCB self-pointer.
+    //   - Image at IMAGE_OFF contains 16 bytes of known data + 8 BSS bytes
+    //     (filesz=16, memsz=24, align=8 ⇒ imageSize=24).
+    //   - Block mapped at BLOCK_OFF; after setupStaticTls, BLOCK[0..16] must
+    //     match the source image, BLOCK[16..24] must be zero, TCB at
+    //     BLOCK_OFF+24 must contain BLOCK_OFF+24 (self-pointer).
+    {
+        const U64 BASE      = 0x20000000;
+        const U64 IMAGE_OFF = 0x100;
+        const U64 BLOCK_OFF = 0x400;
+        KMemory64 mem(nullptr);
+        mem.mmapAnonymousFixed(BASE, 0x1000, 3);
+
+        // Write a known 16-byte image.
+        U8 src[16];
+        for (int i = 0; i < 16; i++) src[i] = (U8)(0xA0 + i);
+        mem.memcpyToGuest(BASE + IMAGE_OFF, src, sizeof(src));
+
+        // Poison the block region so we can verify it actually gets written.
+        for (int i = 0; i < 32; i++) mem.writeb(BASE + BLOCK_OFF + i, 0xFF);
+
+        Elf64TlsInfo tls;
+        tls.present = true;
+        tls.vaddr   = 0;
+        tls.filesz  = 16;
+        tls.memsz   = 24;
+        tls.align   = 8;
+
+        U64 fsbase = ElfLoader64::setupStaticTls(
+            &mem, tls, BASE + IMAGE_OFF, BASE + BLOCK_OFF);
+
+        bool ok = true;
+        // Image bytes copied verbatim.
+        for (int i = 0; i < 16 && ok; i++) {
+            U8 got = mem.readb(BASE + BLOCK_OFF + i);
+            if (got != src[i]) {
+                printf("  image byte %d: got 0x%02x want 0x%02x\n", i, got, src[i]);
+                ok = false;
+            }
+        }
+        // BSS portion zeroed (bytes 16..23).
+        for (int i = 16; i < 24 && ok; i++) {
+            U8 got = mem.readb(BASE + BLOCK_OFF + i);
+            if (got != 0) {
+                printf("  bss byte %d: got 0x%02x want 0\n", i, got);
+                ok = false;
+            }
+        }
+        // TCB self-pointer at offset 24 (= imageSize-aligned end of image).
+        U64 expectedTcb = BASE + BLOCK_OFF + 24;
+        U64 gotTcb = mem.readq(expectedTcb);
+        if (fsbase != expectedTcb || gotTcb != expectedTcb) {
+            printf("  TCB self-pointer: fsbase=0x%llx gotTcb=0x%llx want=0x%llx\n",
+                   (unsigned long long)fsbase,
+                   (unsigned long long)gotTcb,
+                   (unsigned long long)expectedTcb);
+            ok = false;
+        }
+        if (ok) {
+            printf("  PASS: setupStaticTls: image copied, bss zeroed, TCB self-pointer set\n");
+            r.passed++;
+        } else {
+            printf("  FAIL: setupStaticTls\n");
+            r.failed++;
+        }
+        fflush(stdout);
+    }
+
     // ---- SSE2 scalar FP coverage ----
     // Helper-style pattern: load doubles into xmm via "mov rax, imm64;
     // movq xmm, rax", perform the op, write the resulting bits back to

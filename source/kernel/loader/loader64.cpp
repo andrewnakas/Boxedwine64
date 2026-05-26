@@ -283,6 +283,55 @@ U64 ElfLoader64::applyRelativeRelocations(KMemory64* mem,
     return relativeCount;
 }
 
+// glibc x86-64 TLS layout (variant II, the only one glibc uses on amd64):
+//
+//   [ static TLS image (memsz bytes) ][ TCB (≥ tcbhead_t) ]
+//                                     ^
+//                                     fs base = TCB address
+//
+// The TLS image sits at negative offsets from FS. The first qword of the
+// TCB is the self-pointer ($fs:0 must equal $fs), which glibc reads in its
+// hot paths to find the current thread-control block. We size the TCB at
+// 0x100 bytes — larger than the actual tcbhead_t (~0x80) so plenty of
+// padding for things we haven't audited.
+//
+// blockBase must be pre-mapped by the caller (caller chooses the address
+// so it can either pin a known free region or allocate from a heap).
+U64 ElfLoader64::setupStaticTls(KMemory64* mem,
+                                const Elf64TlsInfo& tls,
+                                U64 imageBase,
+                                U64 blockBase) {
+    if (!tls.present) return 0;
+
+    // Round image size up to alignment so the TCB lands aligned too.
+    U64 align = tls.align ? tls.align : 8;
+    U64 imageSize = (tls.memsz + align - 1) & ~(align - 1);
+
+    // Copy the file portion of the image (filesz bytes) into the front of
+    // the block, then zero-fill the BSS portion (memsz - filesz).
+    if (tls.filesz) {
+        std::vector<U8> buf(tls.filesz);
+        mem->memcpyFromGuest(buf.data(), imageBase, tls.filesz);
+        mem->memcpyToGuest(blockBase, buf.data(), tls.filesz);
+    }
+    if (tls.memsz > tls.filesz) {
+        mem->memsetGuest(blockBase + tls.filesz, 0,
+                         tls.memsz - tls.filesz);
+    }
+
+    // TCB sits immediately after the (aligned) image. First qword =
+    // self-pointer.
+    U64 tcb = blockBase + imageSize;
+    mem->writeq(tcb, tcb);
+
+    klog_fmt("setupStaticTls: image=[0x%llx..+%llu] tcb=0x%llx (fs=0x%llx)",
+             (unsigned long long)blockBase,
+             (unsigned long long)imageSize,
+             (unsigned long long)tcb,
+             (unsigned long long)tcb);
+    return tcb;
+}
+
 bool ElfLoader64::loadProgram(KThread* thread, FsOpenNode* openNode, U64* rip) {
     Elf64ParseResult r = parse(openNode);
     if (!r.ok) {
