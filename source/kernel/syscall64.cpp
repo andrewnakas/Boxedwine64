@@ -104,6 +104,9 @@
 #ifndef K_EAGAIN
 #define K_EAGAIN 11
 #endif
+#ifndef K_ENOMEM
+#define K_ENOMEM 12
+#endif
 
 // FUTEX_* op codes from <linux/futex.h>. We only handle WAIT/WAKE +
 // PRIVATE variants — the rest go to the catch-all "return success" path
@@ -652,6 +655,56 @@ static U64 sys_rt_sigprocmask64(CPU64* cpu, U64 how, U64 setPtr, U64 oldSetPtr,
     return 0;
 }
 
+// sigaltstack(2) — storage-only round-trip, completes the sig{action,
+// procmask, altstack} trio. Layout of stack_t on x86-64 (24 bytes):
+//   off  0: ss_sp    (8)
+//   off  8: ss_flags (4)
+//   off 12: pad      (4)
+//   off 16: ss_size  (8)
+//
+// Kernel rules we honour here:
+//   - If oldss != NULL, write the current state first.
+//   - If ss != NULL with SS_DISABLE(2): clear the registration.
+//   - If ss != NULL otherwise: ss_flags must be 0 (or SS_AUTODISARM=0x80000000)
+//     and ss_size must be >= MINSIGSTKSZ (~2048). Reject otherwise.
+//   - Cannot change altstack while currently executing on it (SS_ONSTACK
+//     flag set). We don't track that yet, so the check is skipped.
+#define X64_SS_ONSTACK     1
+#define X64_SS_DISABLE     2
+#define X64_SS_AUTODISARM  0x80000000u
+#define X64_MINSIGSTKSZ    2048
+
+static U64 sys_sigaltstack64(CPU64* cpu, U64 ssPtr, U64 oldSsPtr) {
+    if (!cpu->memory) return (U64)-K_EFAULT;
+
+    if (oldSsPtr) {
+        cpu->memory->writeq(oldSsPtr + 0,  cpu->sigAltStack.ssSp);
+        cpu->memory->writed(oldSsPtr + 8,  cpu->sigAltStack.ssFlags);
+        cpu->memory->writed(oldSsPtr + 12, 0);
+        cpu->memory->writeq(oldSsPtr + 16, cpu->sigAltStack.ssSize);
+    }
+
+    if (ssPtr) {
+        U64 sp    = cpu->memory->readq(ssPtr + 0);
+        U32 flags = cpu->memory->readd(ssPtr + 8);
+        U64 size  = cpu->memory->readq(ssPtr + 16);
+
+        if (flags & X64_SS_DISABLE) {
+            cpu->sigAltStack.ssSp    = 0;
+            cpu->sigAltStack.ssFlags = X64_SS_DISABLE;
+            cpu->sigAltStack.ssSize  = 0;
+        } else {
+            U32 allowed = X64_SS_AUTODISARM;
+            if (flags & ~allowed) return (U64)-K_EINVAL;
+            if (size < X64_MINSIGSTKSZ) return (U64)-K_ENOMEM;
+            cpu->sigAltStack.ssSp    = sp;
+            cpu->sigAltStack.ssFlags = flags;
+            cpu->sigAltStack.ssSize  = size;
+        }
+    }
+    return 0;
+}
+
 // Map an x86-64 Linux syscall number to a human-readable name. Used only by
 // the unimplemented-syscall log path — when running real glibc binaries, the
 // first thing you want to see is "which syscall is missing", not "#291".
@@ -803,10 +856,12 @@ void ksyscall64(CPU64* cpu) {
         case X64_SYS_rt_sigprocmask:
             ret = sys_rt_sigprocmask64(cpu, a1, a2, a3, a4);
             break;
+        case X64_SYS_sigaltstack:
+            ret = sys_sigaltstack64(cpu, a1, a2);
+            break;
         case X64_SYS_set_robust_list:
         case X64_SYS_ioctl:
         case X64_SYS_madvise:
-        case X64_SYS_sigaltstack:
         case X64_SYS_chdir:
             // ld-linux makes these calls before main; safe to no-op.
             ret = 0;

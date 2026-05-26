@@ -82,6 +82,17 @@ public:
     // at delivery time, since delivery itself isn't built yet.
     U64 sigMask = 0;
 
+    // Alternate signal stack, round-tripped through sigaltstack(2). When
+    // disabled, ssSp/ssSize are 0 and ssFlags has SS_DISABLE(2) set. The
+    // signal-frame builder (future B work) will consult this when an
+    // installed SigAction has SA_ONSTACK set.
+    struct SigAltStack {
+        U64 ssSp = 0;
+        U32 ssFlags = 2; // SS_DISABLE — disabled by default
+        U64 ssSize = 0;
+    };
+    SigAltStack sigAltStack;
+
     KThread*   thread = nullptr;
     KMemory64* memory = nullptr;
 
