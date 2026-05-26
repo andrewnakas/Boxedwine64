@@ -76,6 +76,16 @@ public:
     //
     // NOT YET WIRED — depends on KMemory64 (Phase 1.5) and CPU64 (Phase 2).
     static bool loadProgram(KThread* thread, FsOpenNode* openNode, U64* rip);
+
+    // Apply R_X86_64_RELATIVE relocations against the dynamic section at
+    // dyn.vaddr+reloc. Public so self-tests can exercise the relocation
+    // pass without an FS round-trip. Returns the number of RELATIVE
+    // relocations applied; symbol-bound types (GLOB_DAT/JUMP_SLOT/64/COPY)
+    // are skipped — those are Milestone A3's job.
+    static U64 applyRelativeRelocations(class KMemory64* mem,
+                                        const Elf64DynamicInfo& dyn,
+                                        U64 reloc,
+                                        const char* tag);
 #endif
 };
 

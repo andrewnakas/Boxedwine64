@@ -13,6 +13,7 @@
 
 #include "cpu64.h"
 #include "kmemory64.h"
+#include "../../kernel/loader/loader64.h"
 
 #include <cstdio>
 #include <cstring>
@@ -1044,6 +1045,71 @@ int runX64SelfTest() {
             return c.reg[X64_R15].u64 == 3;
         });
     }
+    // Test 55 — applyRelativeRelocations end-to-end.
+    // Models a relocated module loaded at LOAD_RELOC. Lays out a 4-entry
+    // dynamic array (RELA, RELASZ, RELAENT, NULL) and a 3-entry RELA table
+    // entirely inside one mapped page at LOAD_RELOC. Each RELA entry says
+    // "store (load_base + addend) at offset 0x800+i*8". After the call,
+    // destination words should contain LOAD_RELOC + i*0x100 instead of
+    // the sentinel we pre-filled.
+    {
+        const U64 LOAD_RELOC = 0x10000000;  // pretend load slide
+        const U64 DYN_OFF    = 0x100;       // dyn array at relocated address
+        const U64 RELA_OFF   = 0x200;       // RELA table at relocated address
+        const U64 DEST_OFF   = 0x800;       // relocation destinations
+        KMemory64 mem(nullptr);
+        mem.mmapAnonymousFixed(LOAD_RELOC, 0x1000, 3); // RW
+
+        // RELA table at LOAD_RELOC + RELA_OFF.
+        for (U64 i = 0; i < 3; i++) {
+            k_Elf64_Rela rela{};
+            rela.r_offset = DEST_OFF + i * 8;                // unrelocated
+            rela.r_info   = ((U64)0 << 32) | k_R_X86_64_RELATIVE;
+            rela.r_addend = (S64)(i * 0x100);
+            mem.memcpyToGuest(LOAD_RELOC + RELA_OFF + i * sizeof(rela),
+                              &rela, sizeof(rela));
+            mem.writeq(LOAD_RELOC + rela.r_offset, 0xDEADBEEFCAFEBABEULL);
+        }
+
+        // Dyn array at LOAD_RELOC + DYN_OFF.
+        k_Elf64_Dyn dyn[4]{};
+        dyn[0].d_tag = k_DT_RELA;    dyn[0].d_un.d_ptr = RELA_OFF; // unrelocated
+        dyn[1].d_tag = k_DT_RELASZ;  dyn[1].d_un.d_val = 3 * sizeof(k_Elf64_Rela);
+        dyn[2].d_tag = k_DT_RELAENT; dyn[2].d_un.d_val = sizeof(k_Elf64_Rela);
+        dyn[3].d_tag = k_DT_NULL;    dyn[3].d_un.d_val = 0;
+        mem.memcpyToGuest(LOAD_RELOC + DYN_OFF, dyn, sizeof(dyn));
+
+        Elf64DynamicInfo info;
+        info.present = true;
+        info.vaddr   = DYN_OFF;
+        info.memsz   = sizeof(dyn);
+
+        U64 applied = ElfLoader64::applyRelativeRelocations(
+            &mem, info, LOAD_RELOC, "selftest");
+
+        bool ok = (applied == 3);
+        for (U64 i = 0; i < 3 && ok; i++) {
+            U64 got = mem.readq(LOAD_RELOC + DEST_OFF + i * 8);
+            U64 want = LOAD_RELOC + i * 0x100;
+            if (got != want) {
+                printf("  relocation %llu: got 0x%llx want 0x%llx\n",
+                       (unsigned long long)i,
+                       (unsigned long long)got,
+                       (unsigned long long)want);
+                ok = false;
+            }
+        }
+        if (ok) {
+            printf("  PASS: applyRelativeRelocations: 3 R_X86_64_RELATIVE entries fixed up\n");
+            r.passed++;
+        } else {
+            printf("  FAIL: applyRelativeRelocations (applied=%llu)\n",
+                   (unsigned long long)applied);
+            r.failed++;
+        }
+        fflush(stdout);
+    }
+
     printf("=== self-test summary: %d passed, %d failed ===\n\n", r.passed, r.failed);
     return r.failed == 0 ? 0 : 1;
 }

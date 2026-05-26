@@ -217,10 +217,10 @@ static FsOpenNode* openGuestPath(BString path) {
 // in place — they require the cross-library symbol table that A3 builds.
 //
 // Returns the number of RELATIVE relocations applied (mainly for logging).
-static U64 applyDynamicRelocations(KMemory64* mem,
-                                   const Elf64DynamicInfo& dyn,
-                                   U64 reloc,
-                                   const char* tag) {
+U64 ElfLoader64::applyRelativeRelocations(KMemory64* mem,
+                                          const Elf64DynamicInfo& dyn,
+                                          U64 reloc,
+                                          const char* tag) {
     if (!dyn.present || dyn.memsz == 0) return 0;
 
     // Read the entire PT_DYNAMIC array out of guest memory (it's small —
@@ -331,7 +331,7 @@ bool ElfLoader64::loadProgram(KThread* thread, FsOpenNode* openNode, U64* rip) {
     // Apply R_X86_64_RELATIVE relocations against the exe's dynamic section
     // (if any). Symbol-bound relocations are still left to ld-linux until
     // Milestone A3 wires up cross-library symbol resolution.
-    applyDynamicRelocations(mem, r.dynamic, reloc, "exe");
+    applyRelativeRelocations(mem, r.dynamic, reloc, "exe");
 
     *rip = r.entry + reloc;
     klog_fmt("loadProgram64: exe RIP=0x%llx (pages mapped: %llu)",
@@ -384,7 +384,7 @@ bool ElfLoader64::loadProgram(KThread* thread, FsOpenNode* openNode, U64* rip) {
         // R_X86_64_RELATIVE entries fixed up before it can run. (Without
         // this, _dl_start crashes on the first indirect call through its
         // own GOT.)
-        applyDynamicRelocations(mem, interpR.dynamic, interpBase, "interp");
+        applyRelativeRelocations(mem, interpR.dynamic, interpBase, "interp");
         // Control transfers to the interpreter, not the exe.
         *rip = interpR.entry + interpBase;
         klog_fmt("loadProgram64: interp '%s' mapped at base 0x%llx, RIP=0x%llx",
