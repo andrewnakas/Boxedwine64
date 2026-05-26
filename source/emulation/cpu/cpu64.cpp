@@ -2881,6 +2881,49 @@ U32 CPU64::step() {
                 rip += used;
                 return used;
             }
+            if (op2 == 0x38 && op3 == 0x29) {
+                // PCMPEQQ xmm1, xmm2/m128 — SSE4.1
+                // Per qword: if equal, all-ones (0xFFFFFFFFFFFFFFFF); else zero.
+                // Used by glibc's SSE4.1 strstr / __strcasestr_sse42.
+                ModRM m = decodeModRM(rip + opOff + 3, p, 0);
+                U64 sLo, sHi;
+                if (m.isReg) {
+                    sLo = xmm[m.rmIndex].lo; sHi = xmm[m.rmIndex].hi;
+                } else {
+                    sLo = memory->readq(m.effAddr);
+                    sHi = memory->readq(m.effAddr + 8);
+                }
+                xmm[m.regField].lo = (xmm[m.regField].lo == sLo) ? 0xFFFFFFFFFFFFFFFFULL : 0;
+                xmm[m.regField].hi = (xmm[m.regField].hi == sHi) ? 0xFFFFFFFFFFFFFFFFULL : 0;
+                U32 used = opOff + 3 + m.length;
+                rip += used;
+                return used;
+            }
+            if (op2 == 0x38 && op3 == 0x17) {
+                // PTEST xmm1, xmm2/m128 — SSE4.1
+                // ZF = ((dst & src) == 0) ? 1 : 0
+                // CF = ((~dst & src) == 0) ? 1 : 0    (AND NOT test)
+                // OF/SF/AF/PF cleared. Used everywhere by glibc's SSE4.2
+                // string ops for fast "all zero?" branches.
+                ModRM m = decodeModRM(rip + opOff + 3, p, 0);
+                U64 sLo, sHi;
+                if (m.isReg) {
+                    sLo = xmm[m.rmIndex].lo; sHi = xmm[m.rmIndex].hi;
+                } else {
+                    sLo = memory->readq(m.effAddr);
+                    sHi = memory->readq(m.effAddr + 8);
+                }
+                U64 dLo = xmm[m.regField].lo;
+                U64 dHi = xmm[m.regField].hi;
+                bool zf = ((dLo & sLo) == 0) && ((dHi & sHi) == 0);
+                bool cf = ((~dLo & sLo) == 0) && ((~dHi & sHi) == 0);
+                rflags &= ~(X64_ZF | X64_CF | X64_OF | X64_SF | X64_AF | X64_PF);
+                if (zf) rflags |= X64_ZF;
+                if (cf) rflags |= X64_CF;
+                U32 used = opOff + 3 + m.length;
+                rip += used;
+                return used;
+            }
             if (op2 == 0x3A && op3 == 0x0F) {
                 // PALIGNR
                 ModRM m = decodeModRM(rip + opOff + 3, p, 1);

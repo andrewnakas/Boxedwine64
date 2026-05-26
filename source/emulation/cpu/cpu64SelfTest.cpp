@@ -1373,6 +1373,72 @@ int runX64SelfTest() {
         });
     }
 
+    // Test 72 — PCMPEQQ: low qwords differ → low result = 0; high qwords both
+    // 0 (from movq) → high result = -1. We read back .lo expecting 0.
+    {
+        std::vector<U8> code = {
+            0x48, 0xC7, 0xC0, 0xAA, 0x00, 0x00, 0x00,                     // mov rax, 0xAA
+            0x66, 0x48, 0x0F, 0x6E, 0xC0,                                 // movq xmm0, rax
+            0x48, 0xC7, 0xC0, 0xBB, 0x00, 0x00, 0x00,                     // mov rax, 0xBB
+            0x66, 0x48, 0x0F, 0x6E, 0xC8,                                 // movq xmm1, rax
+            0x66, 0x0F, 0x38, 0x29, 0xC1,                                 // pcmpeqq xmm0, xmm1
+            0x66, 0x48, 0x0F, 0x7E, 0xC0,                                 // movq rax, xmm0
+        };
+        runAndCheck(r, "pcmpeqq low qwords differ → low lane = 0", withExit(code), [](CPU64& c) {
+            return c.reg[X64_R15].u64 == 0;
+        });
+    }
+
+    // Test 73 — PCMPEQQ both qwords equal → both lanes -1, .lo readback = -1.
+    {
+        std::vector<U8> code = {
+            0x48, 0xC7, 0xC0, 0x42, 0x00, 0x00, 0x00,                     // mov rax, 0x42
+            0x66, 0x48, 0x0F, 0x6E, 0xC0,                                 // movq xmm0, rax
+            0x66, 0x48, 0x0F, 0x6E, 0xC8,                                 // movq xmm1, rax
+            0x66, 0x0F, 0x38, 0x29, 0xC1,                                 // pcmpeqq xmm0, xmm1
+            0x66, 0x48, 0x0F, 0x7E, 0xC0,                                 // movq rax, xmm0
+        };
+        runAndCheck(r, "pcmpeqq both qwords equal → low lane all-ones", withExit(code), [](CPU64& c) {
+            return c.reg[X64_R15].u64 == 0xFFFFFFFFFFFFFFFFULL;
+        });
+    }
+
+    // Test 74 — PTEST sets ZF when (dst & src) == 0.
+    //   xmm0 = {0x0F00, 0}, xmm1 = {0x00F0, 0}; AND = 0 → ZF=1.
+    //   We readback rflags via pushfq+pop rax then mask ZF (0x40).
+    {
+        std::vector<U8> code = {
+            0x48, 0xC7, 0xC0, 0x00, 0x0F, 0x00, 0x00,                     // mov rax, 0x0F00
+            0x66, 0x48, 0x0F, 0x6E, 0xC0,                                 // movq xmm0, rax
+            0x48, 0xC7, 0xC0, 0xF0, 0x00, 0x00, 0x00,                     // mov rax, 0x00F0
+            0x66, 0x48, 0x0F, 0x6E, 0xC8,                                 // movq xmm1, rax
+            0x66, 0x0F, 0x38, 0x17, 0xC1,                                 // ptest xmm0, xmm1
+            0x9C,                                                         // pushfq
+            0x58,                                                         // pop rax
+            0x48, 0x25, 0x40, 0x00, 0x00, 0x00,                           // and rax, 0x40 (ZF)
+        };
+        runAndCheck(r, "ptest disjoint bits → ZF=1", withExit(code), [](CPU64& c) {
+            return c.reg[X64_R15].u64 == 0x40;
+        });
+    }
+
+    // Test 75 — PTEST clears ZF when (dst & src) != 0.
+    //   xmm0 = xmm1 = {0xFF, 0} → AND non-zero → ZF=0.
+    {
+        std::vector<U8> code = {
+            0x48, 0xC7, 0xC0, 0xFF, 0x00, 0x00, 0x00,                     // mov rax, 0xFF
+            0x66, 0x48, 0x0F, 0x6E, 0xC0,                                 // movq xmm0, rax
+            0x66, 0x48, 0x0F, 0x6E, 0xC8,                                 // movq xmm1, rax
+            0x66, 0x0F, 0x38, 0x17, 0xC1,                                 // ptest xmm0, xmm1
+            0x9C,                                                         // pushfq
+            0x58,                                                         // pop rax
+            0x48, 0x25, 0x40, 0x00, 0x00, 0x00,                           // and rax, 0x40 (ZF)
+        };
+        runAndCheck(r, "ptest overlapping bits → ZF=0", withExit(code), [](CPU64& c) {
+            return c.reg[X64_R15].u64 == 0;
+        });
+    }
+
     printf("=== self-test summary: %d passed, %d failed ===\n\n", r.passed, r.failed);
     return r.failed == 0 ? 0 : 1;
 }
