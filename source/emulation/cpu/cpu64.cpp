@@ -1678,6 +1678,32 @@ U32 CPU64::step() {
         return opOff + 1;
     }
 
+    // PUSHFQ (9C) / POPFQ (9D). PUSHFQ pushes the low 32 bits of rflags
+    // extended to 64; POPFQ pops 64 bits but only the low 32 carry the
+    // user-visible flags. We mirror that: writeable mask covers the
+    // arithmetic and direction flags + IF.
+    if (op == 0x9C) {
+        push64((U64)rflags);
+        rip += opOff + 1;
+        return opOff + 1;
+    }
+    if (op == 0x9D) {
+        U64 v = pop64();
+        const U32 writable = 0x00254FD5u; // CF PF AF ZF SF TF IF DF OF + others
+        rflags = (rflags & ~writable) | ((U32)v & writable);
+        rip += opOff + 1;
+        return opOff + 1;
+    }
+
+    // CLD (FC) / STD (FD). Direction flag for string ops.
+    if (op == 0xFC) { rflags &= ~X64_DF; rip += opOff + 1; return opOff + 1; }
+    if (op == 0xFD) { rflags |=  X64_DF; rip += opOff + 1; return opOff + 1; }
+
+    // CMC (F5) / CLC (F8) / STC (F9). Carry-flag toggle/clear/set.
+    if (op == 0xF5) { rflags ^= X64_CF; rip += opOff + 1; return opOff + 1; }
+    if (op == 0xF8) { rflags &= ~X64_CF; rip += opOff + 1; return opOff + 1; }
+    if (op == 0xF9) { rflags |=  X64_CF; rip += opOff + 1; return opOff + 1; }
+
     // CPUID (0F A2). Return a conservative feature set: SSE2 only, no SSE3+,
     // no AVX. glibc IFUNC dispatchers consult ECX feature bits and select the
     // simpler implementations when AVX/SSSE3 are clear, which keeps us off
@@ -2497,6 +2523,93 @@ U32 CPU64::step() {
         // only legal encoding. We don't model FP types — just take bit 31
         // of each 32-bit lane. MOVMSKPD — 66 0F 50 /r. Same idea but 2
         // double-precision lanes (bits 63 of each 64-bit half).
+        // SHUFPS — 0F C6 /r ib (no 66). Per-imm8 4-dword shuffle: bits
+        // [1:0]/[3:2] pick lanes from dst, [5:4]/[7:6] pick from src.
+        // Output lanes 0,1 ← dst, 2,3 ← src.
+        // SHUFPD — 66 0F C6 /r ib. 2-qword shuffle: bit 0 picks dst lane,
+        // bit 1 picks src lane.
+        if (op2 == 0xC6) {
+            ModRM m = decodeModRM(rip + opOff + 2, p, 0);
+            U8 imm = fetchByte(rip + opOff + 2 + m.length);
+            U64 srcLo, srcHi;
+            if (m.isReg) {
+                srcLo = xmm[m.rmIndex].lo;
+                srcHi = xmm[m.rmIndex].hi;
+            } else {
+                srcLo = memory->readq(m.effAddr);
+                srcHi = memory->readq(m.effAddr + 8);
+            }
+            U64 dLo = xmm[m.regField].lo;
+            U64 dHi = xmm[m.regField].hi;
+            U64 oLo = 0, oHi = 0;
+            if (osize66) {
+                // SHUFPD
+                U64 dHalves[2] = { dLo, dHi };
+                U64 sHalves[2] = { srcLo, srcHi };
+                oLo = dHalves[(imm >> 0) & 1];
+                oHi = sHalves[(imm >> 1) & 1];
+            } else {
+                // SHUFPS — break into 4 dwords.
+                U32 d[4] = { (U32)dLo, (U32)(dLo >> 32), (U32)dHi, (U32)(dHi >> 32) };
+                U32 s[4] = { (U32)srcLo, (U32)(srcLo >> 32), (U32)srcHi, (U32)(srcHi >> 32) };
+                U32 o[4];
+                o[0] = d[(imm >> 0) & 3];
+                o[1] = d[(imm >> 2) & 3];
+                o[2] = s[(imm >> 4) & 3];
+                o[3] = s[(imm >> 6) & 3];
+                oLo = (U64)o[0] | ((U64)o[1] << 32);
+                oHi = (U64)o[2] | ((U64)o[3] << 32);
+            }
+            xmm[m.regField].lo = oLo;
+            xmm[m.regField].hi = oHi;
+            U32 used = opOff + 2 + m.length + 1;
+            rip += used;
+            return used;
+        }
+        // PEXTRW — 66 0F C5 /r ib. Extract one word from xmm[rmIndex] (imm8
+        // & 7 selects the lane) into r32/r64.
+        if (op2 == 0xC5 && osize66) {
+            ModRM m = decodeModRM(rip + opOff + 2, p, 0);
+            U8 imm = fetchByte(rip + opOff + 2 + m.length);
+            if (m.isReg) {
+                int lane = imm & 7;
+                U64 src = (lane < 4) ? xmm[m.rmIndex].lo : xmm[m.rmIndex].hi;
+                U64 w = (src >> ((lane & 3) * 16)) & 0xFFFF;
+                reg[m.regField].setU64(w);
+            }
+            U32 used = opOff + 2 + m.length + 1;
+            rip += used;
+            return used;
+        }
+        // PINSRW — 66 0F C4 /r ib. Insert low 16 of r32 (or m16) into xmm[reg]
+        // at lane (imm8 & 7).
+        if (op2 == 0xC4 && osize66) {
+            ModRM m = decodeModRM(rip + opOff + 2, p, 0);
+            U8 imm = fetchByte(rip + opOff + 2 + m.length);
+            U16 v;
+            if (m.isReg) v = (U16)reg[m.rmIndex].u32;
+            else         v = memory->readw(m.effAddr);
+            int lane = imm & 7;
+            U64* dst = (lane < 4) ? &xmm[m.regField].lo : &xmm[m.regField].hi;
+            int sub = lane & 3;
+            U64 mask = ~((U64)0xFFFF << (sub * 16));
+            *dst = (*dst & mask) | ((U64)v << (sub * 16));
+            U32 used = opOff + 2 + m.length + 1;
+            rip += used;
+            return used;
+        }
+        // MOVNTDQ — 66 0F E7 /r. Non-temporal store of xmm to m128. We
+        // ignore the cache hint and treat as a plain 16-byte store.
+        if (op2 == 0xE7 && osize66) {
+            ModRM m = decodeModRM(rip + opOff + 2, p, 0);
+            if (!m.isReg) {
+                memory->writeq(m.effAddr,     xmm[m.regField].lo);
+                memory->writeq(m.effAddr + 8, xmm[m.regField].hi);
+            }
+            U32 used = opOff + 2 + m.length;
+            rip += used;
+            return used;
+        }
         // MOVLHPS — 0F 16 /r (reg form). xmm[reg].hi := xmm[rm].lo.
         // MOVHLPS — 0F 12 /r (reg form). xmm[reg].lo := xmm[rm].hi.
         // Memory forms (MOVLPS/MOVHPS) are also encoded with 0F 12/16 but

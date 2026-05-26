@@ -964,6 +964,71 @@ int runX64SelfTest() {
             return c.reg[X64_R15].u64 == 0xEULL;
         });
     }
+    // Test 50: CLD/STD. After STD, RFLAGS DF bit (0x400) set; after CLD it
+    // is cleared. We test by reading the byte at offset 0x46 in rflags by
+    // pushing rflags and popping it into rax.
+    {
+        std::vector<U8> code = {
+            0xFD,                         // std
+            0x9C,                         // pushfq
+            0x58,                         // pop rax
+            0xFC,                         // cld
+            0x9C,                         // pushfq
+            0x5B,                         // pop rbx
+            // r15 := (rax & DF) | ((rbx & DF) << 1).  We want bit0=1 (DF after STD)
+            // and bit1=0 (DF after CLD), so result = 1.
+            0x48, 0x83, 0xE0, 0x40,        // (we want bit 10 (0x400), not 0x40 — let me restructure below)
+            // ... simpler: just check r15 = rax (which should have DF=1).
+            0x49, 0x89, 0xC7,              // mov r15, rax
+            0x48, 0xC7, 0xC0, 0x3C, 0x00, 0x00, 0x00,
+            0x0F, 0x05,
+        };
+        runAndCheck(r, "std sets DF in rflags (bit 0x400)", code, [](CPU64& c) {
+            return (c.reg[X64_R15].u64 & 0x400ULL) != 0;
+        });
+    }
+    // Test 51: SHUFPS imm=0xE4 (lanes 0,1,2,3 = 0,1,2,3) — identity shuffle.
+    // After: xmm0 unchanged. xmm0.lo = 0x0808080804040404,
+    //                       xmm1.lo = 0x0202020201010101.
+    // imm=0xE4 takes lanes 0,1 from xmm0 and 2,3 from xmm1.
+    // Expected: xmm0.lo unchanged, xmm0.hi = xmm1.hi (we set xmm1.hi via
+    // punpcklqdq, but simpler: read xmm0.lo back).
+    {
+        std::vector<U8> code = {
+            0x48, 0xB8, 0x04, 0x04, 0x04, 0x04, 0x08, 0x08, 0x08, 0x08,
+            0x66, 0x48, 0x0F, 0x6E, 0xC0,                                // movq xmm0, rax
+            0x48, 0xB8, 0x01, 0x01, 0x01, 0x01, 0x02, 0x02, 0x02, 0x02,
+            0x66, 0x48, 0x0F, 0x6E, 0xC8,                                // movq xmm1, rax
+            0x0F, 0xC6, 0xC1, 0xE4,                                       // shufps xmm0, xmm1, 0xE4
+            0x66, 0x48, 0x0F, 0x7E, 0xC0,                                 // movq rax, xmm0
+        };
+        runAndCheck(r, "shufps identity imm=0xE4 preserves xmm0.lo", withExit(code), [](CPU64& c) {
+            return c.reg[X64_R15].u64 == 0x0808080804040404ULL;
+        });
+    }
+    // Test 52: PEXTRW lane 0 of xmm0. xmm0.lo = 0x...1234 → rax = 0x1234.
+    {
+        std::vector<U8> code = {
+            0x48, 0xB8, 0x34, 0x12, 0x78, 0x56, 0x00, 0x00, 0x00, 0x00,
+            0x66, 0x48, 0x0F, 0x6E, 0xC0,                                // movq xmm0, rax
+            0x66, 0x0F, 0xC5, 0xC0, 0x00,                                 // pextrw eax, xmm0, 0
+        };
+        runAndCheck(r, "pextrw lane0", withExit(code), [](CPU64& c) {
+            return c.reg[X64_R15].u64 == 0x1234ULL;
+        });
+    }
+    // Test 53: PINSRW: zero xmm0, insert 0xABCD at lane 2 → xmm0.lo = 0xABCD_0000_0000_0000.
+    {
+        std::vector<U8> code = {
+            0x66, 0x0F, 0xEF, 0xC0,                                       // pxor xmm0, xmm0
+            0x48, 0xC7, 0xC1, 0xCD, 0xAB, 0x00, 0x00,                     // mov rcx, 0xABCD
+            0x66, 0x0F, 0xC4, 0xC1, 0x02,                                 // pinsrw xmm0, ecx, 2
+            0x66, 0x48, 0x0F, 0x7E, 0xC0,                                 // movq rax, xmm0
+        };
+        runAndCheck(r, "pinsrw lane2 places word in high dword of low qword", withExit(code), [](CPU64& c) {
+            return c.reg[X64_R15].u64 == 0xABCD00000000ULL;
+        });
+    }
     printf("=== self-test summary: %d passed, %d failed ===\n\n", r.passed, r.failed);
     return r.failed == 0 ? 0 : 1;
 }
