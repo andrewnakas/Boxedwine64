@@ -205,6 +205,84 @@ static FsOpenNode* openGuestPath(BString path) {
     return node->open(K_O_RDONLY);
 }
 
+// Eager application of R_X86_64_RELATIVE relocations from a parsed dynamic
+// section. RELATIVE entries do not name a symbol — they just say "store
+// (load_base + addend) at this offset". They make up the vast majority of
+// relocations in PIE binaries and shared libraries, and resolving them in
+// the host loader is what lets a PIE exe run without first jumping through
+// the dynamic linker.
+//
+// Cross-module / symbol-resolving relocations (GLOB_DAT, JUMP_SLOT, 64,
+// COPY, IRELATIVE) are left for Milestone A3 once DT_NEEDED recursion is
+// in place — they require the cross-library symbol table that A3 builds.
+//
+// Returns the number of RELATIVE relocations applied (mainly for logging).
+static U64 applyDynamicRelocations(KMemory64* mem,
+                                   const Elf64DynamicInfo& dyn,
+                                   U64 reloc,
+                                   const char* tag) {
+    if (!dyn.present || dyn.memsz == 0) return 0;
+
+    // Read the entire PT_DYNAMIC array out of guest memory (it's small —
+    // typically a few dozen entries).
+    U64 dynAddr = dyn.vaddr + reloc;
+    U64 nEntries = dyn.memsz / sizeof(k_Elf64_Dyn);
+    std::vector<k_Elf64_Dyn> dynArr(nEntries);
+    mem->memcpyFromGuest(dynArr.data(), dynAddr, dyn.memsz);
+
+    // First pass: pluck the tags we care about. We only use the RELA tables
+    // here; JMPREL (PLT relocations) are also RELA-shaped on x86-64 but
+    // their entries are GLOB_DAT/JUMP_SLOT which we leave for A3.
+    U64 relaAddr = 0, relaSz = 0, relaEnt = sizeof(k_Elf64_Rela);
+    for (U64 i = 0; i < nEntries; i++) {
+        const k_Elf64_Dyn& d = dynArr[i];
+        if (d.d_tag == k_DT_NULL) break;
+        switch (d.d_tag) {
+            case k_DT_RELA:    relaAddr = d.d_un.d_ptr; break;
+            case k_DT_RELASZ:  relaSz   = d.d_un.d_val; break;
+            case k_DT_RELAENT: relaEnt  = d.d_un.d_val; break;
+        }
+    }
+
+    if (relaAddr == 0 || relaSz == 0) {
+        klog_fmt("loadProgram64[%s]: no RELA table — skipping relocation pass", tag);
+        return 0;
+    }
+
+    U64 nRela = relaSz / relaEnt;
+    klog_fmt("loadProgram64[%s]: RELA table at 0x%llx, %llu entries (entsize=%llu)",
+             tag,
+             (unsigned long long)(relaAddr + reloc),
+             (unsigned long long)nRela,
+             (unsigned long long)relaEnt);
+
+    U64 relativeCount = 0;
+    U64 skippedCount = 0;
+    for (U64 i = 0; i < nRela; i++) {
+        k_Elf64_Rela rela;
+        mem->memcpyFromGuest(&rela, relaAddr + reloc + i * relaEnt, sizeof(rela));
+        U32 type = k_ELF64_R_TYPE(rela.r_info);
+        U64 dst = rela.r_offset + reloc;
+        switch (type) {
+            case k_R_X86_64_RELATIVE:
+                mem->writeq(dst, (U64)((S64)reloc + rela.r_addend));
+                relativeCount++;
+                break;
+            case k_R_X86_64_NONE:
+                break;
+            default:
+                // Defer to ld-linux for everything else (symbol-bound types).
+                skippedCount++;
+                break;
+        }
+    }
+    klog_fmt("loadProgram64[%s]: applied %llu RELATIVE relocs (deferred %llu symbol-bound)",
+             tag,
+             (unsigned long long)relativeCount,
+             (unsigned long long)skippedCount);
+    return relativeCount;
+}
+
 bool ElfLoader64::loadProgram(KThread* thread, FsOpenNode* openNode, U64* rip) {
     Elf64ParseResult r = parse(openNode);
     if (!r.ok) {
@@ -249,6 +327,11 @@ bool ElfLoader64::loadProgram(KThread* thread, FsOpenNode* openNode, U64* rip) {
     if (!mapSegments(mem, openNode, r, reloc, "exe")) {
         return false;
     }
+
+    // Apply R_X86_64_RELATIVE relocations against the exe's dynamic section
+    // (if any). Symbol-bound relocations are still left to ld-linux until
+    // Milestone A3 wires up cross-library symbol resolution.
+    applyDynamicRelocations(mem, r.dynamic, reloc, "exe");
 
     *rip = r.entry + reloc;
     klog_fmt("loadProgram64: exe RIP=0x%llx (pages mapped: %llu)",
@@ -297,6 +380,11 @@ bool ElfLoader64::loadProgram(KThread* thread, FsOpenNode* openNode, U64* rip) {
             delete interpNode;
             return false;
         }
+        // ld-linux is itself a PIE shared object — it needs its own
+        // R_X86_64_RELATIVE entries fixed up before it can run. (Without
+        // this, _dl_start crashes on the first indirect call through its
+        // own GOT.)
+        applyDynamicRelocations(mem, interpR.dynamic, interpBase, "interp");
         // Control transfers to the interpreter, not the exe.
         *rip = interpR.entry + interpBase;
         klog_fmt("loadProgram64: interp '%s' mapped at base 0x%llx, RIP=0x%llx",
