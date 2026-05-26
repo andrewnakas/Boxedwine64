@@ -28,6 +28,24 @@ struct Elf64LoadSegment {
     U64 align;
 };
 
+// Captured PT_DYNAMIC location for later relocation processing. vaddr/memsz
+// are the unrelocated values straight out of the phdr; the loader adds the
+// load slide when reading the dynamic array from guest memory.
+struct Elf64DynamicInfo {
+    bool present = false;
+    U64 vaddr = 0;
+    U64 memsz = 0;
+};
+
+// Captured PT_TLS template info (used to size and copy per-thread TLS blocks).
+struct Elf64TlsInfo {
+    bool present = false;
+    U64 vaddr = 0;
+    U64 filesz = 0;
+    U64 memsz = 0;
+    U64 align = 0;
+};
+
 struct Elf64ParseResult {
     bool ok = false;
     U64 entry = 0;            // e_entry
@@ -39,6 +57,8 @@ struct Elf64ParseResult {
     bool isPie = false;       // e_type == ET_DYN, needs relocation
     std::vector<Elf64LoadSegment> segments;
     BString interpreter;      // PT_INTERP contents (empty if none)
+    Elf64DynamicInfo dynamic; // PT_DYNAMIC vaddr/memsz (empty if none)
+    Elf64TlsInfo tls;         // PT_TLS template info (empty if none)
 };
 
 class ElfLoader64 {

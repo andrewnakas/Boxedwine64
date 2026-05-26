@@ -87,4 +87,105 @@ struct k_Elf64_Phdr {
 #define k_ELFCLASS32 1
 #define k_ELFCLASS64 2
 
+// p_type values used by the dynamic linker path.
+#define k_PT_NULL    0
+#define k_PT_LOAD    1
+#define k_PT_DYNAMIC 2
+#define k_PT_INTERP  3
+#define k_PT_NOTE    4
+#define k_PT_PHDR    6
+#define k_PT_TLS     7
+#define k_PT_GNU_EH_FRAME 0x6474e550
+#define k_PT_GNU_STACK    0x6474e551
+#define k_PT_GNU_RELRO    0x6474e552
+
+// PT_DYNAMIC entry. Walked as an array terminated by d_tag == DT_NULL.
+PACKED(
+struct k_Elf64_Dyn {
+    k_Elf64_Sxword d_tag;
+    union {
+        k_Elf64_Xword d_val;
+        k_Elf64_Addr  d_ptr;
+    } d_un;
+}
+);
+
+// RELA: relocations with explicit addend (the form x86-64 uses; REL is unused).
+PACKED(
+struct k_Elf64_Rela {
+    k_Elf64_Addr   r_offset;
+    k_Elf64_Xword  r_info;
+    k_Elf64_Sxword r_addend;
+}
+);
+
+// Symbol table entry.
+PACKED(
+struct k_Elf64_Sym {
+    k_Elf64_Word   st_name;
+    unsigned char  st_info;
+    unsigned char  st_other;
+    k_Elf64_Half   st_shndx;
+    k_Elf64_Addr   st_value;
+    k_Elf64_Xword  st_size;
+}
+);
+
+// r_info packs symbol index in high 32 bits and relocation type in low 32.
+#define k_ELF64_R_SYM(i)  ((U32)((i) >> 32))
+#define k_ELF64_R_TYPE(i) ((U32)((i) & 0xFFFFFFFFULL))
+
+// DT_* tags we consume during dynamic linking.
+#define k_DT_NULL     0
+#define k_DT_NEEDED   1
+#define k_DT_PLTRELSZ 2
+#define k_DT_PLTGOT   3
+#define k_DT_HASH     4
+#define k_DT_STRTAB   5
+#define k_DT_SYMTAB   6
+#define k_DT_RELA     7
+#define k_DT_RELASZ   8
+#define k_DT_RELAENT  9
+#define k_DT_STRSZ    10
+#define k_DT_SYMENT   11
+#define k_DT_INIT     12
+#define k_DT_FINI     13
+#define k_DT_SONAME   14
+#define k_DT_RPATH    15
+#define k_DT_PLTREL   20
+#define k_DT_JMPREL   23
+#define k_DT_INIT_ARRAY    25
+#define k_DT_FINI_ARRAY    26
+#define k_DT_INIT_ARRAYSZ  27
+#define k_DT_FINI_ARRAYSZ  28
+#define k_DT_RUNPATH       29
+#define k_DT_FLAGS         30
+
+// R_X86_64_* relocation types per the AMD64 ABI.
+#define k_R_X86_64_NONE      0
+#define k_R_X86_64_64        1
+#define k_R_X86_64_PC32      2
+#define k_R_X86_64_GOT32     3
+#define k_R_X86_64_PLT32     4
+#define k_R_X86_64_COPY      5
+#define k_R_X86_64_GLOB_DAT  6
+#define k_R_X86_64_JUMP_SLOT 7
+#define k_R_X86_64_RELATIVE  8
+#define k_R_X86_64_GOTPCREL  9
+#define k_R_X86_64_32        10
+#define k_R_X86_64_32S       11
+#define k_R_X86_64_16        12
+#define k_R_X86_64_PC16      13
+#define k_R_X86_64_8         14
+#define k_R_X86_64_PC8       15
+#define k_R_X86_64_DTPMOD64  16
+#define k_R_X86_64_DTPOFF64  17
+#define k_R_X86_64_TPOFF64   18
+#define k_R_X86_64_TLSGD     19
+#define k_R_X86_64_TLSLD     20
+#define k_R_X86_64_DTPOFF32  21
+#define k_R_X86_64_GOTTPOFF  22
+#define k_R_X86_64_TPOFF32   23
+#define k_R_X86_64_IRELATIVE 37
+
 #endif

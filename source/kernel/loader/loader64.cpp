@@ -111,6 +111,16 @@ Elf64ParseResult ElfLoader64::parse(FsOpenNode* openNode) {
             }
             interp[phdr.p_filesz] = 0;
             result.interpreter = BString::copy(interp);
+        } else if (phdr.p_type == k_PT_DYNAMIC) {
+            result.dynamic.present = true;
+            result.dynamic.vaddr = phdr.p_vaddr;
+            result.dynamic.memsz = phdr.p_memsz;
+        } else if (phdr.p_type == k_PT_TLS) {
+            result.tls.present = true;
+            result.tls.vaddr  = phdr.p_vaddr;
+            result.tls.filesz = phdr.p_filesz;
+            result.tls.memsz  = phdr.p_memsz;
+            result.tls.align  = phdr.p_align;
         }
     }
 
@@ -211,6 +221,18 @@ bool ElfLoader64::loadProgram(KThread* thread, FsOpenNode* openNode, U64* rip) {
              (unsigned long long)r.baseAddrLow,
              (unsigned long long)r.baseAddrHigh,
              (unsigned long long)(r.baseAddrHigh - r.baseAddrLow));
+    if (r.dynamic.present) {
+        klog_fmt("loadProgram64: PT_DYNAMIC vaddr=0x%llx memsz=%llu",
+                 (unsigned long long)r.dynamic.vaddr,
+                 (unsigned long long)r.dynamic.memsz);
+    }
+    if (r.tls.present) {
+        klog_fmt("loadProgram64: PT_TLS vaddr=0x%llx filesz=%llu memsz=%llu align=%llu",
+                 (unsigned long long)r.tls.vaddr,
+                 (unsigned long long)r.tls.filesz,
+                 (unsigned long long)r.tls.memsz,
+                 (unsigned long long)r.tls.align);
+    }
 
     if (!thread || !thread->process) {
         klog("loadProgram64: null thread/process");
