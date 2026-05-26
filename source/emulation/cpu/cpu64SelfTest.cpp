@@ -2069,6 +2069,75 @@ int runX64SelfTest() {
         });
     }
 
+    // ---- futex(202) stub semantics ----
+    // FUTEX_WAKE_PRIVATE always returns 0 — "no waiters in our world".
+    //   syscall convention: RAX=202 (futex), RDI=uaddr, RSI=op, RDX=val
+    //   exit-suffix captures the futex-return-value into R15.
+    {
+        U64 dst = STACK_TOP - 0x800;
+        std::vector<U8> code = {
+            0x48, 0xC7, 0xC0, 0xCA, 0x00, 0x00, 0x00,                     // mov rax, 202
+            0x48, 0xBF,
+                (U8)(dst), (U8)(dst >> 8), (U8)(dst >> 16), (U8)(dst >> 24),
+                (U8)(dst >> 32), (U8)(dst >> 40), (U8)(dst >> 48), (U8)(dst >> 56),
+            0x48, 0xC7, 0xC6, 0x81, 0x00, 0x00, 0x00,                     // mov rsi, 0x81 (FUTEX_WAKE_PRIVATE)
+            0x48, 0xC7, 0xC2, 0x01, 0x00, 0x00, 0x00,                     // mov rdx, 1
+            0x0F, 0x05,                                                   // syscall
+        };
+        runAndCheck(r, "futex FUTEX_WAKE_PRIVATE → 0", withExit(code), [](CPU64& c) {
+            return c.reg[X64_R15].u64 == 0;
+        });
+    }
+
+    // FUTEX_WAIT mismatch: pre-store 42 at *uaddr, call WAIT with val=99 →
+    // value mismatched, must return -EAGAIN per Linux semantics. EAGAIN=11
+    // so the negated u64 is 0xFFFFFFFFFFFFFFF5.
+    {
+        U64 dst = STACK_TOP - 0x800;
+        std::vector<U8> code = {
+            // mov rdi, dst (uaddr)
+            0x48, 0xBF,
+                (U8)(dst), (U8)(dst >> 8), (U8)(dst >> 16), (U8)(dst >> 24),
+                (U8)(dst >> 32), (U8)(dst >> 40), (U8)(dst >> 48), (U8)(dst >> 56),
+            // mov dword [rdi], 42
+            0xC7, 0x07, 0x2A, 0x00, 0x00, 0x00,
+            // mov rax, 202
+            0x48, 0xC7, 0xC0, 0xCA, 0x00, 0x00, 0x00,
+            // mov rsi, 0x80 (FUTEX_WAIT_PRIVATE)
+            0x48, 0xC7, 0xC6, 0x80, 0x00, 0x00, 0x00,
+            // mov rdx, 99 (expected val — mismatches the stored 42)
+            0x48, 0xC7, 0xC2, 0x63, 0x00, 0x00, 0x00,
+            // xor r10, r10 (no timeout)
+            0x4D, 0x31, 0xD2,
+            // syscall
+            0x0F, 0x05,
+        };
+        runAndCheck(r, "futex FUTEX_WAIT mismatch → -EAGAIN", withExit(code), [](CPU64& c) {
+            return c.reg[X64_R15].u64 == 0xFFFFFFFFFFFFFFF5ULL;
+        });
+    }
+
+    // FUTEX_WAIT match: would normally block; we return -EAGAIN as a
+    // would-block stand-in (see sys_futex64 header comment). Pre-store 42,
+    // call WAIT with val=42 → -EAGAIN.
+    {
+        U64 dst = STACK_TOP - 0x800;
+        std::vector<U8> code = {
+            0x48, 0xBF,
+                (U8)(dst), (U8)(dst >> 8), (U8)(dst >> 16), (U8)(dst >> 24),
+                (U8)(dst >> 32), (U8)(dst >> 40), (U8)(dst >> 48), (U8)(dst >> 56),
+            0xC7, 0x07, 0x2A, 0x00, 0x00, 0x00,                           // mov dword [rdi], 42
+            0x48, 0xC7, 0xC0, 0xCA, 0x00, 0x00, 0x00,                     // mov rax, 202
+            0x48, 0xC7, 0xC6, 0x80, 0x00, 0x00, 0x00,                     // mov rsi, FUTEX_WAIT_PRIVATE
+            0x48, 0xC7, 0xC2, 0x2A, 0x00, 0x00, 0x00,                     // mov rdx, 42 (matches)
+            0x4D, 0x31, 0xD2,                                             // xor r10, r10
+            0x0F, 0x05,                                                   // syscall
+        };
+        runAndCheck(r, "futex FUTEX_WAIT match (no-block) → -EAGAIN", withExit(code), [](CPU64& c) {
+            return c.reg[X64_R15].u64 == 0xFFFFFFFFFFFFFFF5ULL;
+        });
+    }
+
     printf("=== self-test summary: %d passed, %d failed ===\n\n", r.passed, r.failed);
     return r.failed == 0 ? 0 : 1;
 }

@@ -101,6 +101,18 @@
 #ifndef K_EFAULT
 #define K_EFAULT 14
 #endif
+#ifndef K_EAGAIN
+#define K_EAGAIN 11
+#endif
+
+// FUTEX_* op codes from <linux/futex.h>. We only handle WAIT/WAKE +
+// PRIVATE variants — the rest go to the catch-all "return success" path
+// until we wire real blocking via KThread::futex in Milestone B proper.
+#define X64_FUTEX_WAIT          0
+#define X64_FUTEX_WAKE          1
+#define X64_FUTEX_PRIVATE_FLAG  128
+#define X64_FUTEX_WAIT_PRIVATE  (X64_FUTEX_WAIT | X64_FUTEX_PRIVATE_FLAG)
+#define X64_FUTEX_WAKE_PRIVATE  (X64_FUTEX_WAKE | X64_FUTEX_PRIVATE_FLAG)
 
 // MAP_* bits used by mmap. Kept local to avoid pulling kernel.h here.
 #ifndef K_MAP_ANONYMOUS
@@ -526,6 +538,43 @@ static U64 sys_readlink64(CPU64* cpu, U64 pathAddr, U64 buf, U64 sz) {
     return toCopy;
 }
 
+// Minimal futex semantics, enough for glibc's uncontended-mutex path.
+//
+// We do NOT block — Milestone B proper needs to widen KThread::futex to
+// accept U64 addresses, and that's a churn we're deferring. What we DO get
+// right here:
+//
+//   FUTEX_WAKE / WAKE_PRIVATE → return 0 (no waiters in our world)
+//   FUTEX_WAIT / WAIT_PRIVATE → read the 32-bit word at uaddr; if it does
+//       NOT equal val, return -EAGAIN. This is the Linux-spec answer for
+//       the "value changed between userspace check and syscall entry"
+//       race, and it matches what glibc's __lll_lock_wait_private retries
+//       against. If the value DOES equal val we'd normally block; we
+//       return -EAGAIN there too — glibc will spin briefly and then retry,
+//       which is wrong for truly contended mutexes but harmless and
+//       forward-progressing for single-threaded binaries (the only kind
+//       we can run today anyway).
+//   Anything else (REQUEUE/CMP_REQUEUE/WAKE_OP/LOCK_PI/etc) → return 0.
+//
+// Caller passes the 32-bit op/val truncations done at the call site.
+static U64 sys_futex64(CPU64* cpu, U64 uaddr, U32 op, U32 val) {
+    U32 baseOp = op & ~X64_FUTEX_PRIVATE_FLAG;
+    switch (baseOp) {
+        case X64_FUTEX_WAKE:
+            return 0;
+        case X64_FUTEX_WAIT: {
+            if (uaddr == 0) return (U64)-K_EINVAL;
+            U32 cur = cpu->memory->readd(uaddr);
+            if (cur != val) return (U64)-K_EAGAIN;
+            // Would-block path: return EAGAIN instead of blocking. See the
+            // function-header comment for why this is acceptable for v0.
+            return (U64)-K_EAGAIN;
+        }
+        default:
+            return 0;
+    }
+}
+
 // Map an x86-64 Linux syscall number to a human-readable name. Used only by
 // the unimplemented-syscall log path — when running real glibc binaries, the
 // first thing you want to see is "which syscall is missing", not "#291".
@@ -809,9 +858,7 @@ void ksyscall64(CPU64* cpu) {
             ret = cpu->thread ? cpu->thread->id : 1;
             break;
         case X64_SYS_futex:
-            // ld-linux uses futex for lazy init; FUTEX_WAKE on uncontended
-            // mutex returns 0. We'll return success and skip blocking.
-            ret = 0;
+            ret = sys_futex64(cpu, a1, (U32)a2, (U32)a3);
             break;
         case X64_SYS_poll:
             ret = 0; // timeout — nothing ready
