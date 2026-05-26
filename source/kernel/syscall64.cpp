@@ -526,6 +526,107 @@ static U64 sys_readlink64(CPU64* cpu, U64 pathAddr, U64 buf, U64 sz) {
     return toCopy;
 }
 
+// Map an x86-64 Linux syscall number to a human-readable name. Used only by
+// the unimplemented-syscall log path — when running real glibc binaries, the
+// first thing you want to see is "which syscall is missing", not "#291".
+// Covers both syscalls we already handle (useful for trace) and the obvious
+// gaps that are most likely to surface during early Wine/glibc bring-up.
+// Returns "?" for unknown numbers; the caller still logs the raw #N.
+static const char* x64SyscallName(U64 nr) {
+    switch (nr) {
+        case 0: return "read";
+        case 1: return "write";
+        case 2: return "open";
+        case 3: return "close";
+        case 4: return "stat";
+        case 5: return "fstat";
+        case 6: return "lstat";
+        case 7: return "poll";
+        case 8: return "lseek";
+        case 9: return "mmap";
+        case 10: return "mprotect";
+        case 11: return "munmap";
+        case 12: return "brk";
+        case 13: return "rt_sigaction";
+        case 14: return "rt_sigprocmask";
+        case 15: return "rt_sigreturn";
+        case 16: return "ioctl";
+        case 17: return "pread64";
+        case 18: return "pwrite64";
+        case 19: return "readv";
+        case 20: return "writev";
+        case 21: return "access";
+        case 22: return "pipe";
+        case 23: return "select";
+        case 24: return "sched_yield";
+        case 25: return "mremap";
+        case 28: return "madvise";
+        case 32: return "dup";
+        case 33: return "dup2";
+        case 35: return "nanosleep";
+        case 39: return "getpid";
+        case 41: return "socket";
+        case 42: return "connect";
+        case 43: return "accept";
+        case 44: return "sendto";
+        case 45: return "recvfrom";
+        case 46: return "sendmsg";
+        case 47: return "recvmsg";
+        case 53: return "socketpair";
+        case 56: return "clone";
+        case 57: return "fork";
+        case 58: return "vfork";
+        case 59: return "execve";
+        case 60: return "exit";
+        case 61: return "wait4";
+        case 62: return "kill";
+        case 63: return "uname";
+        case 72: return "fcntl";
+        case 79: return "getcwd";
+        case 80: return "chdir";
+        case 89: return "readlink";
+        case 90: return "chmod";
+        case 91: return "fchmod";
+        case 96: return "gettimeofday";
+        case 98: return "getrusage";
+        case 99: return "sysinfo";
+        case 102: return "getuid";
+        case 104: return "getgid";
+        case 107: return "geteuid";
+        case 108: return "getegid";
+        case 110: return "getppid";
+        case 111: return "getpgrp";
+        case 121: return "getpgid";
+        case 124: return "getsid";
+        case 131: return "sigaltstack";
+        case 137: return "statfs";
+        case 138: return "fstatfs";
+        case 158: return "arch_prctl";
+        case 186: return "gettid";
+        case 202: return "futex";
+        case 217: return "getdents64";
+        case 218: return "set_tid_address";
+        case 228: return "clock_gettime";
+        case 229: return "clock_getres";
+        case 230: return "clock_nanosleep";
+        case 231: return "exit_group";
+        case 232: return "epoll_wait";
+        case 233: return "epoll_ctl";
+        case 234: return "tgkill";
+        case 257: return "openat";
+        case 262: return "newfstatat";
+        case 273: return "set_robust_list";
+        case 290: return "eventfd2";
+        case 291: return "epoll_create1";
+        case 293: return "pipe2";
+        case 302: return "prlimit64";
+        case 318: return "getrandom";
+        case 334: return "rseq";
+        case 435: return "clone3";
+        default:  return "?";
+    }
+}
+
 void ksyscall64(CPU64* cpu) {
     if (!cpu) return;
     U64 nr   = cpu->reg[X64_RAX].u64;
@@ -785,11 +886,16 @@ void ksyscall64(CPU64* cpu) {
             ret = sys_exit64(cpu, a1);
             break;
         default:
-            klog_fmt("ksyscall64: unimplemented syscall #%llu (RDI=0x%llx RSI=0x%llx RDX=0x%llx)",
+            klog_fmt("ksyscall64: unimplemented syscall #%llu (%s) at RIP=0x%llx — RDI=0x%llx RSI=0x%llx RDX=0x%llx R10=0x%llx R8=0x%llx R9=0x%llx",
                      (unsigned long long)nr,
+                     x64SyscallName(nr),
+                     (unsigned long long)cpu->rip,
                      (unsigned long long)a1,
                      (unsigned long long)a2,
-                     (unsigned long long)a3);
+                     (unsigned long long)a3,
+                     (unsigned long long)a4,
+                     (unsigned long long)a5,
+                     (unsigned long long)a6);
             ret = (U64)-K_ENOSYS;
             break;
     }
