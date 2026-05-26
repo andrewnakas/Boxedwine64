@@ -575,6 +575,51 @@ static U64 sys_futex64(CPU64* cpu, U64 uaddr, U32 op, U32 val) {
     }
 }
 
+// rt_sigaction(2) — storage-only round-trip. We do not yet deliver signals
+// to guest handlers (that needs the signal-frame builder of Milestone B),
+// but glibc's startup *registers* SIGFPE/SIGSEGV/SIGPIPE handlers very
+// early and later queries them; previously this was a bald no-op so the
+// second sigaction(SIG, NULL, &old) call always reported SIG_DFL, which
+// confuses libpthread's "did the user install a handler?" check.
+//
+// x86-64 `struct kernel_sigaction` layout (32 bytes):
+//   off  0: sa_handler  (8)
+//   off  8: sa_flags    (8)
+//   off 16: sa_restorer (8)
+//   off 24: sa_mask     (8, = full sigset_t on x86-64)
+//
+// Signal numbers 1..64 are valid; SIGKILL(9) and SIGSTOP(19) can be queried
+// but cannot have their handlers changed — we accept the read and silently
+// drop the write, matching kernel behaviour.
+static U64 sys_rt_sigaction64(CPU64* cpu, U64 sig, U64 actPtr, U64 oldActPtr,
+                              U64 sigsetsize) {
+    if (sig < 1 || sig > 64) return (U64)-K_EINVAL;
+    if (sigsetsize != 8) return (U64)-K_EINVAL; // x86-64 sigset_t is 8 bytes
+    if (!cpu->memory) return (U64)-K_EFAULT;
+
+    CPU64::SigAction& slot = cpu->sigActions[sig];
+
+    if (oldActPtr) {
+        cpu->memory->writeq(oldActPtr + 0,  slot.installed ? slot.handler  : 0);
+        cpu->memory->writeq(oldActPtr + 8,  slot.installed ? slot.flags    : 0);
+        cpu->memory->writeq(oldActPtr + 16, slot.installed ? slot.restorer : 0);
+        cpu->memory->writeq(oldActPtr + 24, slot.installed ? slot.mask     : 0);
+    }
+
+    if (actPtr) {
+        if (sig == 9 || sig == 19) {
+            // SIGKILL / SIGSTOP: read accepted, write ignored — matches Linux.
+            return 0;
+        }
+        slot.handler  = cpu->memory->readq(actPtr + 0);
+        slot.flags    = cpu->memory->readq(actPtr + 8);
+        slot.restorer = cpu->memory->readq(actPtr + 16);
+        slot.mask     = cpu->memory->readq(actPtr + 24);
+        slot.installed = true;
+    }
+    return 0;
+}
+
 // Map an x86-64 Linux syscall number to a human-readable name. Used only by
 // the unimplemented-syscall log path — when running real glibc binaries, the
 // first thing you want to see is "which syscall is missing", not "#291".
@@ -720,9 +765,11 @@ void ksyscall64(CPU64* cpu) {
             // yet, so just give back something plausible.
             ret = cpu->thread ? cpu->thread->id : 1;
             break;
+        case X64_SYS_rt_sigaction:
+            ret = sys_rt_sigaction64(cpu, a1, a2, a3, a4);
+            break;
         case X64_SYS_set_robust_list:
         case X64_SYS_rt_sigprocmask:
-        case X64_SYS_rt_sigaction:
         case X64_SYS_ioctl:
         case X64_SYS_madvise:
         case X64_SYS_sigaltstack:

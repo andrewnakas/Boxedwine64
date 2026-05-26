@@ -63,6 +63,20 @@ public:
     // on FPU take a 32-bit CPU* that we can't satisfy.
     FPU fpu;
 
+    // Signal handler table. Mirrors the x86-64 `struct kernel_sigaction`
+    // round-tripped through rt_sigaction(2): handler, flags, restorer,
+    // sa_mask (64-bit). Indexed by signal number 1..64; slot 0 unused.
+    // v1 stores only — no delivery yet. Lets glibc's startup sigaction()
+    // calls observe their previous registrations instead of losing them.
+    struct SigAction {
+        U64 handler = 0;   // SIG_DFL=0, SIG_IGN=1, else func ptr
+        U64 flags = 0;
+        U64 restorer = 0;
+        U64 mask = 0;
+        bool installed = false;
+    };
+    SigAction sigActions[65] = {};
+
     KThread*   thread = nullptr;
     KMemory64* memory = nullptr;
 

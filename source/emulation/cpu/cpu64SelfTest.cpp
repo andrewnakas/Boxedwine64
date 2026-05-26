@@ -2255,6 +2255,113 @@ int runX64SelfTest() {
         });
     }
 
+    // ----- rt_sigaction storage round-trip (Milestone B1) -----
+    // Layout on stack: [rsp+0..63] new act struct, [rsp+64..127] old act buffer.
+    // sub rsp,128 ; build act at [rsp]; sigaction(SIGUSR1, [rsp], [rsp+64], 8).
+
+    // T: rt_sigaction install handler then read it back via second call's oldact.
+    {
+        std::vector<U8> code = {
+            0x48, 0x83, 0xEC, 0x80,                                     // sub rsp, 128
+            // build act at [rsp]: handler=0xCAFE1234DEADBEEF, others 0
+            0x48, 0xB8, 0xEF, 0xBE, 0xAD, 0xDE, 0x34, 0x12, 0xFE, 0xCA, // mov rax, 0xCAFE1234DEADBEEF
+            0x48, 0x89, 0x04, 0x24,                                     // mov [rsp+0], rax (handler)
+            0x48, 0x31, 0xC0,                                           // xor rax, rax
+            0x48, 0x89, 0x44, 0x24, 0x08,                               // mov [rsp+8], rax  (flags)
+            0x48, 0x89, 0x44, 0x24, 0x10,                               // mov [rsp+16], rax (restorer)
+            0x48, 0x89, 0x44, 0x24, 0x18,                               // mov [rsp+24], rax (mask)
+            // syscall rt_sigaction(10=SIGUSR1, rsp, NULL, 8) — install
+            0x48, 0xC7, 0xC0, 0x0D, 0x00, 0x00, 0x00,                   // mov rax, 13
+            0x48, 0xC7, 0xC7, 0x0A, 0x00, 0x00, 0x00,                   // mov rdi, 10
+            0x48, 0x89, 0xE6,                                           // mov rsi, rsp
+            0x48, 0x31, 0xD2,                                           // xor rdx, rdx
+            0x49, 0xC7, 0xC2, 0x08, 0x00, 0x00, 0x00,                   // mov r10, 8
+            0x0F, 0x05,                                                 // syscall
+            // syscall rt_sigaction(10, NULL, rsp+64, 8) — read back oldact
+            0x48, 0xC7, 0xC0, 0x0D, 0x00, 0x00, 0x00,                   // mov rax, 13
+            0x48, 0xC7, 0xC7, 0x0A, 0x00, 0x00, 0x00,                   // mov rdi, 10
+            0x48, 0x31, 0xF6,                                           // xor rsi, rsi
+            0x48, 0x8D, 0x54, 0x24, 0x40,                               // lea rdx, [rsp+64]
+            0x49, 0xC7, 0xC2, 0x08, 0x00, 0x00, 0x00,                   // mov r10, 8
+            0x0F, 0x05,                                                 // syscall
+            // load oldact.handler → rax
+            0x48, 0x8B, 0x44, 0x24, 0x40,                               // mov rax, [rsp+64]
+            0x48, 0x83, 0xC4, 0x80,                                     // add rsp, 128
+        };
+        runAndCheck(r, "rt_sigaction install + readback SIGUSR1 handler", withExit(code), [](CPU64& c) {
+            return c.reg[X64_R15].u64 == 0xCAFE1234DEADBEEFULL;
+        });
+    }
+
+    // T: rt_sigaction invalid signal number (0) → -EINVAL.
+    {
+        std::vector<U8> code = {
+            0x48, 0xC7, 0xC0, 0x0D, 0x00, 0x00, 0x00,                   // mov rax, 13
+            0x48, 0x31, 0xFF,                                           // xor rdi, rdi (sig=0)
+            0x48, 0x31, 0xF6,                                           // xor rsi
+            0x48, 0x31, 0xD2,                                           // xor rdx
+            0x49, 0xC7, 0xC2, 0x08, 0x00, 0x00, 0x00,                   // mov r10, 8
+            0x0F, 0x05,                                                 // syscall
+        };
+        runAndCheck(r, "rt_sigaction sig=0 → -EINVAL", withExit(code), [](CPU64& c) {
+            return c.reg[X64_R15].u64 == 0xFFFFFFFFFFFFFFEAULL; // -22
+        });
+    }
+
+    // T: rt_sigaction bad sigsetsize (16, not 8) → -EINVAL.
+    {
+        std::vector<U8> code = {
+            0x48, 0xC7, 0xC0, 0x0D, 0x00, 0x00, 0x00,                   // mov rax, 13
+            0x48, 0xC7, 0xC7, 0x0A, 0x00, 0x00, 0x00,                   // mov rdi, 10
+            0x48, 0x31, 0xF6,                                           // xor rsi
+            0x48, 0x31, 0xD2,                                           // xor rdx
+            0x49, 0xC7, 0xC2, 0x10, 0x00, 0x00, 0x00,                   // mov r10, 16
+            0x0F, 0x05,                                                 // syscall
+        };
+        runAndCheck(r, "rt_sigaction sigsetsize=16 → -EINVAL", withExit(code), [](CPU64& c) {
+            return c.reg[X64_R15].u64 == 0xFFFFFFFFFFFFFFEAULL; // -22
+        });
+    }
+
+    // T: rt_sigaction SIGKILL (9) — write is silently dropped, readback shows
+    // no handler installed (oldact.handler stays 0). Verifies the kernel-style
+    // "accept the call but don't change the slot" behaviour.
+    {
+        std::vector<U8> code = {
+            0x48, 0x83, 0xEC, 0x80,                                     // sub rsp, 128
+            // act.handler = 0xDEADBEEF
+            0x48, 0xB8, 0xEF, 0xBE, 0xAD, 0xDE, 0x00, 0x00, 0x00, 0x00, // mov rax, 0xDEADBEEF
+            0x48, 0x89, 0x04, 0x24,                                     // mov [rsp], rax
+            0x48, 0x31, 0xC0,
+            0x48, 0x89, 0x44, 0x24, 0x08,
+            0x48, 0x89, 0x44, 0x24, 0x10,
+            0x48, 0x89, 0x44, 0x24, 0x18,
+            // attempt to install for SIGKILL — kernel silently ignores write
+            0x48, 0xC7, 0xC0, 0x0D, 0x00, 0x00, 0x00,                   // mov rax, 13
+            0x48, 0xC7, 0xC7, 0x09, 0x00, 0x00, 0x00,                   // mov rdi, 9 (SIGKILL)
+            0x48, 0x89, 0xE6,                                           // mov rsi, rsp
+            0x48, 0x31, 0xD2,                                           // xor rdx
+            0x49, 0xC7, 0xC2, 0x08, 0x00, 0x00, 0x00,                   // mov r10, 8
+            0x0F, 0x05,                                                 // syscall
+            // pre-poison oldact buffer with 0x55 so we can tell it was written
+            0x48, 0xC7, 0xC0, 0x55, 0x55, 0x55, 0x55,                   // mov rax, 0x55555555
+            0x48, 0x89, 0x44, 0x24, 0x40,                               // mov [rsp+64], rax
+            // query SIGKILL — should write zeroed slot into oldact
+            0x48, 0xC7, 0xC0, 0x0D, 0x00, 0x00, 0x00,                   // mov rax, 13
+            0x48, 0xC7, 0xC7, 0x09, 0x00, 0x00, 0x00,                   // mov rdi, 9
+            0x48, 0x31, 0xF6,                                           // xor rsi
+            0x48, 0x8D, 0x54, 0x24, 0x40,                               // lea rdx, [rsp+64]
+            0x49, 0xC7, 0xC2, 0x08, 0x00, 0x00, 0x00,
+            0x0F, 0x05,
+            // load oldact.handler — must be 0, NOT 0xDEADBEEF nor 0x55555555
+            0x48, 0x8B, 0x44, 0x24, 0x40,
+            0x48, 0x83, 0xC4, 0x80,
+        };
+        runAndCheck(r, "rt_sigaction SIGKILL write ignored", withExit(code), [](CPU64& c) {
+            return c.reg[X64_R15].u64 == 0;
+        });
+    }
+
     printf("=== self-test summary: %d passed, %d failed ===\n\n", r.passed, r.failed);
     return r.failed == 0 ? 0 : 1;
 }
