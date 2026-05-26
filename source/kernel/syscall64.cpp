@@ -70,6 +70,8 @@
 #define X64_SYS_prlimit64         302
 #define X64_SYS_getrandom         318
 #define X64_SYS_sched_yield       24
+#define X64_SYS_sched_setaffinity 203
+#define X64_SYS_sched_getaffinity 204
 #define X64_SYS_kill              62
 #define X64_SYS_gettimeofday      96
 #define X64_SYS_getrusage         98
@@ -705,6 +707,39 @@ static U64 sys_sigaltstack64(CPU64* cpu, U64 ssPtr, U64 oldSsPtr) {
     return 0;
 }
 
+// sched_getaffinity(2): glibc + libgomp probe this very early to decide thread
+// pool sizes. We expose exactly one CPU. The Linux signature is unusual:
+//   ssize_t sched_getaffinity(pid_t pid, size_t cpusetsize, cpu_set_t *mask)
+// On success returns the number of bytes the kernel actually wrote (clamped
+// to cpusetsize, but must be a multiple of sizeof(long)=8). cpusetsize must
+// be a multiple of sizeof(long) and >= 8.
+//
+// We write 8 bytes (one U64 with bit 0 set) and return 8. Userspace then
+// counts the bits to get nproc, which is exactly what we want it to see.
+static U64 sys_sched_getaffinity64(CPU64* cpu, U64 pid, U64 cpusetsize, U64 maskPtr) {
+    (void)pid; // ignore — we model one process
+    if (cpusetsize == 0 || (cpusetsize & 7)) return (U64)-K_EINVAL;
+    if (!maskPtr) return (U64)-K_EFAULT;
+    if (!cpu->memory) return (U64)-K_EFAULT;
+
+    // Write 1 in the low qword (CPU 0 is in our affinity set), zero the rest
+    // up to cpusetsize. Userspace inspects only the bytes the kernel wrote
+    // (which is our return value), so 8 bytes is enough.
+    cpu->memory->writeq(maskPtr, 1);
+    for (U64 off = 8; off < cpusetsize && off < 1024; off += 8) {
+        cpu->memory->writeq(maskPtr + off, 0);
+    }
+    return 8;
+}
+
+// sched_setaffinity(2): silently accept any mask — we don't actually move
+// the thread anywhere, but reject obviously bogus calls.
+static U64 sys_sched_setaffinity64(CPU64* cpu, U64 pid, U64 cpusetsize, U64 maskPtr) {
+    (void)cpu; (void)pid; (void)maskPtr;
+    if (cpusetsize == 0 || (cpusetsize & 7)) return (U64)-K_EINVAL;
+    return 0;
+}
+
 // Map an x86-64 Linux syscall number to a human-readable name. Used only by
 // the unimplemented-syscall log path — when running real glibc binaries, the
 // first thing you want to see is "which syscall is missing", not "#291".
@@ -783,6 +818,8 @@ static const char* x64SyscallName(U64 nr) {
         case 158: return "arch_prctl";
         case 186: return "gettid";
         case 202: return "futex";
+        case 203: return "sched_setaffinity";
+        case 204: return "sched_getaffinity";
         case 217: return "getdents64";
         case 218: return "set_tid_address";
         case 228: return "clock_gettime";
@@ -1001,6 +1038,12 @@ void ksyscall64(CPU64* cpu) {
             break;
         case X64_SYS_sched_yield:
             ret = 0;
+            break;
+        case X64_SYS_sched_getaffinity:
+            ret = sys_sched_getaffinity64(cpu, a1, a2, a3);
+            break;
+        case X64_SYS_sched_setaffinity:
+            ret = sys_sched_setaffinity64(cpu, a1, a2, a3);
             break;
         case X64_SYS_kill:
             // For now: silently succeed. glibc's abort() goes here via

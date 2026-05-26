@@ -2588,6 +2588,80 @@ int runX64SelfTest() {
         });
     }
 
+    // ----- sched_getaffinity / sched_setaffinity (Milestone B2) -----
+
+    // T: sched_getaffinity(0, 8, [rsp]) returns 8 and mask[0]=1.
+    // Pack r14 with the written mask value so the verifier can read it.
+    {
+        std::vector<U8> code = {
+            0x48, 0x83, 0xEC, 0x10,                                     // sub rsp, 16
+            // pre-poison [rsp]
+            0x48, 0xC7, 0xC0, 0xFF, 0xFF, 0xFF, 0xFF,                   // mov rax, -1
+            0x48, 0x89, 0x04, 0x24,
+            // sys_sched_getaffinity(0, 8, rsp)
+            0x48, 0xC7, 0xC0, 0xCC, 0x00, 0x00, 0x00,                   // mov rax, 204
+            0x48, 0x31, 0xFF,                                           // xor rdi, rdi (pid=0)
+            0x48, 0xC7, 0xC6, 0x08, 0x00, 0x00, 0x00,                   // mov rsi, 8
+            0x48, 0x89, 0xE2,                                           // mov rdx, rsp
+            0x0F, 0x05,
+            // stash return value (8) in r14 via the mask we just wrote
+            0x4C, 0x8B, 0x34, 0x24,                                     // mov r14, [rsp]   (should be 1)
+            0x48, 0x83, 0xC4, 0x10,                                     // add rsp, 16
+        };
+        runAndCheck(r, "sched_getaffinity returns 8, mask=1", withExit(code), [](CPU64& c) {
+            return c.reg[X64_R15].u64 == 8ULL  // return value
+                && c.reg[X64_R14].u64 == 1ULL; // written mask
+        });
+    }
+
+    // T: cpusetsize=0 → -EINVAL.
+    {
+        std::vector<U8> code = {
+            0x48, 0xC7, 0xC0, 0xCC, 0x00, 0x00, 0x00,                   // sys_sched_getaffinity
+            0x48, 0x31, 0xFF,                                           // pid=0
+            0x48, 0x31, 0xF6,                                           // cpusetsize=0
+            0x48, 0x31, 0xD2,                                           // mask=NULL (doesn't matter)
+            0x0F, 0x05,
+        };
+        runAndCheck(r, "sched_getaffinity cpusetsize=0 → -EINVAL", withExit(code), [](CPU64& c) {
+            return c.reg[X64_R15].u64 == 0xFFFFFFFFFFFFFFEAULL;
+        });
+    }
+
+    // T: cpusetsize=7 (not multiple of 8) → -EINVAL.
+    {
+        std::vector<U8> code = {
+            0x48, 0x83, 0xEC, 0x10,
+            0x48, 0xC7, 0xC0, 0xCC, 0x00, 0x00, 0x00,
+            0x48, 0x31, 0xFF,
+            0x48, 0xC7, 0xC6, 0x07, 0x00, 0x00, 0x00,                   // cpusetsize=7
+            0x48, 0x89, 0xE2,
+            0x0F, 0x05,
+            0x48, 0x83, 0xC4, 0x10,
+        };
+        runAndCheck(r, "sched_getaffinity cpusetsize=7 → -EINVAL", withExit(code), [](CPU64& c) {
+            return c.reg[X64_R15].u64 == 0xFFFFFFFFFFFFFFEAULL;
+        });
+    }
+
+    // T: sched_setaffinity accepts valid args.
+    {
+        std::vector<U8> code = {
+            0x48, 0x83, 0xEC, 0x10,
+            0x48, 0xC7, 0xC0, 0x01, 0x00, 0x00, 0x00,                   // mask=1
+            0x48, 0x89, 0x04, 0x24,
+            0x48, 0xC7, 0xC0, 0xCB, 0x00, 0x00, 0x00,                   // sys_sched_setaffinity (203)
+            0x48, 0x31, 0xFF,
+            0x48, 0xC7, 0xC6, 0x08, 0x00, 0x00, 0x00,
+            0x48, 0x89, 0xE2,
+            0x0F, 0x05,
+            0x48, 0x83, 0xC4, 0x10,
+        };
+        runAndCheck(r, "sched_setaffinity(valid) → 0", withExit(code), [](CPU64& c) {
+            return c.reg[X64_R15].u64 == 0;
+        });
+    }
+
     printf("=== self-test summary: %d passed, %d failed ===\n\n", r.passed, r.failed);
     return r.failed == 0 ? 0 : 1;
 }
