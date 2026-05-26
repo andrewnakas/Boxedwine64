@@ -2783,6 +2783,45 @@ U32 CPU64::step() {
             rip += used;
             return used;
         }
+        // 0F 01 — group containing XGETBV / RDTSCP / SWAPGS / etc.
+        // The third byte distinguishes the form. We implement the two
+        // that user-space glibc actually issues:
+        //   0F 01 D0   XGETBV   — read XSAVE feature mask into EDX:EAX
+        //   0F 01 F9   RDTSCP   — read TSC and processor ID
+        if (op2 == 0x01) {
+            U8 op3 = fetchByte(rip + opOff + 2);
+            if (op3 == 0xD0) {
+                // XGETBV: glibc calls it via __get_cpu_features to decide
+                // which XMM state is enabled. We advertise legacy XSAVE
+                // state only: bit0=x87, bit1=SSE → ECX selector 0 returns
+                // EDX:EAX = 0:0x3.
+                if (reg[X64_RCX].u32 == 0) {
+                    reg[X64_RAX].setU64(0x3);
+                    reg[X64_RDX].setU64(0);
+                } else {
+                    // Unknown XCR — return zero (legacy behaviour).
+                    reg[X64_RAX].setU64(0);
+                    reg[X64_RDX].setU64(0);
+                }
+                U32 used = opOff + 3;
+                rip += used;
+                return used;
+            }
+            if (op3 == 0xF9) {
+                // RDTSCP: same as RDTSC plus aux ID in ECX. Reuse the
+                // TSC counter our RDTSC path uses (instructionCount-based
+                // monotonic synthetic clock); ECX = 0 (CPU 0).
+                U64 tsc = (U64)instructionCount;
+                reg[X64_RAX].setU64(tsc & 0xFFFFFFFFULL);
+                reg[X64_RDX].setU64((tsc >> 32) & 0xFFFFFFFFULL);
+                reg[X64_RCX].setU64(0);
+                U32 used = opOff + 3;
+                rip += used;
+                return used;
+            }
+            // Fall through to default panic for unimplemented 0F 01 .. forms.
+        }
+
         // PREFETCH* — 0F 18 /reg. Treated as a no-op (hint only).
         if (op2 == 0x18) {
             ModRM m = decodeModRM(rip + opOff + 2, p, 0);

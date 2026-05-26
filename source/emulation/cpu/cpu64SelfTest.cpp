@@ -1273,6 +1273,33 @@ int runX64SelfTest() {
         });
     }
 
+    // Test 66 — XGETBV(0) returns EAX=3 (x87+SSE enabled), EDX=0.
+    // Encoding: xor ecx,ecx; xgetbv; shl rdx,32; or rax,rdx.
+    {
+        std::vector<U8> code = {
+            0x31, 0xC9,             // xor ecx, ecx
+            0x0F, 0x01, 0xD0,       // xgetbv
+            0x48, 0xC1, 0xE2, 0x20, // shl rdx, 32
+            0x48, 0x09, 0xD0,       // or rax, rdx
+        };
+        runAndCheck(r, "xgetbv(0) → EDX:EAX = 0:3", withExit(code), [](CPU64& c) {
+            return c.reg[X64_R15].u64 == 0x3;
+        });
+    }
+
+    // Test 67 — RDTSCP returns ECX=0 (CPU 0). We don't check the TSC value
+    // since it's monotonic but synthetic; just verify ECX was zeroed.
+    {
+        std::vector<U8> code = {
+            0x48, 0xC7, 0xC1, 0xFF, 0x00, 0x00, 0x00, // mov rcx, 0xFF (sentinel)
+            0x0F, 0x01, 0xF9,                          // rdtscp
+            0x48, 0x89, 0xC8,                          // mov rax, rcx (capture ECX→RAX)
+        };
+        runAndCheck(r, "rdtscp → ECX = 0 (cpu id)", withExit(code), [](CPU64& c) {
+            return c.reg[X64_R15].u64 == 0;
+        });
+    }
+
     printf("=== self-test summary: %d passed, %d failed ===\n\n", r.passed, r.failed);
     return r.failed == 0 ? 0 : 1;
 }
