@@ -971,17 +971,11 @@ int runX64SelfTest() {
         std::vector<U8> code = {
             0xFD,                         // std
             0x9C,                         // pushfq
-            0x58,                         // pop rax
-            0xFC,                         // cld
-            0x9C,                         // pushfq
-            0x5B,                         // pop rbx
-            // r15 := (rax & DF) | ((rbx & DF) << 1).  We want bit0=1 (DF after STD)
-            // and bit1=0 (DF after CLD), so result = 1.
-            0x48, 0x83, 0xE0, 0x40,        // (we want bit 10 (0x400), not 0x40 — let me restructure below)
-            // ... simpler: just check r15 = rax (which should have DF=1).
-            0x49, 0x89, 0xC7,              // mov r15, rax
-            0x48, 0xC7, 0xC0, 0x3C, 0x00, 0x00, 0x00,
-            0x0F, 0x05,
+            0x58,                         // pop rax            ; rax = rflags with DF=1
+            0xFC,                         // cld                 ; restore DF=0 before exiting
+            0x49, 0x89, 0xC7,             // mov r15, rax
+            0x48, 0xC7, 0xC0, 0x3C, 0x00, 0x00, 0x00, // mov rax, 60
+            0x0F, 0x05,                   // syscall (exit)
         };
         runAndCheck(r, "std sets DF in rflags (bit 0x400)", code, [](CPU64& c) {
             return (c.reg[X64_R15].u64 & 0x400ULL) != 0;
