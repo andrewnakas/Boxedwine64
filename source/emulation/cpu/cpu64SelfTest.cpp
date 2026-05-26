@@ -404,6 +404,150 @@ int runX64SelfTest() {
         });
     }
 
+    // Test 22b: BTR rax, 7. Start with 0xFF; clear bit 7 → 0x7F.
+    {
+        std::vector<U8> code = {
+            0x48, 0xC7, 0xC0, 0xFF, 0x00, 0x00, 0x00,                     // mov rax, 0xFF
+            0x48, 0x0F, 0xBA, 0xF0, 0x07,                                 // btr rax, 7
+        };
+        runAndCheck(r, "btr rax, 7 (0xFF → 0x7F)", withExit(code), [](CPU64& c) {
+            return c.reg[X64_R15].u64 == 0x7FULL;
+        });
+    }
+
+    // Test 22c: BTC rax, 0. Toggle bit 0 of zero → 1.
+    {
+        std::vector<U8> code = {
+            0x48, 0x31, 0xC0,                                             // xor rax, rax
+            0x48, 0x0F, 0xBA, 0xF8, 0x00,                                 // btc rax, 0
+        };
+        runAndCheck(r, "btc rax, 0 (0 → 1)", withExit(code), [](CPU64& c) {
+            return c.reg[X64_R15].u64 == 1ULL;
+        });
+    }
+
+    // Test 22d: BT (read-only) — verify CF reflects the bit. rax=0x20, bit 5 set;
+    // bt sets CF=1; setc cl captures it; movzx rcx; mov rax,rcx → 1.
+    {
+        std::vector<U8> code = {
+            0x48, 0xC7, 0xC0, 0x20, 0x00, 0x00, 0x00,                     // mov rax, 0x20
+            0x48, 0x0F, 0xBA, 0xE0, 0x05,                                 // bt rax, 5
+            0x0F, 0x92, 0xC1,                                             // setc cl
+            0x48, 0x0F, 0xB6, 0xC1,                                       // movzx rcx, cl
+            0x48, 0x89, 0xC8,                                             // mov rax, rcx
+        };
+        runAndCheck(r, "bt+setc (bit 5 of 0x20 → CF=1)", withExit(code), [](CPU64& c) {
+            return c.reg[X64_R15].u64 == 1ULL;
+        });
+    }
+
+    // Test 22e: CMOVE taken — xor sets ZF; cmove copies rbx into rax.
+    {
+        std::vector<U8> code = {
+            0x48, 0x31, 0xC0,                                             // xor rax, rax        ; ZF=1
+            0x48, 0xC7, 0xC3, 0x42, 0x00, 0x00, 0x00,                     // mov rbx, 0x42
+            0x48, 0x0F, 0x44, 0xC3,                                       // cmove rax, rbx
+        };
+        runAndCheck(r, "cmove taken (ZF=1)", withExit(code), [](CPU64& c) {
+            return c.reg[X64_R15].u64 == 0x42ULL;
+        });
+    }
+
+    // Test 22f: CMOVNE not taken — same ZF=1 setup, but cmovne is condition NE.
+    // rax must keep its zero value because the move is not performed.
+    {
+        std::vector<U8> code = {
+            0x48, 0x31, 0xC0,                                             // xor rax, rax        ; ZF=1
+            0x48, 0xC7, 0xC3, 0x42, 0x00, 0x00, 0x00,                     // mov rbx, 0x42
+            0x48, 0x0F, 0x45, 0xC3,                                       // cmovne rax, rbx     ; not taken
+        };
+        runAndCheck(r, "cmovne not taken (ZF=1)", withExit(code), [](CPU64& c) {
+            return c.reg[X64_R15].u64 == 0ULL;
+        });
+    }
+
+    // Test 22g: CMOVL signed — rax=-1, cmp rax,5 → SF=1, OF=0, SF≠OF → L true.
+    {
+        std::vector<U8> code = {
+            0x48, 0xC7, 0xC0, 0xFF, 0xFF, 0xFF, 0xFF,                     // mov rax, -1 (sign-extended)
+            0x48, 0x83, 0xF8, 0x05,                                       // cmp rax, 5
+            0x48, 0xC7, 0xC3, 0xAA, 0x00, 0x00, 0x00,                     // mov rbx, 0xAA
+            0x48, 0x0F, 0x4C, 0xC3,                                       // cmovl rax, rbx
+        };
+        runAndCheck(r, "cmovl taken (-1 < 5 signed)", withExit(code), [](CPU64& c) {
+            return c.reg[X64_R15].u64 == 0xAAULL;
+        });
+    }
+
+    // Test 22h: CMOVB unsigned — rax=3, cmp rax,5 → CF=1 → B (below) true.
+    {
+        std::vector<U8> code = {
+            0x48, 0xC7, 0xC0, 0x03, 0x00, 0x00, 0x00,                     // mov rax, 3
+            0x48, 0x83, 0xF8, 0x05,                                       // cmp rax, 5
+            0x48, 0xC7, 0xC3, 0xCC, 0x00, 0x00, 0x00,                     // mov rbx, 0xCC
+            0x48, 0x0F, 0x42, 0xC3,                                       // cmovb rax, rbx
+        };
+        runAndCheck(r, "cmovb taken (3 < 5 unsigned)", withExit(code), [](CPU64& c) {
+            return c.reg[X64_R15].u64 == 0xCCULL;
+        });
+    }
+
+    // Test 22i: CMOVcc 32-bit not-taken zero-extension quirk. When the
+    // destination is the 32-bit name of a register, *any* write (including the
+    // implicit no-op write when CMOVcc is not taken) must zero the upper 32
+    // bits. Start with rax = 0xFFFFFFFFFFFFFFFF, run a not-taken cmove eax,ebx,
+    // and verify the upper 32 bits are now zero.
+    {
+        std::vector<U8> code = {
+            0x48, 0xB8, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,   // mov rax, -1
+            0x48, 0x83, 0xF8, 0x00,                                       // cmp rax, 0  ; ZF=0
+            0xBB, 0x42, 0x00, 0x00, 0x00,                                 // mov ebx, 0x42
+            0x0F, 0x44, 0xC3,                                             // cmove eax, ebx  ; not taken
+        };
+        runAndCheck(r, "cmove eax (not taken) zero-extends upper 32", withExit(code), [](CPU64& c) {
+            return c.reg[X64_R15].u64 == 0xFFFFFFFFULL;
+        });
+    }
+
+    // Test 22j: SETE — cmp rax,rax forces ZF=1; sete al; movzx → 1.
+    {
+        std::vector<U8> code = {
+            0x48, 0x31, 0xC0,                                             // xor rax, rax
+            0x48, 0x39, 0xC0,                                             // cmp rax, rax  ; ZF=1
+            0x0F, 0x94, 0xC0,                                             // sete al
+            0x48, 0x0F, 0xB6, 0xC0,                                       // movzx rax, al
+        };
+        runAndCheck(r, "sete (equal → 1)", withExit(code), [](CPU64& c) {
+            return c.reg[X64_R15].u64 == 1ULL;
+        });
+    }
+
+    // Test 22k: SETB — unsigned below, opposite-of-setg pair.
+    {
+        std::vector<U8> code = {
+            0x48, 0xC7, 0xC0, 0x03, 0x00, 0x00, 0x00,                     // mov rax, 3
+            0x48, 0x83, 0xF8, 0x05,                                       // cmp rax, 5
+            0x0F, 0x92, 0xC0,                                             // setb al
+            0x48, 0x0F, 0xB6, 0xC0,                                       // movzx rax, al
+        };
+        runAndCheck(r, "setb (3 < 5 unsigned → 1)", withExit(code), [](CPU64& c) {
+            return c.reg[X64_R15].u64 == 1ULL;
+        });
+    }
+
+    // Test 22l: SETL — signed less; rax=-1, cmp rax,0 → SF=1, OF=0 → L true.
+    {
+        std::vector<U8> code = {
+            0x48, 0xC7, 0xC0, 0xFF, 0xFF, 0xFF, 0xFF,                     // mov rax, -1
+            0x48, 0x83, 0xF8, 0x00,                                       // cmp rax, 0
+            0x0F, 0x9C, 0xC0,                                             // setl al
+            0x48, 0x0F, 0xB6, 0xC0,                                       // movzx rax, al
+        };
+        runAndCheck(r, "setl (-1 < 0 signed → 1)", withExit(code), [](CPU64& c) {
+            return c.reg[X64_R15].u64 == 1ULL;
+        });
+    }
+
     // Test 23: POPCNT. popcnt(0xFF) = 8.
     {
         std::vector<U8> code = {
