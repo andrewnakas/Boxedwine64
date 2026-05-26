@@ -2838,6 +2838,86 @@ U32 CPU64::step() {
             return used;
         }
 
+        // ---- SSSE3 three-byte opcodes ----
+        //
+        // 66 0F 38 00 /r  — PSHUFB  xmm1, xmm2/m128
+        //   For each byte i of the destination: if shuffle[i] high bit set,
+        //   write 0; else write src[shuffle[i] & 0x0F]. Used by glibc's
+        //   SSSE3-optimised strlen/strcmp/memcpy.
+        //
+        // 66 0F 3A 0F /r ib — PALIGNR xmm1, xmm2/m128, imm8
+        //   Concatenate dest:src into a 32-byte temp, then right-shift it
+        //   by imm8 bytes, take the low 16 bytes. Used by some glibc
+        //   memcpy variants and Wine's CRT.
+        if ((op2 == 0x38 || op2 == 0x3A) && osize66) {
+            U8 op3 = fetchByte(rip + opOff + 2);
+            if (op2 == 0x38 && op3 == 0x00) {
+                // PSHUFB
+                ModRM m = decodeModRM(rip + opOff + 3, p, 0);
+                U64 ctrlLo, ctrlHi;
+                if (m.isReg) {
+                    ctrlLo = xmm[m.rmIndex].lo;
+                    ctrlHi = xmm[m.rmIndex].hi;
+                } else {
+                    ctrlLo = memory->readq(m.effAddr);
+                    ctrlHi = memory->readq(m.effAddr + 8);
+                }
+                U8 src[16];
+                for (int i = 0; i < 8; i++) src[i]     = (U8)(xmm[m.regField].lo >> (i*8));
+                for (int i = 0; i < 8; i++) src[i+8]   = (U8)(xmm[m.regField].hi >> (i*8));
+                U8 ctrl[16];
+                for (int i = 0; i < 8; i++) ctrl[i]    = (U8)(ctrlLo >> (i*8));
+                for (int i = 0; i < 8; i++) ctrl[i+8]  = (U8)(ctrlHi >> (i*8));
+                U8 dst[16];
+                for (int i = 0; i < 16; i++) {
+                    dst[i] = (ctrl[i] & 0x80) ? 0 : src[ctrl[i] & 0x0F];
+                }
+                U64 nLo = 0, nHi = 0;
+                for (int i = 0; i < 8; i++) nLo |= ((U64)dst[i])   << (i*8);
+                for (int i = 0; i < 8; i++) nHi |= ((U64)dst[i+8]) << (i*8);
+                xmm[m.regField].lo = nLo;
+                xmm[m.regField].hi = nHi;
+                U32 used = opOff + 3 + m.length;
+                rip += used;
+                return used;
+            }
+            if (op2 == 0x3A && op3 == 0x0F) {
+                // PALIGNR
+                ModRM m = decodeModRM(rip + opOff + 3, p, 1);
+                U64 srcLo, srcHi;
+                if (m.isReg) {
+                    srcLo = xmm[m.rmIndex].lo;
+                    srcHi = xmm[m.rmIndex].hi;
+                } else {
+                    srcLo = memory->readq(m.effAddr);
+                    srcHi = memory->readq(m.effAddr + 8);
+                }
+                U8 imm = fetchByte(rip + opOff + 3 + m.length);
+                // Concatenate dest:src — dest is high 16, src is low 16.
+                U8 cat[32];
+                for (int i = 0; i < 8; i++) cat[i]     = (U8)(srcLo >> (i*8));
+                for (int i = 0; i < 8; i++) cat[i+8]   = (U8)(srcHi >> (i*8));
+                for (int i = 0; i < 8; i++) cat[i+16]  = (U8)(xmm[m.regField].lo >> (i*8));
+                for (int i = 0; i < 8; i++) cat[i+24]  = (U8)(xmm[m.regField].hi >> (i*8));
+                U8 dst[16] = {0};
+                if (imm < 32) {
+                    for (int i = 0; i < 16; i++) {
+                        int idx = i + imm;
+                        dst[i] = (idx < 32) ? cat[idx] : 0;
+                    }
+                }
+                U64 nLo = 0, nHi = 0;
+                for (int i = 0; i < 8; i++) nLo |= ((U64)dst[i])   << (i*8);
+                for (int i = 0; i < 8; i++) nHi |= ((U64)dst[i+8]) << (i*8);
+                xmm[m.regField].lo = nLo;
+                xmm[m.regField].hi = nHi;
+                U32 used = opOff + 3 + m.length + 1;
+                rip += used;
+                return used;
+            }
+            // Other 0F 38 / 0F 3A forms — fall through to default panic.
+        }
+
         // ---- SSE2 scalar double-precision FP ----
         //
         // Scalar SSE2 ops touch only the low 64 bits of the XMM register

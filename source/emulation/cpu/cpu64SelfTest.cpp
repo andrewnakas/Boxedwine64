@@ -1300,6 +1300,79 @@ int runX64SelfTest() {
         });
     }
 
+    // Test 68 — PSHUFB reverses the low 8 bytes.
+    //   xmm0.lo = 0x0706050403020100 (bytes: 0x00,0x01,...,0x07)
+    //   xmm1.lo = 0x0001020304050607 (shuffle ctrl: pick src[7],src[6],...,src[0])
+    //   PSHUFB xmm0, xmm1
+    //   xmm0.lo should be 0x0001020304050607 (reversed bytes)
+    {
+        std::vector<U8> code = {
+            0x48, 0xB8, 0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07,
+            0x66, 0x48, 0x0F, 0x6E, 0xC0,                                // movq xmm0, rax
+            0x48, 0xB8, 0x07, 0x06, 0x05, 0x04, 0x03, 0x02, 0x01, 0x00,
+            0x66, 0x48, 0x0F, 0x6E, 0xC8,                                // movq xmm1, rax
+            0x66, 0x0F, 0x38, 0x00, 0xC1,                                // pshufb xmm0, xmm1
+            0x66, 0x48, 0x0F, 0x7E, 0xC0,                                // movq rax, xmm0
+        };
+        runAndCheck(r, "pshufb reverses low 8 bytes", withExit(code), [](CPU64& c) {
+            return c.reg[X64_R15].u64 == 0x0001020304050607ULL;
+        });
+    }
+
+    // Test 69 — PSHUFB zero-byte semantics: ctrl byte with high bit set → 0.
+    //   xmm0.lo = 0xDEADBEEFCAFEBABE
+    //   xmm1.lo = all 0x80 (every ctrl byte requests "write zero")
+    //   PSHUFB xmm0, xmm1 → xmm0.lo should be 0
+    {
+        std::vector<U8> code = {
+            0x48, 0xB8, 0xBE, 0xBA, 0xFE, 0xCA, 0xEF, 0xBE, 0xAD, 0xDE,
+            0x66, 0x48, 0x0F, 0x6E, 0xC0,                                // movq xmm0, rax
+            0x48, 0xB8, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80,
+            0x66, 0x48, 0x0F, 0x6E, 0xC8,                                // movq xmm1, rax
+            0x66, 0x0F, 0x38, 0x00, 0xC1,                                // pshufb xmm0, xmm1
+            0x66, 0x48, 0x0F, 0x7E, 0xC0,                                // movq rax, xmm0
+        };
+        runAndCheck(r, "pshufb high-bit ctrl produces zero bytes", withExit(code), [](CPU64& c) {
+            return c.reg[X64_R15].u64 == 0;
+        });
+    }
+
+    // Test 70 — PALIGNR with imm=8 takes the high 8 bytes of src and low 8
+    // of dest. With dest.lo=0xAA..., src.lo=0xBB..., src.hi=0, dest.hi=0:
+    //   concatenated = src(16B) || dest(16B), shifted right by 8 bytes
+    //   the resulting low 16B starts at byte 8 of the concatenation, which is
+    //   src.hi (0) followed by dest.lo, so low qword = dest.lo (0xAA...).
+    // But our movq sets .hi=0 for both, so result.lo = 0 (src.hi),
+    // result.hi = dest.lo (0xAA...). We read back .lo, expecting 0.
+    {
+        std::vector<U8> code = {
+            0x48, 0xB8, 0xAA, 0xAA, 0xAA, 0xAA, 0xAA, 0xAA, 0xAA, 0xAA,
+            0x66, 0x48, 0x0F, 0x6E, 0xC0,                                // movq xmm0, rax
+            0x48, 0xB8, 0xBB, 0xBB, 0xBB, 0xBB, 0xBB, 0xBB, 0xBB, 0xBB,
+            0x66, 0x48, 0x0F, 0x6E, 0xC8,                                // movq xmm1, rax
+            0x66, 0x0F, 0x3A, 0x0F, 0xC1, 0x08,                          // palignr xmm0, xmm1, 8
+            0x66, 0x48, 0x0F, 0x7E, 0xC0,                                // movq rax, xmm0
+        };
+        runAndCheck(r, "palignr imm=8 shifts concatenated 32B right by 8", withExit(code), [](CPU64& c) {
+            return c.reg[X64_R15].u64 == 0;
+        });
+    }
+
+    // Test 71 — PALIGNR imm=0 returns src unchanged (low 16B = src).
+    // src.lo = 0xCAFEBABEDEADBEEF, after movq src.hi=0. dest is don't-care.
+    // Result.lo = src.lo, so read back rax = 0xCAFEBABEDEADBEEF.
+    {
+        std::vector<U8> code = {
+            0x48, 0xB8, 0xEF, 0xBE, 0xAD, 0xDE, 0xBE, 0xBA, 0xFE, 0xCA,
+            0x66, 0x48, 0x0F, 0x6E, 0xC8,                                // movq xmm1, rax
+            0x66, 0x0F, 0x3A, 0x0F, 0xC1, 0x00,                          // palignr xmm0, xmm1, 0
+            0x66, 0x48, 0x0F, 0x7E, 0xC0,                                // movq rax, xmm0
+        };
+        runAndCheck(r, "palignr imm=0 copies src to dest", withExit(code), [](CPU64& c) {
+            return c.reg[X64_R15].u64 == 0xCAFEBABEDEADBEEFULL;
+        });
+    }
+
     printf("=== self-test summary: %d passed, %d failed ===\n\n", r.passed, r.failed);
     return r.failed == 0 ? 0 : 1;
 }
