@@ -77,6 +77,11 @@ public:
     };
     SigAction sigActions[65] = {};
 
+    // Signal blocking mask, round-tripped through rt_sigprocmask(2). Bit N
+    // (1..64) corresponds to signal N+1. v1 stores only — no enforcement
+    // at delivery time, since delivery itself isn't built yet.
+    U64 sigMask = 0;
+
     KThread*   thread = nullptr;
     KMemory64* memory = nullptr;
 

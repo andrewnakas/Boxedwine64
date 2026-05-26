@@ -620,6 +620,38 @@ static U64 sys_rt_sigaction64(CPU64* cpu, U64 sig, U64 actPtr, U64 oldActPtr,
     return 0;
 }
 
+// rt_sigprocmask(2) — storage-only round-trip, paired with rt_sigaction
+// above. how=SIG_BLOCK(0)/SIG_UNBLOCK(1)/SIG_SETMASK(2). v1 enforces nothing
+// at delivery time (no delivery yet) but lets pthread_sigmask round-trip
+// without losing state, which libpthread queries during thread init.
+#define X64_SIG_BLOCK   0
+#define X64_SIG_UNBLOCK 1
+#define X64_SIG_SETMASK 2
+
+static U64 sys_rt_sigprocmask64(CPU64* cpu, U64 how, U64 setPtr, U64 oldSetPtr,
+                                U64 sigsetsize) {
+    if (sigsetsize != 8) return (U64)-K_EINVAL;
+    if (!cpu->memory) return (U64)-K_EFAULT;
+
+    if (oldSetPtr) {
+        cpu->memory->writeq(oldSetPtr, cpu->sigMask);
+    }
+    if (setPtr) {
+        U64 incoming = cpu->memory->readq(setPtr);
+        // SIGKILL(9) and SIGSTOP(19) can never be blocked — strip them
+        // from any incoming mask to match kernel behaviour.
+        U64 kernelStrip = (1ULL << (9 - 1)) | (1ULL << (19 - 1));
+        incoming &= ~kernelStrip;
+        switch (how) {
+            case X64_SIG_BLOCK:   cpu->sigMask |=  incoming; break;
+            case X64_SIG_UNBLOCK: cpu->sigMask &= ~incoming; break;
+            case X64_SIG_SETMASK: cpu->sigMask  =  incoming; break;
+            default: return (U64)-K_EINVAL;
+        }
+    }
+    return 0;
+}
+
 // Map an x86-64 Linux syscall number to a human-readable name. Used only by
 // the unimplemented-syscall log path — when running real glibc binaries, the
 // first thing you want to see is "which syscall is missing", not "#291".
@@ -768,8 +800,10 @@ void ksyscall64(CPU64* cpu) {
         case X64_SYS_rt_sigaction:
             ret = sys_rt_sigaction64(cpu, a1, a2, a3, a4);
             break;
-        case X64_SYS_set_robust_list:
         case X64_SYS_rt_sigprocmask:
+            ret = sys_rt_sigprocmask64(cpu, a1, a2, a3, a4);
+            break;
+        case X64_SYS_set_robust_list:
         case X64_SYS_ioctl:
         case X64_SYS_madvise:
         case X64_SYS_sigaltstack:
