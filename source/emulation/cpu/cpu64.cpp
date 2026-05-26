@@ -3093,6 +3093,144 @@ U32 CPU64::step() {
             rip += used;
             return used;
         }
+
+        // ---- SSE scalar single-precision FP ----
+        //
+        // Mirror image of the F2 0F double-precision block. F3 prefix +
+        // 0F xx selects the scalar single (float) form. Touches only the
+        // low 32 bits (one float) of the XMM register; bits 32..127 are
+        // left untouched on reg/reg moves and zeroed on memory loads.
+        auto u32ToFloat = [](U32 bits) -> float {
+            float f; std::memcpy(&f, &bits, sizeof(f)); return f;
+        };
+        auto floatToU32 = [](float f) -> U32 {
+            U32 bits; std::memcpy(&bits, &f, sizeof(bits)); return bits;
+        };
+
+        // MOVSS xmm, xmm/m32   F3 0F 10 /r
+        // MOVSS xmm/m32, xmm   F3 0F 11 /r
+        if ((op2 == 0x10 || op2 == 0x11) && p.rep == 0xF3) {
+            ModRM m = decodeModRM(rip + opOff + 2, p, 0);
+            bool isStore = (op2 == 0x11);
+            if (isStore) {
+                U32 v = (U32)(xmm[m.regField].lo & 0xFFFFFFFFULL);
+                if (m.isReg) {
+                    // reg/reg: replace low 32 bits, leave rest.
+                    U64 keep = xmm[m.rmIndex].lo & 0xFFFFFFFF00000000ULL;
+                    xmm[m.rmIndex].lo = keep | v;
+                } else {
+                    memory->writed(m.effAddr, v);
+                }
+            } else {
+                U32 v;
+                if (m.isReg) {
+                    v = (U32)(xmm[m.rmIndex].lo & 0xFFFFFFFFULL);
+                    U64 keep = xmm[m.regField].lo & 0xFFFFFFFF00000000ULL;
+                    xmm[m.regField].lo = keep | v;
+                    // .hi unchanged for reg/reg
+                } else {
+                    v = memory->readd(m.effAddr);
+                    xmm[m.regField].lo = (U64)v; // zero-extend; high32 of lo cleared
+                    xmm[m.regField].hi = 0;      // memory form zeros high qword too
+                }
+            }
+            U32 used = opOff + 2 + m.length;
+            rip += used;
+            return used;
+        }
+
+        // Scalar single arithmetic:
+        //   ADDSS  F3 0F 58
+        //   MULSS  F3 0F 59
+        //   SUBSS  F3 0F 5C
+        //   DIVSS  F3 0F 5E
+        //   SQRTSS F3 0F 51
+        //   MINSS  F3 0F 5D
+        //   MAXSS  F3 0F 5F
+        if (p.rep == 0xF3 &&
+            (op2 == 0x58 || op2 == 0x59 || op2 == 0x5C || op2 == 0x5E ||
+             op2 == 0x51 || op2 == 0x5D || op2 == 0x5F)) {
+            ModRM m = decodeModRM(rip + opOff + 2, p, 0);
+            U32 srcBits = m.isReg
+                ? (U32)(xmm[m.rmIndex].lo & 0xFFFFFFFFULL)
+                : memory->readd(m.effAddr);
+            float a = u32ToFloat((U32)(xmm[m.regField].lo & 0xFFFFFFFFULL));
+            float b = u32ToFloat(srcBits);
+            float r;
+            switch (op2) {
+                case 0x58: r = a + b; break;
+                case 0x59: r = a * b; break;
+                case 0x5C: r = a - b; break;
+                case 0x5E: r = a / b; break;
+                case 0x51: r = std::sqrt(b); break; // SQRT uses src as input
+                case 0x5D: r = (a < b) ? a : b; break;
+                case 0x5F: r = (a > b) ? a : b; break;
+                default:   r = a; break;
+            }
+            U64 keep = xmm[m.regField].lo & 0xFFFFFFFF00000000ULL;
+            xmm[m.regField].lo = keep | (U64)floatToU32(r);
+            U32 used = opOff + 2 + m.length;
+            rip += used;
+            return used;
+        }
+
+        // CVTSI2SS xmm, r/m32 (or r/m64 with REX.W)  F3 0F 2A /r
+        if (op2 == 0x2A && p.rep == 0xF3) {
+            ModRM m = decodeModRM(rip + opOff + 2, p, 0);
+            float f;
+            if (rexW) {
+                S64 v = m.isReg ? (S64)reg[m.rmIndex].u64 : (S64)memory->readq(m.effAddr);
+                f = (float)v;
+            } else {
+                S32 v = m.isReg ? (S32)reg[m.rmIndex].u32 : (S32)memory->readd(m.effAddr);
+                f = (float)v;
+            }
+            U64 keep = xmm[m.regField].lo & 0xFFFFFFFF00000000ULL;
+            xmm[m.regField].lo = keep | (U64)floatToU32(f);
+            U32 used = opOff + 2 + m.length;
+            rip += used;
+            return used;
+        }
+
+        // CVTSS2SI r32/r64, xmm/m32   F3 0F 2D /r
+        if (op2 == 0x2D && p.rep == 0xF3) {
+            ModRM m = decodeModRM(rip + opOff + 2, p, 0);
+            U32 srcBits = m.isReg
+                ? (U32)(xmm[m.rmIndex].lo & 0xFFFFFFFFULL)
+                : memory->readd(m.effAddr);
+            float f = u32ToFloat(srcBits);
+            if (rexW) reg[m.regField].setU64((U64)(S64)f);
+            else      reg[m.regField].setU32((U32)(S32)f);
+            U32 used = opOff + 2 + m.length;
+            rip += used;
+            return used;
+        }
+
+        // UCOMISS xmm, xmm/m32   0F 2E /r   (no 66, no F2/F3 prefix)
+        // COMISS  xmm, xmm/m32   0F 2F /r
+        if ((op2 == 0x2E || op2 == 0x2F) && !osize66 && p.rep == 0) {
+            ModRM m = decodeModRM(rip + opOff + 2, p, 0);
+            U32 srcBits = m.isReg
+                ? (U32)(xmm[m.rmIndex].lo & 0xFFFFFFFFULL)
+                : memory->readd(m.effAddr);
+            float a = u32ToFloat((U32)(xmm[m.regField].lo & 0xFFFFFFFFULL));
+            float b = u32ToFloat(srcBits);
+            U64 newFlags = rflags & ~(X64_ZF | X64_PF | X64_CF |
+                                      X64_OF | X64_SF | X64_AF);
+            if (std::isnan(a) || std::isnan(b)) {
+                newFlags |= X64_ZF | X64_PF | X64_CF;
+            } else if (a > b) {
+                // all three remain 0
+            } else if (a < b) {
+                newFlags |= X64_CF;
+            } else {
+                newFlags |= X64_ZF;
+            }
+            rflags = newFlags;
+            U32 used = opOff + 2 + m.length;
+            rip += used;
+            return used;
+        }
     }
 
     // FXSAVE / FXRSTOR (0F AE /0 and /1). v1: no-op — we don't model x87/SSE

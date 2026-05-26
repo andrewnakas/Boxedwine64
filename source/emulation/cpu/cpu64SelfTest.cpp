@@ -1439,6 +1439,129 @@ int runX64SelfTest() {
         });
     }
 
+    // ---- SSE scalar single-precision FP (MOVSS + ADDSS family) ----
+    //
+    // Pattern: load 32-bit float bits into low dword of an xmm via movd,
+    // then run the scalar op, then read low dword back into eax.
+    //   movd xmm0, eax   = 66 0F 6E /r  (we use it in 32-bit form, no REX.W)
+    //   movd eax, xmm0   = 66 0F 7E /r
+    // For two-source ops we use cvtsi2ss to load the second operand from
+    // an integer constant directly into xmm1.
+
+    // Test 76 — ADDSS 2.0 + 3.0 = 5.0
+    //   IEEE-754 bits: 2.0f=0x40000000, 3.0f=0x40400000, 5.0f=0x40A00000
+    {
+        std::vector<U8> code = {
+            0xB8, 0x00, 0x00, 0x00, 0x40,           // mov eax, 0x40000000 (2.0f)
+            0x66, 0x0F, 0x6E, 0xC0,                 // movd xmm0, eax
+            0xB8, 0x00, 0x00, 0x40, 0x40,           // mov eax, 0x40400000 (3.0f)
+            0x66, 0x0F, 0x6E, 0xC8,                 // movd xmm1, eax
+            0xF3, 0x0F, 0x58, 0xC1,                 // addss xmm0, xmm1
+            0x66, 0x0F, 0x7E, 0xC0,                 // movd eax, xmm0
+        };
+        runAndCheck(r, "addss 2.0f + 3.0f = 5.0f", withExit(code), [](CPU64& c) {
+            return c.reg[X64_R15].u64 == 0x40A00000ULL;
+        });
+    }
+
+    // Test 77 — MULSS 2.0 * 3.0 = 6.0 (bits 0x40C00000)
+    {
+        std::vector<U8> code = {
+            0xB8, 0x00, 0x00, 0x00, 0x40,           // mov eax, 2.0f
+            0x66, 0x0F, 0x6E, 0xC0,                 // movd xmm0, eax
+            0xB8, 0x00, 0x00, 0x40, 0x40,           // mov eax, 3.0f
+            0x66, 0x0F, 0x6E, 0xC8,                 // movd xmm1, eax
+            0xF3, 0x0F, 0x59, 0xC1,                 // mulss xmm0, xmm1
+            0x66, 0x0F, 0x7E, 0xC0,                 // movd eax, xmm0
+        };
+        runAndCheck(r, "mulss 2.0f * 3.0f = 6.0f", withExit(code), [](CPU64& c) {
+            return c.reg[X64_R15].u64 == 0x40C00000ULL;
+        });
+    }
+
+    // Test 78 — SUBSS 5.0 - 3.0 = 2.0 (0x40000000)
+    {
+        std::vector<U8> code = {
+            0xB8, 0x00, 0x00, 0xA0, 0x40,           // mov eax, 5.0f
+            0x66, 0x0F, 0x6E, 0xC0,                 // movd xmm0, eax
+            0xB8, 0x00, 0x00, 0x40, 0x40,           // mov eax, 3.0f
+            0x66, 0x0F, 0x6E, 0xC8,                 // movd xmm1, eax
+            0xF3, 0x0F, 0x5C, 0xC1,                 // subss xmm0, xmm1
+            0x66, 0x0F, 0x7E, 0xC0,                 // movd eax, xmm0
+        };
+        runAndCheck(r, "subss 5.0f - 3.0f = 2.0f", withExit(code), [](CPU64& c) {
+            return c.reg[X64_R15].u64 == 0x40000000ULL;
+        });
+    }
+
+    // Test 79 — DIVSS 3.0 / 2.0 = 1.5 (0x3FC00000)
+    {
+        std::vector<U8> code = {
+            0xB8, 0x00, 0x00, 0x40, 0x40,           // mov eax, 3.0f
+            0x66, 0x0F, 0x6E, 0xC0,                 // movd xmm0, eax
+            0xB8, 0x00, 0x00, 0x00, 0x40,           // mov eax, 2.0f
+            0x66, 0x0F, 0x6E, 0xC8,                 // movd xmm1, eax
+            0xF3, 0x0F, 0x5E, 0xC1,                 // divss xmm0, xmm1
+            0x66, 0x0F, 0x7E, 0xC0,                 // movd eax, xmm0
+        };
+        runAndCheck(r, "divss 3.0f / 2.0f = 1.5f", withExit(code), [](CPU64& c) {
+            return c.reg[X64_R15].u64 == 0x3FC00000ULL;
+        });
+    }
+
+    // Test 80 — SQRTSS sqrt(4.0) = 2.0
+    {
+        std::vector<U8> code = {
+            0xB8, 0x00, 0x00, 0x80, 0x40,           // mov eax, 4.0f
+            0x66, 0x0F, 0x6E, 0xC8,                 // movd xmm1, eax
+            0xF3, 0x0F, 0x51, 0xC1,                 // sqrtss xmm0, xmm1
+            0x66, 0x0F, 0x7E, 0xC0,                 // movd eax, xmm0
+        };
+        runAndCheck(r, "sqrtss sqrt(4.0f) = 2.0f", withExit(code), [](CPU64& c) {
+            return c.reg[X64_R15].u64 == 0x40000000ULL;
+        });
+    }
+
+    // Test 81 — CVTSI2SS: int 42 → 42.0f (0x42280000)
+    {
+        std::vector<U8> code = {
+            0xB8, 0x2A, 0x00, 0x00, 0x00,           // mov eax, 42
+            0xF3, 0x0F, 0x2A, 0xC0,                 // cvtsi2ss xmm0, eax
+            0x66, 0x0F, 0x7E, 0xC0,                 // movd eax, xmm0
+        };
+        runAndCheck(r, "cvtsi2ss int 42 -> 42.0f", withExit(code), [](CPU64& c) {
+            return c.reg[X64_R15].u64 == 0x42280000ULL;
+        });
+    }
+
+    // Test 82 — CVTSS2SI: 42.0f → int 42
+    {
+        std::vector<U8> code = {
+            0xB8, 0x00, 0x00, 0x28, 0x42,           // mov eax, 0x42280000 (42.0f)
+            0x66, 0x0F, 0x6E, 0xC0,                 // movd xmm0, eax
+            0xF3, 0x0F, 0x2D, 0xC0,                 // cvtss2si eax, xmm0
+        };
+        runAndCheck(r, "cvtss2si 42.0f -> int 42", withExit(code), [](CPU64& c) {
+            return c.reg[X64_R15].u64 == 42;
+        });
+    }
+
+    // Test 83 — UCOMISS: 5.0 vs 3.0 → CF=0 (greater)
+    {
+        std::vector<U8> code = {
+            0xB8, 0x00, 0x00, 0xA0, 0x40,           // mov eax, 5.0f
+            0x66, 0x0F, 0x6E, 0xC0,                 // movd xmm0, eax
+            0xB8, 0x00, 0x00, 0x40, 0x40,           // mov eax, 3.0f
+            0x66, 0x0F, 0x6E, 0xC8,                 // movd xmm1, eax
+            0x0F, 0x2E, 0xC1,                       // ucomiss xmm0, xmm1
+            0x48, 0x31, 0xC0,                       // xor rax, rax
+            0x0F, 0x92, 0xC0,                       // setb al  (CF=1 ⇒ less; here CF=0 ⇒ al=0)
+        };
+        runAndCheck(r, "ucomiss 5.0f vs 3.0f → CF=0 (greater)", withExit(code), [](CPU64& c) {
+            return c.reg[X64_R15].u64 == 0;
+        });
+    }
+
     printf("=== self-test summary: %d passed, %d failed ===\n\n", r.passed, r.failed);
     return r.failed == 0 ? 0 : 1;
 }
