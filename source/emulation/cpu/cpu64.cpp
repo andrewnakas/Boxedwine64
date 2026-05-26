@@ -3206,6 +3206,93 @@ U32 CPU64::step() {
             return used;
         }
 
+        // UNPCKLPD xmm, xmm/m128  66 0F 14 /r — interleave low qwords.
+        //   dst.hi = src.lo;  dst.lo unchanged.
+        // Used by glibc/Wine to assemble a {lo, hi} pair of doubles from
+        // two separate xmm.lo halves.
+        if (op2 == 0x14 && osize66) {
+            ModRM m = decodeModRM(rip + opOff + 2, p, 0);
+            U64 sLo = m.isReg ? xmm[m.rmIndex].lo : memory->readq(m.effAddr);
+            xmm[m.regField].hi = sLo;
+            U32 used = opOff + 2 + m.length;
+            rip += used;
+            return used;
+        }
+
+        // ---- Packed FP↔int converts ----
+        //
+        // All five variants share opcode bytes 0F 5B (FP conversions) or
+        // 0F E6 (the F2/F3-specific double-precision variants), and the
+        // prefix selects which form. Source is xmm/m128, dest is xmm.
+
+        // CVTDQ2PS   0F 5B /r        — 4× S32 → 4× float
+        // CVTPS2DQ   66 0F 5B /r     — 4× float → 4× S32 (round to nearest)
+        // CVTTPS2DQ  F3 0F 5B /r     — 4× float → 4× S32 (truncate toward zero)
+        if (op2 == 0x5B) {
+            ModRM m = decodeModRM(rip + opOff + 2, p, 0);
+            U64 sLo, sHi;
+            if (m.isReg) { sLo = xmm[m.rmIndex].lo; sHi = xmm[m.rmIndex].hi; }
+            else         { sLo = memory->readq(m.effAddr); sHi = memory->readq(m.effAddr + 8); }
+            U32 dwords[4] = { (U32)sLo, (U32)(sLo >> 32), (U32)sHi, (U32)(sHi >> 32) };
+            U32 nDw[4];
+            if (!osize66 && p.rep == 0) {
+                // CVTDQ2PS: dwords are signed ints, write float bits.
+                for (int i = 0; i < 4; i++) {
+                    float f = (float)(S32)dwords[i];
+                    U32 bits; std::memcpy(&bits, &f, 4); nDw[i] = bits;
+                }
+            } else if (osize66) {
+                // CVTPS2DQ: dwords are float bits, write rounded ints.
+                for (int i = 0; i < 4; i++) {
+                    float f; std::memcpy(&f, &dwords[i], 4);
+                    nDw[i] = (U32)(S32)std::lrintf(f);
+                }
+            } else if (p.rep == 0xF3) {
+                // CVTTPS2DQ: float → int truncating.
+                for (int i = 0; i < 4; i++) {
+                    float f; std::memcpy(&f, &dwords[i], 4);
+                    nDw[i] = (U32)(S32)f;
+                }
+            } else {
+                goto unhandled; // F2 0F 5B is not defined
+            }
+            xmm[m.regField].lo = ((U64)nDw[0]) | (((U64)nDw[1]) << 32);
+            xmm[m.regField].hi = ((U64)nDw[2]) | (((U64)nDw[3]) << 32);
+            U32 used = opOff + 2 + m.length;
+            rip += used;
+            return used;
+        }
+
+        // CVTDQ2PD  F3 0F E6 /r — low 2× S32 → 2× f64
+        // CVTPD2DQ  F2 0F E6 /r — 2× f64 → low 2× S32 (rounded), hi qword = 0
+        if (op2 == 0xE6 && (p.rep == 0xF3 || p.rep == 0xF2)) {
+            ModRM m = decodeModRM(rip + opOff + 2, p, 0);
+            U64 sLo, sHi;
+            if (m.isReg) { sLo = xmm[m.rmIndex].lo; sHi = xmm[m.rmIndex].hi; }
+            else         { sLo = memory->readq(m.effAddr); sHi = memory->readq(m.effAddr + 8); }
+            if (p.rep == 0xF3) {
+                // CVTDQ2PD: take low 2 dwords of src as S32, write 2 f64s.
+                S32 i0 = (S32)(U32)sLo;
+                S32 i1 = (S32)(U32)(sLo >> 32);
+                double d0 = (double)i0, d1 = (double)i1;
+                U64 b0, b1;
+                std::memcpy(&b0, &d0, 8); std::memcpy(&b1, &d1, 8);
+                xmm[m.regField].lo = b0;
+                xmm[m.regField].hi = b1;
+            } else {
+                // CVTPD2DQ: 2 f64s → 2 S32s in low qword, high qword zeroed.
+                double d0, d1;
+                std::memcpy(&d0, &sLo, 8); std::memcpy(&d1, &sHi, 8);
+                U32 i0 = (U32)(S32)std::lrint(d0);
+                U32 i1 = (U32)(S32)std::lrint(d1);
+                xmm[m.regField].lo = ((U64)i0) | (((U64)i1) << 32);
+                xmm[m.regField].hi = 0;
+            }
+            U32 used = opOff + 2 + m.length;
+            rip += used;
+            return used;
+        }
+
         // UCOMISS xmm, xmm/m32   0F 2E /r   (no 66, no F2/F3 prefix)
         // COMISS  xmm, xmm/m32   0F 2F /r
         if ((op2 == 0x2E || op2 == 0x2F) && !osize66 && p.rep == 0) {

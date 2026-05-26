@@ -1562,6 +1562,86 @@ int runX64SelfTest() {
         });
     }
 
+    // ---- Packed FP <-> int converts ----
+
+    // Test 84 — CVTDQ2PD: low 2 dwords of src are S32 ints {3,4}.
+    //   Result: xmm0.lo = double(3) bits = 0x4008000000000000,
+    //           xmm0.hi = double(4) bits = 0x4010000000000000.
+    //   We read .lo back into rax and check.
+    {
+        std::vector<U8> code = {
+            0x48, 0xB8, 0x03, 0x00, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00,   // mov rax, (3)|(4<<32)
+            0x66, 0x48, 0x0F, 0x6E, 0xC8,                                  // movq xmm1, rax
+            0xF3, 0x0F, 0xE6, 0xC1,                                        // cvtdq2pd xmm0, xmm1
+            0x66, 0x48, 0x0F, 0x7E, 0xC0,                                  // movq rax, xmm0
+        };
+        runAndCheck(r, "cvtdq2pd low {3,4} -> {3.0, 4.0}", withExit(code), [](CPU64& c) {
+            return c.reg[X64_R15].u64 == 0x4008000000000000ULL;
+        });
+    }
+
+    // Test 85 — CVTPD2DQ: src = {3.0, 4.0} → low.lo = 3 | 4<<32, hi qword = 0.
+    {
+        std::vector<U8> code = {
+            // Build xmm1 = {3.0, 4.0}. Use movq for .lo, then need .hi.
+            // Easier: load both doubles via writing through a temp + movdqu...
+            // We use a different approach: cvtsi2sd twice to fill .lo,
+            // then unpcklpd to shift it. But that's more bytes.
+            // Simplest: write to stack and use movdqu via SS:[rsp].
+            //
+            // Use movq for xmm1.lo=3.0, then F2 0F 12 (movddup) won't help.
+            // We use a 2-step build with cvtsi2sd to populate .lo with 3.0,
+            // then move .lo into .hi using SHUFPD imm=0, then cvtsi2sd
+            // again for the new .lo = 4.0.
+            // Wait — SHUFPD with imm=0 copies src.lo into both halves of dst,
+            // so dst.hi becomes src.lo. So: cvtsi2sd xmm1, 3 (lo=3.0);
+            // shufpd xmm1, xmm1, 0 (hi=lo=3.0); now lo=3.0 and we need 4.0.
+            // Then mov rax=4, cvtsi2sd xmm1, rax — that only overwrites lo,
+            // leaves hi=3.0. That's wrong; we want hi=4.0.
+            //
+            // Simpler: use unpcklpd to combine xmm0=3.0 and xmm1=4.0.
+            // unpcklpd xmm0, xmm1 produces {xmm0.lo, xmm1.lo} = {3.0, 4.0}.
+            0x48, 0xC7, 0xC0, 0x03, 0x00, 0x00, 0x00,                      // mov rax, 3
+            0xF2, 0x48, 0x0F, 0x2A, 0xC0,                                  // cvtsi2sd xmm0, rax  (3.0 → xmm0.lo)
+            0x48, 0xC7, 0xC0, 0x04, 0x00, 0x00, 0x00,                      // mov rax, 4
+            0xF2, 0x48, 0x0F, 0x2A, 0xC8,                                  // cvtsi2sd xmm1, rax  (4.0 → xmm1.lo)
+            0x66, 0x0F, 0x14, 0xC1,                                        // unpcklpd xmm0, xmm1  ({3.0, 4.0})
+            0xF2, 0x0F, 0xE6, 0xC8,                                        // cvtpd2dq xmm1, xmm0
+            0x66, 0x48, 0x0F, 0x7E, 0xC8,                                  // movq rax, xmm1
+        };
+        runAndCheck(r, "cvtpd2dq {3.0, 4.0} -> {3, 4} packed S32", withExit(code), [](CPU64& c) {
+            return c.reg[X64_R15].u64 == ((U64)3 | ((U64)4 << 32));
+        });
+    }
+
+    // Test 86 — CVTDQ2PS: src.lo = (1)|(2<<32) → result.lo = 1.0f|2.0f<<32
+    //   1.0f=0x3F800000, 2.0f=0x40000000 → expected lo = 0x400000003F800000.
+    {
+        std::vector<U8> code = {
+            0x48, 0xB8, 0x01, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00,    // mov rax, 1|2<<32
+            0x66, 0x48, 0x0F, 0x6E, 0xC8,                                   // movq xmm1, rax
+            0x0F, 0x5B, 0xC1,                                               // cvtdq2ps xmm0, xmm1
+            0x66, 0x48, 0x0F, 0x7E, 0xC0,                                   // movq rax, xmm0
+        };
+        runAndCheck(r, "cvtdq2ps {1,2,0,0} -> {1.0f, 2.0f, 0.0f, 0.0f}", withExit(code), [](CPU64& c) {
+            return c.reg[X64_R15].u64 == 0x400000003F800000ULL;
+        });
+    }
+
+    // Test 87 — CVTPS2DQ: src.lo = 1.0f|2.0f<<32 → result.lo = 1|2<<32
+    //   src.hi was zeroed by movq, so dst lanes 2/3 = 0.
+    {
+        std::vector<U8> code = {
+            0x48, 0xB8, 0x00, 0x00, 0x80, 0x3F, 0x00, 0x00, 0x00, 0x40,    // mov rax, bits of {1.0f, 2.0f}
+            0x66, 0x48, 0x0F, 0x6E, 0xC8,                                   // movq xmm1, rax
+            0x66, 0x0F, 0x5B, 0xC1,                                         // cvtps2dq xmm0, xmm1
+            0x66, 0x48, 0x0F, 0x7E, 0xC0,                                   // movq rax, xmm0
+        };
+        runAndCheck(r, "cvtps2dq {1.0f, 2.0f, 0, 0} -> {1, 2, 0, 0}", withExit(code), [](CPU64& c) {
+            return c.reg[X64_R15].u64 == ((U64)1 | ((U64)2 << 32));
+        });
+    }
+
     printf("=== self-test summary: %d passed, %d failed ===\n\n", r.passed, r.failed);
     return r.failed == 0 ? 0 : 1;
 }
