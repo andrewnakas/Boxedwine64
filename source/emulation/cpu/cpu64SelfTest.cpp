@@ -1023,6 +1023,27 @@ int runX64SelfTest() {
             return c.reg[X64_R15].u64 == 0xABCD00000000ULL;
         });
     }
+    // Test 54 — end-to-end "hello world" via the write+exit syscalls.
+    // Issues write(1, msg, 3) where msg is appended inline to the code
+    // buffer, then exits with the write return value stashed in r15.
+    // Validates: syscall dispatch, sys_write64 host-stdout tee, RIP-relative
+    // LEA, syscall return into RAX, and the SysV ABI register layout.
+    {
+        std::vector<U8> code = {
+            0x48, 0xC7, 0xC0, 0x01, 0x00, 0x00, 0x00,             // mov rax, 1            ; SYS_write
+            0x48, 0xC7, 0xC7, 0x01, 0x00, 0x00, 0x00,             // mov rdi, 1            ; fd=stdout
+            0x48, 0x8D, 0x35, 0x15, 0x00, 0x00, 0x00,             // lea rsi, [rip+0x15]   ; → msg
+            0x48, 0xC7, 0xC2, 0x03, 0x00, 0x00, 0x00,             // mov rdx, 3            ; len
+            0x0F, 0x05,                                            // syscall               ; write
+            0x49, 0x89, 0xC7,                                      // mov r15, rax          ; r15 = bytes written
+            0x48, 0xC7, 0xC0, 0x3C, 0x00, 0x00, 0x00,             // mov rax, 60           ; SYS_exit
+            0x0F, 0x05,                                            // syscall               ; exit(r15)
+            'h', 'i', '\n',                                        // msg: "hi\n"
+        };
+        runAndCheck(r, "write(1,\"hi\\n\",3) end-to-end via syscall", code, [](CPU64& c) {
+            return c.reg[X64_R15].u64 == 3;
+        });
+    }
     printf("=== self-test summary: %d passed, %d failed ===\n\n", r.passed, r.failed);
     return r.failed == 0 ? 0 : 1;
 }
