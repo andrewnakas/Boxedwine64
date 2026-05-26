@@ -1110,6 +1110,169 @@ int runX64SelfTest() {
         fflush(stdout);
     }
 
+    // ---- SSE2 scalar FP coverage ----
+    // Helper-style pattern: load doubles into xmm via "mov rax, imm64;
+    // movq xmm, rax", perform the op, write the resulting bits back to
+    // rax via "movq rax, xmm0", stash in r15 for the verifier.
+    //
+    // Bit patterns for the test doubles (IEEE-754 binary64):
+    //   2.0  = 0x4000000000000000
+    //   3.0  = 0x4008000000000000
+    //   5.0  = 0x4014000000000000
+    //   6.0  = 0x4018000000000000  (2 * 3)
+    //   8.0  = 0x4020000000000000
+    //   1.5  = 0x3FF8000000000000  (3 / 2)
+
+    // Test 56 — ADDSD xmm0, xmm1: 2.0 + 3.0 = 5.0
+    {
+        std::vector<U8> code = {
+            // mov rax, 0x4000000000000000 (2.0)
+            0x48, 0xB8, 0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x40,
+            0x66, 0x48, 0x0F, 0x6E, 0xC0,                         // movq xmm0, rax
+            // mov rax, 0x4008000000000000 (3.0)
+            0x48, 0xB8, 0x00,0x00,0x00,0x00,0x00,0x00,0x08,0x40,
+            0x66, 0x48, 0x0F, 0x6E, 0xC8,                         // movq xmm1, rax
+            0xF2, 0x0F, 0x58, 0xC1,                               // addsd xmm0, xmm1
+            0x66, 0x48, 0x0F, 0x7E, 0xC0,                         // movq rax, xmm0
+        };
+        runAndCheck(r, "addsd 2.0 + 3.0 = 5.0", withExit(code), [](CPU64& c) {
+            return c.reg[X64_R15].u64 == 0x4014000000000000ULL;
+        });
+    }
+
+    // Test 57 — MULSD xmm0, xmm1: 2.0 * 3.0 = 6.0
+    {
+        std::vector<U8> code = {
+            0x48, 0xB8, 0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x40, // 2.0
+            0x66, 0x48, 0x0F, 0x6E, 0xC0,
+            0x48, 0xB8, 0x00,0x00,0x00,0x00,0x00,0x00,0x08,0x40, // 3.0
+            0x66, 0x48, 0x0F, 0x6E, 0xC8,
+            0xF2, 0x0F, 0x59, 0xC1,                               // mulsd xmm0, xmm1
+            0x66, 0x48, 0x0F, 0x7E, 0xC0,
+        };
+        runAndCheck(r, "mulsd 2.0 * 3.0 = 6.0", withExit(code), [](CPU64& c) {
+            return c.reg[X64_R15].u64 == 0x4018000000000000ULL;
+        });
+    }
+
+    // Test 58 — SUBSD xmm0, xmm1: 5.0 - 3.0 = 2.0
+    {
+        std::vector<U8> code = {
+            0x48, 0xB8, 0x00,0x00,0x00,0x00,0x00,0x00,0x14,0x40, // 5.0
+            0x66, 0x48, 0x0F, 0x6E, 0xC0,
+            0x48, 0xB8, 0x00,0x00,0x00,0x00,0x00,0x00,0x08,0x40, // 3.0
+            0x66, 0x48, 0x0F, 0x6E, 0xC8,
+            0xF2, 0x0F, 0x5C, 0xC1,                               // subsd xmm0, xmm1
+            0x66, 0x48, 0x0F, 0x7E, 0xC0,
+        };
+        runAndCheck(r, "subsd 5.0 - 3.0 = 2.0", withExit(code), [](CPU64& c) {
+            return c.reg[X64_R15].u64 == 0x4000000000000000ULL;
+        });
+    }
+
+    // Test 59 — DIVSD xmm0, xmm1: 3.0 / 2.0 = 1.5
+    {
+        std::vector<U8> code = {
+            0x48, 0xB8, 0x00,0x00,0x00,0x00,0x00,0x00,0x08,0x40, // 3.0
+            0x66, 0x48, 0x0F, 0x6E, 0xC0,
+            0x48, 0xB8, 0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x40, // 2.0
+            0x66, 0x48, 0x0F, 0x6E, 0xC8,
+            0xF2, 0x0F, 0x5E, 0xC1,                               // divsd xmm0, xmm1
+            0x66, 0x48, 0x0F, 0x7E, 0xC0,
+        };
+        runAndCheck(r, "divsd 3.0 / 2.0 = 1.5", withExit(code), [](CPU64& c) {
+            return c.reg[X64_R15].u64 == 0x3FF8000000000000ULL;
+        });
+    }
+
+    // Test 60 — SQRTSD xmm0, xmm1: sqrt(4.0) = 2.0  (4.0 = 0x4010000000000000)
+    {
+        std::vector<U8> code = {
+            0x48, 0xB8, 0x00,0x00,0x00,0x00,0x00,0x00,0x10,0x40, // 4.0
+            0x66, 0x48, 0x0F, 0x6E, 0xC8,                         // movq xmm1, rax
+            0xF2, 0x0F, 0x51, 0xC1,                               // sqrtsd xmm0, xmm1
+            0x66, 0x48, 0x0F, 0x7E, 0xC0,                         // movq rax, xmm0
+        };
+        runAndCheck(r, "sqrtsd sqrt(4.0) = 2.0", withExit(code), [](CPU64& c) {
+            return c.reg[X64_R15].u64 == 0x4000000000000000ULL;
+        });
+    }
+
+    // Test 61 — CVTSI2SD with REX.W: int64 42 → double 42.0
+    // 42.0 = 0x4045000000000000
+    {
+        std::vector<U8> code = {
+            0x48, 0xC7, 0xC0, 0x2A, 0x00, 0x00, 0x00,             // mov rax, 42
+            0xF2, 0x48, 0x0F, 0x2A, 0xC0,                         // cvtsi2sd xmm0, rax
+            0x66, 0x48, 0x0F, 0x7E, 0xC0,                         // movq rax, xmm0
+        };
+        runAndCheck(r, "cvtsi2sd int 42 -> 42.0", withExit(code), [](CPU64& c) {
+            return c.reg[X64_R15].u64 == 0x4045000000000000ULL;
+        });
+    }
+
+    // Test 62 — CVTSD2SI with REX.W: double 42.0 → int 42
+    {
+        std::vector<U8> code = {
+            0x48, 0xB8, 0x00,0x00,0x00,0x00,0x00,0x00,0x45,0x40, // 42.0
+            0x66, 0x48, 0x0F, 0x6E, 0xC0,                         // movq xmm0, rax
+            0xF2, 0x48, 0x0F, 0x2D, 0xC0,                         // cvtsd2si rax, xmm0
+        };
+        runAndCheck(r, "cvtsd2si 42.0 -> 42", withExit(code), [](CPU64& c) {
+            return c.reg[X64_R15].u64 == 42;
+        });
+    }
+
+    // Test 63 — UCOMISD: 5.0 vs 3.0 → greater. Use setcc-style readback
+    // by clearing rax and setting al=1 iff CF after the compare. Greater
+    // case: CF=0, so al stays 0.
+    {
+        std::vector<U8> code = {
+            0x48, 0xB8, 0x00,0x00,0x00,0x00,0x00,0x00,0x14,0x40, // 5.0
+            0x66, 0x48, 0x0F, 0x6E, 0xC0,
+            0x48, 0xB8, 0x00,0x00,0x00,0x00,0x00,0x00,0x08,0x40, // 3.0
+            0x66, 0x48, 0x0F, 0x6E, 0xC8,
+            0x48, 0x31, 0xC0,                                     // xor rax, rax
+            0x66, 0x0F, 0x2E, 0xC1,                               // ucomisd xmm0, xmm1
+            0x0F, 0x92, 0xC0,                                     // setb al (1 if CF)
+        };
+        runAndCheck(r, "ucomisd 5.0 vs 3.0 → CF=0 (greater)", withExit(code), [](CPU64& c) {
+            return c.reg[X64_R15].u64 == 0;
+        });
+    }
+
+    // Test 64 — UCOMISD: 2.0 vs 5.0 → less. CF=1, so setb al sets al=1.
+    {
+        std::vector<U8> code = {
+            0x48, 0xB8, 0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x40, // 2.0
+            0x66, 0x48, 0x0F, 0x6E, 0xC0,
+            0x48, 0xB8, 0x00,0x00,0x00,0x00,0x00,0x00,0x14,0x40, // 5.0
+            0x66, 0x48, 0x0F, 0x6E, 0xC8,
+            0x48, 0x31, 0xC0,                                     // xor rax, rax
+            0x66, 0x0F, 0x2E, 0xC1,                               // ucomisd
+            0x0F, 0x92, 0xC0,                                     // setb al
+        };
+        runAndCheck(r, "ucomisd 2.0 vs 5.0 → CF=1 (less)", withExit(code), [](CPU64& c) {
+            return c.reg[X64_R15].u64 == 1;
+        });
+    }
+
+    // Test 65 — UCOMISD equal: ZF=1. Use sete al.
+    {
+        std::vector<U8> code = {
+            0x48, 0xB8, 0x00,0x00,0x00,0x00,0x00,0x00,0x14,0x40, // 5.0
+            0x66, 0x48, 0x0F, 0x6E, 0xC0,
+            0x48, 0xB8, 0x00,0x00,0x00,0x00,0x00,0x00,0x14,0x40, // 5.0
+            0x66, 0x48, 0x0F, 0x6E, 0xC8,
+            0x48, 0x31, 0xC0,                                     // xor rax, rax
+            0x66, 0x0F, 0x2E, 0xC1,                               // ucomisd
+            0x0F, 0x94, 0xC0,                                     // sete al
+        };
+        runAndCheck(r, "ucomisd 5.0 vs 5.0 → ZF=1 (equal)", withExit(code), [](CPU64& c) {
+            return c.reg[X64_R15].u64 == 1;
+        });
+    }
+
     printf("=== self-test summary: %d passed, %d failed ===\n\n", r.passed, r.failed);
     return r.failed == 0 ? 0 : 1;
 }

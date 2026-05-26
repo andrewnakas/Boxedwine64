@@ -15,6 +15,9 @@
 #include "kmemory64.h"
 #include "syscall64.h"
 
+#include <cmath>
+#include <cstring>
+
 CPU64::CPU64(KMemory64* memory) : memory(memory) {
     reg[X64_RSP].setU64(0);
 }
@@ -1764,8 +1767,14 @@ U32 CPU64::step() {
         // MOVDQU                            — F3 0F 6F / F3 0F 7F
         // All do a 16-byte aligned-or-unaligned memcpy. We treat them
         // identically — no #GP on misalignment.
+        //
+        // Carve out F2/F3 prefixed variants of 0x10/0x11 — those are the
+        // scalar SSE2 MOVSD/MOVSS forms, handled in the scalar-FP block
+        // further down, not as 16-byte moves.
+        bool isScalarPrefixed10or11 =
+            (op2 == 0x10 || op2 == 0x11) && (p.rep == 0xF2 || p.rep == 0xF3);
         bool isMove128 =
-            (op2 == 0x10 || op2 == 0x11 || op2 == 0x28 || op2 == 0x29) ||
+            ((op2 == 0x10 || op2 == 0x11 || op2 == 0x28 || op2 == 0x29) && !isScalarPrefixed10or11) ||
             ((op2 == 0x6F || op2 == 0x7F) && (osize66 || p.rep == 0xF3));
         if (isMove128) {
             bool isStore = (op2 == 0x11 || op2 == 0x29 || op2 == 0x7F);
@@ -2785,6 +2794,139 @@ U32 CPU64::step() {
         // for code alignment; ModR/M absorbs disp/SIB bytes.
         if (op2 == 0x1F) {
             ModRM m = decodeModRM(rip + opOff + 2, p, 0);
+            U32 used = opOff + 2 + m.length;
+            rip += used;
+            return used;
+        }
+
+        // ---- SSE2 scalar double-precision FP ----
+        //
+        // Scalar SSE2 ops touch only the low 64 bits of the XMM register
+        // (one double); the high 64 bits are left untouched for reg/reg
+        // forms and zeroed for memory loads via MOVSD (per the Intel SDM
+        // wording, but glibc's hot paths only care about the low qword,
+        // so we leave .hi alone for moves between registers too).
+        //
+        // We use type-punning via memcpy on a U64<->double pair to stay
+        // strict-aliasing-clean.
+        auto u64ToDouble = [](U64 bits) -> double {
+            double d; std::memcpy(&d, &bits, sizeof(d)); return d;
+        };
+        auto doubleToU64 = [](double d) -> U64 {
+            U64 bits; std::memcpy(&bits, &d, sizeof(bits)); return bits;
+        };
+
+        // MOVSD xmm, xmm/m64   F2 0F 10 /r   (load low qword; zero high if mem)
+        // MOVSD xmm/m64, xmm   F2 0F 11 /r   (store low qword)
+        if ((op2 == 0x10 || op2 == 0x11) && p.rep == 0xF2) {
+            ModRM m = decodeModRM(rip + opOff + 2, p, 0);
+            bool isStore = (op2 == 0x11);
+            if (isStore) {
+                U64 v = xmm[m.regField].lo;
+                if (m.isReg) xmm[m.rmIndex].lo = v;
+                else         memory->writeq(m.effAddr, v);
+            } else {
+                U64 v;
+                if (m.isReg) {
+                    v = xmm[m.rmIndex].lo;
+                    xmm[m.regField].lo = v; // .hi unchanged for reg/reg
+                } else {
+                    v = memory->readq(m.effAddr);
+                    xmm[m.regField].lo = v;
+                    xmm[m.regField].hi = 0; // memory form zeros high
+                }
+            }
+            U32 used = opOff + 2 + m.length;
+            rip += used;
+            return used;
+        }
+
+        // Scalar FP arithmetic — all share the F2 0F prefix and a ModR/M
+        // operand that is either xmm or m64.
+        //   ADDSD  F2 0F 58
+        //   MULSD  F2 0F 59
+        //   SUBSD  F2 0F 5C
+        //   DIVSD  F2 0F 5E
+        //   SQRTSD F2 0F 51
+        //   MINSD  F2 0F 5D
+        //   MAXSD  F2 0F 5F
+        if (p.rep == 0xF2 &&
+            (op2 == 0x58 || op2 == 0x59 || op2 == 0x5C || op2 == 0x5E ||
+             op2 == 0x51 || op2 == 0x5D || op2 == 0x5F)) {
+            ModRM m = decodeModRM(rip + opOff + 2, p, 0);
+            U64 srcBits = m.isReg ? xmm[m.rmIndex].lo : memory->readq(m.effAddr);
+            double a = u64ToDouble(xmm[m.regField].lo);
+            double b = u64ToDouble(srcBits);
+            double r;
+            switch (op2) {
+                case 0x58: r = a + b; break;
+                case 0x59: r = a * b; break;
+                case 0x5C: r = a - b; break;
+                case 0x5E: r = a / b; break;
+                case 0x51: r = std::sqrt(b); break; // SQRTSD reads src, ignores dst
+                case 0x5D: r = (a < b) ? a : b; break;
+                case 0x5F: r = (a > b) ? a : b; break;
+                default:   r = a; break;
+            }
+            xmm[m.regField].lo = doubleToU64(r);
+            U32 used = opOff + 2 + m.length;
+            rip += used;
+            return used;
+        }
+
+        // CVTSI2SD xmm, r/m32   F2 0F 2A /r       (REX.W → r/m64)
+        // Convert int to double; result in low 64 of dst, high unchanged.
+        if (op2 == 0x2A && p.rep == 0xF2) {
+            ModRM m = decodeModRM(rip + opOff + 2, p, 0);
+            U32 srcSize = rexW ? 8 : 4;
+            U64 srcRaw = loadRM(m, srcSize, rexPresent);
+            double d = rexW
+                ? (double)(S64)srcRaw
+                : (double)(S32)(U32)srcRaw;
+            xmm[m.regField].lo = doubleToU64(d);
+            U32 used = opOff + 2 + m.length;
+            rip += used;
+            return used;
+        }
+
+        // CVTSD2SI r32, xmm/m64   F2 0F 2D /r     (REX.W → r64)
+        // Convert double to signed int with current rounding (truncate-or-
+        // round-to-nearest). For Milestone C we use C cast (truncate).
+        if (op2 == 0x2D && p.rep == 0xF2) {
+            ModRM m = decodeModRM(rip + opOff + 2, p, 0);
+            U64 srcBits = m.isReg ? xmm[m.rmIndex].lo : memory->readq(m.effAddr);
+            double d = u64ToDouble(srcBits);
+            if (rexW) reg[m.regField].setU64((U64)(S64)d);
+            else      reg[m.regField].setU32((U32)(S32)d);
+            U32 used = opOff + 2 + m.length;
+            rip += used;
+            return used;
+        }
+
+        // UCOMISD xmm, xmm/m64   66 0F 2E /r
+        // COMISD  xmm, xmm/m64   66 0F 2F /r
+        // Compare two doubles, set EFLAGS ZF/PF/CF per result. UCOMISD and
+        // COMISD only differ in whether QNaN raises #IA — we treat them
+        // identically (no FP exceptions modelled).
+        if ((op2 == 0x2E || op2 == 0x2F) && osize66) {
+            ModRM m = decodeModRM(rip + opOff + 2, p, 0);
+            U64 srcBits = m.isReg ? xmm[m.rmIndex].lo : memory->readq(m.effAddr);
+            double a = u64ToDouble(xmm[m.regField].lo);
+            double b = u64ToDouble(srcBits);
+            // Per Intel SDM: unordered → ZF=PF=CF=1, greater → all 0,
+            // less → CF=1, equal → ZF=1. Also clears OF/SF/AF.
+            U64 newFlags = rflags & ~(X64_ZF | X64_PF | X64_CF |
+                                      X64_OF | X64_SF | X64_AF);
+            if (std::isnan(a) || std::isnan(b)) {
+                newFlags |= X64_ZF | X64_PF | X64_CF;
+            } else if (a > b) {
+                // all three remain 0
+            } else if (a < b) {
+                newFlags |= X64_CF;
+            } else {
+                newFlags |= X64_ZF;
+            }
+            rflags = newFlags;
             U32 used = opOff + 2 + m.length;
             rip += used;
             return used;
