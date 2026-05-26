@@ -13,6 +13,7 @@
 #ifdef BOXEDWINE_GUEST_X64
 
 #include "reg64.h"
+#include "../source/emulation/cpu/common/fpu.h"
 
 class KThread;
 class KMemory64;
@@ -55,6 +56,12 @@ public:
     // before main() runs.
     struct Xmm { U64 lo = 0; U64 hi = 0; };
     Xmm   xmm[16] = {};
+
+    // x87 FPU state — shared with the 32-bit CPU's FPU implementation. We
+    // only use the register-side methods (FLD/FADD/...) and do all memory
+    // I/O ourselves through CPU64's KMemory64 helpers; the EA-form helpers
+    // on FPU take a 32-bit CPU* that we can't satisfy.
+    FPU fpu;
 
     KThread*   thread = nullptr;
     KMemory64* memory = nullptr;

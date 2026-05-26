@@ -2138,6 +2138,123 @@ int runX64SelfTest() {
         });
     }
 
+    // ----- x87 FPU minimal subset (D9/DC/DD) -----
+    // Pattern: spill the operand double into a stack slot via
+    //   sub rsp,8 ; mov rax,imm64 ; mov [rsp],rax
+    // then drive x87 via fld/fstp qword [rsp], then read result back through rax.
+
+    // T: FLD/FSTP m64fp round-trip preserves bits (3.0 = 0x4008000000000000).
+    {
+        std::vector<U8> code = {
+            0x48, 0x83, 0xEC, 0x08,                                     // sub rsp, 8
+            0x48, 0xB8, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x08, 0x40, // mov rax, 0x4008000000000000 (3.0)
+            0x48, 0x89, 0x04, 0x24,                                     // mov [rsp], rax
+            0xDD, 0x04, 0x24,                                           // fld  qword [rsp]
+            0x48, 0x31, 0xC0,                                           // xor rax, rax (poison)
+            0x48, 0x89, 0x04, 0x24,                                     // mov [rsp], rax (clear)
+            0xDD, 0x1C, 0x24,                                           // fstp qword [rsp]
+            0x48, 0x8B, 0x04, 0x24,                                     // mov rax, [rsp]
+            0x48, 0x83, 0xC4, 0x08,                                     // add rsp, 8
+        };
+        runAndCheck(r, "x87 FLD/FSTP m64fp round-trip (3.0)", withExit(code), [](CPU64& c) {
+            return c.reg[X64_R15].u64 == 0x4008000000000000ULL;
+        });
+    }
+
+    // T: FADD m64fp — 2.0 + 3.0 = 5.0.
+    {
+        std::vector<U8> code = {
+            0x48, 0x83, 0xEC, 0x08,                                     // sub rsp, 8
+            0x48, 0xB8, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x40, // mov rax, 0x4000000000000000 (2.0)
+            0x48, 0x89, 0x04, 0x24,                                     // mov [rsp], rax
+            0xDD, 0x04, 0x24,                                           // fld  qword [rsp]   ; st0=2.0
+            0x48, 0xB8, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x08, 0x40, // mov rax, 3.0
+            0x48, 0x89, 0x04, 0x24,                                     // mov [rsp], rax
+            0xDC, 0x04, 0x24,                                           // fadd qword [rsp]   ; st0=5.0
+            0xDD, 0x1C, 0x24,                                           // fstp qword [rsp]
+            0x48, 0x8B, 0x04, 0x24,                                     // mov rax, [rsp]
+            0x48, 0x83, 0xC4, 0x08,                                     // add rsp, 8
+        };
+        runAndCheck(r, "x87 FADD m64fp (2.0+3.0=5.0)", withExit(code), [](CPU64& c) {
+            return c.reg[X64_R15].u64 == 0x4014000000000000ULL; // 5.0
+        });
+    }
+
+    // T: FMUL m64fp — 2.5 * 4.0 = 10.0.
+    {
+        std::vector<U8> code = {
+            0x48, 0x83, 0xEC, 0x08,
+            0x48, 0xB8, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x04, 0x40, // 2.5
+            0x48, 0x89, 0x04, 0x24,
+            0xDD, 0x04, 0x24,                                           // fld 2.5
+            0x48, 0xB8, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x10, 0x40, // 4.0
+            0x48, 0x89, 0x04, 0x24,
+            0xDC, 0x0C, 0x24,                                           // fmul qword [rsp]
+            0xDD, 0x1C, 0x24,                                           // fstp
+            0x48, 0x8B, 0x04, 0x24,
+            0x48, 0x83, 0xC4, 0x08,
+        };
+        runAndCheck(r, "x87 FMUL m64fp (2.5*4.0=10.0)", withExit(code), [](CPU64& c) {
+            return c.reg[X64_R15].u64 == 0x4024000000000000ULL; // 10.0
+        });
+    }
+
+    // T: FLD m32fp + FSTP m64fp — single-precision 2.5f promotes to double 2.5.
+    {
+        std::vector<U8> code = {
+            0x48, 0x83, 0xEC, 0x08,
+            0x48, 0xC7, 0xC0, 0x00, 0x00, 0x20, 0x40,                   // mov rax, 0x40200000 (2.5f, sign-ext fine)
+            0x48, 0x89, 0x04, 0x24,                                     // mov [rsp], rax (upper half junk, ignored)
+            0xD9, 0x04, 0x24,                                           // fld  dword [rsp]   ; st0 = 2.5 (promoted)
+            0xDD, 0x1C, 0x24,                                           // fstp qword [rsp]   ; store as f64
+            0x48, 0x8B, 0x04, 0x24,                                     // mov rax, [rsp]
+            0x48, 0x83, 0xC4, 0x08,
+        };
+        runAndCheck(r, "x87 FLD m32fp + FSTP m64fp (2.5f → 2.5)", withExit(code), [](CPU64& c) {
+            return c.reg[X64_R15].u64 == 0x4004000000000000ULL; // 2.5
+        });
+    }
+
+    // T: FXCH — push 2.0 then 3.0 (st0=3, st1=2), fxch st1 (st0=2), fstp → 2.0.
+    {
+        std::vector<U8> code = {
+            0x48, 0x83, 0xEC, 0x08,
+            0x48, 0xB8, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x40, // 2.0
+            0x48, 0x89, 0x04, 0x24,
+            0xDD, 0x04, 0x24,                                           // fld 2.0  → st0=2
+            0x48, 0xB8, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x08, 0x40, // 3.0
+            0x48, 0x89, 0x04, 0x24,
+            0xDD, 0x04, 0x24,                                           // fld 3.0  → st0=3, st1=2
+            0xD9, 0xC9,                                                 // fxch st1 → st0=2, st1=3
+            0xDD, 0x1C, 0x24,                                           // fstp     → mem=2.0; st0=3
+            0x48, 0x8B, 0x04, 0x24,
+            0x48, 0x83, 0xC4, 0x08,
+        };
+        runAndCheck(r, "x87 FXCH ST(1) swaps tops", withExit(code), [](CPU64& c) {
+            return c.reg[X64_R15].u64 == 0x4000000000000000ULL; // 2.0
+        });
+    }
+
+    // T: FLD ST(0) duplicates TOS; then FADD ST(0)+mem path. Pattern:
+    //   fld 3.0; fld st0 (now st0=3, st1=3); fstp → 3.0 (st0=3 still).
+    {
+        std::vector<U8> code = {
+            0x48, 0x83, 0xEC, 0x08,
+            0x48, 0xB8, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x08, 0x40, // 3.0
+            0x48, 0x89, 0x04, 0x24,
+            0xDD, 0x04, 0x24,                                           // fld 3.0
+            0xD9, 0xC0,                                                 // fld st0 (dup)
+            0x48, 0x31, 0xC0,                                           // xor rax, rax
+            0x48, 0x89, 0x04, 0x24,                                     // clear slot
+            0xDD, 0x1C, 0x24,                                           // fstp (pops the duplicate)
+            0x48, 0x8B, 0x04, 0x24,
+            0x48, 0x83, 0xC4, 0x08,
+        };
+        runAndCheck(r, "x87 FLD ST(0) duplicate then FSTP", withExit(code), [](CPU64& c) {
+            return c.reg[X64_R15].u64 == 0x4008000000000000ULL; // 3.0
+        });
+    }
+
     printf("=== self-test summary: %d passed, %d failed ===\n\n", r.passed, r.failed);
     return r.failed == 0 ? 0 : 1;
 }

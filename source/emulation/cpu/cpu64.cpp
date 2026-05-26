@@ -20,6 +20,7 @@
 
 CPU64::CPU64(KMemory64* memory) : memory(memory) {
     reg[X64_RSP].setU64(0);
+    fpu.FINIT();
 }
 
 CPU64::~CPU64() = default;
@@ -3347,6 +3348,89 @@ U32 CPU64::step() {
         U32 used = opOff + 2 + m.length;
         rip += used;
         return used;
+    }
+
+    // x87 FPU minimal subset. Reuses the shared FPU class (common/fpu.h) for
+    // register-side state — we drive memory I/O through CPU64::memory ourselves
+    // because the FPU::FLD_F64_EA family takes a 32-bit CPU* that we can't
+    // satisfy. ModR/M "reg" field is the sub-opcode (/0../7) for memory forms;
+    // for register forms (mod==11) the low 3 bits identify ST(i).
+    if (op == 0xD9 || op == 0xDC || op == 0xDD) {
+        U8 modrmByte = fetchByte(rip + opOff + 1);
+        ModRM m = decodeModRM(rip + opOff + 1, p, 0);
+        U32 used = opOff + 1 + m.length;
+        U8 sub = m.regField & 7; // x87 sub-opcode, ignore REX.R
+        if (!m.isReg) {
+            // memory form
+            if (op == 0xD9 && sub == 0) {
+                // FLD m32fp
+                U32 bits = memory->readd(m.effAddr);
+                fpu.PREP_PUSH();
+                fpu.FLD_F32(bits, fpu.STV(0));
+            } else if (op == 0xD9 && sub == 3) {
+                // FSTP m32fp — convert TOS to f32, store, pop
+                double d;
+                if (fpu.isRegCached[fpu.top]) {
+                    d = fpu.regCache[fpu.top].d;
+                } else {
+                    d = (double)fpu.getF64(fpu.top);
+                }
+                union { float f; U32 i; } u; u.f = (float)d;
+                memory->writed(m.effAddr, u.i);
+                fpu.FPOP();
+            } else if (op == 0xDD && sub == 0) {
+                // FLD m64fp
+                U64 bits = memory->readq(m.effAddr);
+                fpu.PREP_PUSH();
+                fpu.FLD_F64(bits, fpu.STV(0));
+            } else if (op == 0xDD && sub == 3) {
+                // FSTP m64fp — store TOS bits, pop
+                U64 bits;
+                if (fpu.isRegCached[fpu.top]) {
+                    bits = fpu.regCache[fpu.top].l;
+                } else {
+                    union { double d; U64 u; } u; u.d = fpu.getF64(fpu.top);
+                    bits = u.u;
+                }
+                memory->writeq(m.effAddr, bits);
+                fpu.FPOP();
+            } else if (op == 0xDC && sub == 0) {
+                // FADD m64fp — load operand into scratch slot 8, add to ST(0)
+                U64 bits = memory->readq(m.effAddr);
+                fpu.FLD_F64(bits, 8);
+                fpu.FADD(fpu.STV(0), 8);
+            } else if (op == 0xDC && sub == 1) {
+                // FMUL m64fp
+                U64 bits = memory->readq(m.effAddr);
+                fpu.FLD_F64(bits, 8);
+                fpu.FMUL(fpu.STV(0), 8);
+            } else {
+                goto unhandled;
+            }
+            rip += used;
+            return used;
+        } else {
+            // register form (mod==11)
+            U8 i = modrmByte & 7; // ST(i) selector
+            if (op == 0xD9 && (modrmByte & 0xF8) == 0xC0) {
+                // D9 C0+i = FLD ST(i)
+                U32 src = fpu.STV(i);
+                fpu.PREP_PUSH();
+                U32 dst = fpu.STV(0);
+                // duplicate src into dst. F64 fast path stores bits + cache flag.
+                fpu.regCache[dst] = fpu.regCache[src];
+                fpu.regs[dst] = fpu.regs[src];
+                fpu.isRegCached[dst] = fpu.isRegCached[src];
+                fpu.tags[dst] = TAG_Valid;
+            } else if (op == 0xD9 && (modrmByte & 0xF8) == 0xC8) {
+                // D9 C8+i = FXCH ST(0),ST(i)
+                fpu.FXCH(fpu.STV(0), fpu.STV(i));
+            } else {
+                goto unhandled;
+            }
+            rip += used;
+            return used;
+        }
     }
 
 unhandled:
