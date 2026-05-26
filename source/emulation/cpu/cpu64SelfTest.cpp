@@ -1322,6 +1322,180 @@ int runX64SelfTest() {
         fflush(stdout);
     }
 
+    // Test: applySymbolRelocations — synthetic module with one symbol-bound
+    // entry in DT_RELA (GLOB_DAT), one in DT_RELA (R_X86_64_64 with addend),
+    // one RELATIVE (which the symbol pass must ignore), and one JUMP_SLOT in
+    // DT_JMPREL. Resolves against an injected symbol table; verifies the
+    // GOT/PLT slots end up with the correct (symbol + addend) bytes.
+    {
+        const U64 LOAD_RELOC = 0x30000000;
+        const U64 DYN_OFF    = 0x100;
+        const U64 RELA_OFF   = 0x200;
+        const U64 JMPREL_OFF = 0x300;
+        const U64 SYMTAB_OFF = 0x400;
+        const U64 STRTAB_OFF = 0x500;
+        const U64 DEST_OFF   = 0x800;
+        KMemory64 mem(nullptr);
+        mem.mmapAnonymousFixed(LOAD_RELOC, 0x1000, 3);
+
+        // String table: leading NUL (ELF requires strtab[0]==0), then names.
+        // Offsets: 1="puts", 6="global_var", 17="missing_sym"
+        const char* strs = "\0puts\0global_var\0missing_sym";
+        const U32 STR_LEN = 1 + 5 + 11 + 12; // = 29
+        mem.memcpyToGuest(LOAD_RELOC + STRTAB_OFF, (const void*)strs, STR_LEN);
+
+        // Symbol table: sym[0] = null sym, sym[1] = "puts", sym[2] = "global_var",
+        // sym[3] = "missing_sym" (used by the unresolved-counter check below).
+        k_Elf64_Sym syms[4]{};
+        syms[1].st_name = 1;   // "puts"
+        syms[2].st_name = 6;   // "global_var"
+        syms[3].st_name = 17;  // "missing_sym"
+        mem.memcpyToGuest(LOAD_RELOC + SYMTAB_OFF, syms, sizeof(syms));
+
+        // RELA table: 3 entries.
+        //   [0] GLOB_DAT, sym=2 (global_var), addend=0, dst=DEST_OFF+0
+        //   [1] R_X86_64_64, sym=1 (puts), addend=8, dst=DEST_OFF+8
+        //   [2] RELATIVE, addend=0x123, dst=DEST_OFF+0x10  (ignored by symbol pass)
+        k_Elf64_Rela rela[3]{};
+        rela[0].r_offset = DEST_OFF + 0x00;
+        rela[0].r_info   = ((U64)2 << 32) | k_R_X86_64_GLOB_DAT;
+        rela[0].r_addend = 0;
+        rela[1].r_offset = DEST_OFF + 0x08;
+        rela[1].r_info   = ((U64)1 << 32) | k_R_X86_64_64;
+        rela[1].r_addend = 8;
+        rela[2].r_offset = DEST_OFF + 0x10;
+        rela[2].r_info   = ((U64)0 << 32) | k_R_X86_64_RELATIVE;
+        rela[2].r_addend = 0x123;
+        mem.memcpyToGuest(LOAD_RELOC + RELA_OFF, rela, sizeof(rela));
+
+        // JMPREL table: 1 entry.
+        //   JUMP_SLOT, sym=1 (puts), addend=0, dst=DEST_OFF+0x18
+        k_Elf64_Rela plt[1]{};
+        plt[0].r_offset = DEST_OFF + 0x18;
+        plt[0].r_info   = ((U64)1 << 32) | k_R_X86_64_JUMP_SLOT;
+        plt[0].r_addend = 0;
+        mem.memcpyToGuest(LOAD_RELOC + JMPREL_OFF, plt, sizeof(plt));
+
+        // Dyn array.
+        k_Elf64_Dyn dyn[10]{};
+        dyn[0].d_tag = k_DT_RELA;     dyn[0].d_un.d_ptr = RELA_OFF;
+        dyn[1].d_tag = k_DT_RELASZ;   dyn[1].d_un.d_val = sizeof(rela);
+        dyn[2].d_tag = k_DT_RELAENT;  dyn[2].d_un.d_val = sizeof(k_Elf64_Rela);
+        dyn[3].d_tag = k_DT_JMPREL;   dyn[3].d_un.d_ptr = JMPREL_OFF;
+        dyn[4].d_tag = k_DT_PLTRELSZ; dyn[4].d_un.d_val = sizeof(plt);
+        dyn[5].d_tag = k_DT_SYMTAB;   dyn[5].d_un.d_ptr = SYMTAB_OFF;
+        dyn[6].d_tag = k_DT_STRTAB;   dyn[6].d_un.d_ptr = STRTAB_OFF;
+        dyn[7].d_tag = k_DT_SYMENT;   dyn[7].d_un.d_val = sizeof(k_Elf64_Sym);
+        dyn[8].d_tag = k_DT_NULL;     dyn[8].d_un.d_val = 0;
+        mem.memcpyToGuest(LOAD_RELOC + DYN_OFF, dyn, sizeof(dyn));
+
+        Elf64DynamicInfo info;
+        info.present = true;
+        info.vaddr   = DYN_OFF;
+        info.memsz   = sizeof(dyn);
+
+        std::unordered_map<std::string, U64> symbols;
+        symbols["puts"]       = 0xDEADC0DEULL;
+        symbols["global_var"] = 0xABCD1234ULL;
+
+        // Poison destinations.
+        mem.writeq(LOAD_RELOC + DEST_OFF + 0x00, 0xFFFFFFFFFFFFFFFFULL);
+        mem.writeq(LOAD_RELOC + DEST_OFF + 0x08, 0xFFFFFFFFFFFFFFFFULL);
+        mem.writeq(LOAD_RELOC + DEST_OFF + 0x18, 0xFFFFFFFFFFFFFFFFULL);
+
+        U64 resolved = 0, unresolved = 0;
+        ElfLoader64::applySymbolRelocations(
+            &mem, info, LOAD_RELOC, symbols, "symtest",
+            &resolved, &unresolved);
+
+        U64 got0 = mem.readq(LOAD_RELOC + DEST_OFF + 0x00);
+        U64 got1 = mem.readq(LOAD_RELOC + DEST_OFF + 0x08);
+        U64 got3 = mem.readq(LOAD_RELOC + DEST_OFF + 0x18);
+        bool ok = (resolved == 3) && (unresolved == 0) &&
+                  (got0 == 0xABCD1234ULL) &&
+                  (got1 == 0xDEADC0DEULL + 8) &&
+                  (got3 == 0xDEADC0DEULL);
+        if (ok) {
+            printf("  PASS: applySymbolRelocations: 2 RELA + 1 JMPREL resolved against synthetic symtab\n");
+            r.passed++;
+        } else {
+            printf("  FAIL: applySymbolRelocations resolved=%llu unresolved=%llu got0=0x%llx got1=0x%llx got3=0x%llx\n",
+                   (unsigned long long)resolved,
+                   (unsigned long long)unresolved,
+                   (unsigned long long)got0,
+                   (unsigned long long)got1,
+                   (unsigned long long)got3);
+            r.failed++;
+        }
+        fflush(stdout);
+    }
+
+    // Test: applySymbolRelocations — unresolved symbol path. Replays the
+    // setup above but uses sym index 3 (missing_sym) and an EMPTY caller
+    // symbol map. Must report unresolved=1 without writing the destination.
+    {
+        const U64 LOAD_RELOC = 0x31000000;
+        const U64 DYN_OFF    = 0x100;
+        const U64 RELA_OFF   = 0x200;
+        const U64 SYMTAB_OFF = 0x400;
+        const U64 STRTAB_OFF = 0x500;
+        const U64 DEST_OFF   = 0x800;
+        KMemory64 mem(nullptr);
+        mem.mmapAnonymousFixed(LOAD_RELOC, 0x1000, 3);
+
+        const char* strs = "\0missing_sym";
+        mem.memcpyToGuest(LOAD_RELOC + STRTAB_OFF, (const void*)strs, 13);
+
+        k_Elf64_Sym syms[2]{};
+        syms[1].st_name = 1;
+        mem.memcpyToGuest(LOAD_RELOC + SYMTAB_OFF, syms, sizeof(syms));
+
+        k_Elf64_Rela rela[1]{};
+        rela[0].r_offset = DEST_OFF;
+        rela[0].r_info   = ((U64)1 << 32) | k_R_X86_64_GLOB_DAT;
+        rela[0].r_addend = 0;
+        mem.memcpyToGuest(LOAD_RELOC + RELA_OFF, rela, sizeof(rela));
+
+        k_Elf64_Dyn dyn[8]{};
+        dyn[0].d_tag = k_DT_RELA;     dyn[0].d_un.d_ptr = RELA_OFF;
+        dyn[1].d_tag = k_DT_RELASZ;   dyn[1].d_un.d_val = sizeof(rela);
+        dyn[2].d_tag = k_DT_RELAENT;  dyn[2].d_un.d_val = sizeof(k_Elf64_Rela);
+        dyn[3].d_tag = k_DT_SYMTAB;   dyn[3].d_un.d_ptr = SYMTAB_OFF;
+        dyn[4].d_tag = k_DT_STRTAB;   dyn[4].d_un.d_ptr = STRTAB_OFF;
+        dyn[5].d_tag = k_DT_SYMENT;   dyn[5].d_un.d_val = sizeof(k_Elf64_Sym);
+        dyn[6].d_tag = k_DT_NULL;     dyn[6].d_un.d_val = 0;
+        mem.memcpyToGuest(LOAD_RELOC + DYN_OFF, dyn, sizeof(dyn));
+
+        Elf64DynamicInfo info;
+        info.present = true;
+        info.vaddr   = DYN_OFF;
+        info.memsz   = sizeof(dyn);
+
+        std::unordered_map<std::string, U64> emptySymbols;
+
+        const U64 POISON = 0xFFFFFFFFFFFFFFFFULL;
+        mem.writeq(LOAD_RELOC + DEST_OFF, POISON);
+
+        U64 resolved = 0, unresolved = 0;
+        ElfLoader64::applySymbolRelocations(
+            &mem, info, LOAD_RELOC, emptySymbols, "missing-symtest",
+            &resolved, &unresolved);
+
+        U64 got = mem.readq(LOAD_RELOC + DEST_OFF);
+        bool ok = (resolved == 0) && (unresolved == 1) && (got == POISON);
+        if (ok) {
+            printf("  PASS: applySymbolRelocations: unresolved symbol reported, destination unchanged\n");
+            r.passed++;
+        } else {
+            printf("  FAIL: applySymbolRelocations unresolved-path resolved=%llu unresolved=%llu got=0x%llx\n",
+                   (unsigned long long)resolved,
+                   (unsigned long long)unresolved,
+                   (unsigned long long)got);
+            r.failed++;
+        }
+        fflush(stdout);
+    }
+
     // ---- SSE2 scalar FP coverage ----
     // Helper-style pattern: load doubles into xmm via "mov rax, imm64;
     // movq xmm, rax", perform the op, write the resulting bits back to

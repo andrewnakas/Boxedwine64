@@ -283,6 +283,126 @@ U64 ElfLoader64::applyRelativeRelocations(KMemory64* mem,
     return relativeCount;
 }
 
+// Resolve a NUL-terminated string out of guest memory at strtab+offset. Caps
+// at maxLen so a malformed entry can't run off the page and DoS the loader.
+static std::string readGuestCString(KMemory64* mem, U64 strtab, U32 offset, U32 maxLen = 1024) {
+    std::string out;
+    out.reserve(64);
+    for (U32 i = 0; i < maxLen; i++) {
+        U8 b = mem->readb(strtab + offset + i);
+        if (b == 0) break;
+        out.push_back((char)b);
+    }
+    return out;
+}
+
+// Apply the symbol-bound R_X86_64_* relocations against the dynamic section
+// at dyn.vaddr+reloc. This is the Milestone A3 relocation engine — the
+// remaining piece (DT_NEEDED file loading + symbol-table merging) is a
+// separate concern handled by the caller; this function takes the merged
+// symbol table as input so it can be unit-tested in isolation against
+// synthetic data.
+//
+// Handled types:
+//   R_X86_64_GLOB_DAT  *dst = sym + addend
+//   R_X86_64_JUMP_SLOT *dst = sym + addend         (PLT slot — eager binding)
+//   R_X86_64_64        *dst = sym + addend         (64-bit absolute)
+//   R_X86_64_RELATIVE  ignored (handled by applyRelativeRelocations)
+//   R_X86_64_NONE      ignored
+//   any other type     skipped, counted as unresolved-deferred
+//
+// Walks BOTH DT_RELA and DT_JMPREL — x86-64 uses RELA for both. The PLT
+// table (DT_JMPREL) is conventionally pure JUMP_SLOT, but we don't assume
+// that — the same opcode switch handles both tables.
+U64 ElfLoader64::applySymbolRelocations(KMemory64* mem,
+                                        const Elf64DynamicInfo& dyn,
+                                        U64 reloc,
+                                        const std::unordered_map<std::string, U64>& symbols,
+                                        const char* tag,
+                                        U64* outResolved,
+                                        U64* outUnresolved) {
+    U64 resolved = 0;
+    U64 unresolved = 0;
+    auto finish = [&]() {
+        if (outResolved) *outResolved = resolved;
+        if (outUnresolved) *outUnresolved = unresolved;
+        return resolved + unresolved;
+    };
+    if (!dyn.present || dyn.memsz == 0) return finish();
+
+    U64 dynAddr = dyn.vaddr + reloc;
+    U64 nEntries = dyn.memsz / sizeof(k_Elf64_Dyn);
+    std::vector<k_Elf64_Dyn> dynArr(nEntries);
+    mem->memcpyFromGuest(dynArr.data(), dynAddr, dyn.memsz);
+
+    U64 relaAddr = 0, relaSz = 0, relaEnt = sizeof(k_Elf64_Rela);
+    U64 pltRelAddr = 0, pltRelSz = 0;
+    U64 symtab = 0, strtab = 0;
+    U64 syment = sizeof(k_Elf64_Sym);
+    for (U64 i = 0; i < nEntries; i++) {
+        const k_Elf64_Dyn& d = dynArr[i];
+        if (d.d_tag == k_DT_NULL) break;
+        switch (d.d_tag) {
+            case k_DT_RELA:     relaAddr   = d.d_un.d_ptr; break;
+            case k_DT_RELASZ:   relaSz     = d.d_un.d_val; break;
+            case k_DT_RELAENT:  relaEnt    = d.d_un.d_val; break;
+            case k_DT_JMPREL:   pltRelAddr = d.d_un.d_ptr; break;
+            case k_DT_PLTRELSZ: pltRelSz   = d.d_un.d_val; break;
+            case k_DT_SYMTAB:   symtab     = d.d_un.d_ptr; break;
+            case k_DT_STRTAB:   strtab     = d.d_un.d_ptr; break;
+            case k_DT_SYMENT:   syment     = d.d_un.d_val; break;
+        }
+    }
+
+    if (symtab == 0 || strtab == 0) {
+        klog_fmt("applySymbolRelocations[%s]: no SYMTAB/STRTAB — nothing to resolve",
+                 tag);
+        return finish();
+    }
+
+    auto walkTable = [&](U64 tableAddr, U64 tableSz, U64 entSize, const char* which) {
+        if (tableAddr == 0 || tableSz == 0) return;
+        U64 nRela = tableSz / entSize;
+        for (U64 i = 0; i < nRela; i++) {
+            k_Elf64_Rela rela;
+            mem->memcpyFromGuest(&rela, tableAddr + reloc + i * entSize, sizeof(rela));
+            U32 type = k_ELF64_R_TYPE(rela.r_info);
+            U32 symIdx = k_ELF64_R_SYM(rela.r_info);
+            U64 dst = rela.r_offset + reloc;
+            if (type == k_R_X86_64_NONE || type == k_R_X86_64_RELATIVE) continue;
+            if (type != k_R_X86_64_GLOB_DAT &&
+                type != k_R_X86_64_JUMP_SLOT &&
+                type != k_R_X86_64_64) {
+                // COPY/IRELATIVE/TLS — out of scope for the eager pass.
+                unresolved++;
+                continue;
+            }
+            k_Elf64_Sym sym;
+            mem->memcpyFromGuest(&sym, symtab + reloc + symIdx * syment, sizeof(sym));
+            std::string name = readGuestCString(mem, strtab + reloc, sym.st_name);
+            auto it = symbols.find(name);
+            if (it == symbols.end()) {
+                unresolved++;
+                klog_fmt("applySymbolRelocations[%s/%s]: unresolved '%s' (type=%u)",
+                         tag, which, name.c_str(), (unsigned)type);
+                continue;
+            }
+            U64 value = it->second + (U64)rela.r_addend;
+            mem->writeq(dst, value);
+            resolved++;
+        }
+    };
+
+    walkTable(relaAddr, relaSz, relaEnt, "RELA");
+    walkTable(pltRelAddr, pltRelSz, sizeof(k_Elf64_Rela), "JMPREL");
+
+    klog_fmt("applySymbolRelocations[%s]: resolved=%llu unresolved=%llu",
+             tag,
+             (unsigned long long)resolved,
+             (unsigned long long)unresolved);
+    return finish();
+}
+
 // glibc x86-64 TLS layout (variant II, the only one glibc uses on amd64):
 //
 //   [ static TLS image (memsz bytes) ][ TCB (≥ tcbhead_t) ]

@@ -12,6 +12,8 @@
 
 #include "kelf64.h"
 #include <vector>
+#include <string>
+#include <unordered_map>
 
 class FsOpenNode;
 class KThread;
@@ -86,6 +88,31 @@ public:
                                         const Elf64DynamicInfo& dyn,
                                         U64 reloc,
                                         const char* tag);
+
+    // Apply symbol-bound relocations (R_X86_64_GLOB_DAT, JUMP_SLOT, 64) against
+    // the dynamic section at dyn.vaddr+reloc. Symbol names are resolved against
+    // a flat caller-supplied table — for the full DT_NEEDED recursion path this
+    // would be the merged symbol table across all loaded DSOs; for self-tests
+    // the caller injects a small synthetic table.
+    //
+    // Result counts:
+    //   resolved   = number of relocations whose symbol was found and written
+    //   unresolved = symbol not in the table (caller decides whether to fail
+    //                or defer to ld-linux)
+    // Returns resolved + unresolved; RELATIVE/NONE entries are silently
+    // ignored (they're handled by applyRelativeRelocations).
+    //
+    // Walks BOTH the DT_RELA table AND the DT_JMPREL (PLT) table — on x86-64
+    // both are RELA-shaped and both can contain symbol-bound entries.
+    //
+    // Public so self-tests can exercise resolution without an FS round-trip.
+    static U64 applySymbolRelocations(class KMemory64* mem,
+                                      const Elf64DynamicInfo& dyn,
+                                      U64 reloc,
+                                      const std::unordered_map<std::string, U64>& symbols,
+                                      const char* tag,
+                                      U64* outResolved = nullptr,
+                                      U64* outUnresolved = nullptr);
 
     // Allocate and populate a static TLS block from the PT_TLS template.
     // Layout (glibc x86-64): [tls image at negative offsets] [TCB] ← FS.
