@@ -72,6 +72,8 @@
 #define X64_SYS_sched_yield       24
 #define X64_SYS_sched_setaffinity 203
 #define X64_SYS_sched_getaffinity 204
+#define X64_SYS_statfs            137
+#define X64_SYS_fstatfs           138
 #define X64_SYS_kill              62
 #define X64_SYS_gettimeofday      96
 #define X64_SYS_getrusage         98
@@ -740,6 +742,44 @@ static U64 sys_sched_setaffinity64(CPU64* cpu, U64 pid, U64 cpusetsize, U64 mask
     return 0;
 }
 
+// statfs(2) / fstatfs(2) — fixed-shape stub. Layout of x86-64 struct statfs
+// (120 bytes, all fields long-sized):
+//   off  0: f_type        off 56: f_fsid (8)
+//   off  8: f_bsize       off 64: f_namelen
+//   off 16: f_blocks      off 72: f_frsize
+//   off 24: f_bfree       off 80: f_flags
+//   off 32: f_bavail      off 88..119: f_spare[4]
+//   off 40: f_files
+//   off 48: f_ffree
+//
+// glibc's dynamic loader probes statfs("/proc"), the system's ld.so.cache
+// directory, etc. The load-bearing fields are f_type (to know "is this
+// tmpfs/proc/etc?"), f_bsize (cache alignment), and f_namelen (path
+// canonicalisation). We claim tmpfs (0x01021994) with 4096-byte blocks
+// and 255-byte filenames, zero free/total — glibc tolerates the lie.
+#define X64_TMPFS_MAGIC 0x01021994
+
+static U64 sys_statfs64_common(CPU64* cpu, U64 bufPtr) {
+    if (!bufPtr) return (U64)-K_EFAULT;
+    if (!cpu->memory) return (U64)-K_EFAULT;
+    cpu->memory->writeq(bufPtr +  0, X64_TMPFS_MAGIC); // f_type
+    cpu->memory->writeq(bufPtr +  8, 4096);            // f_bsize
+    cpu->memory->writeq(bufPtr + 16, 0);               // f_blocks
+    cpu->memory->writeq(bufPtr + 24, 0);               // f_bfree
+    cpu->memory->writeq(bufPtr + 32, 0);               // f_bavail
+    cpu->memory->writeq(bufPtr + 40, 0);               // f_files
+    cpu->memory->writeq(bufPtr + 48, 0);               // f_ffree
+    cpu->memory->writeq(bufPtr + 56, 0);               // f_fsid
+    cpu->memory->writeq(bufPtr + 64, 255);             // f_namelen
+    cpu->memory->writeq(bufPtr + 72, 4096);            // f_frsize
+    cpu->memory->writeq(bufPtr + 80, 0);               // f_flags
+    cpu->memory->writeq(bufPtr + 88, 0);
+    cpu->memory->writeq(bufPtr + 96, 0);
+    cpu->memory->writeq(bufPtr + 104, 0);
+    cpu->memory->writeq(bufPtr + 112, 0);
+    return 0;
+}
+
 // Map an x86-64 Linux syscall number to a human-readable name. Used only by
 // the unimplemented-syscall log path — when running real glibc binaries, the
 // first thing you want to see is "which syscall is missing", not "#291".
@@ -988,6 +1028,14 @@ void ksyscall64(CPU64* cpu) {
             break;
         case X64_SYS_newfstatat:
             ret = sys_newfstatat64(cpu, a1, a2, a3, a4);
+            break;
+        case X64_SYS_statfs:
+            // a1 = path (ignored — same lie for every fs), a2 = struct statfs*
+            ret = sys_statfs64_common(cpu, a2);
+            break;
+        case X64_SYS_fstatfs:
+            // a1 = fd (ignored), a2 = struct statfs*
+            ret = sys_statfs64_common(cpu, a2);
             break;
         case X64_SYS_lseek:
             ret = sys_lseek64(cpu, a1, a2, a3);

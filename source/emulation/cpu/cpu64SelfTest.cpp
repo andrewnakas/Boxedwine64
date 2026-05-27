@@ -2662,6 +2662,70 @@ int runX64SelfTest() {
         });
     }
 
+    // ----- statfs / fstatfs stub (Milestone B3) -----
+    // Both write a 120-byte struct statfs. We verify the load-bearing fields
+    // (f_type, f_bsize, f_namelen) — glibc reads those during ld.so cache
+    // lookup. Buffer at [rsp], path/fd is unused by our stub.
+
+    // T: statfs(path, buf) writes tmpfs magic + bsize=4096 + namelen=255.
+    {
+        std::vector<U8> code = {
+            0x48, 0x83, 0xEC, 0x80,                                     // sub rsp, 128
+            // sys_statfs(NULL, rsp)
+            0x48, 0xC7, 0xC0, 0x89, 0x00, 0x00, 0x00,                   // mov rax, 137
+            0x48, 0x31, 0xFF,                                           // path=NULL
+            0x48, 0x89, 0xE6,                                           // rsi=rsp (buf)
+            0x0F, 0x05,                                                 // syscall
+            // Pack three load-bearing fields into one composite for the
+            // verifier: r12=f_type, r13=f_bsize, r14=f_namelen. R15 will
+            // be the syscall return (set by exit suffix).
+            0x4C, 0x8B, 0x24, 0x24,                                     // mov r12, [rsp+0]   f_type
+            0x4C, 0x8B, 0x6C, 0x24, 0x08,                               // mov r13, [rsp+8]   f_bsize
+            0x4C, 0x8B, 0x74, 0x24, 0x40,                               // mov r14, [rsp+64]  f_namelen
+            0x48, 0x83, 0xC4, 0x80,
+        };
+        runAndCheck(r, "statfs writes tmpfs magic + bsize + namelen", withExit(code), [](CPU64& c) {
+            return c.reg[X64_R15].u64 == 0
+                && c.reg[X64_R12].u64 == 0x01021994ULL
+                && c.reg[X64_R13].u64 == 4096ULL
+                && c.reg[X64_R14].u64 == 255ULL;
+        });
+    }
+
+    // T: fstatfs(fd, buf) writes the same fields.
+    {
+        std::vector<U8> code = {
+            0x48, 0x83, 0xEC, 0x80,
+            0x48, 0xC7, 0xC0, 0x8A, 0x00, 0x00, 0x00,                   // mov rax, 138
+            0x48, 0xC7, 0xC7, 0x03, 0x00, 0x00, 0x00,                   // fd=3 (ignored)
+            0x48, 0x89, 0xE6,
+            0x0F, 0x05,
+            0x4C, 0x8B, 0x24, 0x24,
+            0x4C, 0x8B, 0x6C, 0x24, 0x08,
+            0x4C, 0x8B, 0x74, 0x24, 0x40,
+            0x48, 0x83, 0xC4, 0x80,
+        };
+        runAndCheck(r, "fstatfs writes tmpfs magic + bsize + namelen", withExit(code), [](CPU64& c) {
+            return c.reg[X64_R15].u64 == 0
+                && c.reg[X64_R12].u64 == 0x01021994ULL
+                && c.reg[X64_R13].u64 == 4096ULL
+                && c.reg[X64_R14].u64 == 255ULL;
+        });
+    }
+
+    // T: statfs with NULL buf → -EFAULT.
+    {
+        std::vector<U8> code = {
+            0x48, 0xC7, 0xC0, 0x89, 0x00, 0x00, 0x00,
+            0x48, 0x31, 0xFF,
+            0x48, 0x31, 0xF6,                                           // buf=NULL
+            0x0F, 0x05,
+        };
+        runAndCheck(r, "statfs NULL buf → -EFAULT", withExit(code), [](CPU64& c) {
+            return c.reg[X64_R15].u64 == 0xFFFFFFFFFFFFFFF2ULL; // -14
+        });
+    }
+
     printf("=== self-test summary: %d passed, %d failed ===\n\n", r.passed, r.failed);
     return r.failed == 0 ? 0 : 1;
 }
