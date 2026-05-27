@@ -76,6 +76,7 @@ run_one scalarFp       "$ROOT/tools/buildScalarFpElf64.py"     8          || fai
 run_one div            "$ROOT/tools/buildDivElf64.py"          135        || fail=$((fail+1))
 run_one repMovsb       "$ROOT/tools/buildRepMovsbElf64.py"     13         || fail=$((fail+1))
 run_one shiftBranch    "$ROOT/tools/buildShiftBranchElf64.py"  80         || fail=$((fail+1))
+run_one arraySum       "$ROOT/tools/buildArraySumElf64.py"     36         || fail=$((fail+1))
 
-echo "=== summary: $((11 - fail))/11 passed ==="
+echo "=== summary: $((12 - fail))/12 passed ==="
 exit $fail
