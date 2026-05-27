@@ -57,6 +57,7 @@ run_one pieReloc       "$ROOT/tools/buildPieRelocElf64.py"     5592471    || fai
 run_one multiSegment   "$ROOT/tools/buildMultiSegmentElf64.py" 0          || fail=$((fail+1))
 run_one callReturn     "$ROOT/tools/buildCallReturnElf64.py"   43         || fail=$((fail+1))
 run_one loop           "$ROOT/tools/buildLoopElf64.py"         55         || fail=$((fail+1))
+run_one stackString    "$ROOT/tools/buildStackStringElf64.py"  3          || fail=$((fail+1))
 
-echo "=== summary: $((5 - fail))/5 passed ==="
+echo "=== summary: $((6 - fail))/6 passed ==="
 exit $fail
