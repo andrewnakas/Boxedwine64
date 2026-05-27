@@ -87,6 +87,15 @@
 #define X64_SYS_nanosleep         35
 #define X64_SYS_pipe2_alias       293
 #define X64_SYS_rseq              334
+#define X64_SYS_clone             56
+#define X64_SYS_wait4             61
+#define X64_SYS_pause             34
+#define X64_SYS_getitimer         36
+#define X64_SYS_setitimer         38
+#define X64_SYS_rt_sigpending     127
+#define X64_SYS_rt_sigtimedwait   128
+#define X64_SYS_rt_sigqueueinfo   129
+#define X64_SYS_rt_sigsuspend     130
 
 // arch_prctl subfunctions
 #define X64_ARCH_SET_GS  0x1001
@@ -110,6 +119,12 @@
 #endif
 #ifndef K_ENOMEM
 #define K_ENOMEM 12
+#endif
+#ifndef K_ECHILD
+#define K_ECHILD 10
+#endif
+#ifndef K_EINTR
+#define K_EINTR 4
 #endif
 
 // FUTEX_* op codes from <linux/futex.h>. We handle WAIT/WAKE + their
@@ -607,6 +622,37 @@ static U64 sys_futex64(CPU64* cpu, U64 uaddr, U32 op, U32 val) {
     }
 }
 
+// rt_sigtimedwait(set, info, timeout, sigsetsize) — block till a signal in
+// `set` arrives or `timeout` elapses. With no delivery implemented, the
+// only correct non-hanging answer is -EAGAIN (timeout). Validate sigsetsize
+// for the standard 8-byte mask first.
+static U64 sys_rt_sigtimedwait64(CPU64* /*cpu*/, U64 setPtr, U64 /*infoPtr*/,
+                                  U64 /*timeoutPtr*/, U64 sigsetsize) {
+    if (sigsetsize != 8) return (U64)-K_EINVAL;
+    if (setPtr == 0) return (U64)-K_EFAULT;
+    // No signals pending; timeout result.
+    return (U64)-K_EAGAIN;
+}
+
+// rt_sigsuspend(mask, sigsetsize) — replace mask, sleep till signal, restore.
+// With no delivery, returning -EINTR forces glibc to retry the surrounding
+// loop (correct for poll/select-on-signal idioms).
+static U64 sys_rt_sigsuspend64(CPU64* /*cpu*/, U64 maskPtr, U64 sigsetsize) {
+    if (sigsetsize != 8) return (U64)-K_EINVAL;
+    if (maskPtr == 0) return (U64)-K_EFAULT;
+    return (U64)-K_EINTR;
+}
+
+// rt_sigpending(set, sigsetsize) — write currently-pending signal mask.
+// Nothing is ever pending in our world; write zeros and succeed.
+static U64 sys_rt_sigpending64(CPU64* cpu, U64 setPtr, U64 sigsetsize) {
+    if (sigsetsize != 8) return (U64)-K_EINVAL;
+    if (setPtr == 0) return (U64)-K_EFAULT;
+    if (!cpu->memory) return (U64)-K_EFAULT;
+    cpu->memory->writeq(setPtr, 0);
+    return 0;
+}
+
 // rt_sigaction(2) — storage-only round-trip. We do not yet deliver signals
 // to guest handlers (that needs the signal-frame builder of Milestone B),
 // but glibc's startup *registers* SIGFPE/SIGSEGV/SIGPIPE handlers very
@@ -842,7 +888,10 @@ static const char* x64SyscallName(U64 nr) {
         case 28: return "madvise";
         case 32: return "dup";
         case 33: return "dup2";
+        case 34: return "pause";
         case 35: return "nanosleep";
+        case 36: return "getitimer";
+        case 38: return "setitimer";
         case 39: return "getpid";
         case 41: return "socket";
         case 42: return "connect";
@@ -877,6 +926,10 @@ static const char* x64SyscallName(U64 nr) {
         case 111: return "getpgrp";
         case 121: return "getpgid";
         case 124: return "getsid";
+        case 127: return "rt_sigpending";
+        case 128: return "rt_sigtimedwait";
+        case 129: return "rt_sigqueueinfo";
+        case 130: return "rt_sigsuspend";
         case 131: return "sigaltstack";
         case 137: return "statfs";
         case 138: return "fstatfs";
@@ -1122,6 +1175,43 @@ void ksyscall64(CPU64* cpu) {
             // For now: silently succeed. glibc's abort() goes here via
             // tgkill, but exits handle the actual termination elsewhere.
             ret = 0;
+            break;
+        case X64_SYS_rt_sigtimedwait:
+            ret = sys_rt_sigtimedwait64(cpu, a1, a2, a3, a4);
+            break;
+        case X64_SYS_rt_sigsuspend:
+            ret = sys_rt_sigsuspend64(cpu, a1, a2);
+            break;
+        case X64_SYS_rt_sigpending:
+            ret = sys_rt_sigpending64(cpu, a1, a2);
+            break;
+        case X64_SYS_rt_sigqueueinfo:
+            // rt_sigqueueinfo(tgid, sig, info) — like kill but with siginfo.
+            // We don't deliver, so report success the same way kill does.
+            ret = 0;
+            break;
+        case X64_SYS_pause:
+            // pause() blocks till any signal; we never deliver, so the
+            // glibc-compatible answer is -EINTR (caller's loop retries).
+            ret = (U64)-K_EINTR;
+            break;
+        case X64_SYS_wait4:
+            // No children to reap (single-process world).
+            ret = (U64)-K_ECHILD;
+            break;
+        case X64_SYS_clone:
+            // Real thread/process creation needs KThread64 (deferred). Log
+            // so we know when a binary tries — return -ENOSYS so glibc's
+            // pthread_create surfaces the failure cleanly instead of looping.
+            klog_fmt("ksyscall64: clone(flags=0x%llx) not implemented",
+                     (unsigned long long)a1);
+            ret = (U64)-K_ENOSYS;
+            break;
+        case X64_SYS_getitimer:
+        case X64_SYS_setitimer:
+            // Interval timers are rarely used by modern glibc (timer_create
+            // is preferred); explicit ENOSYS keeps callers honest.
+            ret = (U64)-K_ENOSYS;
             break;
         case X64_SYS_gettimeofday: {
             // struct timeval { U64 sec; U64 usec; }

@@ -2226,6 +2226,135 @@ int runX64SelfTest() {
         });
     }
 
+    // ---- Milestone B5: signal-syscall stubs ----
+
+    // pause(34) → -EINTR (we never deliver, so loop-retry is the honest answer)
+    {
+        std::vector<U8> code = {
+            0x48, 0xC7, 0xC0, 0x22, 0x00, 0x00, 0x00,                     // mov rax, 34 (pause)
+            0x0F, 0x05,
+        };
+        runAndCheck(r, "pause() → -EINTR", withExit(code), [](CPU64& c) {
+            return c.reg[X64_R15].u64 == 0xFFFFFFFFFFFFFFFCULL;
+        });
+    }
+
+    // wait4(61) → -ECHILD (no children to reap)
+    {
+        std::vector<U8> code = {
+            0x48, 0xC7, 0xC0, 0x3D, 0x00, 0x00, 0x00,                     // mov rax, 61
+            0x48, 0xC7, 0xC7, 0xFF, 0xFF, 0xFF, 0xFF,                     // mov rdi, -1 (any child)
+            0x48, 0x31, 0xF6,                                             // xor rsi, rsi
+            0x48, 0x31, 0xD2,                                             // xor rdx, rdx
+            0x4D, 0x31, 0xD2,                                             // xor r10, r10
+            0x0F, 0x05,
+        };
+        runAndCheck(r, "wait4(-1) → -ECHILD", withExit(code), [](CPU64& c) {
+            return c.reg[X64_R15].u64 == 0xFFFFFFFFFFFFFFF6ULL;
+        });
+    }
+
+    // clone(56) → -ENOSYS (real impl deferred; explicit so glibc surfaces it)
+    {
+        std::vector<U8> code = {
+            0x48, 0xC7, 0xC0, 0x38, 0x00, 0x00, 0x00,                     // mov rax, 56
+            0x48, 0x31, 0xFF,                                             // xor rdi, rdi (flags=0)
+            0x48, 0x31, 0xF6,                                             // xor rsi, rsi
+            0x0F, 0x05,
+        };
+        runAndCheck(r, "clone(0) → -ENOSYS", withExit(code), [](CPU64& c) {
+            return c.reg[X64_R15].u64 == 0xFFFFFFFFFFFFFFDAULL;
+        });
+    }
+
+    // getitimer(36) → -ENOSYS
+    {
+        std::vector<U8> code = {
+            0x48, 0xC7, 0xC0, 0x24, 0x00, 0x00, 0x00,                     // mov rax, 36
+            0x48, 0x31, 0xFF,                                             // rdi=which=0
+            0x48, 0x31, 0xF6,                                             // rsi=NULL
+            0x0F, 0x05,
+        };
+        runAndCheck(r, "getitimer() → -ENOSYS", withExit(code), [](CPU64& c) {
+            return c.reg[X64_R15].u64 == 0xFFFFFFFFFFFFFFDAULL;
+        });
+    }
+
+    // rt_sigpending(127) writes zeros, returns 0
+    {
+        U64 dst = STACK_TOP - 0x900;
+        std::vector<U8> code = {
+            // Prefill mask slot with 0xDEADBEEF to confirm overwrite-to-zero.
+            0x48, 0xBF,
+                (U8)(dst), (U8)(dst >> 8), (U8)(dst >> 16), (U8)(dst >> 24),
+                (U8)(dst >> 32), (U8)(dst >> 40), (U8)(dst >> 48), (U8)(dst >> 56),
+            0x48, 0xB8, 0xEF, 0xBE, 0xAD, 0xDE, 0x00, 0x00, 0x00, 0x00,   // mov rax, 0xDEADBEEF
+            0x48, 0x89, 0x07,                                             // mov [rdi], rax
+            // syscall: rax=127, rdi=dst, rsi=8
+            0x48, 0xC7, 0xC0, 0x7F, 0x00, 0x00, 0x00,
+            0x48, 0xC7, 0xC6, 0x08, 0x00, 0x00, 0x00,
+            0x0F, 0x05,
+            // Move the written mask into r15 via the verifier (r15 picks up rax).
+            // We want r15 to reflect *both* return value (0) AND the mask write.
+            // Pack: load mask into rcx, OR with rax-shifted... simpler: just
+            // confirm rax==0 and check mask via a separate read-back into rax.
+            0x48, 0xBF,
+                (U8)(dst), (U8)(dst >> 8), (U8)(dst >> 16), (U8)(dst >> 24),
+                (U8)(dst >> 32), (U8)(dst >> 40), (U8)(dst >> 48), (U8)(dst >> 56),
+            0x48, 0x8B, 0x07,                                             // mov rax, [rdi]  (final RAX→R15 via withExit)
+        };
+        runAndCheck(r, "rt_sigpending writes zero mask", withExit(code), [](CPU64& c) {
+            return c.reg[X64_R15].u64 == 0;
+        });
+    }
+
+    // rt_sigpending sigsetsize=4 → -EINVAL
+    {
+        std::vector<U8> code = {
+            0x48, 0x83, 0xEC, 0x10,
+            0x48, 0xC7, 0xC0, 0x7F, 0x00, 0x00, 0x00,                     // mov rax, 127
+            0x48, 0x89, 0xE7,                                             // mov rdi, rsp
+            0x48, 0xC7, 0xC6, 0x04, 0x00, 0x00, 0x00,                     // mov rsi, 4 (wrong size)
+            0x0F, 0x05,
+            0x48, 0x83, 0xC4, 0x10,
+        };
+        runAndCheck(r, "rt_sigpending sigsetsize=4 → -EINVAL", withExit(code), [](CPU64& c) {
+            return c.reg[X64_R15].u64 == 0xFFFFFFFFFFFFFFEAULL;
+        });
+    }
+
+    // rt_sigtimedwait(128) → -EAGAIN (we treat unblocked as immediate timeout)
+    {
+        std::vector<U8> code = {
+            0x48, 0x83, 0xEC, 0x10,
+            0x48, 0xC7, 0xC0, 0x80, 0x00, 0x00, 0x00,                     // mov rax, 128
+            0x48, 0x89, 0xE7,                                             // mov rdi, rsp (set)
+            0x48, 0x31, 0xF6,                                             // rsi=NULL (info)
+            0x48, 0x31, 0xD2,                                             // rdx=NULL (timeout)
+            0x49, 0xC7, 0xC2, 0x08, 0x00, 0x00, 0x00,                     // mov r10, 8
+            0x0F, 0x05,
+            0x48, 0x83, 0xC4, 0x10,
+        };
+        runAndCheck(r, "rt_sigtimedwait → -EAGAIN", withExit(code), [](CPU64& c) {
+            return c.reg[X64_R15].u64 == 0xFFFFFFFFFFFFFFF5ULL;
+        });
+    }
+
+    // rt_sigsuspend(130) → -EINTR (we pretend a signal interrupted)
+    {
+        std::vector<U8> code = {
+            0x48, 0x83, 0xEC, 0x10,
+            0x48, 0xC7, 0xC0, 0x82, 0x00, 0x00, 0x00,                     // mov rax, 130
+            0x48, 0x89, 0xE7,                                             // mov rdi, rsp (mask)
+            0x48, 0xC7, 0xC6, 0x08, 0x00, 0x00, 0x00,                     // mov rsi, 8
+            0x0F, 0x05,
+            0x48, 0x83, 0xC4, 0x10,
+        };
+        runAndCheck(r, "rt_sigsuspend → -EINTR", withExit(code), [](CPU64& c) {
+            return c.reg[X64_R15].u64 == 0xFFFFFFFFFFFFFFFCULL;
+        });
+    }
+
     // ----- x87 FPU minimal subset (D9/DC/DD) -----
     // Pattern: spill the operand double into a stack slot via
     //   sub rsp,8 ; mov rax,imm64 ; mov [rsp],rax
