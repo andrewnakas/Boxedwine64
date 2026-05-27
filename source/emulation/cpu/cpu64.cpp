@@ -3355,7 +3355,7 @@ U32 CPU64::step() {
     // because the FPU::FLD_F64_EA family takes a 32-bit CPU* that we can't
     // satisfy. ModR/M "reg" field is the sub-opcode (/0../7) for memory forms;
     // for register forms (mod==11) the low 3 bits identify ST(i).
-    if (op == 0xD9 || op == 0xDC || op == 0xDD) {
+    if (op == 0xD9 || op == 0xDC || op == 0xDD || op == 0xDF) {
         U8 modrmByte = fetchByte(rip + opOff + 1);
         ModRM m = decodeModRM(rip + opOff + 1, p, 0);
         U32 used = opOff + 1 + m.length;
@@ -3404,6 +3404,26 @@ U32 CPU64::step() {
                 U64 bits = memory->readq(m.effAddr);
                 fpu.FLD_F64(bits, 8);
                 fpu.FMUL(fpu.STV(0), 8);
+            } else if (op == 0xDC && sub == 4) {
+                // FSUB m64fp — ST(0) = ST(0) - m64
+                U64 bits = memory->readq(m.effAddr);
+                fpu.FLD_F64(bits, 8);
+                fpu.FSUB(fpu.STV(0), 8);
+            } else if (op == 0xDC && sub == 5) {
+                // FSUBR m64fp — ST(0) = m64 - ST(0)
+                U64 bits = memory->readq(m.effAddr);
+                fpu.FLD_F64(bits, 8);
+                fpu.FSUBR(fpu.STV(0), 8);
+            } else if (op == 0xDC && sub == 6) {
+                // FDIV m64fp — ST(0) = ST(0) / m64
+                U64 bits = memory->readq(m.effAddr);
+                fpu.FLD_F64(bits, 8);
+                fpu.FDIV(fpu.STV(0), 8);
+            } else if (op == 0xDC && sub == 7) {
+                // FDIVR m64fp — ST(0) = m64 / ST(0)
+                U64 bits = memory->readq(m.effAddr);
+                fpu.FLD_F64(bits, 8);
+                fpu.FDIVR(fpu.STV(0), 8);
             } else {
                 goto unhandled;
             }
@@ -3425,6 +3445,24 @@ U32 CPU64::step() {
             } else if (op == 0xD9 && (modrmByte & 0xF8) == 0xC8) {
                 // D9 C8+i = FXCH ST(0),ST(i)
                 fpu.FXCH(fpu.STV(0), fpu.STV(i));
+            } else if (op == 0xD9 && modrmByte == 0xE0) {
+                // D9 E0 = FCHS — negate ST(0)
+                fpu.FCHS();
+            } else if (op == 0xD9 && modrmByte == 0xE1) {
+                // D9 E1 = FABS — absolute value of ST(0)
+                fpu.FABS();
+            } else if (op == 0xD9 && modrmByte == 0xE8) {
+                // D9 E8 = FLD1 — push +1.0
+                fpu.PREP_PUSH();
+                fpu.FLD1();
+            } else if (op == 0xD9 && modrmByte == 0xEE) {
+                // D9 EE = FLDZ — push +0.0
+                fpu.PREP_PUSH();
+                fpu.FLDZ();
+            } else if (op == 0xDF && modrmByte == 0xE0) {
+                // DF E0 = FNSTSW AX — write status word into AX, preserving
+                // the upper 48 bits of RAX (per AMD64 manual).
+                reg[X64_RAX].setU16((U16)fpu.SW());
             } else {
                 goto unhandled;
             }
