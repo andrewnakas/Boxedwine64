@@ -1653,6 +1653,242 @@ int runX64SelfTest() {
         fflush(stdout);
     }
 
+    // Test: linkSharedObjects end-to-end with a preloaded lib.
+    // libfoo defines `foo` at its code offset; main exe imports `foo`
+    // via a JUMP_SLOT entry. After linking, the GOT slot in the main
+    // exe must hold libfoo's resolved foo address (= libReloc + foo_off).
+    {
+        const U64 MAIN_RELOC = 0x40000000;
+        const U64 LIB_RELOC  = 0x50000000;
+
+        KMemory64 mem(nullptr);
+        mem.mmapAnonymousFixed(MAIN_RELOC, 0x2000, 7);
+        mem.mmapAnonymousFixed(LIB_RELOC,  0x2000, 7);
+
+        // ---------- Build libfoo blob (in-memory ELF) ----------
+        // Layout:
+        //   0x0000 Ehdr
+        //   0x0040 Phdr (1 LOAD)
+        //   0x0078 STRTAB ("\0foo")
+        //   0x0080 SYMTAB (2 entries: 0=null, 1=foo @ st_value=code_off, GLOBAL)
+        //   0x00B0 DYN (4: SYMTAB, STRTAB, SYMENT, NULL)
+        //   0x00F0 Phdr[1] PT_DYNAMIC pointer  (NO — we put dyn ptr in dyn struct, not extra Phdr)
+        // Wait — dynamic info comes via PT_DYNAMIC phdr. Need 2 Phdrs.
+        //
+        // Re-layout:
+        //   0x0000 Ehdr (64)
+        //   0x0040 Phdr[0] PT_LOAD (56)
+        //   0x0078 Phdr[1] PT_DYNAMIC (56)
+        //   0x00B0 DYN array (4 entries × 16 = 64)
+        //   0x00F0 STRTAB ("\0foo")
+        //   0x00F4 SYMTAB (2 syms × 24 = 48)
+        //   0x0124 Code: mov r15, 0xF00; ret
+        const U64 L_EHDR  = 0x0000;
+        const U64 L_PHDR  = 0x0040;
+        const U64 L_DYN   = 0x00B0;
+        const U64 L_STR   = 0x00F0;
+        const U64 L_SYM   = 0x00F4;
+        const U64 L_CODE  = 0x0124;
+        const U64 L_END   = 0x0140;
+
+        std::vector<U8> libBuf(L_END, 0);
+        // STRTAB.
+        memcpy(libBuf.data() + L_STR, "\0foo", 4);
+        // SYMTAB. Slot 0 zero, slot 1 = foo.
+        k_Elf64_Sym lsyms[2]{};
+        lsyms[1].st_name  = 1;          // "foo"
+        lsyms[1].st_info  = 1 << 4;     // GLOBAL
+        lsyms[1].st_shndx = 1;
+        lsyms[1].st_value = L_CODE;     // function offset
+        memcpy(libBuf.data() + L_SYM, lsyms, sizeof(lsyms));
+        // Note: STRTAB at 0xF0, SYMTAB at 0xF4 — STRTAB sits BEFORE SYMTAB
+        // here, which violates the (strtab > symtab) assumption in
+        // extractGlobalSymbols. Swap them.
+        //   Use: STRTAB at L_STR (after SYMTAB), SYMTAB at L_SYM (before).
+        // Re-layout swap: L_SYM = 0xF0 (48 bytes), L_STR = 0x120 (4 bytes).
+        // Redo with corrected layout below.
+
+        const U64 L2_EHDR = 0x0000;
+        const U64 L2_PHDR = 0x0040;
+        const U64 L2_DYN  = 0x00B0;
+        const U64 L2_SYM  = 0x00F0;
+        const U64 L2_STR  = 0x0120; // immediately after SYMTAB
+        const U64 L2_CODE = 0x0128;
+        const U64 L2_END  = 0x0140;
+        libBuf.assign(L2_END, 0);
+
+        // Ehdr.
+        k_Elf64_Ehdr leh{};
+        leh.e_ident[0]=0x7F; leh.e_ident[1]='E'; leh.e_ident[2]='L'; leh.e_ident[3]='F';
+        leh.e_ident[4]=k_ELFCLASS64; leh.e_ident[5]=1; leh.e_ident[6]=1;
+        leh.e_type=3;             // ET_DYN
+        leh.e_machine=k_EM_X86_64;
+        leh.e_version=1;
+        leh.e_entry=L2_CODE;
+        leh.e_phoff=L2_PHDR;
+        leh.e_ehsize=sizeof(k_Elf64_Ehdr);
+        leh.e_phentsize=sizeof(k_Elf64_Phdr);
+        leh.e_phnum=2;
+        memcpy(libBuf.data() + L2_EHDR, &leh, sizeof(leh));
+
+        // Phdrs.
+        k_Elf64_Phdr lload{};
+        lload.p_type=k_PT_LOAD; lload.p_flags=7;
+        lload.p_offset=0; lload.p_vaddr=0; lload.p_paddr=0;
+        lload.p_filesz=L2_END; lload.p_memsz=L2_END; lload.p_align=0x1000;
+        memcpy(libBuf.data() + L2_PHDR, &lload, sizeof(lload));
+        k_Elf64_Phdr ldyn{};
+        ldyn.p_type=k_PT_DYNAMIC; ldyn.p_flags=6;
+        ldyn.p_offset=L2_DYN; ldyn.p_vaddr=L2_DYN;
+        ldyn.p_filesz=0x40; ldyn.p_memsz=0x40; ldyn.p_align=8;
+        memcpy(libBuf.data() + L2_PHDR + sizeof(k_Elf64_Phdr), &ldyn, sizeof(ldyn));
+
+        // DYN.
+        k_Elf64_Dyn ldynArr[4]{};
+        ldynArr[0].d_tag=k_DT_SYMTAB; ldynArr[0].d_un.d_ptr=L2_SYM;
+        ldynArr[1].d_tag=k_DT_STRTAB; ldynArr[1].d_un.d_ptr=L2_STR;
+        ldynArr[2].d_tag=k_DT_SYMENT; ldynArr[2].d_un.d_val=sizeof(k_Elf64_Sym);
+        ldynArr[3].d_tag=k_DT_NULL;   ldynArr[3].d_un.d_val=0;
+        memcpy(libBuf.data() + L2_DYN, ldynArr, sizeof(ldynArr));
+
+        // SYMTAB: slot 1 = foo.
+        k_Elf64_Sym lsyms2[2]{};
+        lsyms2[1].st_name  = 1;
+        lsyms2[1].st_info  = 1 << 4;
+        lsyms2[1].st_shndx = 1;
+        lsyms2[1].st_value = L2_CODE;
+        memcpy(libBuf.data() + L2_SYM, lsyms2, sizeof(lsyms2));
+
+        // STRTAB (5 bytes including trailing NUL — see main exe note).
+        memcpy(libBuf.data() + L2_STR, "\0foo\0", 5);
+
+        // Code at L2_CODE: mov r15, 0xF00; ret  (5 bytes — but we never
+        // actually execute this in the test, we only verify the relocated
+        // GOT slot value).
+        // 49 C7 C7 00 0F 00 00 = mov r15, 0xF00 (7 bytes)
+        // C3                    = ret
+        U8* lcode = libBuf.data() + L2_CODE;
+        lcode[0]=0x49; lcode[1]=0xC7; lcode[2]=0xC7;
+        lcode[3]=0x00; lcode[4]=0x0F; lcode[5]=0x00; lcode[6]=0x00;
+        lcode[7]=0xC3;
+
+        // ---------- Build main exe ----------
+        // Imports `foo` via R_X86_64_JUMP_SLOT into a GOT slot. We won't
+        // run code; we just check the relocated slot holds LIB_RELOC + L2_CODE.
+        //
+        // Layout:
+        //   0x0000 Ehdr (64)
+        //   0x0040 Phdr[0] PT_LOAD (56)
+        //   0x0078 Phdr[1] PT_DYNAMIC (56)
+        //   0x00B0 DYN (5 entries: SYMTAB, STRTAB, SYMENT, JMPREL, PLTRELSZ, NULL → 6×16=96)
+        //   0x0110 SYMTAB (2 entries × 24 = 48: slot 0=null, slot 1=foo UNDEF)
+        //   0x0140 STRTAB ("\0foo" = 4 bytes)
+        //   0x0144 JMPREL: 1 RELA (24 bytes), r_offset=GOT_SLOT, type=JUMP_SLOT, sym=1
+        //   0x015C GOT slot (8 bytes, target of relocation, initially 0)
+        //   0x0164 end
+        const U64 M_EHDR   = 0x0000;
+        const U64 M_PHDR   = 0x0040;
+        const U64 M_DYN    = 0x00B0;
+        const U64 M_SYM    = 0x0110;
+        const U64 M_STR    = 0x0140;
+        const U64 M_JMP    = 0x0148;   // strtab is 5 bytes ("\0foo\0") + 3 pad
+        const U64 M_GOT    = 0x0160;
+        const U64 M_END    = 0x0168;
+
+        std::vector<U8> mainBuf(M_END, 0);
+
+        k_Elf64_Ehdr meh{};
+        meh.e_ident[0]=0x7F; meh.e_ident[1]='E'; meh.e_ident[2]='L'; meh.e_ident[3]='F';
+        meh.e_ident[4]=k_ELFCLASS64; meh.e_ident[5]=1; meh.e_ident[6]=1;
+        meh.e_type=2;             // ET_EXEC (we apply MAIN_RELOC manually anyway)
+        meh.e_machine=k_EM_X86_64;
+        meh.e_version=1;
+        meh.e_entry=M_GOT;        // doesn't matter, we don't run
+        meh.e_phoff=M_PHDR;
+        meh.e_ehsize=sizeof(k_Elf64_Ehdr);
+        meh.e_phentsize=sizeof(k_Elf64_Phdr);
+        meh.e_phnum=2;
+        memcpy(mainBuf.data() + M_EHDR, &meh, sizeof(meh));
+
+        k_Elf64_Phdr mload{};
+        mload.p_type=k_PT_LOAD; mload.p_flags=7;
+        mload.p_offset=0; mload.p_vaddr=0; mload.p_paddr=0;
+        mload.p_filesz=M_END; mload.p_memsz=M_END; mload.p_align=0x1000;
+        memcpy(mainBuf.data() + M_PHDR, &mload, sizeof(mload));
+        k_Elf64_Phdr mdyn{};
+        mdyn.p_type=k_PT_DYNAMIC; mdyn.p_flags=6;
+        mdyn.p_offset=M_DYN; mdyn.p_vaddr=M_DYN;
+        mdyn.p_filesz=0x60; mdyn.p_memsz=0x60; mdyn.p_align=8;
+        memcpy(mainBuf.data() + M_PHDR + sizeof(k_Elf64_Phdr), &mdyn, sizeof(mdyn));
+
+        // DYN (6 entries).
+        k_Elf64_Dyn mdynArr[6]{};
+        mdynArr[0].d_tag=k_DT_SYMTAB;   mdynArr[0].d_un.d_ptr=M_SYM;
+        mdynArr[1].d_tag=k_DT_STRTAB;   mdynArr[1].d_un.d_ptr=M_STR;
+        mdynArr[2].d_tag=k_DT_SYMENT;   mdynArr[2].d_un.d_val=sizeof(k_Elf64_Sym);
+        mdynArr[3].d_tag=k_DT_JMPREL;   mdynArr[3].d_un.d_ptr=M_JMP;
+        mdynArr[4].d_tag=k_DT_PLTRELSZ; mdynArr[4].d_un.d_val=sizeof(k_Elf64_Rela);
+        mdynArr[5].d_tag=k_DT_NULL;     mdynArr[5].d_un.d_val=0;
+        memcpy(mainBuf.data() + M_DYN, mdynArr, sizeof(mdynArr));
+
+        // SYMTAB. Slot 1 is foo UNDEF (st_shndx=0).
+        k_Elf64_Sym msyms[2]{};
+        msyms[1].st_name  = 1;          // "foo"
+        msyms[1].st_info  = 1 << 4;     // GLOBAL
+        msyms[1].st_shndx = 0;          // UNDEF — imported
+        memcpy(mainBuf.data() + M_SYM, msyms, sizeof(msyms));
+
+        // STRTAB: leading NUL, "foo", trailing NUL. 5 bytes total — the
+        // trailing NUL is required because readGuestCString reads until
+        // it hits a 0 byte and the next thing in memory is the JMPREL
+        // table (otherwise the first JMPREL byte gets read as a char).
+        memcpy(mainBuf.data() + M_STR, "\0foo\0", 5);
+
+        // JMPREL: one entry, JUMP_SLOT, sym index 1, r_offset = GOT slot.
+        k_Elf64_Rela mrela{};
+        mrela.r_offset = M_GOT;
+        mrela.r_info   = ((U64)1 << 32) | k_R_X86_64_JUMP_SLOT; // sym=1, type=7
+        mrela.r_addend = 0;
+        memcpy(mainBuf.data() + M_JMP, &mrela, sizeof(mrela));
+
+        // ---------- Parse + map main exe ----------
+        Elf64ParseResult mainParsed = ElfLoader64::parseBuffer(mainBuf.data(), mainBuf.size());
+        bool mainMapOk = mainParsed.ok &&
+                         ElfLoader64::mapSegmentsFromBuffer(&mem, mainParsed,
+                                                            mainBuf.data(), mainBuf.size(),
+                                                            MAIN_RELOC, "a3d-main");
+
+        // ---------- Run orchestrator ----------
+        std::vector<ElfLoader64::PreloadedLibrary> preloaded = {
+            { "libfoo.so", libBuf.data(), (U64)libBuf.size(), LIB_RELOC }
+        };
+        std::vector<ElfLoader64::LinkedLibrary> outLibs;
+        U64 nLinked = mainMapOk ? ElfLoader64::linkSharedObjects(
+            &mem, mainParsed, MAIN_RELOC, preloaded, 0, &outLibs) : 0;
+
+        // ---------- Verify ----------
+        U64 gotValue = mem.readq(M_GOT + MAIN_RELOC);
+        U64 expected = LIB_RELOC + L2_CODE;
+
+        bool ok = mainMapOk && nLinked == 1 &&
+                  outLibs.size() == 1 &&
+                  outLibs[0].name == "libfoo.so" &&
+                  outLibs[0].reloc == LIB_RELOC &&
+                  gotValue == expected;
+        if (ok) {
+            printf("  PASS: linkSharedObjects: main JUMP_SLOT for `foo` resolved to libfoo+0x%llx\n",
+                   (unsigned long long)L2_CODE);
+            r.passed++;
+        } else {
+            printf("  FAIL: A3d link (mapOk=%d nLinked=%llu outSize=%zu got=0x%llx exp=0x%llx)\n",
+                   mainMapOk, (unsigned long long)nLinked, outLibs.size(),
+                   (unsigned long long)gotValue,
+                   (unsigned long long)expected);
+            r.failed++;
+        }
+        fflush(stdout);
+    }
+
     // Test: extractGlobalSymbols — missing SYMTAB returns empty without
     // dereferencing nullptr.
     {

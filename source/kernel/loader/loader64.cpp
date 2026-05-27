@@ -562,6 +562,71 @@ ElfLoader64::extractGlobalSymbols(KMemory64* mem,
     return out;
 }
 
+// Single-level DT_NEEDED orchestrator. See header for the contract.
+U64 ElfLoader64::linkSharedObjects(KMemory64* mem,
+                                   const Elf64ParseResult& mainParsed,
+                                   U64 mainReloc,
+                                   const std::vector<PreloadedLibrary>& preloaded,
+                                   U64 firstLibBase,
+                                   std::vector<LinkedLibrary>* outLibs) {
+    // Start the symbol union with whatever the main exe defines (rarely
+    // important — most exes import everything — but executables can
+    // export symbols via -rdynamic, and we shouldn't lose them).
+    std::unordered_map<std::string, U64> globals =
+        extractGlobalSymbols(mem, mainParsed.dynamic, mainReloc);
+
+    // Step through each lib: parse → map → RELATIVE → harvest globals.
+    std::vector<LinkedLibrary> linked;
+    U64 nextBase = firstLibBase;
+    const U64 LIB_STEP = 16ULL * 1024 * 1024; // 16 MiB per lib slot
+
+    for (const PreloadedLibrary& lib : preloaded) {
+        Elf64ParseResult r = parseBuffer(lib.buffer, lib.length);
+        if (!r.ok) {
+            klog_fmt("linkSharedObjects: parse failed for '%s'", lib.name.c_str());
+            continue;
+        }
+        U64 reloc = lib.desiredReloc ? lib.desiredReloc : nextBase;
+        if (!mapSegmentsFromBuffer(mem, r, lib.buffer, lib.length, reloc, lib.name.c_str())) {
+            klog_fmt("linkSharedObjects: map failed for '%s'", lib.name.c_str());
+            continue;
+        }
+        applyRelativeRelocations(mem, r.dynamic, reloc, lib.name.c_str());
+        auto libGlobals = extractGlobalSymbols(mem, r.dynamic, reloc);
+        for (auto& [name, addr] : libGlobals) {
+            // First definition wins (matches ld.so load-order scope).
+            globals.emplace(name, addr);
+        }
+        linked.push_back({lib.name, reloc, r});
+        if (!lib.desiredReloc) nextBase += LIB_STEP;
+    }
+
+    // Resolve symbol-bound relocs on the main exe AND every lib against
+    // the merged table. Main first matches ld.so's main-exe-first
+    // symbol-search scope.
+    U64 totalResolved = 0, totalUnresolved = 0;
+    U64 resolved = 0, unresolved = 0;
+    applySymbolRelocations(mem, mainParsed.dynamic, mainReloc, globals,
+                           "exe", &resolved, &unresolved);
+    totalResolved   += resolved;
+    totalUnresolved += unresolved;
+    for (const LinkedLibrary& lib : linked) {
+        resolved = unresolved = 0;
+        applySymbolRelocations(mem, lib.parsed.dynamic, lib.reloc, globals,
+                               lib.name.c_str(), &resolved, &unresolved);
+        totalResolved   += resolved;
+        totalUnresolved += unresolved;
+    }
+    klog_fmt("linkSharedObjects: %zu libs linked, %llu resolved, %llu unresolved",
+             linked.size(),
+             (unsigned long long)totalResolved,
+             (unsigned long long)totalUnresolved);
+
+    U64 linkedCount = linked.size();
+    if (outLibs) *outLibs = std::move(linked);
+    return linkedCount;
+}
+
 // glibc x86-64 TLS layout (variant II, the only one glibc uses on amd64):
 //
 //   [ static TLS image (memsz bytes) ][ TCB (≥ tcbhead_t) ]

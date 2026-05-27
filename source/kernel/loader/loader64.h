@@ -153,6 +153,47 @@ public:
                              const Elf64DynamicInfo& dyn,
                              U64 reloc);
 
+    // One pre-resolved dependency for linkSharedObjects.
+    struct PreloadedLibrary {
+        std::string name;
+        const U8* buffer;
+        U64 length;
+        U64 desiredReloc; // 0 = auto-assign sequentially.
+    };
+
+    // Result of linking one library through the pipeline.
+    struct LinkedLibrary {
+        std::string name;
+        U64 reloc;
+        Elf64ParseResult parsed;
+    };
+
+    // Eager DT_NEEDED orchestrator (single-level — does NOT transitively
+    // walk DT_NEEDED inside each preloaded lib; the caller pre-flattens).
+    //
+    // For each lib in `preloaded`:
+    //   1. Parse + mapSegmentsFromBuffer at the assigned reloc
+    //   2. applyRelativeRelocations on its PT_DYNAMIC
+    //   3. extractGlobalSymbols → merge into the symbol union
+    // Then:
+    //   4. applySymbolRelocations on the main exe AND every lib, against
+    //      the merged symbol table.
+    //
+    // Main exe must already be mapped and RELATIVE-relocated by the caller.
+    // `firstLibBase` is the address at which to place the first lib; each
+    // subsequent lib gets bumped by a 16 MiB step (way more than any DSO
+    // we'll see) unless its desiredReloc is non-zero.
+    //
+    // Returns the number of libs successfully linked; populates outLibs
+    // with their parse results + assigned relocs (for the caller to
+    // re-discover entry, TLS, etc).
+    static U64 linkSharedObjects(class KMemory64* mem,
+                                 const Elf64ParseResult& mainParsed,
+                                 U64 mainReloc,
+                                 const std::vector<PreloadedLibrary>& preloaded,
+                                 U64 firstLibBase,
+                                 std::vector<LinkedLibrary>* outLibs = nullptr);
+
     // Map every PT_LOAD segment from a contiguous in-memory ELF buffer
     // into guest memory at the given relocation base. Mirrors the file-
     // backed loader path but takes its segment bytes from a buffer.
