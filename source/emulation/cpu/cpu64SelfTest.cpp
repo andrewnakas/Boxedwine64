@@ -3640,6 +3640,96 @@ int runX64SelfTest() {
         });
     }
 
+    // ----- A6: end-to-end synthesize → parse → map → execute -----
+    // Builds an ET_EXEC ELF with code that performs:
+    //   mov r15, 0xCAFE  ; stash sentinel
+    //   mov rax, 60      ; SYS_exit
+    //   xor rdi, rdi     ; status=0
+    //   syscall
+    // Parses it via parseBuffer, maps PT_LOAD via mapSegmentsFromBuffer,
+    // points CPU64 at e_entry, runs. Asserts R15==0xCAFE (proves code ran)
+    // and cpu.yield==true (proves exit was hit).
+    {
+        // Code that the ELF will carry.
+        std::vector<U8> code = {
+            0x49, 0xC7, 0xC7, 0xFE, 0xCA, 0x00, 0x00,                     // mov r15, 0xCAFE
+            0x48, 0xC7, 0xC0, 0x3C, 0x00, 0x00, 0x00,                     // mov rax, 60
+            0x48, 0x31, 0xFF,                                             // xor rdi, rdi
+            0x0F, 0x05,                                                   // syscall
+        };
+
+        // ELF layout: Ehdr immediately followed by Phdr, then code.
+        const U64 LOAD_VADDR  = 0x500000;
+        const size_t ehdrSize = sizeof(k_Elf64_Ehdr);
+        const size_t phdrSize = sizeof(k_Elf64_Phdr);
+        const size_t totalSize = ehdrSize + phdrSize + code.size();
+        const U64 ENTRY_ADDR = LOAD_VADDR + ehdrSize + phdrSize;
+
+        std::vector<U8> elf(totalSize, 0);
+
+        k_Elf64_Ehdr eh{};
+        eh.e_ident[0] = 0x7F;
+        eh.e_ident[1] = 'E';
+        eh.e_ident[2] = 'L';
+        eh.e_ident[3] = 'F';
+        eh.e_ident[4] = k_ELFCLASS64;
+        eh.e_ident[5] = 1;
+        eh.e_ident[6] = 1;
+        eh.e_type     = 2; // ET_EXEC
+        eh.e_machine  = k_EM_X86_64;
+        eh.e_version  = 1;
+        eh.e_entry    = ENTRY_ADDR;
+        eh.e_phoff    = ehdrSize;
+        eh.e_ehsize   = (U16)ehdrSize;
+        eh.e_phentsize = (U16)phdrSize;
+        eh.e_phnum    = 1;
+        memcpy(elf.data(), &eh, ehdrSize);
+
+        k_Elf64_Phdr ph{};
+        ph.p_type   = 1; // PT_LOAD
+        ph.p_flags  = 5; // PF_R | PF_X
+        ph.p_offset = 0;
+        ph.p_vaddr  = LOAD_VADDR;
+        ph.p_paddr  = LOAD_VADDR;
+        ph.p_filesz = totalSize;
+        ph.p_memsz  = totalSize;
+        ph.p_align  = 0x1000;
+        memcpy(elf.data() + ehdrSize, &ph, phdrSize);
+        memcpy(elf.data() + ehdrSize + phdrSize, code.data(), code.size());
+
+        // --- Parse, map, run.
+        Elf64ParseResult parsed = ElfLoader64::parseBuffer(elf.data(), elf.size());
+        bool parseOk = parsed.ok &&
+                       parsed.entry == ENTRY_ADDR &&
+                       parsed.segments.size() == 1;
+
+        KMemory64 mem(nullptr);
+        mem.mmapAnonymousFixed(STACK_TOP - 0x1000, 0x1000, 3); // stack
+        bool mapOk = parseOk && ElfLoader64::mapSegmentsFromBuffer(
+            &mem, parsed, elf.data(), elf.size(), 0, "a6-e2e");
+
+        CPU64 cpu(&mem);
+        cpu.rip = parsed.entry;
+        cpu.reg[X64_RSP].setU64(STACK_TOP - 16);
+        if (mapOk) cpu.runBounded(200);
+
+        bool ok = parseOk &&
+                  mapOk &&
+                  cpu.yield &&
+                  cpu.reg[X64_R15].u64 == 0xCAFE;
+        if (ok) {
+            printf("  PASS: synthesized ET_EXEC parses + maps + runs to exit (R15=0xCAFE)\n");
+            r.passed++;
+        } else {
+            printf("  FAIL: A6 e2e (parseOk=%d mapOk=%d yield=%d R15=0x%llx RIP=0x%llx)\n",
+                   parseOk, mapOk, cpu.yield,
+                   (unsigned long long)cpu.reg[X64_R15].u64,
+                   (unsigned long long)cpu.rip);
+            r.failed++;
+        }
+        fflush(stdout);
+    }
+
     // ----- C11: SAHF / LAHF / INT3 -----
     // T: SAHF — load AH into the low byte of rflags. Set AH=0xD5 (CF|PF|AF|ZF|SF
     // all on, plus the always-1 reserved bit), call SAHF, then read rflags low

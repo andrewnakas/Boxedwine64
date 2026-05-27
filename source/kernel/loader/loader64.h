@@ -135,6 +135,21 @@ public:
                                                           const Elf64DynamicInfo& dyn,
                                                           U64 reloc);
 
+    // Map every PT_LOAD segment from a contiguous in-memory ELF buffer
+    // into guest memory at the given relocation base. Mirrors the file-
+    // backed loader path but takes its segment bytes from a buffer.
+    //
+    // Used by self-tests that synthesize ELF blobs in memory; the file-
+    // backed loader path uses an internal helper with the same shape.
+    //
+    // Returns true on success.
+    static bool mapSegmentsFromBuffer(class KMemory64* mem,
+                                      const Elf64ParseResult& r,
+                                      const U8* buffer,
+                                      U64 bufferLength,
+                                      U64 reloc,
+                                      const char* tag);
+
     // Allocate and populate a static TLS block from the PT_TLS template.
     // Layout (glibc x86-64): [tls image at negative offsets] [TCB] ← FS.
     // TCB head's first qword is the self-pointer ($fs:0 = $fs).

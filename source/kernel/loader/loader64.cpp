@@ -185,6 +185,41 @@ static U32 phdrFlagsToProt(U32 pFlags) {
     return prot;
 }
 
+// Public companion to the file-backed mapSegments — same shape, buffer
+// source. Self-test entry point.
+bool ElfLoader64::mapSegmentsFromBuffer(KMemory64* mem,
+                                        const Elf64ParseResult& r,
+                                        const U8* buffer,
+                                        U64 bufferLength,
+                                        U64 reloc,
+                                        const char* tag) {
+    for (const Elf64LoadSegment& seg : r.segments) {
+        U64 vaddr = seg.vaddr + reloc;
+        U64 alignedAddr = vaddr & ~K64_PAGE_MASK;
+        U64 trailing = vaddr - alignedAddr;
+        U64 mapLen = (seg.memsz + trailing + K64_PAGE_SIZE - 1) & ~K64_PAGE_MASK;
+        U32 prot = phdrFlagsToProt(seg.flags);
+        U64 mapped = mem->mmapAnonymousFixed(alignedAddr, mapLen, prot);
+        if (mapped != alignedAddr) {
+            klog_fmt("mapSegmentsFromBuffer[%s]: mmap failed for segment at 0x%llx (got 0x%llx)",
+                     tag, (unsigned long long)alignedAddr, (unsigned long long)mapped);
+            return false;
+        }
+        if (seg.filesz > 0) {
+            if (seg.offset + seg.filesz > bufferLength) {
+                klog_fmt("mapSegmentsFromBuffer[%s]: segment extends past buffer (offset=%llu filesz=%llu bufLen=%llu)",
+                         tag,
+                         (unsigned long long)seg.offset,
+                         (unsigned long long)seg.filesz,
+                         (unsigned long long)bufferLength);
+                return false;
+            }
+            mem->memcpyToGuest(vaddr, buffer + seg.offset, seg.filesz);
+        }
+    }
+    return true;
+}
+
 // Map every PT_LOAD segment of one parsed ELF into guest memory at the
 // given relocation base. Returns true on success. Used for both the main
 // executable and (recursively) PT_INTERP.
