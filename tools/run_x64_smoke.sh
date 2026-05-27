@@ -75,6 +75,7 @@ run_one strEq          "$ROOT/tools/buildStrEqElf64.py"        17         || fai
 run_one scalarFp       "$ROOT/tools/buildScalarFpElf64.py"     8          || fail=$((fail+1))
 run_one div            "$ROOT/tools/buildDivElf64.py"          135        || fail=$((fail+1))
 run_one repMovsb       "$ROOT/tools/buildRepMovsbElf64.py"     13         || fail=$((fail+1))
+run_one shiftBranch    "$ROOT/tools/buildShiftBranchElf64.py"  80         || fail=$((fail+1))
 
-echo "=== summary: $((10 - fail))/10 passed ==="
+echo "=== summary: $((11 - fail))/11 passed ==="
 exit $fail
