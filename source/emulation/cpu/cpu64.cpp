@@ -1708,6 +1708,40 @@ U32 CPU64::step() {
         return opOff + 1;
     }
 
+    // SAHF (9E). Load the low 8 bits of rflags from AH. Only SF/ZF/AF/PF/CF
+    // are user-visible in those bits per AMD64; bit 1 reads as 1.
+    if (op == 0x9E) {
+        U8 ah = (U8)((reg[X64_RAX].u64 >> 8) & 0xFF);
+        const U32 mask = X64_SF | X64_ZF | X64_AF | X64_PF | X64_CF;
+        rflags = (rflags & ~mask) | ((U32)ah & mask);
+        rip += opOff + 1;
+        return opOff + 1;
+    }
+
+    // LAHF (9F). Store the low 8 bits of rflags (SF/ZF/0/AF/0/PF/1/CF) into
+    // AH. Bit 1 is always 1, bits 3/5 are always 0.
+    if (op == 0x9F) {
+        U8 v = (U8)(rflags & (X64_SF | X64_ZF | X64_AF | X64_PF | X64_CF));
+        v |= 0x02; // reserved bit 1 reads as 1
+        U64 rax = reg[X64_RAX].u64;
+        rax = (rax & ~0xFF00ULL) | ((U64)v << 8);
+        reg[X64_RAX].setU64(rax);
+        rip += opOff + 1;
+        return opOff + 1;
+    }
+
+    // INT3 (CC). Software-breakpoint. In user mode this raises SIGTRAP;
+    // without real signal delivery, klog the trap and yield so the guest
+    // exits cleanly instead of looping or corrupting host state. assert()
+    // failure paths and debugger-injected breakpoints emit this.
+    if (op == 0xCC) {
+        klog_fmt("CPU64: INT3 at RIP=0x%llx — yielding (no SIGTRAP delivery yet)",
+                 (unsigned long long)rip);
+        yield = true;
+        rip += opOff + 1;
+        return opOff + 1;
+    }
+
     // CLD (FC) / STD (FD). Direction flag for string ops.
     if (op == 0xFC) { rflags &= ~X64_DF; rip += opOff + 1; return opOff + 1; }
     if (op == 0xFD) { rflags |=  X64_DF; rip += opOff + 1; return opOff + 1; }

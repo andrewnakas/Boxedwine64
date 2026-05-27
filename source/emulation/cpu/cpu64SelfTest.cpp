@@ -3640,6 +3640,60 @@ int runX64SelfTest() {
         });
     }
 
+    // ----- C11: SAHF / LAHF / INT3 -----
+    // T: SAHF — load AH into the low byte of rflags. Set AH=0xD5 (CF|PF|AF|ZF|SF
+    // all on, plus the always-1 reserved bit), call SAHF, then read rflags low
+    // byte via LAHF into AH and stash. After SAHF, AF/CF/PF/SF/ZF should be set;
+    // LAHF reads back 0xD7 (0xD5 mask | reserved bit 0x02).
+    {
+        std::vector<U8> code = {
+            // Clear flags by xor rax,rax — leaves ZF=1 / others=0
+            0x48, 0x31, 0xC0,
+            // mov rax, 0xD500 — AH=0xD5, AL=0
+            0x48, 0xC7, 0xC0, 0x00, 0xD5, 0x00, 0x00,
+            0x9E,                                                          // SAHF
+            // Zero AH so LAHF result is observable; AL preserved
+            0x48, 0xB8, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,    // mov rax, 0
+            0x9F,                                                          // LAHF — read flags back into AH
+            // Shift AH down to AL via shr rax, 8
+            0x48, 0xC1, 0xE8, 0x08,
+        };
+        runAndCheck(r, "SAHF + LAHF round-trip (0xD5 → 0xD7)", withExit(code), [](CPU64& c) {
+            // 0xD5 user-visible bits + 0x02 reserved bit = 0xD7
+            return (c.reg[X64_R15].u64 & 0xFF) == 0xD7;
+        });
+    }
+
+    // T: LAHF with known starting flags. xor rax,rax sets ZF=1 + PF=1 (parity
+    // of 0 = even). After LAHF, AH must contain ZF|PF|reserved = 0x40|0x04|0x02 = 0x46.
+    {
+        std::vector<U8> code = {
+            0x48, 0x31, 0xC0,                                              // xor rax,rax — ZF=1, PF=1
+            0x9F,                                                          // LAHF
+            0x48, 0xC1, 0xE8, 0x08,                                        // shr rax, 8
+        };
+        runAndCheck(r, "LAHF after xor (ZF=1, PF=1) → AH=0x46", withExit(code), [](CPU64& c) {
+            return (c.reg[X64_R15].u64 & 0xFF) == 0x46;
+        });
+    }
+
+    // T: INT3 — yields cleanly. R15 stays at its pre-trap value (0xDEAD)
+    // since we never reach the exit syscall.
+    {
+        std::vector<U8> code = {
+            0x49, 0xC7, 0xC7, 0xAD, 0xDE, 0x00, 0x00,                      // mov r15, 0xDEAD
+            0xCC,                                                          // INT3 — yields
+            // unreachable: exit(0)
+            0x48, 0xC7, 0xC0, 0x3C, 0x00, 0x00, 0x00,
+            0x48, 0x31, 0xFF,
+            0x0F, 0x05,
+        };
+        // Use bare runAndCheck without withExit since INT3 prevents exit() from running
+        runAndCheck(r, "INT3 yields cleanly (no host crash)", code, [](CPU64& c) {
+            return c.reg[X64_R15].u64 == 0xDEAD && c.yield;
+        });
+    }
+
     printf("=== self-test summary: %d passed, %d failed ===\n\n", r.passed, r.failed);
     return r.failed == 0 ? 0 : 1;
 }
