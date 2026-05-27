@@ -77,6 +77,7 @@ run_one div            "$ROOT/tools/buildDivElf64.py"          135        || fai
 run_one repMovsb       "$ROOT/tools/buildRepMovsbElf64.py"     13         || fail=$((fail+1))
 run_one shiftBranch    "$ROOT/tools/buildShiftBranchElf64.py"  80         || fail=$((fail+1))
 run_one arraySum       "$ROOT/tools/buildArraySumElf64.py"     36         || fail=$((fail+1))
+run_one indirectCall   "$ROOT/tools/buildIndirectCallElf64.py" 119        || fail=$((fail+1))
 
-echo "=== summary: $((12 - fail))/12 passed ==="
+echo "=== summary: $((13 - fail))/13 passed ==="
 exit $fail
