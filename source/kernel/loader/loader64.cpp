@@ -403,6 +403,45 @@ U64 ElfLoader64::applySymbolRelocations(KMemory64* mem,
     return finish();
 }
 
+// Extract DT_NEEDED library names from the dynamic array. Two-pass walk:
+// first find DT_STRTAB so we know where to dereference d_val into a name,
+// then collect all DT_NEEDED entries in original order (ordering is
+// load-significant for symbol-resolution scope under ld.so).
+std::vector<std::string> ElfLoader64::extractNeededLibraries(KMemory64* mem,
+                                                             const Elf64DynamicInfo& dyn,
+                                                             U64 reloc) {
+    std::vector<std::string> out;
+    if (!dyn.present || dyn.memsz == 0) return out;
+
+    U64 dynAddr = dyn.vaddr + reloc;
+    U64 nEntries = dyn.memsz / sizeof(k_Elf64_Dyn);
+    std::vector<k_Elf64_Dyn> dynArr(nEntries);
+    mem->memcpyFromGuest(dynArr.data(), dynAddr, dyn.memsz);
+
+    U64 strtab = 0;
+    for (U64 i = 0; i < nEntries; i++) {
+        const k_Elf64_Dyn& d = dynArr[i];
+        if (d.d_tag == k_DT_NULL) break;
+        if (d.d_tag == k_DT_STRTAB) { strtab = d.d_un.d_ptr; break; }
+    }
+    if (strtab == 0) {
+        klog("extractNeededLibraries: no DT_STRTAB — skipping");
+        return out;
+    }
+
+    U64 strtabAddr = strtab + reloc;
+    for (U64 i = 0; i < nEntries; i++) {
+        const k_Elf64_Dyn& d = dynArr[i];
+        if (d.d_tag == k_DT_NULL) break;
+        if (d.d_tag != k_DT_NEEDED) continue;
+        std::string name = readGuestCString(mem, strtabAddr, (U32)d.d_un.d_val);
+        if (!name.empty()) out.push_back(std::move(name));
+    }
+    klog_fmt("extractNeededLibraries: %llu DT_NEEDED entries",
+             (unsigned long long)out.size());
+    return out;
+}
+
 // glibc x86-64 TLS layout (variant II, the only one glibc uses on amd64):
 //
 //   [ static TLS image (memsz bytes) ][ TCB (≥ tcbhead_t) ]

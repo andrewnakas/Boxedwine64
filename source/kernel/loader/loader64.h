@@ -114,6 +114,22 @@ public:
                                       U64* outResolved = nullptr,
                                       U64* outUnresolved = nullptr);
 
+    // Extract DT_NEEDED entries from PT_DYNAMIC and resolve each one to a
+    // shared-object name via DT_STRTAB. Returns library names in their
+    // original PT_DYNAMIC order (which matters for symbol-resolution
+    // ordering once DT_NEEDED recursion is wired). Returns an empty vector
+    // if there's no PT_DYNAMIC, no DT_STRTAB, or no DT_NEEDED entries.
+    //
+    // Pure parser — does NOT open files, does NOT recurse. The file-loading
+    // and recursive parse pass (real Milestone A3) consumes this list and
+    // is gated on the rootfs containing libc.so.6.
+    //
+    // Public so self-tests can exercise the parse path against synthetic
+    // dynamic-array bytes without an FS round-trip.
+    static std::vector<std::string> extractNeededLibraries(class KMemory64* mem,
+                                                          const Elf64DynamicInfo& dyn,
+                                                          U64 reloc);
+
     // Allocate and populate a static TLS block from the PT_TLS template.
     // Layout (glibc x86-64): [tls image at negative offsets] [TCB] ← FS.
     // TCB head's first qword is the self-pointer ($fs:0 = $fs).

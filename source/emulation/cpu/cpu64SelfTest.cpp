@@ -1496,6 +1496,95 @@ int runX64SelfTest() {
         fflush(stdout);
     }
 
+    // Test: extractNeededLibraries — synthetic PT_DYNAMIC with three
+    // DT_NEEDED entries pointing into a small strtab. Verifies order is
+    // preserved and DT_STRTAB lookup is correct.
+    {
+        const U64 LOAD_RELOC = 0x32000000;
+        const U64 DYN_OFF    = 0x100;
+        const U64 STRTAB_OFF = 0x300;
+        KMemory64 mem(nullptr);
+        mem.mmapAnonymousFixed(LOAD_RELOC, 0x1000, 3);
+
+        // String table layout (offsets):
+        //   1  = "libc.so.6"        (10 bytes incl. NUL)
+        //   11 = "libpthread.so.0"  (16 bytes incl. NUL)
+        //   27 = "ld-linux-x86-64.so.2" (21 bytes incl. NUL)
+        const char* strs =
+            "\0libc.so.6\0libpthread.so.0\0ld-linux-x86-64.so.2";
+        const U32 STR_LEN = 1 + 10 + 16 + 21; // = 48
+        mem.memcpyToGuest(LOAD_RELOC + STRTAB_OFF, (const void*)strs, STR_LEN);
+
+        // Dyn array: three DT_NEEDED entries interleaved with a stray non-
+        // matching tag to verify the filter behaves.
+        k_Elf64_Dyn dyn[6]{};
+        dyn[0].d_tag = k_DT_NEEDED;  dyn[0].d_un.d_val = 1;   // libc.so.6
+        dyn[1].d_tag = k_DT_NEEDED;  dyn[1].d_un.d_val = 11;  // libpthread.so.0
+        dyn[2].d_tag = k_DT_STRTAB;  dyn[2].d_un.d_ptr = STRTAB_OFF;
+        dyn[3].d_tag = k_DT_NEEDED;  dyn[3].d_un.d_val = 27;  // ld-linux...
+        dyn[4].d_tag = k_DT_RELA;    dyn[4].d_un.d_ptr = 0;   // unrelated tag
+        dyn[5].d_tag = k_DT_NULL;    dyn[5].d_un.d_val = 0;
+        mem.memcpyToGuest(LOAD_RELOC + DYN_OFF, dyn, sizeof(dyn));
+
+        Elf64DynamicInfo info;
+        info.present = true;
+        info.vaddr   = DYN_OFF;
+        info.memsz   = sizeof(dyn);
+
+        std::vector<std::string> needed =
+            ElfLoader64::extractNeededLibraries(&mem, info, LOAD_RELOC);
+
+        bool ok = (needed.size() == 3) &&
+                  (needed[0] == "libc.so.6") &&
+                  (needed[1] == "libpthread.so.0") &&
+                  (needed[2] == "ld-linux-x86-64.so.2");
+        if (ok) {
+            printf("  PASS: extractNeededLibraries: 3 DT_NEEDED entries resolved in order\n");
+            r.passed++;
+        } else {
+            printf("  FAIL: extractNeededLibraries: size=%zu",
+                   needed.size());
+            for (size_t i = 0; i < needed.size(); i++) {
+                printf(" [%zu]=\"%s\"", i, needed[i].c_str());
+            }
+            printf("\n");
+            r.failed++;
+        }
+        fflush(stdout);
+    }
+
+    // Test: extractNeededLibraries — empty case (no DT_STRTAB). Must return
+    // an empty vector without crashing.
+    {
+        const U64 LOAD_RELOC = 0x33000000;
+        const U64 DYN_OFF    = 0x100;
+        KMemory64 mem(nullptr);
+        mem.mmapAnonymousFixed(LOAD_RELOC, 0x1000, 3);
+
+        k_Elf64_Dyn dyn[3]{};
+        dyn[0].d_tag = k_DT_NEEDED;  dyn[0].d_un.d_val = 1;
+        dyn[1].d_tag = k_DT_RELA;    dyn[1].d_un.d_ptr = 0;
+        dyn[2].d_tag = k_DT_NULL;    dyn[2].d_un.d_val = 0;
+        mem.memcpyToGuest(LOAD_RELOC + DYN_OFF, dyn, sizeof(dyn));
+
+        Elf64DynamicInfo info;
+        info.present = true;
+        info.vaddr   = DYN_OFF;
+        info.memsz   = sizeof(dyn);
+
+        std::vector<std::string> needed =
+            ElfLoader64::extractNeededLibraries(&mem, info, LOAD_RELOC);
+        if (needed.empty()) {
+            printf("  PASS: extractNeededLibraries: empty vector when DT_STRTAB missing\n");
+            r.passed++;
+        } else {
+            printf("  FAIL: extractNeededLibraries: expected empty, got size=%zu\n",
+                   needed.size());
+            r.failed++;
+        }
+        fflush(stdout);
+    }
+
     // ---- SSE2 scalar FP coverage ----
     // Helper-style pattern: load doubles into xmm via "mov rax, imm64;
     // movq xmm, rax", perform the op, write the resulting bits back to
