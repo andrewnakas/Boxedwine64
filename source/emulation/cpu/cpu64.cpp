@@ -3138,9 +3138,13 @@ U32 CPU64::step() {
         }
 
         // CVTSD2SI r32, xmm/m64   F2 0F 2D /r     (REX.W → r64)
-        // Convert double to signed int with current rounding (truncate-or-
-        // round-to-nearest). For Milestone C we use C cast (truncate).
-        if (op2 == 0x2D && p.rep == 0xF2) {
+        // CVTTSD2SI r32, xmm/m64  F2 0F 2C /r     (REX.W → r64) — truncate
+        // Convert double to signed int. Compilers emit 2C (truncate) far
+        // more often than 2D (current rounding) because C's int cast is
+        // defined as truncate. Bodies are identical here — our 2D path
+        // already truncates via C cast — so the only difference is which
+        // opcode bytes we accept.
+        if ((op2 == 0x2D || op2 == 0x2C) && p.rep == 0xF2) {
             ModRM m = decodeModRM(rip + opOff + 2, p, 0);
             U64 srcBits = m.isReg ? xmm[m.rmIndex].lo : memory->readq(m.effAddr);
             double d = u64ToDouble(srcBits);
@@ -3278,8 +3282,12 @@ U32 CPU64::step() {
             return used;
         }
 
-        // CVTSS2SI r32/r64, xmm/m32   F3 0F 2D /r
-        if (op2 == 0x2D && p.rep == 0xF3) {
+        // CVTSS2SI  r32/r64, xmm/m32  F3 0F 2D /r
+        // CVTTSS2SI r32/r64, xmm/m32  F3 0F 2C /r  — truncating variant
+        // Same rationale as F2 0x2C: compilers prefer the truncating form
+        // for C int casts; our 2D path already uses C cast (truncate) so
+        // the body is shared.
+        if ((op2 == 0x2D || op2 == 0x2C) && p.rep == 0xF3) {
             ModRM m = decodeModRM(rip + opOff + 2, p, 0);
             U32 srcBits = m.isReg
                 ? (U32)(xmm[m.rmIndex].lo & 0xFFFFFFFFULL)

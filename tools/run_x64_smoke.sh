@@ -13,12 +13,25 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-BOXEDWINE="${1:-$ROOT/project/mac-xcode/Boxedwine/build/Debug/Boxedwine.app/Contents/MacOS/Boxedwine}"
 
-if [ ! -x "$BOXEDWINE" ]; then
-    echo "error: Boxedwine binary not found at $BOXEDWINE" >&2
+# Xcode writes into either project/mac-xcode/.../build (when build folder is
+# colocated) or ~/Library/Developer/Xcode/DerivedData (the default). Pick the
+# freshest binary across BOTH so we never run a stale in-tree binary after a
+# DerivedData build (or vice versa). User-supplied path overrides everything.
+if [ -n "${1:-}" ]; then
+    BOXEDWINE="$1"
+else
+    BOXEDWINE="$(ls -t \
+        "$ROOT/project/mac-xcode/Boxedwine/build/Debug/Boxedwine.app/Contents/MacOS/Boxedwine" \
+        "$HOME/Library/Developer/Xcode/DerivedData"/Boxedwine-*/Build/Products/Debug/Boxedwine.app/Contents/MacOS/Boxedwine \
+        2>/dev/null | head -1)"
+fi
+
+if [ -z "$BOXEDWINE" ] || [ ! -x "$BOXEDWINE" ]; then
+    echo "error: Boxedwine binary not found (tried in-tree build and DerivedData)" >&2
     exit 1
 fi
+echo "using: $BOXEDWINE"
 
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
@@ -59,6 +72,7 @@ run_one callReturn     "$ROOT/tools/buildCallReturnElf64.py"   43         || fai
 run_one loop           "$ROOT/tools/buildLoopElf64.py"         55         || fail=$((fail+1))
 run_one stackString    "$ROOT/tools/buildStackStringElf64.py"  3          || fail=$((fail+1))
 run_one strEq          "$ROOT/tools/buildStrEqElf64.py"        17         || fail=$((fail+1))
+run_one scalarFp       "$ROOT/tools/buildScalarFpElf64.py"     8          || fail=$((fail+1))
 
-echo "=== summary: $((7 - fail))/7 passed ==="
+echo "=== summary: $((8 - fail))/8 passed ==="
 exit $fail
