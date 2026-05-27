@@ -3730,6 +3730,166 @@ int runX64SelfTest() {
         fflush(stdout);
     }
 
+    // ----- A7: end-to-end PIE with R_X86_64_RELATIVE -----
+    // Synthesizes an ET_DYN with one PT_LOAD, a PT_DYNAMIC referencing a
+    // single RELA entry. Layout (vaddrs in PIE space, offset by RELOC at load):
+    //   0x0000 Ehdr
+    //   0x0040 Phdr[0] PT_LOAD  (covers whole file)
+    //   0x0078 Phdr[1] PT_DYNAMIC
+    //   0x00B0 Dynamic array (4 entries × 16 bytes = 0x40)
+    //   0x00F0 RELA[0] (24 bytes)
+    //   0x0108 Slot (8 bytes, target of RELATIVE relo)
+    //   0x0110 Code:  mov r15, [rip+slot_disp]; mov rax,60; xor rdi,rdi; syscall
+    //
+    // After relocation: slot @ vaddr 0x0108+reloc holds (reloc + addend).
+    // Code loads the slot via RIP-rel and exits — R15 must equal that value.
+    {
+        const U64 RELOC      = 0x600000ULL;
+        const U64 ADDEND     = 0x4242DEAD4242BABEULL;
+
+        // Fixed layout offsets in the synthesized file.
+        const U64 EHDR_OFF   = 0x0000;
+        const U64 PHDR_OFF   = 0x0040;
+        const U64 DYN_OFF    = 0x00B0;
+        const U64 RELA_OFF   = 0x00F0;
+        const U64 SLOT_OFF   = 0x0108;
+        const U64 CODE_OFF   = 0x0110;
+
+        // Build the buffer.
+        const size_t FILE_SIZE = 0x140;
+        std::vector<U8> elf(FILE_SIZE, 0);
+
+        // Ehdr.
+        k_Elf64_Ehdr eh{};
+        eh.e_ident[0] = 0x7F;
+        eh.e_ident[1] = 'E';
+        eh.e_ident[2] = 'L';
+        eh.e_ident[3] = 'F';
+        eh.e_ident[4] = k_ELFCLASS64;
+        eh.e_ident[5] = 1;
+        eh.e_ident[6] = 1;
+        eh.e_type     = 3; // ET_DYN
+        eh.e_machine  = k_EM_X86_64;
+        eh.e_version  = 1;
+        eh.e_entry    = CODE_OFF;
+        eh.e_phoff    = PHDR_OFF;
+        eh.e_ehsize   = sizeof(k_Elf64_Ehdr);
+        eh.e_phentsize = sizeof(k_Elf64_Phdr);
+        eh.e_phnum    = 2;
+        memcpy(elf.data() + EHDR_OFF, &eh, sizeof(eh));
+
+        // Phdr[0]: PT_LOAD covers the whole file.
+        k_Elf64_Phdr load{};
+        load.p_type   = 1; // PT_LOAD
+        load.p_flags  = 7; // PF_R | PF_W | PF_X (writable because relo writes slot)
+        load.p_offset = 0;
+        load.p_vaddr  = 0;
+        load.p_paddr  = 0;
+        load.p_filesz = FILE_SIZE;
+        load.p_memsz  = FILE_SIZE;
+        load.p_align  = 0x1000;
+        memcpy(elf.data() + PHDR_OFF, &load, sizeof(load));
+
+        // Phdr[1]: PT_DYNAMIC.
+        k_Elf64_Phdr dyn{};
+        dyn.p_type   = k_PT_DYNAMIC;
+        dyn.p_flags  = 6; // PF_R | PF_W
+        dyn.p_offset = DYN_OFF;
+        dyn.p_vaddr  = DYN_OFF;
+        dyn.p_filesz = 0x40;
+        dyn.p_memsz  = 0x40;
+        dyn.p_align  = 8;
+        memcpy(elf.data() + PHDR_OFF + sizeof(k_Elf64_Phdr), &dyn, sizeof(dyn));
+
+        // Dynamic array.
+        k_Elf64_Dyn dynArr[4]{};
+        dynArr[0].d_tag = k_DT_RELA;     dynArr[0].d_un.d_ptr = RELA_OFF;
+        dynArr[1].d_tag = k_DT_RELASZ;   dynArr[1].d_un.d_val = sizeof(k_Elf64_Rela);
+        dynArr[2].d_tag = k_DT_RELAENT;  dynArr[2].d_un.d_val = sizeof(k_Elf64_Rela);
+        dynArr[3].d_tag = k_DT_NULL;     dynArr[3].d_un.d_val = 0;
+        memcpy(elf.data() + DYN_OFF, dynArr, sizeof(dynArr));
+
+        // RELA entry: write SLOT_OFF, RELATIVE type, addend = ADDEND.
+        k_Elf64_Rela rela{};
+        rela.r_offset = SLOT_OFF;
+        rela.r_info   = k_R_X86_64_RELATIVE; // sym=0, type=8
+        rela.r_addend = (S64)ADDEND;
+        memcpy(elf.data() + RELA_OFF, &rela, sizeof(rela));
+
+        // Code: mov r15, [rip + disp32]; mov rax, 60; xor rdi, rdi; syscall.
+        // The "mov r15, [rip+disp32]" is 7 bytes: 4C 8B 3D <disp32>.
+        // RIP at end of this instruction = CODE_OFF + 7 (in vaddr space).
+        // After load it's RELOC + CODE_OFF + 7. We want to read SLOT_OFF + RELOC.
+        // disp32 = (SLOT_OFF + RELOC) - (CODE_OFF + 7 + RELOC) = SLOT_OFF - CODE_OFF - 7.
+        S32 disp = (S32)(SLOT_OFF - CODE_OFF - 7);
+        U8* code = elf.data() + CODE_OFF;
+        code[0] = 0x4C; code[1] = 0x8B; code[2] = 0x3D;
+        code[3] = (U8)(disp & 0xFF);
+        code[4] = (U8)((disp >> 8) & 0xFF);
+        code[5] = (U8)((disp >> 16) & 0xFF);
+        code[6] = (U8)((disp >> 24) & 0xFF);
+        // mov rax, 60
+        code[7]  = 0x48; code[8]  = 0xC7; code[9]  = 0xC0;
+        code[10] = 0x3C; code[11] = 0x00; code[12] = 0x00; code[13] = 0x00;
+        // xor rdi, rdi
+        code[14] = 0x48; code[15] = 0x31; code[16] = 0xFF;
+        // syscall
+        code[17] = 0x0F; code[18] = 0x05;
+
+        // --- Parse.
+        Elf64ParseResult parsed = ElfLoader64::parseBuffer(elf.data(), elf.size());
+        bool parseOk = parsed.ok &&
+                       parsed.isPie &&
+                       parsed.dynamic.present &&
+                       parsed.dynamic.vaddr == DYN_OFF &&
+                       parsed.dynamic.memsz == 0x40 &&
+                       parsed.entry == CODE_OFF;
+
+        // --- Map at RELOC.
+        KMemory64 mem(nullptr);
+        mem.mmapAnonymousFixed(STACK_TOP - 0x1000, 0x1000, 3);
+        bool mapOk = parseOk && ElfLoader64::mapSegmentsFromBuffer(
+            &mem, parsed, elf.data(), elf.size(), RELOC, "a7-pie");
+
+        // --- Apply relocations.
+        U64 applied = 0;
+        if (mapOk) {
+            applied = ElfLoader64::applyRelativeRelocations(
+                &mem, parsed.dynamic, RELOC, "a7-pie");
+        }
+
+        // --- Verify slot was written.
+        U64 slotValue = mapOk ? mem.readq(RELOC + SLOT_OFF) : 0;
+        U64 expected = RELOC + ADDEND;
+
+        // --- Run.
+        CPU64 cpu(&mem);
+        cpu.rip = parsed.entry + RELOC;
+        cpu.reg[X64_RSP].setU64(STACK_TOP - 16);
+        if (mapOk) cpu.runBounded(200);
+
+        bool ok = parseOk &&
+                  mapOk &&
+                  applied == 1 &&
+                  slotValue == expected &&
+                  cpu.yield &&
+                  cpu.reg[X64_R15].u64 == expected;
+        if (ok) {
+            printf("  PASS: PIE+RELATIVE: relocation applied, RIP-rel load reads relocated value\n");
+            r.passed++;
+        } else {
+            printf("  FAIL: A7 (parseOk=%d mapOk=%d applied=%llu slot=0x%llx exp=0x%llx yield=%d R15=0x%llx RIP=0x%llx)\n",
+                   parseOk, mapOk, (unsigned long long)applied,
+                   (unsigned long long)slotValue,
+                   (unsigned long long)expected,
+                   cpu.yield,
+                   (unsigned long long)cpu.reg[X64_R15].u64,
+                   (unsigned long long)cpu.rip);
+            r.failed++;
+        }
+        fflush(stdout);
+    }
+
     // ----- C11: SAHF / LAHF / INT3 -----
     // T: SAHF — load AH into the low byte of rflags. Set AH=0xD5 (CF|PF|AF|ZF|SF
     // all on, plus the always-1 reserved bit), call SAHF, then read rflags low
