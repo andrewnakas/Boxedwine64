@@ -1585,6 +1585,103 @@ int runX64SelfTest() {
         fflush(stdout);
     }
 
+    // Test: extractGlobalSymbols — synthetic SYMTAB+STRTAB layout, three
+    // symbols. Verifies local is skipped, global+weak are included, and
+    // st_value gets the load slide added.
+    {
+        const U64 LOAD_RELOC = 0x34000000;
+        const U64 DYN_OFF    = 0x100;
+        const U64 SYMTAB_OFF = 0x200;
+        const U64 STRTAB_OFF = 0x260; // = SYMTAB_OFF + 4 * sizeof(k_Elf64_Sym)
+        KMemory64 mem(nullptr);
+        mem.mmapAnonymousFixed(LOAD_RELOC, 0x1000, 3);
+
+        // STRTAB. Index 0 is the empty string per ELF convention.
+        // 1  = "ignored" (local, won't appear)
+        // 9  = "foo"     (global)
+        // 13 = "bar"     (weak)
+        const char* strs = "\0ignored\0foo\0bar";
+        const U32 STR_LEN = 17;
+        mem.memcpyToGuest(LOAD_RELOC + STRTAB_OFF, (const void*)strs, STR_LEN);
+
+        // SYMTAB. Slot 0 is reserved/zero in ELF. Slots 1..3 are real.
+        // st_info: bind << 4 | type. bind 0=local, 1=global, 2=weak.
+        k_Elf64_Sym syms[4]{};
+        syms[1].st_name  = 1;       // "ignored"
+        syms[1].st_info  = 0 << 4;  // LOCAL — must be skipped
+        syms[1].st_shndx = 1;
+        syms[1].st_value = 0x1000;
+        syms[2].st_name  = 9;       // "foo"
+        syms[2].st_info  = 1 << 4;  // GLOBAL
+        syms[2].st_shndx = 1;
+        syms[2].st_value = 0x2000;
+        syms[3].st_name  = 13;      // "bar"
+        syms[3].st_info  = 2 << 4;  // WEAK
+        syms[3].st_shndx = 1;
+        syms[3].st_value = 0x3000;
+        mem.memcpyToGuest(LOAD_RELOC + SYMTAB_OFF, syms, sizeof(syms));
+
+        // DYN: SYMTAB + STRTAB + SYMENT + NULL.
+        k_Elf64_Dyn dyn[4]{};
+        dyn[0].d_tag = k_DT_SYMTAB; dyn[0].d_un.d_ptr = SYMTAB_OFF;
+        dyn[1].d_tag = k_DT_STRTAB; dyn[1].d_un.d_ptr = STRTAB_OFF;
+        dyn[2].d_tag = k_DT_SYMENT; dyn[2].d_un.d_val = sizeof(k_Elf64_Sym);
+        dyn[3].d_tag = k_DT_NULL;   dyn[3].d_un.d_val = 0;
+        mem.memcpyToGuest(LOAD_RELOC + DYN_OFF, dyn, sizeof(dyn));
+
+        Elf64DynamicInfo info;
+        info.present = true;
+        info.vaddr   = DYN_OFF;
+        info.memsz   = sizeof(dyn);
+
+        auto sym = ElfLoader64::extractGlobalSymbols(&mem, info, LOAD_RELOC);
+        bool ok = (sym.size() == 2) &&
+                  (sym.count("foo") && sym["foo"] == LOAD_RELOC + 0x2000) &&
+                  (sym.count("bar") && sym["bar"] == LOAD_RELOC + 0x3000) &&
+                  (sym.count("ignored") == 0);
+        if (ok) {
+            printf("  PASS: extractGlobalSymbols: skips LOCAL, exports GLOBAL+WEAK, applies reloc\n");
+            r.passed++;
+        } else {
+            printf("  FAIL: extractGlobalSymbols size=%zu foo=0x%llx bar=0x%llx ignored?=%d\n",
+                   sym.size(),
+                   (unsigned long long)(sym.count("foo") ? sym["foo"] : 0),
+                   (unsigned long long)(sym.count("bar") ? sym["bar"] : 0),
+                   (int)sym.count("ignored"));
+            r.failed++;
+        }
+        fflush(stdout);
+    }
+
+    // Test: extractGlobalSymbols — missing SYMTAB returns empty without
+    // dereferencing nullptr.
+    {
+        const U64 LOAD_RELOC = 0x35000000;
+        const U64 DYN_OFF    = 0x100;
+        KMemory64 mem(nullptr);
+        mem.mmapAnonymousFixed(LOAD_RELOC, 0x1000, 3);
+
+        k_Elf64_Dyn dyn[2]{};
+        dyn[0].d_tag = k_DT_STRTAB; dyn[0].d_un.d_ptr = 0x200;
+        dyn[1].d_tag = k_DT_NULL;   dyn[1].d_un.d_val = 0;
+        mem.memcpyToGuest(LOAD_RELOC + DYN_OFF, dyn, sizeof(dyn));
+
+        Elf64DynamicInfo info;
+        info.present = true;
+        info.vaddr   = DYN_OFF;
+        info.memsz   = sizeof(dyn);
+
+        auto sym = ElfLoader64::extractGlobalSymbols(&mem, info, LOAD_RELOC);
+        if (sym.empty()) {
+            printf("  PASS: extractGlobalSymbols: empty when DT_SYMTAB missing\n");
+            r.passed++;
+        } else {
+            printf("  FAIL: extractGlobalSymbols expected empty, got size=%zu\n", sym.size());
+            r.failed++;
+        }
+        fflush(stdout);
+    }
+
     // ---- SSE2 scalar FP coverage ----
     // Helper-style pattern: load doubles into xmm via "mov rax, imm64;
     // movq xmm, rax", perform the op, write the resulting bits back to

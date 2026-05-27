@@ -135,6 +135,24 @@ public:
                                                           const Elf64DynamicInfo& dyn,
                                                           U64 reloc);
 
+    // Walk DT_SYMTAB / DT_STRTAB and collect every defined global symbol
+    // (st_shndx != 0 and binding STB_GLOBAL or STB_WEAK), keyed by name
+    // and valued at (st_value + reloc).
+    //
+    // The symbol table's length is bounded by `(strtab - symtab) / syment`
+    // because in every observed layout (gcc, ld, llvm-link, hand-built)
+    // STRTAB sits immediately after SYMTAB. If a future binary violates
+    // that we'll need DT_HASH / DT_GNU_HASH chain-following, but every
+    // ELF we'll see in v1 honors the convention.
+    //
+    // Public so self-tests can exercise symbol extraction without an FS
+    // round-trip. Used by the DT_NEEDED orchestrator to build the merged
+    // symbol table that applySymbolRelocations consumes.
+    static std::unordered_map<std::string, U64>
+        extractGlobalSymbols(class KMemory64* mem,
+                             const Elf64DynamicInfo& dyn,
+                             U64 reloc);
+
     // Map every PT_LOAD segment from a contiguous in-memory ELF buffer
     // into guest memory at the given relocation base. Mirrors the file-
     // backed loader path but takes its segment bytes from a buffer.

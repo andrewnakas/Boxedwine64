@@ -505,6 +505,63 @@ std::vector<std::string> ElfLoader64::extractNeededLibraries(KMemory64* mem,
     return out;
 }
 
+// Walk DT_SYMTAB/DT_STRTAB and collect every defined global/weak symbol.
+// See header for the (strtab - symtab) length-bounding rationale.
+std::unordered_map<std::string, U64>
+ElfLoader64::extractGlobalSymbols(KMemory64* mem,
+                                  const Elf64DynamicInfo& dyn,
+                                  U64 reloc) {
+    std::unordered_map<std::string, U64> out;
+    if (!dyn.present || dyn.memsz == 0) return out;
+
+    U64 dynAddr = dyn.vaddr + reloc;
+    U64 nEntries = dyn.memsz / sizeof(k_Elf64_Dyn);
+    std::vector<k_Elf64_Dyn> dynArr(nEntries);
+    mem->memcpyFromGuest(dynArr.data(), dynAddr, dyn.memsz);
+
+    U64 symtab = 0, strtab = 0;
+    U64 syment = sizeof(k_Elf64_Sym);
+    for (U64 i = 0; i < nEntries; i++) {
+        const k_Elf64_Dyn& d = dynArr[i];
+        if (d.d_tag == k_DT_NULL) break;
+        switch (d.d_tag) {
+            case k_DT_SYMTAB: symtab = d.d_un.d_ptr; break;
+            case k_DT_STRTAB: strtab = d.d_un.d_ptr; break;
+            case k_DT_SYMENT: syment = d.d_un.d_val; break;
+        }
+    }
+    if (symtab == 0 || strtab == 0 || strtab <= symtab) {
+        klog_fmt("extractGlobalSymbols: missing SYMTAB/STRTAB or non-adjacent layout (symtab=0x%llx strtab=0x%llx)",
+                 (unsigned long long)symtab, (unsigned long long)strtab);
+        return out;
+    }
+
+    U64 symBytes = strtab - symtab;
+    U64 nSyms = symBytes / syment;
+    U64 strBase = strtab + reloc;
+    for (U64 i = 0; i < nSyms; i++) {
+        k_Elf64_Sym sym;
+        mem->memcpyFromGuest(&sym, symtab + reloc + i * syment, sizeof(sym));
+        // st_shndx==0 (SHN_UNDEF) means this is a reference, not a
+        // definition — skip.
+        if (sym.st_shndx == 0) continue;
+        U8 bind = (U8)(sym.st_info >> 4);
+        // 0=LOCAL, 1=GLOBAL, 2=WEAK. Only GLOBAL/WEAK are exported.
+        if (bind != 1 && bind != 2) continue;
+        if (sym.st_name == 0) continue;
+        std::string name = readGuestCString(mem, strBase, sym.st_name);
+        if (name.empty()) continue;
+        // Don't let a later weak override a strong; for now first-wins
+        // (matches ld.so default scope rules within a single DSO).
+        auto ins = out.emplace(std::move(name), sym.st_value + reloc);
+        (void)ins;
+    }
+    klog_fmt("extractGlobalSymbols: %llu exported symbols (scanned %llu slots)",
+             (unsigned long long)out.size(),
+             (unsigned long long)nSyms);
+    return out;
+}
+
 // glibc x86-64 TLS layout (variant II, the only one glibc uses on amd64):
 //
 //   [ static TLS image (memsz bytes) ][ TCB (≥ tcbhead_t) ]
