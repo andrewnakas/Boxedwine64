@@ -58,6 +58,7 @@ run_one multiSegment   "$ROOT/tools/buildMultiSegmentElf64.py" 0          || fai
 run_one callReturn     "$ROOT/tools/buildCallReturnElf64.py"   43         || fail=$((fail+1))
 run_one loop           "$ROOT/tools/buildLoopElf64.py"         55         || fail=$((fail+1))
 run_one stackString    "$ROOT/tools/buildStackStringElf64.py"  3          || fail=$((fail+1))
+run_one strEq          "$ROOT/tools/buildStrEqElf64.py"        17         || fail=$((fail+1))
 
-echo "=== summary: $((6 - fail))/6 passed ==="
+echo "=== summary: $((7 - fail))/7 passed ==="
 exit $fail
