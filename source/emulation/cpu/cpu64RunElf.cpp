@@ -147,6 +147,90 @@ bool readFileAll(const char* path, std::vector<U8>& out) {
     return got == (size_t)sz;
 }
 
+// Build a SysV x86-64 init stack on top of `mem`. Mirrors the layout in
+// loader64.cpp's loadProgram but operates on raw KMemory64 (no KProcess),
+// so the runner can hand off to glibc-style _start with a valid argc /
+// argv / envp / auxv frame. Returns the resulting RSP value or 0 on failure.
+//
+// Layout (top-down):
+//   strings (argv[0] + env)
+//   AT_RANDOM pool (16 bytes)
+//   <pad to 16B>
+//   auxv[]   (AT_NULL terminated)
+//   envp[]   (NULL terminated)
+//   argv[]   (NULL terminated)
+//   argc                              ← returned RSP
+U64 buildSysVStack(KMemory64* mem,
+                   U64 stackTop,
+                   const Elf64ParseResult& r,
+                   U64 reloc,
+                   U64 interpBase,
+                   const char* exeName) {
+    enum {
+        AT_NULL = 0, AT_PHDR = 3, AT_PHENT = 4, AT_PHNUM = 5,
+        AT_PAGESZ = 6, AT_BASE = 7, AT_ENTRY = 9, AT_UID = 11,
+        AT_EUID = 12, AT_GID = 13, AT_EGID = 14, AT_RANDOM = 25,
+        AT_HWCAP = 16, AT_CLKTCK = 17, AT_SECURE = 23,
+    };
+
+    std::vector<const char*> argv = { exeName };
+    std::vector<const char*> envp = { "PATH=/bin:/usr/bin" };
+
+    U64 sp = stackTop - 16;
+    std::vector<U64> argvPtrs, envpPtrs;
+
+    for (auto it = envp.rbegin(); it != envp.rend(); ++it) {
+        U64 len = (U64)std::strlen(*it) + 1;
+        sp -= len;
+        mem->memcpyToGuest(sp, *it, len);
+        envpPtrs.insert(envpPtrs.begin(), sp);
+    }
+    for (auto it = argv.rbegin(); it != argv.rend(); ++it) {
+        U64 len = (U64)std::strlen(*it) + 1;
+        sp -= len;
+        mem->memcpyToGuest(sp, *it, len);
+        argvPtrs.insert(argvPtrs.begin(), sp);
+    }
+
+    sp -= 16;
+    U64 randomAddr = sp;
+    for (int i = 0; i < 16; i++) mem->writeb(randomAddr + i, 0);
+
+    struct Aux { U64 k, v; };
+    U64 phdrAddr = r.baseAddrLow + reloc + r.phoff;
+    std::vector<Aux> aux = {
+        { AT_PHDR,   phdrAddr },
+        { AT_PHENT,  r.phentsize },
+        { AT_PHNUM,  r.phnum },
+        { AT_PAGESZ, 4096 },
+        { AT_BASE,   interpBase },
+        { AT_ENTRY,  r.entry + reloc },
+        { AT_UID,    0 }, { AT_EUID, 0 }, { AT_GID, 0 }, { AT_EGID, 0 },
+        { AT_RANDOM, randomAddr },
+        { AT_HWCAP,  0 }, { AT_CLKTCK, 100 }, { AT_SECURE, 0 },
+        { AT_NULL,   0 },
+    };
+
+    U64 totalQ = 1 + argvPtrs.size() + 1 + envpPtrs.size() + 1 + 2 * aux.size();
+    U64 afterSize = totalQ * 8;
+    U64 targetSp = (sp - afterSize) & ~0xFULL;
+    sp = targetSp + afterSize;
+
+    auto pushQ = [&](U64 v) { sp -= 8; mem->writeq(sp, v); };
+
+    for (auto it = aux.rbegin(); it != aux.rend(); ++it) {
+        pushQ(it->v);
+        pushQ(it->k);
+    }
+    pushQ(0);
+    for (auto it = envpPtrs.rbegin(); it != envpPtrs.rend(); ++it) pushQ(*it);
+    pushQ(0);
+    for (auto it = argvPtrs.rbegin(); it != argvPtrs.rend(); ++it) pushQ(*it);
+    pushQ((U64)argv.size());
+
+    return sp;
+}
+
 } // namespace
 
 extern "C" int runX64RunElf(const char* path) {
@@ -176,23 +260,48 @@ extern "C" int runX64RunElf(const char* path) {
            parsed.segments.size(),
            parsed.isPie);
 
-    // Stack: one page below STACK_TOP. The embedded payload doesn't use
-    // the stack, but glibc startup will; the runner sets it up either way.
-    const U64 STACK_TOP = 0x800000;
+    // High stack mirroring the real loader (0x7FFFFFFFE000 minus 8 MiB).
+    // Sized to safely host a SysV argc/argv/envp/auxv frame plus glibc
+    // startup, while staying well above PIE reloc bases.
+    const U64 STACK_TOP  = 0x7FFFFFFFE000ULL;
+    const U64 STACK_SIZE = 8ULL * 1024 * 1024;
+    const U64 STACK_BASE = STACK_TOP - STACK_SIZE;
     KMemory64 mem(nullptr);
-    mem.mmapAnonymousFixed(STACK_TOP - 0x1000, 0x1000, 3);
+    if (mem.mmapAnonymousFixed(STACK_BASE, STACK_SIZE, 3) != STACK_BASE) {
+        printf("--x64-run-elf: stack mmap failed\n");
+        return 3;
+    }
 
-    // PIE binaries (ET_DYN) need a load slide; for now pick a fixed one
-    // that doesn't overlap the stack range. Static ET_EXEC uses reloc=0.
-    U64 reloc = parsed.isPie ? 0x10000000ULL : 0ULL;
+    // PIE binaries (ET_DYN) need a load slide; pick a mid-range base well
+    // away from the stack. Static ET_EXEC uses reloc=0.
+    U64 reloc = parsed.isPie ? 0x555555554000ULL : 0ULL;
     if (!ElfLoader64::mapSegmentsFromBuffer(&mem, parsed, elf.data(), elf.size(), reloc, tag)) {
         printf("--x64-run-elf: map failed\n");
         return 3;
     }
 
+    // Apply R_X86_64_RELATIVE relocations against the exe's PT_DYNAMIC.
+    // Symbol-bound relocations are deferred to ld-linux (when we add
+    // DT_NEEDED file-loading recursion).
+    if (parsed.dynamic.present) {
+        U64 applied = ElfLoader64::applyRelativeRelocations(&mem, parsed.dynamic, reloc, tag);
+        printf("--x64-run-elf: applied %llu RELATIVE relocations\n",
+               (unsigned long long)applied);
+    }
+
+    // Build the SysV initial stack so glibc-style _start sees the right
+    // frame. AT_BASE is 0 here — interpreter loading isn't wired in the
+    // runner yet, so dynamic binaries that need ld-linux won't get past
+    // _dl_start. That's fine for static binaries and informative for
+    // dynamic ones (the unimpl-tracer will report exactly where they die).
+    U64 sp = buildSysVStack(&mem, STACK_TOP, parsed, reloc, /*interpBase=*/0,
+                            path ? path : "/boxedwine/embedded");
+
     CPU64 cpu(&mem);
     cpu.rip = parsed.entry + reloc;
-    cpu.reg[X64_RSP].setU64(STACK_TOP - 16);
+    cpu.reg[X64_RSP].setU64(sp);
+    // SysV ABI: RDX at entry holds atexit-callback pointer or 0.
+    cpu.reg[X64_RDX].setU64(0);
 
     // Bounded run. 4M instructions is way more than the embedded payload
     // needs (it's ~7 instructions) but plenty of headroom for a real
