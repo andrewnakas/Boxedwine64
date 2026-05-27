@@ -73,6 +73,7 @@ run_one loop           "$ROOT/tools/buildLoopElf64.py"         55         || fai
 run_one stackString    "$ROOT/tools/buildStackStringElf64.py"  3          || fail=$((fail+1))
 run_one strEq          "$ROOT/tools/buildStrEqElf64.py"        17         || fail=$((fail+1))
 run_one scalarFp       "$ROOT/tools/buildScalarFpElf64.py"     8          || fail=$((fail+1))
+run_one div            "$ROOT/tools/buildDivElf64.py"          135        || fail=$((fail+1))
 
-echo "=== summary: $((8 - fail))/8 passed ==="
+echo "=== summary: $((9 - fail))/9 passed ==="
 exit $fail
