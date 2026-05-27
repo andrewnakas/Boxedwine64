@@ -3890,6 +3890,133 @@ int runX64SelfTest() {
         fflush(stdout);
     }
 
+    // ----- A10: SysV stack frame — argc reachable via [rsp] -----
+    // Synthesizes a minimal ET_EXEC whose entry reads [rsp] (argc) into
+    // R15 then exits. Inlines the same SysV frame builder the runner
+    // uses (one argv element, one envp element) so we catch regressions
+    // in the frame layout. Expect: argc == 1 lands in R15.
+    {
+        const U64 LOAD_VADDR = 0x500000;
+        const size_t ehdrSize = sizeof(k_Elf64_Ehdr);
+        const size_t phdrSize = sizeof(k_Elf64_Phdr);
+        // Code: 4C 8B 3C 24      mov r15, [rsp]
+        //       48 C7 C0 3C ..   mov rax, 60
+        //       48 31 FF         xor rdi, rdi
+        //       0F 05            syscall
+        std::vector<U8> code = {
+            0x4C, 0x8B, 0x3C, 0x24,
+            0x48, 0xC7, 0xC0, 0x3C, 0x00, 0x00, 0x00,
+            0x48, 0x31, 0xFF,
+            0x0F, 0x05,
+        };
+        const size_t totalSize = ehdrSize + phdrSize + code.size();
+        const U64 ENTRY_ADDR = LOAD_VADDR + ehdrSize + phdrSize;
+
+        std::vector<U8> elf(totalSize, 0);
+
+        k_Elf64_Ehdr eh{};
+        eh.e_ident[0] = 0x7F;
+        eh.e_ident[1] = 'E';
+        eh.e_ident[2] = 'L';
+        eh.e_ident[3] = 'F';
+        eh.e_ident[4] = k_ELFCLASS64;
+        eh.e_ident[5] = 1;
+        eh.e_ident[6] = 1;
+        eh.e_type     = 2; // ET_EXEC
+        eh.e_machine  = k_EM_X86_64;
+        eh.e_version  = 1;
+        eh.e_entry    = ENTRY_ADDR;
+        eh.e_phoff    = ehdrSize;
+        eh.e_ehsize   = (U16)ehdrSize;
+        eh.e_phentsize = (U16)phdrSize;
+        eh.e_phnum    = 1;
+        memcpy(elf.data(), &eh, ehdrSize);
+
+        k_Elf64_Phdr ph{};
+        ph.p_type   = k_PT_LOAD;
+        ph.p_flags  = 5; // PF_R | PF_X
+        ph.p_offset = 0;
+        ph.p_vaddr  = LOAD_VADDR;
+        ph.p_paddr  = LOAD_VADDR;
+        ph.p_filesz = totalSize;
+        ph.p_memsz  = totalSize;
+        ph.p_align  = 0x1000;
+        memcpy(elf.data() + ehdrSize, &ph, phdrSize);
+        memcpy(elf.data() + ehdrSize + phdrSize, code.data(), code.size());
+
+        Elf64ParseResult parsed = ElfLoader64::parseBuffer(elf.data(), elf.size());
+
+        // High stack matching the runner's layout.
+        const U64 STACK_TOP_HI  = 0x7FFFFFFFE000ULL;
+        const U64 STACK_SIZE_HI = 64 * 1024;
+        KMemory64 mem(nullptr);
+        mem.mmapAnonymousFixed(STACK_TOP_HI - STACK_SIZE_HI, STACK_SIZE_HI, 3);
+        bool mapOk = ElfLoader64::mapSegmentsFromBuffer(&mem, parsed,
+                                                        elf.data(), elf.size(),
+                                                        0, "a10-sysv");
+
+        // Inline SysV stack builder mirroring cpu64RunElf.cpp.
+        U64 sp = STACK_TOP_HI - 16;
+        const char* env0 = "PATH=/bin";
+        const char* arg0 = "a10";
+        U64 envLen = (U64)strlen(env0) + 1;
+        sp -= envLen;
+        mem.memcpyToGuest(sp, env0, envLen);
+        U64 envpPtr = sp;
+        U64 argLen = (U64)strlen(arg0) + 1;
+        sp -= argLen;
+        mem.memcpyToGuest(sp, arg0, argLen);
+        U64 argvPtr = sp;
+        sp -= 16; // AT_RANDOM pool
+        U64 randomAddr = sp;
+        for (int i = 0; i < 16; i++) mem.writeb(randomAddr + i, 0);
+
+        // 9 aux entries (incl AT_NULL) × 2 qwords + envp[0..2] (env, NULL)
+        // + argv[0..2] (arg, NULL) + argc(1) = 1 + 1 + 1 + 1 + 1 + 2*9 = 23 qwords
+        struct Aux { U64 k, v; } aux[] = {
+            { 3,  parsed.baseAddrLow + parsed.phoff }, // AT_PHDR
+            { 4,  parsed.phentsize },                  // AT_PHENT
+            { 5,  parsed.phnum },                      // AT_PHNUM
+            { 6,  4096 },                              // AT_PAGESZ
+            { 9,  parsed.entry },                      // AT_ENTRY
+            { 25, randomAddr },                        // AT_RANDOM
+            { 11, 0 },                                 // AT_UID
+            { 17, 100 },                               // AT_CLKTCK
+            { 0,  0 },                                 // AT_NULL
+        };
+        U64 totalQ = 1 + 1 + 1 + 1 + 1 + 2 * (sizeof(aux)/sizeof(aux[0]));
+        U64 afterSize = totalQ * 8;
+        U64 targetSp = (sp - afterSize) & ~0xFULL;
+        sp = targetSp + afterSize;
+        auto pushQ = [&](U64 v) { sp -= 8; mem.writeq(sp, v); };
+        for (int i = (int)(sizeof(aux)/sizeof(aux[0])) - 1; i >= 0; --i) {
+            pushQ(aux[i].v); pushQ(aux[i].k);
+        }
+        pushQ(0); pushQ(envpPtr);
+        pushQ(0); pushQ(argvPtr);
+        pushQ(1); // argc
+
+        CPU64 cpu(&mem);
+        cpu.rip = parsed.entry;
+        cpu.reg[X64_RSP].setU64(sp);
+        cpu.reg[X64_RDX].setU64(0);
+        if (mapOk) cpu.runBounded(200);
+
+        bool ok = parsed.ok && mapOk && cpu.yield && cpu.reg[X64_R15].u64 == 1;
+        if (ok) {
+            printf("  PASS: SysV stack frame: [rsp] == argc (1)\n");
+            r.passed++;
+        } else {
+            printf("  FAIL: A10 (parseOk=%d mapOk=%d yield=%d R15=0x%llx RIP=0x%llx sp=0x%llx)\n",
+                   parsed.ok, mapOk, cpu.yield,
+                   (unsigned long long)cpu.reg[X64_R15].u64,
+                   (unsigned long long)cpu.rip,
+                   (unsigned long long)sp);
+            r.failed++;
+        }
+        fflush(stdout);
+    }
+
     // ----- C11: SAHF / LAHF / INT3 -----
     // T: SAHF — load AH into the low byte of rflags. Set AH=0xD5 (CF|PF|AF|ZF|SF
     // all on, plus the always-1 reserved bit), call SAHF, then read rflags low
