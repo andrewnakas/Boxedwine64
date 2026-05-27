@@ -4350,6 +4350,134 @@ int runX64SelfTest() {
         fflush(stdout);
     }
 
+    // ----- A13: multi-PT_LOAD with BSS zero-fill -----
+    // Synthesizes ET_EXEC with TWO PT_LOADs:
+    //   seg0: RX, vaddr=0x500000, file+mem = whole code
+    //   seg1: RW, vaddr=0x501000, filesz=8 (one qword sentinel 0xDEADBEEFCAFEBABE),
+    //                              memsz=0x40 (trailing 56 bytes are BSS — must be zero)
+    // Entry code reads the BSS qword at vaddr 0x501010 (well into the BSS gap)
+    // into R15 via MOV RAX, moffs64. If the loader correctly zero-fills BSS, R15==0;
+    // if stale memory leaks through, the test fails with whatever garbage is there.
+    // Also reads the file-backed qword at 0x501000 into RBX to prove seg1's filesz
+    // bytes were copied (sanity); only R15 is asserted by the predicate.
+    {
+        const U64 SEG0_VADDR = 0x500000;
+        const U64 SEG1_VADDR = 0x501000;
+        const U64 BSS_READ_ADDR = 0x501010; // 0x10 bytes into seg1 (past the 8 file bytes)
+        const size_t ehdrSize = sizeof(k_Elf64_Ehdr);
+        const size_t phdrSize = sizeof(k_Elf64_Phdr);
+        // Code:
+        //   48 A1 imm64        mov rax, [0x501010]   ; read from BSS
+        //   49 89 C7           mov r15, rax
+        //   48 B8 imm64        mov rax, 60
+        //   48 31 FF           xor rdi, rdi
+        //   0F 05              syscall
+        std::vector<U8> code;
+        code.push_back(0x48); code.push_back(0xA1);
+        for (int i = 0; i < 8; i++) code.push_back((U8)((BSS_READ_ADDR >> (8*i)) & 0xFF));
+        code.push_back(0x49); code.push_back(0x89); code.push_back(0xC7); // mov r15, rax
+        code.push_back(0x48); code.push_back(0xC7); code.push_back(0xC0);
+        code.push_back(0x3C); code.push_back(0x00); code.push_back(0x00); code.push_back(0x00); // mov rax,60
+        code.push_back(0x48); code.push_back(0x31); code.push_back(0xFF); // xor rdi,rdi
+        code.push_back(0x0F); code.push_back(0x05); // syscall
+
+        // Layout of the file:
+        //   0x0000 Ehdr (64)
+        //   0x0040 Phdr0 (56)  PT_LOAD for code
+        //   0x0078 Phdr1 (56)  PT_LOAD for data
+        //   0x00B0 code bytes
+        //   0x00B0+len_code (...) data bytes (8 bytes — one sentinel qword)
+        const size_t PHDR0_OFF = ehdrSize;
+        const size_t PHDR1_OFF = ehdrSize + phdrSize;
+        const size_t CODE_OFF  = ehdrSize + 2 * phdrSize;
+        const size_t DATA_OFF  = CODE_OFF + code.size();
+        const size_t fileSize  = DATA_OFF + 8;
+
+        std::vector<U8> elf(fileSize, 0);
+
+        k_Elf64_Ehdr eh{};
+        eh.e_ident[0] = 0x7F; eh.e_ident[1] = 'E'; eh.e_ident[2] = 'L'; eh.e_ident[3] = 'F';
+        eh.e_ident[4] = k_ELFCLASS64; eh.e_ident[5] = 1; eh.e_ident[6] = 1;
+        eh.e_type     = 2; // ET_EXEC
+        eh.e_machine  = k_EM_X86_64;
+        eh.e_version  = 1;
+        eh.e_entry    = SEG0_VADDR + CODE_OFF;
+        eh.e_phoff    = PHDR0_OFF;
+        eh.e_ehsize   = (U16)ehdrSize;
+        eh.e_phentsize = (U16)phdrSize;
+        eh.e_phnum    = 2;
+        memcpy(elf.data(), &eh, ehdrSize);
+
+        // Phdr0: code, RX, file+mem cover [0 .. CODE_OFF+code.size())
+        k_Elf64_Phdr ph0{};
+        ph0.p_type   = k_PT_LOAD;
+        ph0.p_flags  = 5; // PF_R | PF_X
+        ph0.p_offset = 0;
+        ph0.p_vaddr  = SEG0_VADDR;
+        ph0.p_paddr  = SEG0_VADDR;
+        ph0.p_filesz = DATA_OFF;  // everything before the data segment's file region
+        ph0.p_memsz  = DATA_OFF;
+        ph0.p_align  = 0x1000;
+        memcpy(elf.data() + PHDR0_OFF, &ph0, phdrSize);
+
+        // Phdr1: data, RW, filesz=8 (one sentinel qword), memsz=0x40 (rest is BSS)
+        k_Elf64_Phdr ph1{};
+        ph1.p_type   = k_PT_LOAD;
+        ph1.p_flags  = 6; // PF_R | PF_W
+        ph1.p_offset = DATA_OFF;
+        ph1.p_vaddr  = SEG1_VADDR;
+        ph1.p_paddr  = SEG1_VADDR;
+        ph1.p_filesz = 8;
+        ph1.p_memsz  = 0x40;
+        ph1.p_align  = 0x1000;
+        memcpy(elf.data() + PHDR1_OFF, &ph1, phdrSize);
+
+        // Copy code into the file at CODE_OFF
+        memcpy(elf.data() + CODE_OFF, code.data(), code.size());
+        // Sentinel qword at DATA_OFF — proves the file bytes ARE present
+        // (so a passing test isn't just "the page never got written")
+        const U64 sentinel = 0xDEADBEEFCAFEBABEULL;
+        memcpy(elf.data() + DATA_OFF, &sentinel, 8);
+
+        Elf64ParseResult parsed = ElfLoader64::parseBuffer(elf.data(), elf.size());
+        bool parseOk = parsed.ok && parsed.segments.size() == 2;
+
+        KMemory64 mem(nullptr);
+        mem.mmapAnonymousFixed(STACK_TOP - 0x1000, 0x1000, 3);
+        bool mapOk = parseOk && ElfLoader64::mapSegmentsFromBuffer(
+            &mem, parsed, elf.data(), elf.size(), 0, "a13-multi-seg");
+
+        // Pre-flight: prove the BSS gap is actually zero in guest memory.
+        U64 bssQ = mem.readq(BSS_READ_ADDR);
+        U64 fileQ = mem.readq(SEG1_VADDR);
+
+        CPU64 cpu(&mem);
+        cpu.rip = parsed.entry;
+        cpu.reg[X64_RSP].setU64(STACK_TOP - 16);
+        if (mapOk) cpu.runBounded(200);
+
+        bool ok = parseOk &&
+                  mapOk &&
+                  cpu.yield &&
+                  cpu.reg[X64_R15].u64 == 0 &&     // BSS read zero through CPU
+                  bssQ == 0 &&                     // BSS read zero direct
+                  fileQ == sentinel;               // file bytes copied
+        if (ok) {
+            printf("  PASS: multi-PT_LOAD with BSS zero-fill (sentinel=0x%llx)\n",
+                   (unsigned long long)sentinel);
+            r.passed++;
+        } else {
+            printf("  FAIL: A13 (parseOk=%d mapOk=%d yield=%d R15=0x%llx bssQ=0x%llx fileQ=0x%llx RIP=0x%llx)\n",
+                   parseOk, mapOk, cpu.yield,
+                   (unsigned long long)cpu.reg[X64_R15].u64,
+                   (unsigned long long)bssQ,
+                   (unsigned long long)fileQ,
+                   (unsigned long long)cpu.rip);
+            r.failed++;
+        }
+        fflush(stdout);
+    }
+
     // ----- C11: SAHF / LAHF / INT3 -----
     // T: SAHF — load AH into the low byte of rflags. Set AH=0xD5 (CF|PF|AF|ZF|SF
     // all on, plus the always-1 reserved bit), call SAHF, then read rflags low
