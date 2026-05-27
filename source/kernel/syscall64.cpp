@@ -112,14 +112,23 @@
 #define K_ENOMEM 12
 #endif
 
-// FUTEX_* op codes from <linux/futex.h>. We only handle WAIT/WAKE +
-// PRIVATE variants — the rest go to the catch-all "return success" path
-// until we wire real blocking via KThread::futex in Milestone B proper.
-#define X64_FUTEX_WAIT          0
-#define X64_FUTEX_WAKE          1
-#define X64_FUTEX_PRIVATE_FLAG  128
-#define X64_FUTEX_WAIT_PRIVATE  (X64_FUTEX_WAIT | X64_FUTEX_PRIVATE_FLAG)
-#define X64_FUTEX_WAKE_PRIVATE  (X64_FUTEX_WAKE | X64_FUTEX_PRIVATE_FLAG)
+// FUTEX_* op codes from <linux/futex.h>. We handle WAIT/WAKE + their
+// BITSET variants (glibc 2.35+ uses WAKE_BITSET for pthread_cond_signal)
+// and recognize REQUEUE/CMP_REQUEUE/WAKE_OP so we don't reject them with
+// EINVAL — they degrade to "no waiters woken" which is correct for our
+// single-threaded world. The CLOCK_REALTIME bit (0x100) is ignored
+// because we don't block anyway.
+#define X64_FUTEX_WAIT             0
+#define X64_FUTEX_WAKE             1
+#define X64_FUTEX_REQUEUE          3
+#define X64_FUTEX_CMP_REQUEUE      4
+#define X64_FUTEX_WAKE_OP          5
+#define X64_FUTEX_WAIT_BITSET      9
+#define X64_FUTEX_WAKE_BITSET      10
+#define X64_FUTEX_PRIVATE_FLAG     128
+#define X64_FUTEX_CLOCK_REALTIME   256
+#define X64_FUTEX_WAIT_PRIVATE     (X64_FUTEX_WAIT | X64_FUTEX_PRIVATE_FLAG)
+#define X64_FUTEX_WAKE_PRIVATE     (X64_FUTEX_WAKE | X64_FUTEX_PRIVATE_FLAG)
 
 // MAP_* bits used by mmap. Kept local to avoid pulling kernel.h here.
 #ifndef K_MAP_ANONYMOUS
@@ -551,34 +560,50 @@ static U64 sys_readlink64(CPU64* cpu, U64 pathAddr, U64 buf, U64 sz) {
 // accept U64 addresses, and that's a churn we're deferring. What we DO get
 // right here:
 //
-//   FUTEX_WAKE / WAKE_PRIVATE → return 0 (no waiters in our world)
-//   FUTEX_WAIT / WAIT_PRIVATE → read the 32-bit word at uaddr; if it does
-//       NOT equal val, return -EAGAIN. This is the Linux-spec answer for
-//       the "value changed between userspace check and syscall entry"
-//       race, and it matches what glibc's __lll_lock_wait_private retries
-//       against. If the value DOES equal val we'd normally block; we
-//       return -EAGAIN there too — glibc will spin briefly and then retry,
-//       which is wrong for truly contended mutexes but harmless and
-//       forward-progressing for single-threaded binaries (the only kind
-//       we can run today anyway).
-//   Anything else (REQUEUE/CMP_REQUEUE/WAKE_OP/LOCK_PI/etc) → return 0.
+//   WAIT / WAIT_PRIVATE / WAIT_BITSET → read the 32-bit word at uaddr;
+//       if it does NOT equal val, return -EAGAIN (the spec answer for the
+//       race; glibc's __lll_lock_wait_private retries against this). If it
+//       DOES equal val we'd normally block; we also return -EAGAIN, which
+//       lets glibc spin briefly and retry — wrong for truly contended
+//       mutexes but harmless and forward-progressing for single-threaded
+//       binaries (the only kind we can run today).
+//   WAKE / WAKE_PRIVATE / WAKE_BITSET → return 0 (no waiters in our world).
+//       The return value semantically is "number of waiters woken" — zero
+//       is the correct answer when no one is waiting.
+//   REQUEUE / CMP_REQUEUE / WAKE_OP → return 0 (no waiters to move/wake).
+//   Anything else (LOCK_PI/UNLOCK_PI/etc) → return -ENOSYS so glibc falls
+//       back to the BSD-style spin-wait instead of believing the PI op
+//       succeeded.
 //
-// Caller passes the 32-bit op/val truncations done at the call site.
+// uaddr=0 is always -EFAULT regardless of op (matches kernel behaviour
+// for both blocking and non-blocking ops). Caller passes the 32-bit op/val
+// truncations done at the call site.
 static U64 sys_futex64(CPU64* cpu, U64 uaddr, U32 op, U32 val) {
-    U32 baseOp = op & ~X64_FUTEX_PRIVATE_FLAG;
+    if (uaddr == 0) return (U64)-K_EFAULT;
+    // Strip the modifier bits (PRIVATE + CLOCK_REALTIME) before dispatch.
+    U32 baseOp = op & ~(X64_FUTEX_PRIVATE_FLAG | X64_FUTEX_CLOCK_REALTIME);
     switch (baseOp) {
         case X64_FUTEX_WAKE:
+        case X64_FUTEX_WAKE_BITSET:
+            // No waiters; "0 woken" is the correct return.
             return 0;
-        case X64_FUTEX_WAIT: {
-            if (uaddr == 0) return (U64)-K_EINVAL;
+        case X64_FUTEX_WAIT:
+        case X64_FUTEX_WAIT_BITSET: {
+            if (!cpu->memory) return (U64)-K_EFAULT;
             U32 cur = cpu->memory->readd(uaddr);
             if (cur != val) return (U64)-K_EAGAIN;
             // Would-block path: return EAGAIN instead of blocking. See the
             // function-header comment for why this is acceptable for v0.
             return (U64)-K_EAGAIN;
         }
-        default:
+        case X64_FUTEX_REQUEUE:
+        case X64_FUTEX_CMP_REQUEUE:
+        case X64_FUTEX_WAKE_OP:
             return 0;
+        default:
+            // PI futexes, etc. — fall back to ENOSYS so glibc uses its
+            // user-space spin path instead of trusting a fake "OK".
+            return (U64)-K_ENOSYS;
     }
 }
 

@@ -2138,6 +2138,94 @@ int runX64SelfTest() {
         });
     }
 
+    // ---- futex(202) Milestone B4 extensions ----
+
+    // FUTEX_WAKE_BITSET (op=10) is glibc 2.35+'s default for pthread_cond_signal.
+    // Same semantics as WAKE: 0 waiters woken.
+    {
+        U64 dst = STACK_TOP - 0x800;
+        std::vector<U8> code = {
+            0x48, 0xC7, 0xC0, 0xCA, 0x00, 0x00, 0x00,                     // mov rax, 202
+            0x48, 0xBF,
+                (U8)(dst), (U8)(dst >> 8), (U8)(dst >> 16), (U8)(dst >> 24),
+                (U8)(dst >> 32), (U8)(dst >> 40), (U8)(dst >> 48), (U8)(dst >> 56),
+            0x48, 0xC7, 0xC6, 0x8A, 0x00, 0x00, 0x00,                     // mov rsi, 0x8A (WAKE_BITSET|PRIVATE)
+            0x48, 0xC7, 0xC2, 0x01, 0x00, 0x00, 0x00,                     // mov rdx, 1
+            0x0F, 0x05,
+        };
+        runAndCheck(r, "futex FUTEX_WAKE_BITSET_PRIVATE → 0", withExit(code), [](CPU64& c) {
+            return c.reg[X64_R15].u64 == 0;
+        });
+    }
+
+    // FUTEX_WAIT_BITSET (op=9) — value match still returns -EAGAIN (no-block path).
+    {
+        U64 dst = STACK_TOP - 0x800;
+        std::vector<U8> code = {
+            0x48, 0xBF,
+                (U8)(dst), (U8)(dst >> 8), (U8)(dst >> 16), (U8)(dst >> 24),
+                (U8)(dst >> 32), (U8)(dst >> 40), (U8)(dst >> 48), (U8)(dst >> 56),
+            0xC7, 0x07, 0x07, 0x00, 0x00, 0x00,                           // mov dword [rdi], 7
+            0x48, 0xC7, 0xC0, 0xCA, 0x00, 0x00, 0x00,                     // mov rax, 202
+            0x48, 0xC7, 0xC6, 0x89, 0x00, 0x00, 0x00,                     // mov rsi, 0x89 (WAIT_BITSET|PRIVATE)
+            0x48, 0xC7, 0xC2, 0x07, 0x00, 0x00, 0x00,                     // mov rdx, 7 (matches)
+            0x4D, 0x31, 0xD2,                                             // xor r10, r10
+            0x0F, 0x05,
+        };
+        runAndCheck(r, "futex FUTEX_WAIT_BITSET match → -EAGAIN", withExit(code), [](CPU64& c) {
+            return c.reg[X64_R15].u64 == 0xFFFFFFFFFFFFFFF5ULL;
+        });
+    }
+
+    // FUTEX_REQUEUE (op=3) — should return 0 (no waiters to move).
+    {
+        U64 dst = STACK_TOP - 0x800;
+        std::vector<U8> code = {
+            0x48, 0xC7, 0xC0, 0xCA, 0x00, 0x00, 0x00,                     // mov rax, 202
+            0x48, 0xBF,
+                (U8)(dst), (U8)(dst >> 8), (U8)(dst >> 16), (U8)(dst >> 24),
+                (U8)(dst >> 32), (U8)(dst >> 40), (U8)(dst >> 48), (U8)(dst >> 56),
+            0x48, 0xC7, 0xC6, 0x03, 0x00, 0x00, 0x00,                     // mov rsi, 3 (REQUEUE)
+            0x48, 0xC7, 0xC2, 0x00, 0x00, 0x00, 0x00,                     // mov rdx, 0
+            0x0F, 0x05,
+        };
+        runAndCheck(r, "futex FUTEX_REQUEUE → 0", withExit(code), [](CPU64& c) {
+            return c.reg[X64_R15].u64 == 0;
+        });
+    }
+
+    // uaddr=0 → -EFAULT regardless of op. EFAULT=14 → 0xFFFFFFFFFFFFFFF2.
+    {
+        std::vector<U8> code = {
+            0x48, 0xC7, 0xC0, 0xCA, 0x00, 0x00, 0x00,                     // mov rax, 202
+            0x48, 0x31, 0xFF,                                             // xor rdi, rdi (uaddr=0)
+            0x48, 0xC7, 0xC6, 0x81, 0x00, 0x00, 0x00,                     // mov rsi, WAKE_PRIVATE
+            0x48, 0xC7, 0xC2, 0x01, 0x00, 0x00, 0x00,                     // mov rdx, 1
+            0x0F, 0x05,
+        };
+        runAndCheck(r, "futex uaddr=NULL → -EFAULT", withExit(code), [](CPU64& c) {
+            return c.reg[X64_R15].u64 == 0xFFFFFFFFFFFFFFF2ULL;
+        });
+    }
+
+    // Unknown op (e.g. LOCK_PI = 6) → -ENOSYS so glibc falls back to user-space.
+    // ENOSYS=38 → 0xFFFFFFFFFFFFFFDA.
+    {
+        U64 dst = STACK_TOP - 0x800;
+        std::vector<U8> code = {
+            0x48, 0xC7, 0xC0, 0xCA, 0x00, 0x00, 0x00,                     // mov rax, 202
+            0x48, 0xBF,
+                (U8)(dst), (U8)(dst >> 8), (U8)(dst >> 16), (U8)(dst >> 24),
+                (U8)(dst >> 32), (U8)(dst >> 40), (U8)(dst >> 48), (U8)(dst >> 56),
+            0x48, 0xC7, 0xC6, 0x06, 0x00, 0x00, 0x00,                     // mov rsi, 6 (LOCK_PI — unhandled)
+            0x48, 0xC7, 0xC2, 0x00, 0x00, 0x00, 0x00,                     // mov rdx, 0
+            0x0F, 0x05,
+        };
+        runAndCheck(r, "futex unknown op (LOCK_PI) → -ENOSYS", withExit(code), [](CPU64& c) {
+            return c.reg[X64_R15].u64 == 0xFFFFFFFFFFFFFFDAULL;
+        });
+    }
+
     // ----- x87 FPU minimal subset (D9/DC/DD) -----
     // Pattern: spill the operand double into a stack slot via
     //   sub rsp,8 ; mov rax,imm64 ; mov [rsp],rax
