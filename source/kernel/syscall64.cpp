@@ -85,8 +85,17 @@
 #define X64_SYS_clock_getres      229
 #define X64_SYS_clock_nanosleep   230
 #define X64_SYS_nanosleep         35
-#define X64_SYS_pipe2_alias       293
 #define X64_SYS_rseq              334
+#define X64_SYS_clone3            435
+#define X64_SYS_eventfd2          290
+#define X64_SYS_epoll_create1     291
+#define X64_SYS_epoll_ctl         233
+#define X64_SYS_epoll_wait        232
+#define X64_SYS_pwrite64          18
+#define X64_SYS_readv             19
+#define X64_SYS_select            23
+#define X64_SYS_chmod             90
+#define X64_SYS_fchmod            91
 #define X64_SYS_clone             56
 #define X64_SYS_wait4             61
 #define X64_SYS_pause             34
@@ -125,6 +134,12 @@
 #endif
 #ifndef K_EINTR
 #define K_EINTR 4
+#endif
+#ifndef K_EBADF
+#define K_EBADF 9
+#endif
+#ifndef K_EMFILE
+#define K_EMFILE 24
 #endif
 
 // FUTEX_* op codes from <linux/futex.h>. We handle WAIT/WAKE + their
@@ -1212,6 +1227,74 @@ void ksyscall64(CPU64* cpu) {
             // Interval timers are rarely used by modern glibc (timer_create
             // is preferred); explicit ENOSYS keeps callers honest.
             ret = (U64)-K_ENOSYS;
+            break;
+        case X64_SYS_clone3:
+            // Newer glibc tries clone3 first then falls back to clone.
+            // Returning -ENOSYS by name (not via default) lets the fallback
+            // path engage cleanly.
+            klog_fmt("ksyscall64: clone3(args=0x%llx, size=%llu) not implemented",
+                     (unsigned long long)a1,
+                     (unsigned long long)a2);
+            ret = (U64)-K_ENOSYS;
+            break;
+        case X64_SYS_pipe:
+        case X64_SYS_pipe2:
+            // No real pipe infra yet; glibc's posix_spawn and popen will
+            // observe ENOSYS and either skip or surface a clean failure.
+            // a1 (pipefd[2]) should be a writable user pointer if set.
+            if (a1 == 0) { ret = (U64)-K_EFAULT; break; }
+            ret = (U64)-K_ENOSYS;
+            break;
+        case X64_SYS_eventfd2:
+            // Used by glibc for thread-pool wakeups, by GLib mainloop, etc.
+            // Real impl needs an FD allocator that can wire poll/read.
+            ret = (U64)-K_ENOSYS;
+            break;
+        case X64_SYS_epoll_create1:
+            // Real epoll set needs FD + poll integration. ENOSYS pushes
+            // callers onto their poll/select fallback path.
+            ret = (U64)-K_ENOSYS;
+            break;
+        case X64_SYS_epoll_ctl:
+            // Cannot exist meaningfully without epoll_create1 succeeding;
+            // EBADF matches what a closed epoll fd would yield.
+            ret = (U64)-K_EBADF;
+            break;
+        case X64_SYS_epoll_wait:
+            // Same story — no valid epoll fd can exist yet.
+            ret = (U64)-K_EBADF;
+            break;
+        case X64_SYS_getdents64:
+            // Directory iteration needs FsOpenNode + KMemory64 plumbing.
+            // EBADF on the assumption no dir was successfully opened yet
+            // (open() of a directory currently fails earlier).
+            if (a2 == 0) { ret = (U64)-K_EFAULT; break; }
+            ret = (U64)-K_ENOSYS;
+            break;
+        case X64_SYS_pwrite64:
+            // pwrite64(fd, buf, count, offset). No real impl; ENOSYS is
+            // safer than silent zero-write.
+            if (a2 == 0) { ret = (U64)-K_EFAULT; break; }
+            ret = (U64)-K_ENOSYS;
+            break;
+        case X64_SYS_readv:
+            // Scatter-gather read. Same shape: needs iovec walker. ENOSYS
+            // until we add it — callers fall back to plain read().
+            if (a2 == 0) { ret = (U64)-K_EFAULT; break; }
+            ret = (U64)-K_ENOSYS;
+            break;
+        case X64_SYS_select:
+            // select(nfds, readfds, writefds, exceptfds, timeout). Without
+            // real fd polling we cannot honor it; ENOSYS surfaces cleanly.
+            ret = (U64)-K_ENOSYS;
+            break;
+        case X64_SYS_chmod:
+        case X64_SYS_fchmod:
+            // No-op success: rootfs is effectively read-only for our purpose
+            // and glibc's installer paths frequently call chmod on temp
+            // files. Returning 0 avoids spurious install-time failures
+            // without actually touching anything.
+            ret = 0;
             break;
         case X64_SYS_gettimeofday: {
             // struct timeval { U64 sec; U64 usec; }

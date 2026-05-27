@@ -2444,6 +2444,155 @@ int runX64SelfTest() {
         });
     }
 
+    // ----- B6: IPC/IO syscall stub surface -----
+    // All return errno semantics (no real impl); each test pins:
+    //   (a) RAX = expected negated errno
+    //   (b) the dispatcher named the syscall (verified by absence of
+    //       "unimplemented #<n>" in the dispatch path — implicit since we
+    //       reach the per-case break instead of default).
+
+    // clone3 → -ENOSYS (rax=435, expect -38 = 0xFFFFFFFFFFFFFFDA)
+    {
+        std::vector<U8> code = {
+            0x48, 0xC7, 0xC0, 0xB3, 0x01, 0x00, 0x00,                     // mov rax, 435
+            0x48, 0x31, 0xFF,                                             // xor rdi, rdi (args)
+            0x48, 0x31, 0xF6,                                             // xor rsi, rsi (size)
+            0x0F, 0x05,                                                   // syscall
+        };
+        runAndCheck(r, "clone3 → -ENOSYS", withExit(code), [](CPU64& c) {
+            return c.reg[X64_R15].u64 == 0xFFFFFFFFFFFFFFDAULL;
+        });
+    }
+
+    // pipe(NULL) → -EFAULT (rax=22, rdi=0, expect -14 = 0xFFFFFFFFFFFFFFF2)
+    {
+        std::vector<U8> code = {
+            0x48, 0xC7, 0xC0, 0x16, 0x00, 0x00, 0x00,                     // mov rax, 22
+            0x48, 0x31, 0xFF,                                             // xor rdi, rdi
+            0x0F, 0x05,                                                   // syscall
+        };
+        runAndCheck(r, "pipe(NULL) → -EFAULT", withExit(code), [](CPU64& c) {
+            return c.reg[X64_R15].u64 == 0xFFFFFFFFFFFFFFF2ULL;
+        });
+    }
+
+    // pipe2(buf, 0) → -ENOSYS (rax=293, rdi=stack slot, expect -38)
+    {
+        std::vector<U8> code = {
+            0x48, 0x83, 0xEC, 0x10,                                       // sub rsp, 16
+            0x48, 0xC7, 0xC0, 0x25, 0x01, 0x00, 0x00,                     // mov rax, 293
+            0x48, 0x89, 0xE7,                                             // mov rdi, rsp (non-NULL)
+            0x48, 0x31, 0xF6,                                             // xor rsi, rsi (flags=0)
+            0x0F, 0x05,                                                   // syscall
+            0x48, 0x83, 0xC4, 0x10,                                       // add rsp, 16
+        };
+        runAndCheck(r, "pipe2 → -ENOSYS", withExit(code), [](CPU64& c) {
+            return c.reg[X64_R15].u64 == 0xFFFFFFFFFFFFFFDAULL;
+        });
+    }
+
+    // eventfd2(0, 0) → -ENOSYS (rax=290)
+    {
+        std::vector<U8> code = {
+            0x48, 0xC7, 0xC0, 0x22, 0x01, 0x00, 0x00,                     // mov rax, 290
+            0x48, 0x31, 0xFF,                                             // xor rdi
+            0x48, 0x31, 0xF6,                                             // xor rsi
+            0x0F, 0x05,
+        };
+        runAndCheck(r, "eventfd2 → -ENOSYS", withExit(code), [](CPU64& c) {
+            return c.reg[X64_R15].u64 == 0xFFFFFFFFFFFFFFDAULL;
+        });
+    }
+
+    // epoll_create1(0) → -ENOSYS (rax=291)
+    {
+        std::vector<U8> code = {
+            0x48, 0xC7, 0xC0, 0x23, 0x01, 0x00, 0x00,                     // mov rax, 291
+            0x48, 0x31, 0xFF,                                             // xor rdi
+            0x0F, 0x05,
+        };
+        runAndCheck(r, "epoll_create1 → -ENOSYS", withExit(code), [](CPU64& c) {
+            return c.reg[X64_R15].u64 == 0xFFFFFFFFFFFFFFDAULL;
+        });
+    }
+
+    // epoll_ctl → -EBADF (rax=233, expect -9 = 0xFFFFFFFFFFFFFFF7)
+    {
+        std::vector<U8> code = {
+            0x48, 0xC7, 0xC0, 0xE9, 0x00, 0x00, 0x00,                     // mov rax, 233
+            0x48, 0x31, 0xFF, 0x48, 0x31, 0xF6, 0x48, 0x31, 0xD2,         // rdi=rsi=rdx=0
+            0x49, 0x31, 0xD2,                                             // r10=0
+            0x0F, 0x05,
+        };
+        runAndCheck(r, "epoll_ctl → -EBADF", withExit(code), [](CPU64& c) {
+            return c.reg[X64_R15].u64 == 0xFFFFFFFFFFFFFFF7ULL;
+        });
+    }
+
+    // epoll_wait → -EBADF (rax=232)
+    {
+        std::vector<U8> code = {
+            0x48, 0xC7, 0xC0, 0xE8, 0x00, 0x00, 0x00,                     // mov rax, 232
+            0x48, 0x31, 0xFF, 0x48, 0x31, 0xF6, 0x48, 0x31, 0xD2,         // rdi=rsi=rdx=0
+            0x49, 0x31, 0xD2,                                             // r10=0
+            0x0F, 0x05,
+        };
+        runAndCheck(r, "epoll_wait → -EBADF", withExit(code), [](CPU64& c) {
+            return c.reg[X64_R15].u64 == 0xFFFFFFFFFFFFFFF7ULL;
+        });
+    }
+
+    // getdents64(0, NULL, 0) → -EFAULT (rax=217, rsi=0)
+    {
+        std::vector<U8> code = {
+            0x48, 0xC7, 0xC0, 0xD9, 0x00, 0x00, 0x00,                     // mov rax, 217
+            0x48, 0x31, 0xFF,                                             // xor rdi
+            0x48, 0x31, 0xF6,                                             // xor rsi (buf=NULL)
+            0x48, 0x31, 0xD2,                                             // xor rdx
+            0x0F, 0x05,
+        };
+        runAndCheck(r, "getdents64(NULL) → -EFAULT", withExit(code), [](CPU64& c) {
+            return c.reg[X64_R15].u64 == 0xFFFFFFFFFFFFFFF2ULL;
+        });
+    }
+
+    // select → -ENOSYS (rax=23)
+    {
+        std::vector<U8> code = {
+            0x48, 0xC7, 0xC0, 0x17, 0x00, 0x00, 0x00,                     // mov rax, 23
+            0x48, 0x31, 0xFF, 0x48, 0x31, 0xF6, 0x48, 0x31, 0xD2,
+            0x49, 0x31, 0xD2, 0x4D, 0x31, 0xC0,                           // r10=r8=0
+            0x0F, 0x05,
+        };
+        runAndCheck(r, "select → -ENOSYS", withExit(code), [](CPU64& c) {
+            return c.reg[X64_R15].u64 == 0xFFFFFFFFFFFFFFDAULL;
+        });
+    }
+
+    // chmod → 0 (success no-op, rax=90)
+    {
+        std::vector<U8> code = {
+            0x48, 0xC7, 0xC0, 0x5A, 0x00, 0x00, 0x00,                     // mov rax, 90
+            0x48, 0x31, 0xFF, 0x48, 0x31, 0xF6,                           // rdi=rsi=0
+            0x0F, 0x05,
+        };
+        runAndCheck(r, "chmod → 0 (no-op success)", withExit(code), [](CPU64& c) {
+            return c.reg[X64_R15].u64 == 0;
+        });
+    }
+
+    // fchmod → 0 (success no-op, rax=91)
+    {
+        std::vector<U8> code = {
+            0x48, 0xC7, 0xC0, 0x5B, 0x00, 0x00, 0x00,                     // mov rax, 91
+            0x48, 0x31, 0xFF, 0x48, 0x31, 0xF6,                           // rdi=rsi=0
+            0x0F, 0x05,
+        };
+        runAndCheck(r, "fchmod → 0 (no-op success)", withExit(code), [](CPU64& c) {
+            return c.reg[X64_R15].u64 == 0;
+        });
+    }
+
     // ----- x87 FPU minimal subset (D9/DC/DD) -----
     // Pattern: spill the operand double into a stack slot via
     //   sub rsp,8 ; mov rax,imm64 ; mov [rsp],rax
