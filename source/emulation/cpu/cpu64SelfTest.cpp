@@ -4456,9 +4456,15 @@ int runX64SelfTest() {
         cpu.reg[X64_RSP].setU64(STACK_TOP - 16);
         if (mapOk) cpu.runBounded(200);
 
+        // instructionCount > 0 is load-bearing: cpu.yield is set both by the
+        // exit syscall AND by the unimpl-tracer at cpu64.cpp:3698, so checking
+        // yield alone would mask a decode failure on the first instruction
+        // (R15 would still be 0 because it's never written). Require that the
+        // CPU actually executed at least the BSS-load + mov-r15 + setup ops.
         bool ok = parseOk &&
                   mapOk &&
                   cpu.yield &&
+                  cpu.instructionCount >= 4 &&     // BSS-load, mov r15, mov rax=60, xor rdi, syscall
                   cpu.reg[X64_R15].u64 == 0 &&     // BSS read zero through CPU
                   bssQ == 0 &&                     // BSS read zero direct
                   fileQ == sentinel;               // file bytes copied
@@ -4467,8 +4473,9 @@ int runX64SelfTest() {
                    (unsigned long long)sentinel);
             r.passed++;
         } else {
-            printf("  FAIL: A13 (parseOk=%d mapOk=%d yield=%d R15=0x%llx bssQ=0x%llx fileQ=0x%llx RIP=0x%llx)\n",
+            printf("  FAIL: A13 (parseOk=%d mapOk=%d yield=%d insn=%llu R15=0x%llx bssQ=0x%llx fileQ=0x%llx RIP=0x%llx)\n",
                    parseOk, mapOk, cpu.yield,
+                   (unsigned long long)cpu.instructionCount,
                    (unsigned long long)cpu.reg[X64_R15].u64,
                    (unsigned long long)bssQ,
                    (unsigned long long)fileQ,

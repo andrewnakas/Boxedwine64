@@ -839,6 +839,48 @@ U32 CPU64::step() {
     }
 
     // TEST AL/AX/EAX/RAX, imm  (A8 ib / A9 iz).
+    // A0/A1/A2/A3 — MOV AL/AX/EAX/RAX ↔ moffs (64-bit absolute address).
+    // In long mode the displacement is always 8 bytes regardless of address-size
+    // prefix. REX.W on A1/A3 makes the operand 64-bit; otherwise normal opSize
+    // rules apply. AL/A0/A2 are byte-size; AX/EAX/RAX A1/A3 follow opSize.
+    //
+    // gcc emits these for `mov rax, [absolute_addr]` from PIC C code with
+    // -fno-pic compiled against fixed-address globals, and for any static
+    // ET_EXEC that addresses a known absolute symbol. Surfaced by
+    // tools/buildMultiSegmentElf64.py via the unimpl-tracer.
+    if (op == 0xA0 || op == 0xA1 || op == 0xA2 || op == 0xA3) {
+        U32 size = (op == 0xA0 || op == 0xA2) ? 1 : opSize;
+        // Fetch the 8-byte absolute address that follows the opcode.
+        U64 addr = (U64)fetchByte(rip + opOff + 1)
+                 | ((U64)fetchByte(rip + opOff + 2) << 8)
+                 | ((U64)fetchByte(rip + opOff + 3) << 16)
+                 | ((U64)fetchByte(rip + opOff + 4) << 24)
+                 | ((U64)fetchByte(rip + opOff + 5) << 32)
+                 | ((U64)fetchByte(rip + opOff + 6) << 40)
+                 | ((U64)fetchByte(rip + opOff + 7) << 48)
+                 | ((U64)fetchByte(rip + opOff + 8) << 56);
+        if (op == 0xA0 || op == 0xA1) {
+            // load from [moffs] into AL/AX/EAX/RAX
+            switch (size) {
+                case 1: reg[X64_RAX].setU8(memory->readb(addr)); break;
+                case 2: reg[X64_RAX].setU16(memory->readw(addr)); break;
+                case 4: reg[X64_RAX].setU32(memory->readd(addr)); break;
+                case 8: reg[X64_RAX].setU64(memory->readq(addr)); break;
+            }
+        } else {
+            // store AL/AX/EAX/RAX into [moffs]
+            switch (size) {
+                case 1: memory->writeb(addr, reg[X64_RAX].u8); break;
+                case 2: memory->writew(addr, reg[X64_RAX].u16); break;
+                case 4: memory->writed(addr, reg[X64_RAX].u32); break;
+                case 8: memory->writeq(addr, reg[X64_RAX].u64); break;
+            }
+        }
+        U32 used = opOff + 1 + 8;
+        rip += used;
+        return used;
+    }
+
     if (op == 0xA8 || op == 0xA9) {
         U32 size = (op == 0xA8) ? 1 : opSize;
         U64 a = (size == 1) ? reg[X64_RAX].u8
