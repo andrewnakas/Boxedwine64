@@ -2570,6 +2570,150 @@ int runX64SelfTest() {
         });
     }
 
+    // ----- C10 extensions: x87 FCOM/FCOMI compare ops -----
+
+    // T: FCOMI ST(0)>ST(1) — load 5.0 then 2.0 → st0=2,st1=5 (wait reversed)
+    // fld 2.0 then fld 5.0 gives st0=5, st1=2. fcomi st0,st1 → 5>2 → no flags.
+    // Verify ZF=0, CF=0 via pushfq.
+    {
+        std::vector<U8> code = {
+            0x48, 0x83, 0xEC, 0x10,
+            0x48, 0xB8, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x40, // 2.0
+            0x48, 0x89, 0x04, 0x24,
+            0xDD, 0x04, 0x24,                                           // fld 2.0  → st0=2
+            0x48, 0xB8, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x14, 0x40, // 5.0
+            0x48, 0x89, 0x04, 0x24,
+            0xDD, 0x04, 0x24,                                           // fld 5.0  → st0=5, st1=2
+            0xDB, 0xF1,                                                 // fcomi st0,st1 → 5>2: no flags
+            0x9C,                                                       // pushfq
+            0x58,                                                       // pop rax
+            0x48, 0x83, 0xC4, 0x10,
+        };
+        runAndCheck(r, "x87 FCOMI ST(0)>ST(1) clears ZF/CF/PF", withExit(code), [](CPU64& c) {
+            // CF (bit 0), PF (bit 2), ZF (bit 6) must all be 0
+            return (c.reg[X64_R15].u64 & 0x45) == 0;
+        });
+    }
+
+    // T: FCOMI ST(0)<ST(1) — fld 5.0 then 2.0 → st0=2, st1=5; 2<5 → CF=1.
+    {
+        std::vector<U8> code = {
+            0x48, 0x83, 0xEC, 0x10,
+            0x48, 0xB8, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x14, 0x40, // 5.0
+            0x48, 0x89, 0x04, 0x24,
+            0xDD, 0x04, 0x24,                                           // fld 5.0  → st0=5
+            0x48, 0xB8, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x40, // 2.0
+            0x48, 0x89, 0x04, 0x24,
+            0xDD, 0x04, 0x24,                                           // fld 2.0  → st0=2, st1=5
+            0xDB, 0xF1,                                                 // fcomi st0,st1 → 2<5: CF=1
+            0x9C, 0x58,                                                 // pushfq; pop rax
+            0x48, 0x83, 0xC4, 0x10,
+        };
+        runAndCheck(r, "x87 FCOMI ST(0)<ST(1) sets CF=1", withExit(code), [](CPU64& c) {
+            // CF=1, ZF=0, PF=0
+            return (c.reg[X64_R15].u64 & 0x45) == 0x01;
+        });
+    }
+
+    // T: FCOMI ST(0)==ST(1) — fld 3.0 twice → ZF=1.
+    {
+        std::vector<U8> code = {
+            0x48, 0x83, 0xEC, 0x10,
+            0x48, 0xB8, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x08, 0x40, // 3.0
+            0x48, 0x89, 0x04, 0x24,
+            0xDD, 0x04, 0x24,                                           // fld 3.0
+            0xDD, 0x04, 0x24,                                           // fld 3.0 again
+            0xDB, 0xF1,                                                 // fcomi st0,st1 → 3==3: ZF=1
+            0x9C, 0x58,
+            0x48, 0x83, 0xC4, 0x10,
+        };
+        runAndCheck(r, "x87 FCOMI ST(0)==ST(1) sets ZF=1", withExit(code), [](CPU64& c) {
+            // ZF=1, CF=0, PF=0
+            return (c.reg[X64_R15].u64 & 0x45) == 0x40;
+        });
+    }
+
+    // T: FCOMIP ST(0),ST(1) pops — after comparing, st0 should be the
+    // original st1 value (5.0). We verify by storing the new TOS.
+    {
+        std::vector<U8> code = {
+            0x48, 0x83, 0xEC, 0x10,
+            0x48, 0xB8, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x14, 0x40, // 5.0
+            0x48, 0x89, 0x04, 0x24,
+            0xDD, 0x04, 0x24,                                           // fld 5.0  → st0=5
+            0x48, 0xB8, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x40, // 2.0
+            0x48, 0x89, 0x04, 0x24,
+            0xDD, 0x04, 0x24,                                           // fld 2.0  → st0=2, st1=5
+            0xDF, 0xF1,                                                 // fcomip st0,st1 → pops 2; now st0=5
+            0xDD, 0x1C, 0x24,                                           // fstp qword [rsp]  ; stores 5.0
+            0x48, 0x8B, 0x04, 0x24,
+            0x48, 0x83, 0xC4, 0x10,
+        };
+        runAndCheck(r, "x87 FCOMIP pops top, new TOS=ST(1)", withExit(code), [](CPU64& c) {
+            return c.reg[X64_R15].u64 == 0x4014000000000000ULL; // 5.0
+        });
+    }
+
+    // T: FCOM m64fp + FNSTSW — st0=10.0, FCOM 4.0 → 10>4 → C3=C2=C0=0.
+    // FNSTSW into AX low; verify C0 (bit 8), C2 (bit 10), C3 (bit 14) all 0.
+    {
+        std::vector<U8> code = {
+            0x48, 0x83, 0xEC, 0x08,
+            0x48, 0xB8, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x24, 0x40, // 10.0
+            0x48, 0x89, 0x04, 0x24,
+            0xDD, 0x04, 0x24,                                           // fld 10.0
+            0x48, 0xB8, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x10, 0x40, // 4.0
+            0x48, 0x89, 0x04, 0x24,
+            0xDC, 0x14, 0x24,                                           // fcom qword [rsp]  ; 10>4: C3=C2=C0=0
+            0x48, 0x31, 0xC0,                                           // xor rax, rax  (clear AX)
+            0xDF, 0xE0,                                                 // fnstsw ax
+            0x48, 0x83, 0xC4, 0x08,
+        };
+        runAndCheck(r, "x87 FCOM m64fp 10>4 clears C0/C2/C3", withExit(code), [](CPU64& c) {
+            return (c.reg[X64_R15].u64 & 0x4500) == 0;
+        });
+    }
+
+    // T: FCOM m64fp — st0=2.0, FCOM 5.0 → 2<5 → C0=1.
+    {
+        std::vector<U8> code = {
+            0x48, 0x83, 0xEC, 0x08,
+            0x48, 0xB8, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x40, // 2.0
+            0x48, 0x89, 0x04, 0x24,
+            0xDD, 0x04, 0x24,                                           // fld 2.0
+            0x48, 0xB8, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x14, 0x40, // 5.0
+            0x48, 0x89, 0x04, 0x24,
+            0xDC, 0x14, 0x24,                                           // fcom qword [rsp]  ; 2<5: C0=1
+            0x48, 0x31, 0xC0,
+            0xDF, 0xE0,                                                 // fnstsw ax
+            0x48, 0x83, 0xC4, 0x08,
+        };
+        runAndCheck(r, "x87 FCOM m64fp 2<5 sets C0=1", withExit(code), [](CPU64& c) {
+            // bit 8 (C0) = 0x100 must be set; bit 10 (C2) and bit 14 (C3) clear
+            return (c.reg[X64_R15].u64 & 0x4500) == 0x0100;
+        });
+    }
+
+    // T: FCOMPP — fld 3.0, fld 3.0, fcompp → ZF condition (C3=1).
+    // Then fnstsw and pop also drained the stack; st0/st1 are empty now.
+    {
+        std::vector<U8> code = {
+            0x48, 0x83, 0xEC, 0x08,
+            0x48, 0xB8, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x08, 0x40, // 3.0
+            0x48, 0x89, 0x04, 0x24,
+            0xDD, 0x04, 0x24,                                           // fld 3.0
+            0xDD, 0x04, 0x24,                                           // fld 3.0
+            0xDE, 0xD9,                                                 // fcompp → 3==3: C3=1; pops twice
+            0x48, 0x31, 0xC0,
+            0xDF, 0xE0,                                                 // fnstsw ax
+            0x48, 0x83, 0xC4, 0x08,
+        };
+        runAndCheck(r, "x87 FCOMPP 3==3 sets C3 + pops twice", withExit(code), [](CPU64& c) {
+            // C3 = bit 14 = 0x4000. C0/C2 clear.
+            return (c.reg[X64_R15].u64 & 0x4500) == 0x4000;
+        });
+    }
+
     // ----- rt_sigaction storage round-trip (Milestone B1) -----
     // Layout on stack: [rsp+0..63] new act struct, [rsp+64..127] old act buffer.
     // sub rsp,128 ; build act at [rsp]; sigaction(SIGUSR1, [rsp], [rsp+64], 8).

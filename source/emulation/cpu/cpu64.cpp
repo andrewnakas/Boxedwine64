@@ -18,6 +18,15 @@
 #include <cmath>
 #include <cstring>
 
+// FPU status-word C0/C2/C3 bit positions (see Intel SDM Vol 1 §8.1.3).
+// We can't reuse the macros in fpu.cpp because they're file-local there.
+static inline void cpu64_fpu_set_c012_3(FPU& f, int c3, int c2, int c0) {
+    f.sw &= ~(0x4000 | 0x0400 | 0x0100);
+    if (c3) f.sw |= 0x4000;
+    if (c2) f.sw |= 0x0400;
+    if (c0) f.sw |= 0x0100;
+}
+
 CPU64::CPU64(KMemory64* memory) : memory(memory) {
     reg[X64_RSP].setU64(0);
     fpu.FINIT();
@@ -3355,7 +3364,8 @@ U32 CPU64::step() {
     // because the FPU::FLD_F64_EA family takes a 32-bit CPU* that we can't
     // satisfy. ModR/M "reg" field is the sub-opcode (/0../7) for memory forms;
     // for register forms (mod==11) the low 3 bits identify ST(i).
-    if (op == 0xD9 || op == 0xDB || op == 0xDC || op == 0xDD || op == 0xDF) {
+    if (op == 0xD8 || op == 0xD9 || op == 0xDA || op == 0xDB ||
+        op == 0xDC || op == 0xDD || op == 0xDE || op == 0xDF) {
         U8 modrmByte = fetchByte(rip + opOff + 1);
         ModRM m = decodeModRM(rip + opOff + 1, p, 0);
         U32 used = opOff + 1 + m.length;
@@ -3472,6 +3482,32 @@ U32 CPU64::step() {
                 }
                 memory->writeq(m.effAddr, (U64)v);
                 fpu.FPOP();
+            } else if ((op == 0xD8 || op == 0xDC) && (sub == 2 || sub == 3)) {
+                // FCOM/FCOMP m32fp or m64fp — compare ST(0) to memory operand,
+                // set C0/C2/C3. We inline because the FPU::FCOM helper takes
+                // CPU*. Then pop if sub==3.
+                double a = fpu.isRegCached[fpu.top] ? fpu.regCache[fpu.top].d
+                                                     : fpu.getF64(fpu.top);
+                double b;
+                if (op == 0xD8) {
+                    union { U32 i; float f; } u; u.i = memory->readd(m.effAddr);
+                    b = (double)u.f;
+                } else {
+                    union { U64 i; double d; } u; u.i = memory->readq(m.effAddr);
+                    b = u.d;
+                }
+                // FCOM result: C3=1/C2=1/C0=1 for unordered (NaN), C3=1/C2=0/C0=0
+                // for equal, C3=0/C2=0/C0=1 for ST(0)<src, C3=0/C2=0/C0=0 for >.
+                if (std::isnan(a) || std::isnan(b)) {
+                    cpu64_fpu_set_c012_3(fpu, 1, 1, 1);
+                } else if (a == b) {
+                    cpu64_fpu_set_c012_3(fpu, 1, 0, 0);
+                } else if (a < b) {
+                    cpu64_fpu_set_c012_3(fpu, 0, 0, 1);
+                } else {
+                    cpu64_fpu_set_c012_3(fpu, 0, 0, 0);
+                }
+                if (sub == 3) fpu.FPOP();
             } else {
                 goto unhandled;
             }
@@ -3511,6 +3547,99 @@ U32 CPU64::step() {
                 // DF E0 = FNSTSW AX — write status word into AX, preserving
                 // the upper 48 bits of RAX (per AMD64 manual).
                 reg[X64_RAX].setU16((U16)fpu.SW());
+            } else if (op == 0xD8 && (modrmByte & 0xF8) == 0xD0) {
+                // D8 D0+i = FCOM ST(0), ST(i) — set C0/C2/C3
+                U32 si = fpu.STV(i);
+                double a = fpu.isRegCached[fpu.top] ? fpu.regCache[fpu.top].d : fpu.getF64(fpu.top);
+                double b = fpu.isRegCached[si]      ? fpu.regCache[si].d      : fpu.getF64(si);
+                if (std::isnan(a) || std::isnan(b)) {
+                    cpu64_fpu_set_c012_3(fpu, 1, 1, 1);
+                } else if (a == b) {
+                    cpu64_fpu_set_c012_3(fpu, 1, 0, 0);
+                } else if (a < b) {
+                    cpu64_fpu_set_c012_3(fpu, 0, 0, 1);
+                } else {
+                    cpu64_fpu_set_c012_3(fpu, 0, 0, 0);
+                }
+            } else if (op == 0xD8 && (modrmByte & 0xF8) == 0xD8) {
+                // D8 D8+i = FCOMP ST(0), ST(i) — like FCOM, then pop
+                U32 si = fpu.STV(i);
+                double a = fpu.isRegCached[fpu.top] ? fpu.regCache[fpu.top].d : fpu.getF64(fpu.top);
+                double b = fpu.isRegCached[si]      ? fpu.regCache[si].d      : fpu.getF64(si);
+                if (std::isnan(a) || std::isnan(b)) {
+                    cpu64_fpu_set_c012_3(fpu, 1, 1, 1);
+                } else if (a == b) {
+                    cpu64_fpu_set_c012_3(fpu, 1, 0, 0);
+                } else if (a < b) {
+                    cpu64_fpu_set_c012_3(fpu, 0, 0, 1);
+                } else {
+                    cpu64_fpu_set_c012_3(fpu, 0, 0, 0);
+                }
+                fpu.FPOP();
+            } else if (op == 0xDE && modrmByte == 0xD9) {
+                // DE D9 = FCOMPP — compare ST(0) to ST(1), pop twice
+                U32 s1 = fpu.STV(1);
+                double a = fpu.isRegCached[fpu.top] ? fpu.regCache[fpu.top].d : fpu.getF64(fpu.top);
+                double b = fpu.isRegCached[s1]      ? fpu.regCache[s1].d      : fpu.getF64(s1);
+                if (std::isnan(a) || std::isnan(b)) {
+                    cpu64_fpu_set_c012_3(fpu, 1, 1, 1);
+                } else if (a == b) {
+                    cpu64_fpu_set_c012_3(fpu, 1, 0, 0);
+                } else if (a < b) {
+                    cpu64_fpu_set_c012_3(fpu, 0, 0, 1);
+                } else {
+                    cpu64_fpu_set_c012_3(fpu, 0, 0, 0);
+                }
+                fpu.FPOP();
+                fpu.FPOP();
+            } else if ((op == 0xDB || op == 0xDA) && (modrmByte & 0xF8) == 0xF0) {
+                // DB F0+i = FCOMI ST(0), ST(i) — set ZF/PF/CF in rflags.
+                // DA F0+i = FUCOMI — same impl (we don't distinguish QNaN signaling).
+                // SDM table: unordered -> ZF=PF=CF=1; equal -> ZF=1, PF=CF=0;
+                // ST(0)<ST(i) -> CF=1; ST(0)>ST(i) -> all zero. Other flags
+                // (OF/SF/AF) are cleared per spec.
+                U32 si = fpu.STV(i);
+                double a = fpu.isRegCached[fpu.top] ? fpu.regCache[fpu.top].d : fpu.getF64(fpu.top);
+                double b = fpu.isRegCached[si]      ? fpu.regCache[si].d      : fpu.getF64(si);
+                rflags &= ~(X64_CF | X64_PF | X64_ZF | X64_SF | X64_OF | X64_AF);
+                if (std::isnan(a) || std::isnan(b)) {
+                    rflags |= (X64_ZF | X64_PF | X64_CF);
+                } else if (a == b) {
+                    rflags |= X64_ZF;
+                } else if (a < b) {
+                    rflags |= X64_CF;
+                }
+                // a > b: no flags set
+            } else if (op == 0xDF && (modrmByte & 0xF8) == 0xF0) {
+                // DF F0+i = FCOMIP ST(0), ST(i) — same as FCOMI, then pop.
+                U32 si = fpu.STV(i);
+                double a = fpu.isRegCached[fpu.top] ? fpu.regCache[fpu.top].d : fpu.getF64(fpu.top);
+                double b = fpu.isRegCached[si]      ? fpu.regCache[si].d      : fpu.getF64(si);
+                rflags &= ~(X64_CF | X64_PF | X64_ZF | X64_SF | X64_OF | X64_AF);
+                if (std::isnan(a) || std::isnan(b)) {
+                    rflags |= (X64_ZF | X64_PF | X64_CF);
+                } else if (a == b) {
+                    rflags |= X64_ZF;
+                } else if (a < b) {
+                    rflags |= X64_CF;
+                }
+                fpu.FPOP();
+            } else if (op == 0xDA && modrmByte == 0xE9) {
+                // DA E9 = FUCOMPP — compare ST(0) to ST(1), pop twice (same as FCOMPP for our purposes)
+                U32 s1 = fpu.STV(1);
+                double a = fpu.isRegCached[fpu.top] ? fpu.regCache[fpu.top].d : fpu.getF64(fpu.top);
+                double b = fpu.isRegCached[s1]      ? fpu.regCache[s1].d      : fpu.getF64(s1);
+                if (std::isnan(a) || std::isnan(b)) {
+                    cpu64_fpu_set_c012_3(fpu, 1, 1, 1);
+                } else if (a == b) {
+                    cpu64_fpu_set_c012_3(fpu, 1, 0, 0);
+                } else if (a < b) {
+                    cpu64_fpu_set_c012_3(fpu, 0, 0, 1);
+                } else {
+                    cpu64_fpu_set_c012_3(fpu, 0, 0, 0);
+                }
+                fpu.FPOP();
+                fpu.FPOP();
             } else {
                 goto unhandled;
             }
