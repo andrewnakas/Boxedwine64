@@ -2451,6 +2451,125 @@ int runX64SelfTest() {
         });
     }
 
+    // ----- C9 extensions: x87 int↔FP convert FILD/FIST/FISTP -----
+
+    // T: FILD m32int + FSTP m64fp — load int 42, store as f64 = 42.0.
+    {
+        std::vector<U8> code = {
+            0x48, 0x83, 0xEC, 0x08,
+            0x48, 0xC7, 0xC0, 0x2A, 0x00, 0x00, 0x00,                   // mov rax, 42
+            0x48, 0x89, 0x04, 0x24,                                     // mov [rsp], rax
+            0xDB, 0x04, 0x24,                                           // fild dword [rsp]  ; st0=42.0
+            0xDD, 0x1C, 0x24,                                           // fstp qword [rsp]
+            0x48, 0x8B, 0x04, 0x24,
+            0x48, 0x83, 0xC4, 0x08,
+        };
+        runAndCheck(r, "x87 FILD m32int (42 -> 42.0)", withExit(code), [](CPU64& c) {
+            return c.reg[X64_R15].u64 == 0x4045000000000000ULL; // 42.0
+        });
+    }
+
+    // T: FILD m32int negative — load -7, store as f64 = -7.0.
+    {
+        std::vector<U8> code = {
+            0x48, 0x83, 0xEC, 0x08,
+            0x48, 0xC7, 0xC0, 0xF9, 0xFF, 0xFF, 0xFF,                   // mov rax, -7 (sign-ext)
+            0x48, 0x89, 0x04, 0x24,
+            0xDB, 0x04, 0x24,                                           // fild dword [rsp]  ; st0=-7.0
+            0xDD, 0x1C, 0x24,                                           // fstp qword [rsp]
+            0x48, 0x8B, 0x04, 0x24,
+            0x48, 0x83, 0xC4, 0x08,
+        };
+        runAndCheck(r, "x87 FILD m32int negative (-7 -> -7.0)", withExit(code), [](CPU64& c) {
+            return c.reg[X64_R15].u64 == 0xC01C000000000000ULL; // -7.0
+        });
+    }
+
+    // T: FLD 3.7 + FISTP m32int — round-to-nearest gives 4.
+    {
+        std::vector<U8> code = {
+            0x48, 0x83, 0xEC, 0x08,
+            0x48, 0xB8, 0x9A, 0x99, 0x99, 0x99, 0x99, 0x99, 0x0D, 0x40, // 3.7
+            0x48, 0x89, 0x04, 0x24,
+            0xDD, 0x04, 0x24,                                           // fld qword [rsp]   ; st0=3.7
+            0xDB, 0x1C, 0x24,                                           // fistp dword [rsp] ; rounds, stores 4, pops
+            0x48, 0x8B, 0x04, 0x24,                                     // mov rax, [rsp]   ; low dword = 4
+            0x48, 0x83, 0xC4, 0x08,
+        };
+        runAndCheck(r, "x87 FISTP m32int (3.7 -> 4 round-nearest)", withExit(code), [](CPU64& c) {
+            return (c.reg[X64_R15].u64 & 0xFFFFFFFFULL) == 4;
+        });
+    }
+
+    // T: FILD m16int — load int16 0x1234 = 4660, store as f64.
+    {
+        std::vector<U8> code = {
+            0x48, 0x83, 0xEC, 0x08,
+            0x48, 0xC7, 0xC0, 0x34, 0x12, 0x00, 0x00,                   // mov rax, 0x1234
+            0x48, 0x89, 0x04, 0x24,
+            0xDF, 0x04, 0x24,                                           // fild word [rsp]  ; st0=4660.0
+            0xDD, 0x1C, 0x24,                                           // fstp qword [rsp]
+            0x48, 0x8B, 0x04, 0x24,
+            0x48, 0x83, 0xC4, 0x08,
+        };
+        runAndCheck(r, "x87 FILD m16int (0x1234 -> 4660.0)", withExit(code), [](CPU64& c) {
+            return c.reg[X64_R15].u64 == 0x40B2340000000000ULL; // 4660.0
+        });
+    }
+
+    // T: FLD 100.0 + FISTP m16int — stores 16-bit 100 in low word.
+    {
+        std::vector<U8> code = {
+            0x48, 0x83, 0xEC, 0x08,
+            0x48, 0xB8, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x59, 0x40, // 100.0
+            0x48, 0x89, 0x04, 0x24,
+            0xDD, 0x04, 0x24,                                           // fld qword [rsp]
+            0x48, 0x31, 0xC0,                                           // xor rax, rax (clear slot — verifier reads full qword)
+            0x48, 0x89, 0x04, 0x24,
+            0xDF, 0x1C, 0x24,                                           // fistp word [rsp] ; stores 100 in low word
+            0x48, 0x8B, 0x04, 0x24,                                     // mov rax, [rsp]
+            0x48, 0x83, 0xC4, 0x08,
+        };
+        runAndCheck(r, "x87 FISTP m16int (100.0 -> 100)", withExit(code), [](CPU64& c) {
+            return (c.reg[X64_R15].u64 & 0xFFFFULL) == 100;
+        });
+    }
+
+    // T: FILD m64int — load int64 0x123456789, store as f64.
+    {
+        std::vector<U8> code = {
+            0x48, 0x83, 0xEC, 0x08,
+            0x48, 0xB8, 0x89, 0x67, 0x45, 0x23, 0x01, 0x00, 0x00, 0x00, // mov rax, 0x123456789
+            0x48, 0x89, 0x04, 0x24,
+            0xDF, 0x2C, 0x24,                                           // fild qword [rsp]
+            0xDD, 0x1C, 0x24,                                           // fstp qword [rsp]
+            0x48, 0x8B, 0x04, 0x24,
+            0x48, 0x83, 0xC4, 0x08,
+        };
+        runAndCheck(r, "x87 FILD m64int (0x123456789 -> double)", withExit(code), [](CPU64& c) {
+            // (double)0x123456789 = 4886718345.0
+            // Mantissa bits = 0x23456789 << 1 = 0x468ACF12, exp = 32+1023 = 0x41F
+            return c.reg[X64_R15].u64 == 0x41F2345678900000ULL;
+        });
+    }
+
+    // T: FLD 2.5 + FISTP m64int — stores int64 2 (round-nearest-even on .5 ties).
+    // Wait: round-nearest-even on 2.5 gives 2; on 3.5 gives 4. Use 2.5 → 2.
+    {
+        std::vector<U8> code = {
+            0x48, 0x83, 0xEC, 0x08,
+            0x48, 0xB8, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x04, 0x40, // 2.5
+            0x48, 0x89, 0x04, 0x24,
+            0xDD, 0x04, 0x24,                                           // fld qword [rsp]   ; st0=2.5
+            0xDF, 0x3C, 0x24,                                           // fistp qword [rsp] ; rounds to 2
+            0x48, 0x8B, 0x04, 0x24,
+            0x48, 0x83, 0xC4, 0x08,
+        };
+        runAndCheck(r, "x87 FISTP m64int (2.5 -> 2 round-even)", withExit(code), [](CPU64& c) {
+            return c.reg[X64_R15].u64 == 2;
+        });
+    }
+
     // ----- rt_sigaction storage round-trip (Milestone B1) -----
     // Layout on stack: [rsp+0..63] new act struct, [rsp+64..127] old act buffer.
     // sub rsp,128 ; build act at [rsp]; sigaction(SIGUSR1, [rsp], [rsp+64], 8).

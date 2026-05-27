@@ -3355,7 +3355,7 @@ U32 CPU64::step() {
     // because the FPU::FLD_F64_EA family takes a 32-bit CPU* that we can't
     // satisfy. ModR/M "reg" field is the sub-opcode (/0../7) for memory forms;
     // for register forms (mod==11) the low 3 bits identify ST(i).
-    if (op == 0xD9 || op == 0xDC || op == 0xDD || op == 0xDF) {
+    if (op == 0xD9 || op == 0xDB || op == 0xDC || op == 0xDD || op == 0xDF) {
         U8 modrmByte = fetchByte(rip + opOff + 1);
         ModRM m = decodeModRM(rip + opOff + 1, p, 0);
         U32 used = opOff + 1 + m.length;
@@ -3424,6 +3424,54 @@ U32 CPU64::step() {
                 U64 bits = memory->readq(m.effAddr);
                 fpu.FLD_F64(bits, 8);
                 fpu.FDIVR(fpu.STV(0), 8);
+            } else if (op == 0xDB && sub == 0) {
+                // FILD m32int — load signed 32-bit, push as f64
+                S32 v = (S32)memory->readd(m.effAddr);
+                fpu.PREP_PUSH();
+                fpu.FLD_I32(v, fpu.STV(0));
+            } else if (op == 0xDB && (sub == 2 || sub == 3)) {
+                // FIST m32int (sub=2) / FISTP m32int (sub=3) — round per CW
+                S32 v;
+                if (fpu.isRegCached[fpu.top]) {
+                    v = (S32)fpu.FROUND(fpu.regCache[fpu.top].d);
+                } else {
+                    union { U64 u; double d; } u; u.d = fpu.getF64(fpu.top);
+                    v = (S32)fpu.FROUND(u.d);
+                }
+                memory->writed(m.effAddr, (U32)v);
+                if (sub == 3) fpu.FPOP();
+            } else if (op == 0xDF && sub == 0) {
+                // FILD m16int — load signed 16-bit, push as f64
+                S16 v = (S16)memory->readw(m.effAddr);
+                fpu.PREP_PUSH();
+                fpu.FLD_I16(v, fpu.STV(0));
+            } else if (op == 0xDF && (sub == 2 || sub == 3)) {
+                // FIST m16int (sub=2) / FISTP m16int (sub=3)
+                S16 v;
+                if (fpu.isRegCached[fpu.top]) {
+                    v = (S16)fpu.FROUND(fpu.regCache[fpu.top].d);
+                } else {
+                    union { U64 u; double d; } u; u.d = fpu.getF64(fpu.top);
+                    v = (S16)fpu.FROUND(u.d);
+                }
+                memory->writew(m.effAddr, (U16)v);
+                if (sub == 3) fpu.FPOP();
+            } else if (op == 0xDF && sub == 5) {
+                // FILD m64int — load signed 64-bit, push as f64
+                S64 v = (S64)memory->readq(m.effAddr);
+                fpu.PREP_PUSH();
+                fpu.FLD_I64(v, fpu.STV(0));
+            } else if (op == 0xDF && sub == 7) {
+                // FISTP m64int — round per CW, store as i64, pop
+                S64 v;
+                if (fpu.isRegCached[fpu.top]) {
+                    v = (S64)fpu.FROUND(fpu.regCache[fpu.top].d);
+                } else {
+                    union { U64 u; double d; } u; u.d = fpu.getF64(fpu.top);
+                    v = (S64)fpu.FROUND(u.d);
+                }
+                memory->writeq(m.effAddr, (U64)v);
+                fpu.FPOP();
             } else {
                 goto unhandled;
             }
