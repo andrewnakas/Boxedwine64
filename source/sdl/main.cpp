@@ -22,6 +22,7 @@
 
 #ifdef BOXEDWINE_GUEST_X64
 extern int runX64SelfTest();
+extern "C" int runX64RunElf(const char* path);
 #endif
 #ifndef BOXEDWINE_DISABLE_UI
 #include "../ui/mainui.h"
@@ -53,6 +54,13 @@ int boxedmain(int argc, const char **argv) {
     for (int i = 1; i < argc; i++) {
         if (argv[i] && std::string(argv[i]) == "--x64-selftest") {
             return runX64SelfTest();
+        }
+        if (argv[i] && std::string(argv[i]) == "--x64-run-elf") {
+            // Optional next arg = ELF path on host disk. Without it the
+            // runner uses an embedded hand-built static hello-world ELF.
+            const char* path = (i + 1 < argc && argv[i+1] && argv[i+1][0] != '-')
+                                 ? argv[i+1] : nullptr;
+            return runX64RunElf(path);
         }
     }
 #endif
