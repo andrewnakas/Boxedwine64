@@ -70,6 +70,11 @@ public:
     // any 64-bit CPU/memory subsystem present.
     static Elf64ParseResult parse(FsOpenNode* openNode);
 
+    // Same as parse(FsOpenNode*) but operates on a contiguous in-memory
+    // buffer. Used by self-tests with synthesized ELF blobs (no FS
+    // round-trip), and internally by parse() after slurping the file.
+    static Elf64ParseResult parseBuffer(const U8* data, U64 length);
+
 #ifdef BOXEDWINE_GUEST_X64
     // Maps PT_LOAD segments into the thread's guest memory, sets RIP,
     // populates KProcess phdr/phentsize/phnum/loaderBaseAddress/brkEnd/entry.

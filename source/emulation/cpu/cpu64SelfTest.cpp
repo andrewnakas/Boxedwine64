@@ -3694,6 +3694,170 @@ int runX64SelfTest() {
         });
     }
 
+    // ----- A5: in-memory ELF synthesizer + parseBuffer round-trip -----
+    // Builds a minimal valid x86-64 ET_EXEC ELF in a byte buffer:
+    //   [Ehdr][Phdr × 1: PT_LOAD][code bytes]
+    // and asserts parseBuffer() returns ok=true with all fields matching.
+
+    // T: ET_EXEC happy path.
+    {
+        const U64 LOAD_VADDR = 0x400000;
+        const U64 ENTRY_ADDR = 0x400000 + sizeof(k_Elf64_Ehdr) + sizeof(k_Elf64_Phdr);
+        std::vector<U8> code = { 0x90, 0x90, 0x90, 0x90 }; // 4× nop
+
+        // Lay out the ELF.
+        size_t ehdrSize = sizeof(k_Elf64_Ehdr);
+        size_t phdrSize = sizeof(k_Elf64_Phdr);
+        size_t totalSize = ehdrSize + phdrSize + code.size();
+        std::vector<U8> elf(totalSize, 0);
+
+        k_Elf64_Ehdr eh{};
+        eh.e_ident[0] = 0x7F;
+        eh.e_ident[1] = 'E';
+        eh.e_ident[2] = 'L';
+        eh.e_ident[3] = 'F';
+        eh.e_ident[4] = k_ELFCLASS64;
+        eh.e_ident[5] = 1; // ELFDATA2LSB
+        eh.e_ident[6] = 1; // EV_CURRENT
+        eh.e_type     = 2; // ET_EXEC
+        eh.e_machine  = k_EM_X86_64;
+        eh.e_version  = 1;
+        eh.e_entry    = ENTRY_ADDR;
+        eh.e_phoff    = ehdrSize;
+        eh.e_ehsize   = (U16)ehdrSize;
+        eh.e_phentsize = (U16)phdrSize;
+        eh.e_phnum    = 1;
+        memcpy(elf.data(), &eh, ehdrSize);
+
+        k_Elf64_Phdr ph{};
+        ph.p_type   = 1; // PT_LOAD
+        ph.p_flags  = 5; // PF_R | PF_X
+        ph.p_offset = 0; // covers Ehdr + Phdr + code in one mapping
+        ph.p_vaddr  = LOAD_VADDR;
+        ph.p_paddr  = LOAD_VADDR;
+        ph.p_filesz = totalSize;
+        ph.p_memsz  = totalSize;
+        ph.p_align  = 0x1000;
+        memcpy(elf.data() + ehdrSize, &ph, phdrSize);
+
+        memcpy(elf.data() + ehdrSize + phdrSize, code.data(), code.size());
+
+        Elf64ParseResult res = ElfLoader64::parseBuffer(elf.data(), elf.size());
+        bool ok = res.ok &&
+                  !res.isPie &&
+                  res.entry == ENTRY_ADDR &&
+                  res.phnum == 1 &&
+                  res.phentsize == phdrSize &&
+                  res.segments.size() == 1 &&
+                  res.segments[0].vaddr == LOAD_VADDR &&
+                  res.segments[0].memsz == totalSize &&
+                  res.baseAddrLow == LOAD_VADDR &&
+                  res.baseAddrHigh == LOAD_VADDR + totalSize &&
+                  !res.dynamic.present &&
+                  !res.tls.present &&
+                  res.interpreter.length() == 0;
+        if (ok) {
+            printf("  PASS: parseBuffer: synthesized ET_EXEC parses to expected fields\n");
+            r.passed++;
+        } else {
+            printf("  FAIL: parseBuffer (ok=%d entry=0x%llx phnum=%u segs=%zu lo=0x%llx hi=0x%llx)\n",
+                   res.ok, (unsigned long long)res.entry, res.phnum, res.segments.size(),
+                   (unsigned long long)res.baseAddrLow,
+                   (unsigned long long)res.baseAddrHigh);
+            r.failed++;
+        }
+        fflush(stdout);
+    }
+
+    // T: ET_DYN (PIE) — isPie must be true.
+    {
+        size_t ehdrSize = sizeof(k_Elf64_Ehdr);
+        size_t phdrSize = sizeof(k_Elf64_Phdr);
+        size_t totalSize = ehdrSize + phdrSize + 16;
+        std::vector<U8> elf(totalSize, 0);
+
+        k_Elf64_Ehdr eh{};
+        eh.e_ident[0] = 0x7F;
+        eh.e_ident[1] = 'E';
+        eh.e_ident[2] = 'L';
+        eh.e_ident[3] = 'F';
+        eh.e_ident[4] = k_ELFCLASS64;
+        eh.e_ident[5] = 1;
+        eh.e_ident[6] = 1;
+        eh.e_type     = 3; // ET_DYN
+        eh.e_machine  = k_EM_X86_64;
+        eh.e_version  = 1;
+        eh.e_entry    = 0x100;
+        eh.e_phoff    = ehdrSize;
+        eh.e_ehsize   = (U16)ehdrSize;
+        eh.e_phentsize = (U16)phdrSize;
+        eh.e_phnum    = 1;
+        memcpy(elf.data(), &eh, ehdrSize);
+
+        k_Elf64_Phdr ph{};
+        ph.p_type   = 1;
+        ph.p_flags  = 5;
+        ph.p_offset = 0;
+        ph.p_vaddr  = 0;
+        ph.p_filesz = totalSize;
+        ph.p_memsz  = totalSize;
+        ph.p_align  = 0x1000;
+        memcpy(elf.data() + ehdrSize, &ph, phdrSize);
+
+        Elf64ParseResult res = ElfLoader64::parseBuffer(elf.data(), elf.size());
+        bool ok = res.ok && res.isPie && res.entry == 0x100;
+        if (ok) {
+            printf("  PASS: parseBuffer: ET_DYN flagged as isPie\n");
+            r.passed++;
+        } else {
+            printf("  FAIL: parseBuffer ET_DYN (ok=%d isPie=%d entry=0x%llx)\n",
+                   res.ok, res.isPie, (unsigned long long)res.entry);
+            r.failed++;
+        }
+        fflush(stdout);
+    }
+
+    // T: rejection — wrong e_machine.
+    {
+        size_t ehdrSize = sizeof(k_Elf64_Ehdr);
+        std::vector<U8> elf(ehdrSize + sizeof(k_Elf64_Phdr), 0);
+        k_Elf64_Ehdr eh{};
+        eh.e_ident[0] = 0x7F;
+        eh.e_ident[1] = 'E';
+        eh.e_ident[2] = 'L';
+        eh.e_ident[3] = 'F';
+        eh.e_ident[4] = k_ELFCLASS64;
+        eh.e_machine  = 0x28; // EM_ARM
+        eh.e_phnum    = 1;
+        eh.e_phentsize = sizeof(k_Elf64_Phdr);
+        eh.e_phoff    = ehdrSize;
+        memcpy(elf.data(), &eh, ehdrSize);
+        Elf64ParseResult res = ElfLoader64::parseBuffer(elf.data(), elf.size());
+        if (!res.ok) {
+            printf("  PASS: parseBuffer: rejects non-x86_64 e_machine\n");
+            r.passed++;
+        } else {
+            printf("  FAIL: parseBuffer: accepted EM_ARM\n");
+            r.failed++;
+        }
+        fflush(stdout);
+    }
+
+    // T: rejection — short buffer (less than Ehdr).
+    {
+        std::vector<U8> elf(8, 0);
+        elf[0] = 0x7F; elf[1] = 'E'; elf[2] = 'L'; elf[3] = 'F';
+        Elf64ParseResult res = ElfLoader64::parseBuffer(elf.data(), elf.size());
+        if (!res.ok) {
+            printf("  PASS: parseBuffer: rejects truncated buffer\n");
+            r.passed++;
+        } else {
+            printf("  FAIL: parseBuffer: accepted 8-byte buffer\n");
+            r.failed++;
+        }
+        fflush(stdout);
+    }
+
     printf("=== self-test summary: %d passed, %d failed ===\n\n", r.passed, r.failed);
     return r.failed == 0 ? 0 : 1;
 }

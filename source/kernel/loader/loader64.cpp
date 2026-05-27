@@ -33,40 +33,44 @@
 // the cap protects against a malformed/hostile binary.
 #define INTERP_PATH_MAX 1024
 
-Elf64ParseResult ElfLoader64::parse(FsOpenNode* openNode) {
+Elf64ParseResult ElfLoader64::parseBuffer(const U8* data, U64 length) {
     Elf64ParseResult result;
-    if (!openNode) {
+    if (!data || length < sizeof(struct k_Elf64_Ehdr)) {
+        klog_fmt("ElfLoader64::parseBuffer: buffer too short (length=%llu)",
+                 (unsigned long long)length);
         return result;
     }
 
-    struct k_Elf64_Ehdr ehdr = {};
-    openNode->seek(0);
-    if (openNode->readNative((U8*)&ehdr, sizeof(ehdr)) != sizeof(ehdr)) {
-        klog("ElfLoader64::parse: short read on Ehdr");
-        return result;
-    }
+    struct k_Elf64_Ehdr ehdr;
+    memcpy(&ehdr, data, sizeof(ehdr));
 
-    // Caller is expected to have already verified the ELF64 magic via
-    // isElf64Ident, but recheck here so this function is safe in isolation.
     if (ehdr.e_ident[0] != 0x7F ||
         ehdr.e_ident[1] != 'E' ||
         ehdr.e_ident[2] != 'L' ||
         ehdr.e_ident[3] != 'F' ||
         ehdr.e_ident[4] != k_ELFCLASS64) {
-        klog("ElfLoader64::parse: not an ELF64 file");
+        klog("ElfLoader64::parseBuffer: not an ELF64 file");
         return result;
     }
     if (ehdr.e_machine != k_EM_X86_64) {
-        klog_fmt("ElfLoader64::parse: unsupported e_machine 0x%x (only x86-64 is supported in v1)", ehdr.e_machine);
+        klog_fmt("ElfLoader64::parseBuffer: unsupported e_machine 0x%x (only x86-64 is supported in v1)", ehdr.e_machine);
         return result;
     }
     if (ehdr.e_phentsize != sizeof(struct k_Elf64_Phdr)) {
-        klog_fmt("ElfLoader64::parse: e_phentsize %u != sizeof(Elf64_Phdr) %u",
+        klog_fmt("ElfLoader64::parseBuffer: e_phentsize %u != sizeof(Elf64_Phdr) %u",
                  (U32)ehdr.e_phentsize, (U32)sizeof(struct k_Elf64_Phdr));
         return result;
     }
     if (ehdr.e_phnum == 0) {
-        klog("ElfLoader64::parse: e_phnum == 0, nothing to load");
+        klog("ElfLoader64::parseBuffer: e_phnum == 0, nothing to load");
+        return result;
+    }
+    // Bounds check: phdr table must fit inside the buffer.
+    U64 phdrEnd = ehdr.e_phoff + (U64)ehdr.e_phnum * ehdr.e_phentsize;
+    if (phdrEnd > length) {
+        klog_fmt("ElfLoader64::parseBuffer: phdr table extends past buffer (%llu > %llu)",
+                 (unsigned long long)phdrEnd,
+                 (unsigned long long)length);
         return result;
     }
 
@@ -76,16 +80,13 @@ Elf64ParseResult ElfLoader64::parse(FsOpenNode* openNode) {
     result.phnum = ehdr.e_phnum;
     result.isPie = (ehdr.e_type == ET_DYN);
 
-    // First pass: find load extents and the interpreter.
     U64 lo = (U64)-1;
     U64 hi = 0;
     for (U16 i = 0; i < ehdr.e_phnum; i++) {
-        struct k_Elf64_Phdr phdr = {};
-        openNode->seek(ehdr.e_phoff + (U64)i * ehdr.e_phentsize);
-        if (openNode->readNative((U8*)&phdr, sizeof(phdr)) != sizeof(phdr)) {
-            klog_fmt("ElfLoader64::parse: short read on Phdr %u", (U32)i);
-            return result;
-        }
+        struct k_Elf64_Phdr phdr;
+        U64 phdrOff = ehdr.e_phoff + (U64)i * ehdr.e_phentsize;
+        memcpy(&phdr, data + phdrOff, sizeof(phdr));
+
         if (phdr.p_type == PT_LOAD) {
             Elf64LoadSegment seg;
             seg.vaddr  = phdr.p_vaddr;
@@ -99,16 +100,16 @@ Elf64ParseResult ElfLoader64::parse(FsOpenNode* openNode) {
             if (phdr.p_vaddr + phdr.p_memsz > hi) hi = phdr.p_vaddr + phdr.p_memsz;
         } else if (phdr.p_type == PT_INTERP) {
             if (phdr.p_filesz == 0 || phdr.p_filesz > INTERP_PATH_MAX) {
-                klog_fmt("ElfLoader64::parse: PT_INTERP filesz %llu out of range",
+                klog_fmt("ElfLoader64::parseBuffer: PT_INTERP filesz %llu out of range",
                          (unsigned long long)phdr.p_filesz);
                 return result;
             }
-            char interp[INTERP_PATH_MAX + 1] = { 0 };
-            openNode->seek(phdr.p_offset);
-            if (openNode->readNative((U8*)interp, (U32)phdr.p_filesz) != (U32)phdr.p_filesz) {
-                klog("ElfLoader64::parse: short read on PT_INTERP");
+            if (phdr.p_offset + phdr.p_filesz > length) {
+                klog("ElfLoader64::parseBuffer: PT_INTERP extends past buffer");
                 return result;
             }
+            char interp[INTERP_PATH_MAX + 1] = { 0 };
+            memcpy(interp, data + phdr.p_offset, (size_t)phdr.p_filesz);
             interp[phdr.p_filesz] = 0;
             result.interpreter = BString::copy(interp);
         } else if (phdr.p_type == k_PT_DYNAMIC) {
@@ -125,13 +126,40 @@ Elf64ParseResult ElfLoader64::parse(FsOpenNode* openNode) {
     }
 
     if (result.segments.empty()) {
-        klog("ElfLoader64::parse: no PT_LOAD segments");
+        klog("ElfLoader64::parseBuffer: no PT_LOAD segments");
         return result;
     }
     result.baseAddrLow = lo;
     result.baseAddrHigh = hi;
     result.ok = true;
     return result;
+}
+
+Elf64ParseResult ElfLoader64::parse(FsOpenNode* openNode) {
+    Elf64ParseResult result;
+    if (!openNode) return result;
+
+    // Slurp the entire file. ELF binaries we care about are bounded (the
+    // main exe + ld-linux are each well under 10 MB even uncompressed).
+    S64 len = openNode->length();
+    if (len <= 0) {
+        klog("ElfLoader64::parse: file empty or length unknown");
+        return result;
+    }
+    std::vector<U8> buffer((size_t)len);
+    openNode->seek(0);
+    U32 readTotal = 0;
+    while (readTotal < (U32)len) {
+        U32 chunk = openNode->readNative(buffer.data() + readTotal, (U32)len - readTotal);
+        if (chunk == 0) break;
+        readTotal += chunk;
+    }
+    if (readTotal != (U32)len) {
+        klog_fmt("ElfLoader64::parse: short slurp (got %u of %lld)",
+                 readTotal, (long long)len);
+        return result;
+    }
+    return parseBuffer(buffer.data(), (U64)len);
 }
 
 #ifdef BOXEDWINE_GUEST_X64
