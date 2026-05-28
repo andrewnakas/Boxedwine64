@@ -443,8 +443,9 @@ U64 ElfLoader64::applySymbolRelocations(KMemory64* mem,
             if (type == k_R_X86_64_NONE || type == k_R_X86_64_RELATIVE) continue;
             if (type != k_R_X86_64_GLOB_DAT &&
                 type != k_R_X86_64_JUMP_SLOT &&
-                type != k_R_X86_64_64) {
-                // COPY/IRELATIVE/TLS — out of scope for the eager pass.
+                type != k_R_X86_64_64 &&
+                type != k_R_X86_64_COPY) {
+                // IRELATIVE/TLS — out of scope for the eager pass.
                 unresolved++;
                 continue;
             }
@@ -456,6 +457,27 @@ U64 ElfLoader64::applySymbolRelocations(KMemory64* mem,
                 unresolved++;
                 klog_fmt("applySymbolRelocations[%s/%s]: unresolved '%s' (type=%u)",
                          tag, which, name.c_str(), (unsigned)type);
+                continue;
+            }
+            if (type == k_R_X86_64_COPY) {
+                // Copy sym.st_size bytes from the source DSO's symbol into the
+                // exe's reserved BSS slot at dst. Addend is unused for COPY
+                // per ABI. Size comes from the local sym entry — the exe
+                // declares its placeholder at the right size, and that
+                // matches the source's allocated size.
+                U64 size = sym.st_size;
+                if (size == 0 || size > (1ULL << 20)) {
+                    // Sanity-cap at 1 MiB; a COPY larger than that points to a
+                    // malformed binary or a misparse.
+                    klog_fmt("applySymbolRelocations[%s/%s]: COPY '%s' rejected (size=%llu)",
+                             tag, which, name.c_str(), (unsigned long long)size);
+                    unresolved++;
+                    continue;
+                }
+                std::vector<U8> buf((size_t)size);
+                mem->memcpyFromGuest(buf.data(), it->second, size);
+                mem->memcpyToGuest(dst, buf.data(), size);
+                resolved++;
                 continue;
             }
             U64 value = it->second + (U64)rela.r_addend;

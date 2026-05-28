@@ -1496,6 +1496,91 @@ int runX64SelfTest() {
         fflush(stdout);
     }
 
+    // Test: applySymbolRelocations — R_X86_64_COPY semantics. A real-world
+    // example: an exe imports an extern data symbol (e.g. `environ`) from
+    // libc.so.6. The linker emits a COPY reloc; the loader copies the
+    // source DSO's symbol bytes into the exe's BSS placeholder.
+    // We seed the "source DSO" bytes at address 0xCAFE0000 (sym value) and
+    // the exe's COPY target at LOAD_RELOC+DEST_OFF. After the call we
+    // expect the destination to contain the source's bytes.
+    {
+        const U64 LOAD_RELOC = 0x32500000;
+        const U64 SOURCE_ADDR = 0xCAFE0000;
+        const U64 DYN_OFF    = 0x100;
+        const U64 RELA_OFF   = 0x200;
+        const U64 SYMTAB_OFF = 0x400;
+        const U64 STRTAB_OFF = 0x500;
+        const U64 DEST_OFF   = 0x800;
+        KMemory64 mem(nullptr);
+        mem.mmapAnonymousFixed(LOAD_RELOC, 0x1000, 3);
+        mem.mmapAnonymousFixed(SOURCE_ADDR, 0x1000, 3);
+
+        // Seed the "source DSO" data — 24 bytes of recognizable pattern.
+        U8 srcPattern[24];
+        for (int i = 0; i < 24; i++) srcPattern[i] = (U8)(0x40 + i);
+        mem.memcpyToGuest(SOURCE_ADDR, srcPattern, sizeof(srcPattern));
+
+        // Strtab + symtab: one symbol "environ" of size 24.
+        const char* strs = "\0environ";
+        mem.memcpyToGuest(LOAD_RELOC + STRTAB_OFF, (const void*)strs, 9);
+        k_Elf64_Sym syms[2]{};
+        syms[1].st_name = 1;
+        syms[1].st_size = 24;          // exe's placeholder size
+        mem.memcpyToGuest(LOAD_RELOC + SYMTAB_OFF, syms, sizeof(syms));
+
+        // One COPY reloc: sym=1, dst=DEST_OFF (in exe), addend irrelevant.
+        k_Elf64_Rela rela[1]{};
+        rela[0].r_offset = DEST_OFF;
+        rela[0].r_info   = ((U64)1 << 32) | k_R_X86_64_COPY;
+        rela[0].r_addend = 0;
+        mem.memcpyToGuest(LOAD_RELOC + RELA_OFF, rela, sizeof(rela));
+
+        k_Elf64_Dyn dyn[8]{};
+        dyn[0].d_tag = k_DT_RELA;     dyn[0].d_un.d_ptr = RELA_OFF;
+        dyn[1].d_tag = k_DT_RELASZ;   dyn[1].d_un.d_val = sizeof(rela);
+        dyn[2].d_tag = k_DT_RELAENT;  dyn[2].d_un.d_val = sizeof(k_Elf64_Rela);
+        dyn[3].d_tag = k_DT_SYMTAB;   dyn[3].d_un.d_ptr = SYMTAB_OFF;
+        dyn[4].d_tag = k_DT_STRTAB;   dyn[4].d_un.d_ptr = STRTAB_OFF;
+        dyn[5].d_tag = k_DT_SYMENT;   dyn[5].d_un.d_val = sizeof(k_Elf64_Sym);
+        dyn[6].d_tag = k_DT_NULL;     dyn[6].d_un.d_val = 0;
+        mem.memcpyToGuest(LOAD_RELOC + DYN_OFF, dyn, sizeof(dyn));
+
+        Elf64DynamicInfo info;
+        info.present = true;
+        info.vaddr   = DYN_OFF;
+        info.memsz   = sizeof(dyn);
+
+        // Symbol map points "environ" at the source-DSO data.
+        std::unordered_map<std::string, U64> symbols;
+        symbols["environ"] = SOURCE_ADDR;
+
+        // Poison destination.
+        for (int i = 0; i < 24; i++) mem.writeb(LOAD_RELOC + DEST_OFF + i, 0xFF);
+
+        U64 resolved = 0, unresolved = 0;
+        ElfLoader64::applySymbolRelocations(
+            &mem, info, LOAD_RELOC, symbols, "copytest",
+            &resolved, &unresolved);
+
+        bool ok = (resolved == 1) && (unresolved == 0);
+        for (int i = 0; i < 24 && ok; i++) {
+            U8 got = mem.readb(LOAD_RELOC + DEST_OFF + i);
+            if (got != srcPattern[i]) {
+                printf("  copy byte %d: got 0x%02x want 0x%02x\n", i, got, srcPattern[i]);
+                ok = false;
+            }
+        }
+        if (ok) {
+            printf("  PASS: applySymbolRelocations: R_X86_64_COPY copies 24 bytes from source DSO\n");
+            r.passed++;
+        } else {
+            printf("  FAIL: R_X86_64_COPY resolved=%llu unresolved=%llu\n",
+                   (unsigned long long)resolved, (unsigned long long)unresolved);
+            r.failed++;
+        }
+        fflush(stdout);
+    }
+
     // Test: extractNeededLibraries — synthetic PT_DYNAMIC with three
     // DT_NEEDED entries pointing into a small strtab. Verifies order is
     // preserved and DT_STRTAB lookup is correct.
