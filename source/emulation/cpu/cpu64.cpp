@@ -3547,6 +3547,21 @@ U32 CPU64::step() {
                 union { float f; U32 i; } u; u.f = (float)d;
                 memory->writed(m.effAddr, u.i);
                 fpu.FPOP();
+            } else if (op == 0xD9 && sub == 5) {
+                // D9 /5 = FLDCW m16 — load FPU control word. Our soft FPU
+                // honors the rounding bits inside FROUND; we store the
+                // raw value via cwSet for the few callers that read it
+                // back via FNSTCW.
+                U16 cw = (U16)memory->readw(m.effAddr);
+                fpu.SetCW(cw);
+            } else if (op == 0xD9 && sub == 7) {
+                // D9 /7 = FNSTCW m16 — store FPU control word. Always
+                // succeeds; no exception checks because we don't model
+                // FPU exception bits.
+                memory->writew(m.effAddr, (U16)fpu.CW());
+            } else if (op == 0xDD && sub == 7) {
+                // DD /7 = FNSTSW m16 — store status word to memory.
+                memory->writew(m.effAddr, (U16)fpu.SW());
             } else if (op == 0xDD && sub == 0) {
                 // FLD m64fp
                 U64 bits = memory->readq(m.effAddr);
@@ -3593,6 +3608,75 @@ U32 CPU64::step() {
                 U64 bits = memory->readq(m.effAddr);
                 fpu.FLD_F64(bits, 8);
                 fpu.FDIVR(fpu.STV(0), 8);
+            } else if (op == 0xDA && sub <= 7) {
+                // DA /N with m32int operand:
+                //   /0 FIADD, /1 FIMUL, /2 FICOM, /3 FICOMP,
+                //   /4 FISUB, /5 FISUBR, /6 FIDIV, /7 FIDIVR.
+                // Convert int32 to f64, then run the ST(0)-op variant via the
+                // shared FPU helpers (which expect both operands in the FPU
+                // stack), using scratch slot 8.
+                S32 v = (S32)memory->readd(m.effAddr);
+                fpu.FLD_I32(v, 8);
+                if (sub == 0) {
+                    fpu.FADD(fpu.STV(0), 8);
+                } else if (sub == 1) {
+                    fpu.FMUL(fpu.STV(0), 8);
+                } else if (sub == 2 || sub == 3) {
+                    // FICOM / FICOMP — set C3/C2/C0 from comparison
+                    double a = fpu.isRegCached[fpu.top] ? fpu.regCache[fpu.top].d
+                                                         : fpu.getF64(fpu.top);
+                    double b = (double)v;
+                    if (std::isnan(a) || std::isnan(b)) {
+                        cpu64_fpu_set_c012_3(fpu, 1, 1, 1);
+                    } else if (a == b) {
+                        cpu64_fpu_set_c012_3(fpu, 1, 0, 0);
+                    } else if (a < b) {
+                        cpu64_fpu_set_c012_3(fpu, 0, 0, 1);
+                    } else {
+                        cpu64_fpu_set_c012_3(fpu, 0, 0, 0);
+                    }
+                    if (sub == 3) fpu.FPOP();
+                } else if (sub == 4) {
+                    fpu.FSUB(fpu.STV(0), 8);
+                } else if (sub == 5) {
+                    fpu.FSUBR(fpu.STV(0), 8);
+                } else if (sub == 6) {
+                    fpu.FDIV(fpu.STV(0), 8);
+                } else /* sub == 7 */ {
+                    fpu.FDIVR(fpu.STV(0), 8);
+                }
+            } else if (op == 0xDE && sub <= 7) {
+                // DE /N with m16int operand: FIADD/FIMUL/FICOM/FICOMP/FISUB/FISUBR/FIDIV/FIDIVR
+                // Same control flow as DA but the operand is signed 16-bit.
+                S16 v = (S16)memory->readw(m.effAddr);
+                fpu.FLD_I16(v, 8);
+                if (sub == 0) {
+                    fpu.FADD(fpu.STV(0), 8);
+                } else if (sub == 1) {
+                    fpu.FMUL(fpu.STV(0), 8);
+                } else if (sub == 2 || sub == 3) {
+                    double a = fpu.isRegCached[fpu.top] ? fpu.regCache[fpu.top].d
+                                                         : fpu.getF64(fpu.top);
+                    double b = (double)v;
+                    if (std::isnan(a) || std::isnan(b)) {
+                        cpu64_fpu_set_c012_3(fpu, 1, 1, 1);
+                    } else if (a == b) {
+                        cpu64_fpu_set_c012_3(fpu, 1, 0, 0);
+                    } else if (a < b) {
+                        cpu64_fpu_set_c012_3(fpu, 0, 0, 1);
+                    } else {
+                        cpu64_fpu_set_c012_3(fpu, 0, 0, 0);
+                    }
+                    if (sub == 3) fpu.FPOP();
+                } else if (sub == 4) {
+                    fpu.FSUB(fpu.STV(0), 8);
+                } else if (sub == 5) {
+                    fpu.FSUBR(fpu.STV(0), 8);
+                } else if (sub == 6) {
+                    fpu.FDIV(fpu.STV(0), 8);
+                } else /* sub == 7 */ {
+                    fpu.FDIVR(fpu.STV(0), 8);
+                }
             } else if (op == 0xDB && sub == 0) {
                 // FILD m32int — load signed 32-bit, push as f64
                 S32 v = (S32)memory->readd(m.effAddr);
@@ -3788,6 +3872,45 @@ U32 CPU64::step() {
                 // DF E0 = FNSTSW AX — write status word into AX, preserving
                 // the upper 48 bits of RAX (per AMD64 manual).
                 reg[X64_RAX].setU16((U16)fpu.SW());
+            } else if (op == 0xDD && (modrmByte & 0xF8) == 0xC0) {
+                // DD C0+i = FFREE ST(i) — mark ST(i) as empty (TAG_Empty).
+                fpu.tags[fpu.STV(i)] = TAG_Empty;
+                fpu.isRegCached[fpu.STV(i)] = false;
+            } else if (op == 0xDD && (modrmByte & 0xF8) == 0xD0) {
+                // DD D0+i = FST ST(i) — copy ST(0) into ST(i), no pop.
+                U32 src = fpu.STV(0);
+                U32 dst = fpu.STV(i);
+                fpu.regCache[dst] = fpu.regCache[src];
+                fpu.regs[dst] = fpu.regs[src];
+                fpu.isRegCached[dst] = fpu.isRegCached[src];
+                fpu.tags[dst] = TAG_Valid;
+            } else if (op == 0xDD && (modrmByte & 0xF8) == 0xD8) {
+                // DD D8+i = FSTP ST(i) — copy ST(0) into ST(i), then pop.
+                U32 src = fpu.STV(0);
+                U32 dst = fpu.STV(i);
+                fpu.regCache[dst] = fpu.regCache[src];
+                fpu.regs[dst] = fpu.regs[src];
+                fpu.isRegCached[dst] = fpu.isRegCached[src];
+                fpu.tags[dst] = TAG_Valid;
+                fpu.FPOP();
+            } else if (op == 0xDD && ((modrmByte & 0xF8) == 0xE0 || (modrmByte & 0xF8) == 0xE8)) {
+                // DD E0+i = FUCOM ST(i)  (sub-form E0)
+                // DD E8+i = FUCOMP ST(i) (sub-form E8, pops afterwards)
+                // Set C3/C2/C0 per the standard FCOM result; treat QNaN as
+                // unordered (we already do the same for FCOM).
+                U32 si = fpu.STV(i);
+                double a = fpu.isRegCached[fpu.top] ? fpu.regCache[fpu.top].d : fpu.getF64(fpu.top);
+                double b = fpu.isRegCached[si]      ? fpu.regCache[si].d      : fpu.getF64(si);
+                if (std::isnan(a) || std::isnan(b)) {
+                    cpu64_fpu_set_c012_3(fpu, 1, 1, 1);
+                } else if (a == b) {
+                    cpu64_fpu_set_c012_3(fpu, 1, 0, 0);
+                } else if (a < b) {
+                    cpu64_fpu_set_c012_3(fpu, 0, 0, 1);
+                } else {
+                    cpu64_fpu_set_c012_3(fpu, 0, 0, 0);
+                }
+                if ((modrmByte & 0xF8) == 0xE8) fpu.FPOP();
             } else if (op == 0xD8 && (modrmByte & 0xF8) == 0xD0) {
                 // D8 D0+i = FCOM ST(0), ST(i) — set C0/C2/C3
                 U32 si = fpu.STV(i);
@@ -3815,6 +3938,34 @@ U32 CPU64::step() {
                     cpu64_fpu_set_c012_3(fpu, 0, 0, 1);
                 } else {
                     cpu64_fpu_set_c012_3(fpu, 0, 0, 0);
+                }
+                fpu.FPOP();
+            } else if (op == 0xDE && (modrmByte & 0xC0) == 0xC0 && modrmByte != 0xD9) {
+                // DE C0+i / C8+i / E0+i / E8+i / F0+i / F8+i — operate on
+                // ST(i),ST(0), then pop. (DE D9 = FCOMPP is below.) The
+                // shared FPU helpers expect (destSlot, srcSlot), so we
+                // pass STV(i), STV(0).
+                U32 si = fpu.STV(i);
+                U32 s0 = fpu.STV(0);
+                U8 grp = modrmByte & 0xF8;
+                if (grp == 0xC0) {
+                    fpu.FADD(si, s0);
+                } else if (grp == 0xC8) {
+                    fpu.FMUL(si, s0);
+                } else if (grp == 0xE0) {
+                    // FSUBRP: ST(i) = ST(0) - ST(i), pop
+                    fpu.FSUBR(si, s0);
+                } else if (grp == 0xE8) {
+                    // FSUBP: ST(i) = ST(i) - ST(0), pop
+                    fpu.FSUB(si, s0);
+                } else if (grp == 0xF0) {
+                    // FDIVRP: ST(i) = ST(0) / ST(i), pop
+                    fpu.FDIVR(si, s0);
+                } else if (grp == 0xF8) {
+                    // FDIVP: ST(i) = ST(i) / ST(0), pop
+                    fpu.FDIV(si, s0);
+                } else {
+                    goto unhandled;
                 }
                 fpu.FPOP();
             } else if (op == 0xDE && modrmByte == 0xD9) {
