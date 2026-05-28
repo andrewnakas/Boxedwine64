@@ -77,6 +77,13 @@ struct Elf64ParseResult {
     Elf64DynamicInfo dynamic; // PT_DYNAMIC vaddr/memsz (empty if none)
     Elf64TlsInfo tls;         // PT_TLS template info (empty if none)
     Elf64RelroInfo relro;     // PT_GNU_RELRO region (empty if none)
+    // PT_GNU_STACK p_flags: bit 0x1 = exec-stack requested. Most modern
+    // binaries omit PT_GNU_STACK or emit it with p_flags=RW (no exec) —
+    // recording the value lets us refuse to map an executable stack later
+    // if we ever care to enforce NX on the stack region. v1 maps the
+    // stack RWX unconditionally; the field is informational.
+    bool gnuStackPresent = false;
+    bool gnuStackExec = false;
 };
 
 class ElfLoader64 {

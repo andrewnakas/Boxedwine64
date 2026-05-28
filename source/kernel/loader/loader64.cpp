@@ -28,6 +28,11 @@
 // emits them. PT_GNU_RELRO marks the region the linker should mprotect
 // to read-only after relocations complete (typically .got + .got.plt).
 #define PT_GNU_RELRO 0x6474E552
+// PT_GNU_STACK: a 0-sized phdr whose p_flags advertise stack permissions.
+// p_flags & PF_X (=1) means "stack must be executable". Modern toolchains
+// emit RW (no X); the binary opts-in only if it actually needs trampolines.
+#define PT_GNU_STACK 0x6474E551
+#define PF_X 0x1
 
 // ET_EXEC=2, ET_DYN=3. PIE executables (and shared libs) are ET_DYN.
 #define ET_EXEC 2
@@ -130,6 +135,9 @@ Elf64ParseResult ElfLoader64::parseBuffer(const U8* data, U64 length) {
             result.relro.present = true;
             result.relro.vaddr   = phdr.p_vaddr;
             result.relro.memsz   = phdr.p_memsz;
+        } else if (phdr.p_type == PT_GNU_STACK) {
+            result.gnuStackPresent = true;
+            result.gnuStackExec = (phdr.p_flags & PF_X) != 0;
         }
     }
 

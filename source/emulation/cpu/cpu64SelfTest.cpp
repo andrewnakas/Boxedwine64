@@ -4877,6 +4877,47 @@ int runX64SelfTest() {
         fflush(stdout);
     }
 
+    // T: parseBuffer captures PT_GNU_STACK presence and exec-flag.
+    {
+        const U64 PT_GNU_STACK_VAL = 0x6474E551;
+        // Two ELFs: one with PF_X (exec stack), one without.
+        for (int variant = 0; variant < 2; variant++) {
+            std::vector<U8> elf(0x100, 0);
+            elf[0] = 0x7F; elf[1] = 'E'; elf[2] = 'L'; elf[3] = 'F';
+            elf[4] = 2; elf[5] = 1; elf[6] = 1;
+            elf[16] = 2; elf[18] = 0x3E; elf[20] = 1;
+            elf[32] = 64;
+            elf[52] = 64; elf[54] = 56; elf[56] = 2;
+            // Phdr[0] PT_LOAD
+            U64 phOff = 64;
+            elf[phOff + 0] = 1;
+            elf[phOff + 4] = 7;
+            elf[phOff + 32] = 0x00; elf[phOff + 33] = 0x01;
+            elf[phOff + 40] = 0x00; elf[phOff + 41] = 0x01;
+            elf[phOff + 48] = 0x00; elf[phOff + 49] = 0x10;
+            // Phdr[1] PT_GNU_STACK with variant flags.
+            U64 ph1 = 120;
+            elf[ph1 + 0] = (U8)(PT_GNU_STACK_VAL & 0xFF);
+            elf[ph1 + 1] = (U8)((PT_GNU_STACK_VAL >> 8) & 0xFF);
+            elf[ph1 + 2] = (U8)((PT_GNU_STACK_VAL >> 16) & 0xFF);
+            elf[ph1 + 3] = (U8)((PT_GNU_STACK_VAL >> 24) & 0xFF);
+            elf[ph1 + 4] = variant == 0 ? 6 : 7; // RW vs RWX
+            Elf64ParseResult res = ElfLoader64::parseBuffer(elf.data(), elf.size());
+            bool want = (variant == 1);
+            bool ok = res.ok && res.gnuStackPresent && res.gnuStackExec == want;
+            if (ok) {
+                printf("  PASS: parseBuffer: PT_GNU_STACK exec=%d captured\n", (int)want);
+                r.passed++;
+            } else {
+                printf("  FAIL: PT_GNU_STACK variant=%d (ok=%d present=%d exec=%d want=%d)\n",
+                       variant, (int)res.ok, (int)res.gnuStackPresent,
+                       (int)res.gnuStackExec, (int)want);
+                r.failed++;
+            }
+            fflush(stdout);
+        }
+    }
+
     printf("=== self-test summary: %d passed, %d failed ===\n\n", r.passed, r.failed);
     return r.failed == 0 ? 0 : 1;
 }
