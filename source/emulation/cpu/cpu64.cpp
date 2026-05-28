@@ -633,6 +633,15 @@ U32 CPU64::step() {
         return opOff + 1;
     }
 
+    // FWAIT / WAIT (9B). On hardware, waits for pending x87 exceptions to
+    // be serviced. Our soft FPU has no asynchronous exceptions, so this
+    // is a NOP. Discovered around x87 epilogue sequences emitted by
+    // gcc/clang when a function returns long double or stores via FSTP m80.
+    if (op == 0x9B) {
+        rip += opOff + 1;
+        return opOff + 1;
+    }
+
     // XCHG r, RAX (90+rd). XCHG R8-R15 with RAX when REX.B=1. The plain 0x90
     // case is handled above as NOP. opSize from prefix/REX.W.
     if (op >= 0x90 && op <= 0x97) {
