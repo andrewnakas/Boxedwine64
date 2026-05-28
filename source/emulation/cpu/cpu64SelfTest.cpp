@@ -4393,6 +4393,127 @@ int runX64SelfTest() {
         }
     }
 
+    // ----- B3: synchronous signal delivery via kill/tgkill -----
+    //
+    // End-to-end: install a SIGUSR1 (10) handler at a known address,
+    // call kill(0, 10) to deliver to ourselves. Handler writes a
+    // sentinel into a MEMORY slot (survives sigreturn, unlike a GPR
+    // write which would get overwritten by the frame restore), calls
+    // sys_rt_sigreturn. After return, main reads the slot into R15
+    // and exits. The verifier checks R15 == sentinel — proving the
+    // handler actually executed AND the unwind got us back to main.
+    {
+        const U64 HANDLER_ADDR = CODE_BASE + 0x200;
+        const U64 SA_ADDR  = STACK_TOP - 0x80;
+        const U64 MARK_ADDR = STACK_TOP - 0xA0;
+
+        auto writeq_imm = [](std::vector<U8>& buf, U64 addr, U64 value) {
+            buf.push_back(0x48); buf.push_back(0xB8);
+            for (int i = 0; i < 8; i++) buf.push_back((U8)(value >> (8*i)));
+            buf.push_back(0x49); buf.push_back(0xBA);
+            for (int i = 0; i < 8; i++) buf.push_back((U8)(addr  >> (8*i)));
+            buf.push_back(0x49); buf.push_back(0x89); buf.push_back(0x02);
+        };
+
+        std::vector<U8> code;
+
+        // Pre-poison MARK_ADDR with 0 so a successful handler-write to 0xCAFE
+        // is clearly distinguishable.
+        writeq_imm(code, MARK_ADDR, 0);
+
+        // Build sigaction at SA_ADDR.
+        writeq_imm(code, SA_ADDR +  0, HANDLER_ADDR);
+        writeq_imm(code, SA_ADDR +  8, 0);
+        writeq_imm(code, SA_ADDR + 16, 0);
+        writeq_imm(code, SA_ADDR + 24, 0);
+
+        // rt_sigaction(10, SA_ADDR, NULL, 8): rax=13 rdi=10 rsi=SA_ADDR rdx=0 r10=8
+        code.push_back(0x48); code.push_back(0xC7); code.push_back(0xC0);
+        code.push_back(13); code.push_back(0); code.push_back(0); code.push_back(0);
+        code.push_back(0x48); code.push_back(0xC7); code.push_back(0xC7);
+        code.push_back(10); code.push_back(0); code.push_back(0); code.push_back(0);
+        code.push_back(0x48); code.push_back(0xBE);
+        for (int i = 0; i < 8; i++) code.push_back((U8)(SA_ADDR >> (8*i)));
+        code.push_back(0x48); code.push_back(0x31); code.push_back(0xD2);
+        code.push_back(0x49); code.push_back(0xC7); code.push_back(0xC2);
+        code.push_back(8); code.push_back(0); code.push_back(0); code.push_back(0);
+        code.push_back(0x0F); code.push_back(0x05);
+
+        // kill(0, 10)
+        code.push_back(0x48); code.push_back(0xC7); code.push_back(0xC0);
+        code.push_back(62); code.push_back(0); code.push_back(0); code.push_back(0);
+        code.push_back(0x48); code.push_back(0x31); code.push_back(0xFF);
+        code.push_back(0x48); code.push_back(0xC7); code.push_back(0xC6);
+        code.push_back(10); code.push_back(0); code.push_back(0); code.push_back(0);
+        code.push_back(0x0F); code.push_back(0x05);
+        // After handler+sigreturn return here: read MARK_ADDR → R15, exit.
+        code.push_back(0x49); code.push_back(0xBE); // mov r14, MARK_ADDR
+        for (int i = 0; i < 8; i++) code.push_back((U8)(MARK_ADDR >> (8*i)));
+        code.push_back(0x4D); code.push_back(0x8B); code.push_back(0x3E); // mov r15, [r14]
+        code.push_back(0x48); code.push_back(0xC7); code.push_back(0xC0);
+        code.push_back(60); code.push_back(0); code.push_back(0); code.push_back(0);
+        code.push_back(0x0F); code.push_back(0x05);
+
+        if (code.size() > 0x200) {
+            printf("  FAIL: B3 signal-delivery test prologue (%zu) > 0x200\n", code.size());
+            r.failed++;
+        } else {
+            while (code.size() < 0x200) code.push_back(0x90);
+            // Handler: write 0xCAFE to MARK_ADDR via R10/RAX, then rt_sigreturn.
+            // Cannot use writeq_imm closure here (we're past code-building);
+            // emit inline:
+            //   mov rax, 0xCAFE              48 B8 FE CA 00 00 00 00 00 00
+            //   mov r10, MARK_ADDR            49 BA <8 bytes>
+            //   mov [r10], rax                49 89 02
+            //   mov rax, 15                   48 C7 C0 0F 00 00 00
+            //   syscall                       0F 05
+            code.push_back(0x48); code.push_back(0xB8);
+            U64 mark = 0xCAFE;
+            for (int i = 0; i < 8; i++) code.push_back((U8)(mark >> (8*i)));
+            code.push_back(0x49); code.push_back(0xBA);
+            for (int i = 0; i < 8; i++) code.push_back((U8)(MARK_ADDR >> (8*i)));
+            code.push_back(0x49); code.push_back(0x89); code.push_back(0x02);
+            code.push_back(0x48); code.push_back(0xC7); code.push_back(0xC0);
+            code.push_back(15); code.push_back(0); code.push_back(0); code.push_back(0);
+            code.push_back(0x0F); code.push_back(0x05);
+
+            runAndCheck(r, "kill(0, SIGUSR1) delivers to handler, sigreturn unwinds", code,
+                [](CPU64& c) {
+                    return c.reg[X64_R15].u64 == 0xCAFE;
+                });
+        }
+    }
+
+    // T: tgkill(self, self, 0) — sig=0 is a "is this tid alive" probe; for
+    // our own tid it returns 0 (no delivery happens). Verify by exiting
+    // with the syscall return value.
+    {
+        std::vector<U8> code = {
+            0x48, 0xC7, 0xC0, 0xEA, 0x00, 0x00, 0x00,                     // mov rax, 234 (tgkill)
+            0x48, 0xC7, 0xC7, 0x01, 0x00, 0x00, 0x00,                     // mov rdi, 1 (tgid)
+            0x48, 0xC7, 0xC6, 0x01, 0x00, 0x00, 0x00,                     // mov rsi, 1 (tid — KThread default id=1)
+            0x48, 0x31, 0xD2,                                             // xor rdx, rdx (sig=0)
+            0x0F, 0x05,
+        };
+        runAndCheck(r, "tgkill self sig=0 (probe) → 0", withExit(code), [](CPU64& c) {
+            return c.reg[X64_R15].u64 == 0;
+        });
+    }
+
+    // T: kill(0, 10) with NO handler installed → returns 0 (we log and drop
+    // instead of terminating the host process — see comment in dispatch).
+    {
+        std::vector<U8> code = {
+            0x48, 0xC7, 0xC0, 0x3E, 0x00, 0x00, 0x00,                     // mov rax, 62 (kill)
+            0x48, 0x31, 0xFF,                                             // xor rdi (pid=0 → self)
+            0x48, 0xC7, 0xC6, 0x0A, 0x00, 0x00, 0x00,                     // mov rsi, 10 (SIGUSR1)
+            0x0F, 0x05,
+        };
+        runAndCheck(r, "kill(self, 10) no handler → 0 (log+drop)", withExit(code), [](CPU64& c) {
+            return c.reg[X64_R15].u64 == 0;
+        });
+    }
+
     // ----- sched_getaffinity / sched_setaffinity (Milestone B2) -----
 
     // T: sched_getaffinity(0, 8, [rsp]) returns 8 and mask[0]=1.

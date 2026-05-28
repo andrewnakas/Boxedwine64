@@ -141,6 +141,9 @@
 #ifndef K_EMFILE
 #define K_EMFILE 24
 #endif
+#ifndef K_ESRCH
+#define K_ESRCH 3
+#endif
 
 // FUTEX_* op codes from <linux/futex.h>. We handle WAIT/WAKE + their
 // BITSET variants (glibc 2.35+ uses WAKE_BITSET for pthread_cond_signal)
@@ -1020,6 +1023,68 @@ static U64 restoreSignalFrame(CPU64* cpu, U64 uctxPtr) {
     return savedRax;
 }
 
+// SA_ONSTACK = 0x08000000 in glibc's <bits/sigaction.h>. When set, the
+// handler runs on the registered sigaltstack instead of the user stack.
+#define X64_SA_ONSTACK   0x08000000
+
+// Synchronously deliver `sig` to `cpu` (the same thread). Models the
+// kernel's "queue a signal that's pending immediately" path for the
+// single-thread case — i.e. raise(), abort(), pthread_kill(self,...).
+//
+// Caller has already validated the signal number and confirmed that
+// cpu->sigActions[sig].installed && handler is a real function pointer
+// (not SIG_DFL/SIG_IGN).
+//
+// Mechanics:
+//   1. Pick the frame stack: altstack if SA_ONSTACK set and altstack is
+//      live, otherwise current RSP minus a redzone (128 bytes per SysV).
+//   2. Round down to 16-byte alignment, subtract frame size.
+//   3. Build the ucontext_t at frame_base via buildSignalFrame.
+//   4. Set cpu->reg[X64_RSP] = frame_base, RIP = handler, RDI = sig,
+//      RSI = 0 (no siginfo), RDX = &uctx, R10 = 0, R8/R9 = 0.
+//   5. Mask the signal in cpu->sigMask for the duration of handler
+//      execution (kernel adds sig to mask unless SA_NODEFER set).
+//   6. The handler ends with `ret`-to-restorer or `syscall(rt_sigreturn)`,
+//      which (a) hits our rt_sigreturn case → restoreSignalFrame → state
+//      restored, including sigMask.
+//
+// Returns true on successful delivery (handler will run next), false if
+// the handler slot is not installed / is SIG_DFL/SIG_IGN.
+static bool deliverSignalSync(CPU64* cpu, U32 sig) {
+    if (sig < 1 || sig > 64) return false;
+    CPU64::SigAction& sa = cpu->sigActions[sig];
+    if (!sa.installed) return false;
+    if (sa.handler == 0 /*SIG_DFL*/ || sa.handler == 1 /*SIG_IGN*/) return false;
+
+    // Pick stack: SA_ONSTACK requires a non-DISABLED altstack.
+    U64 baseSp;
+    if ((sa.flags & X64_SA_ONSTACK) && cpu->sigAltStack.ssSp != 0 &&
+        (cpu->sigAltStack.ssFlags & 2 /*SS_DISABLE*/) == 0) {
+        baseSp = cpu->sigAltStack.ssSp + cpu->sigAltStack.ssSize;
+    } else {
+        baseSp = cpu->reg[X64_RSP].u64 - 128; // red zone
+    }
+    // 16-align then reserve the frame.
+    U64 frameBase = (baseSp - X64_SIGFRAME_SIZE) & ~(U64)15;
+
+    U64 uctxPtr = buildSignalFrame(cpu, frameBase);
+
+    // Mask the signal during handler execution (unless SA_NODEFER=0x40000000).
+    if ((sa.flags & 0x40000000) == 0) {
+        cpu->sigMask |= (1ULL << (sig - 1));
+    }
+    cpu->sigMask |= sa.mask;
+
+    // Hand off to the handler.
+    cpu->reg[X64_RSP].setU64(uctxPtr);  // sigreturn reads from RSP
+    cpu->reg[X64_RDI].setU64(sig);      // arg1: signal number
+    cpu->reg[X64_RSI].setU64(0);        // arg2: siginfo (we don't synth one)
+    cpu->reg[X64_RDX].setU64(uctxPtr);  // arg3: ucontext pointer
+    cpu->rip = sa.handler;
+
+    return true;
+}
+
 // Map an x86-64 Linux syscall number to a human-readable name. Used only by
 // the unimplemented-syscall log path — when running real glibc binaries, the
 // first thing you want to see is "which syscall is missing", not "#291".
@@ -1237,14 +1302,37 @@ void ksyscall64(CPU64* cpu) {
                 ret = 0;
             }
             break;
-        case X64_SYS_tgkill:
-            // tgkill(tgid, tid, sig) — only used by glibc's abort() path; if
-            // we get here something already failed. Return success so the
-            // caller continues and we can see the next syscall.
-            klog_fmt("ksyscall64: tgkill(tgid=%llu tid=%llu sig=%llu) ignored",
-                     (unsigned long long)a1, (unsigned long long)a2, (unsigned long long)a3);
-            ret = 0;
+        case X64_SYS_tgkill: {
+            // tgkill(tgid, tid, sig). Single-thread world: any tid that
+            // matches our own gets the signal delivered synchronously to
+            // ourselves. Wrong-tid targets fall back to ESRCH so callers
+            // can detect a stale tid (matches kernel behaviour).
+            U64 ourTid = cpu->thread ? (U64)cpu->thread->id : 1;
+            U32 sig    = (U32)a3;
+            if (sig == 0) {
+                // sig=0 is the "is this tid alive?" probe — answer "yes"
+                // for our own tid, "no" otherwise. Don't deliver.
+                ret = (a2 == ourTid) ? 0 : (U64)-K_ESRCH;
+                break;
+            }
+            if (a2 != ourTid) {
+                ret = (U64)-K_ESRCH;
+                break;
+            }
+            if (deliverSignalSync(cpu, sig)) {
+                // Handler will run next; ret=0 (kernel reports success
+                // *before* handler runs, and the syscall return value is
+                // overwritten by RAX-restore at rt_sigreturn anyway).
+                ret = 0;
+            } else {
+                // No handler installed / SIG_DFL / SIG_IGN. For most
+                // signals this should terminate the process; for v1 we
+                // log and return 0 so abort()-paths can be observed.
+                klog_fmt("ksyscall64: tgkill self sig=%u — no handler installed", sig);
+                ret = 0;
+            }
             break;
+        }
         case X64_SYS_rt_sigreturn: {
             // x86-64 ABI: at the moment rt_sigreturn is invoked, RSP points
             // at the ucontext_t of the frame the kernel built when it
@@ -1350,11 +1438,29 @@ void ksyscall64(CPU64* cpu) {
         case X64_SYS_sched_setaffinity:
             ret = sys_sched_setaffinity64(cpu, a1, a2, a3);
             break;
-        case X64_SYS_kill:
-            // For now: silently succeed. glibc's abort() goes here via
-            // tgkill, but exits handle the actual termination elsewhere.
-            ret = 0;
+        case X64_SYS_kill: {
+            // kill(pid, sig). pid==0 means "current process group"; pid==our
+            // pid (or -1 for "all processes we can signal") means us.
+            // Single-process world: any of those paths target us. sig==0
+            // is a permission probe; succeed silently.
+            U32 sig = (U32)a2;
+            if (sig == 0) { ret = 0; break; }
+            // For pid <= 0 or pid == our pid: deliver to self.
+            U64 ourPid = cpu->thread && cpu->thread->process ?
+                         (U64)cpu->thread->process->id : 1;
+            S64 spid = (S64)a1;
+            if (spid > 0 && (U64)spid != ourPid) {
+                ret = (U64)-K_ESRCH;
+                break;
+            }
+            if (deliverSignalSync(cpu, sig)) {
+                ret = 0;
+            } else {
+                klog_fmt("ksyscall64: kill self sig=%u — no handler installed", sig);
+                ret = 0;
+            }
             break;
+        }
         case X64_SYS_rt_sigtimedwait:
             ret = sys_rt_sigtimedwait64(cpu, a1, a2, a3, a4);
             break;
