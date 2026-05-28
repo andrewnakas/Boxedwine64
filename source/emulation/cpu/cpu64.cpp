@@ -1901,7 +1901,11 @@ U32 CPU64::step() {
         }
         // PXOR xmm, xmm/m128 — 66 0F EF /r. Used everywhere for register
         // zeroing (faster than MOV 0).
-        if (op2 == 0xEF && osize66) {
+        // XORPS xmm, xmm/m128 — 0F 57 /r (no prefix). Float-typed bitwise
+        // XOR; bit pattern identical to PXOR. Discovered in musl printf
+        // init — used to zero XMM0 before a varargs scalar-FP write.
+        // XORPD xmm, xmm/m128 — 66 0F 57 /r. Same bit op, double-typed.
+        if ((op2 == 0xEF && osize66) || (op2 == 0x57)) {
             ModRM m = decodeModRM(rip + opOff + 2, p, 0);
             U64 srcLo, srcHi;
             if (m.isReg) {
