@@ -21,11 +21,22 @@ The 64-bit guest path can:
 
 ### What works end-to-end
 
-- Static x86\_64 musl hello-world (`write(1,"hi\n",3); exit(0)`) executes and tees output to host stdout
-- Static musl `sum-loops` (arithmetic loop returning a constant) runs to completion
-- Static musl `printf("%d %s\n", ...)` runs through string/integer formatting paths
-- `malloc → strcpy → snprintf → strlen → strcat` chain executes end-to-end
-- The end-to-end PLT call test loads a synthesized shared library, resolves `R_X86_64_JUMP_SLOT` against an exported function, and the main executable correctly calls through the GOT to return 42
+The in-repo static-PIE smoke suite (`tools/x64test/run-static-elf-suite.sh`) currently runs **7/7 PASS** on `zig cc`-built musl binaries:
+
+- **hello** — `write(1,"hello\n",6); exit(0)`
+- **sum** — `for i in 1..100: s += i; return s` → exit status 5050
+- **sieve** — Sieve of Eratosthenes up to 1000 → exit status 168
+- **fib25** — recursive `fib(25)` → exit status 75025
+- **qsort** — in-place quicksort over 64 ints + verification
+- **strops** — `memcpy / memcmp / strlen` via REP MOVS/CMPS sequences
+- **hash** — open-addressed hash table, 100 inserts + 100 lookups
+
+Additional verified workloads:
+
+- `printf("%d %s %x %o\n", ...)` (integer/string/hex/octal formatting paths)
+- `malloc → strcpy → snprintf → strlen → strcat` chain end-to-end
+- **`fib(30)` recursively** — 832040 result in 29.4M instructions
+- The synthesized end-to-end PLT call test (in `cpu64SelfTest.cpp`) loads a separate shared library, resolves `R_X86_64_JUMP_SLOT` against an exported function, and the main executable correctly calls through the GOT to return 42
 
 ### What does not work yet
 
@@ -74,6 +85,12 @@ Run a static-PIE x86\_64 ELF (cross-compile with `zig cc -target x86_64-linux-mu
 
 ```sh
 ~/Library/Developer/Xcode/DerivedData/Boxedwine-*/Build/Products/Debug/Boxedwine.app/Contents/MacOS/Boxedwine --x64-run-elf /tmp/hello
+```
+
+Run the full static-PIE smoke suite (requires `zig`):
+
+```sh
+tools/x64test/run-static-elf-suite.sh
 ```
 
 For 32-bit builds and the original Wine flow, see the upstream [How-To-Build-Boxedwine.md](docs/How-To-Build-Boxedwine.md).
