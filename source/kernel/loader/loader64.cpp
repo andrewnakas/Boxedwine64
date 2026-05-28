@@ -24,6 +24,10 @@
 #ifndef PT_INTERP
 #define PT_INTERP 3
 #endif
+// GNU extensions — not in the SysV phdr set but every modern toolchain
+// emits them. PT_GNU_RELRO marks the region the linker should mprotect
+// to read-only after relocations complete (typically .got + .got.plt).
+#define PT_GNU_RELRO 0x6474E552
 
 // ET_EXEC=2, ET_DYN=3. PIE executables (and shared libs) are ET_DYN.
 #define ET_EXEC 2
@@ -122,6 +126,10 @@ Elf64ParseResult ElfLoader64::parseBuffer(const U8* data, U64 length) {
             result.tls.filesz = phdr.p_filesz;
             result.tls.memsz  = phdr.p_memsz;
             result.tls.align  = phdr.p_align;
+        } else if (phdr.p_type == PT_GNU_RELRO) {
+            result.relro.present = true;
+            result.relro.vaddr   = phdr.p_vaddr;
+            result.relro.memsz   = phdr.p_memsz;
         }
     }
 
@@ -725,6 +733,19 @@ bool ElfLoader64::loadProgram(KThread* thread, FsOpenNode* openNode, U64* rip) {
     // (if any). Symbol-bound relocations are still left to ld-linux until
     // Milestone A3 wires up cross-library symbol resolution.
     applyRelativeRelocations(mem, r.dynamic, reloc, "exe");
+
+    // PT_GNU_RELRO: now that relocations have written through .got/.got.plt,
+    // mark the region read-only (matches what ld.so does at runtime). The
+    // region is page-rounded outward — RELRO p_vaddr is page-aligned per the
+    // spec but p_memsz is not always page-aligned, so we round up.
+    if (r.relro.present && r.relro.memsz) {
+        U64 relroAddr = (r.relro.vaddr + reloc) & ~K64_PAGE_MASK;
+        U64 relroEnd  = (r.relro.vaddr + reloc + r.relro.memsz + K64_PAGE_MASK) & ~K64_PAGE_MASK;
+        mem->mprotect(relroAddr, relroEnd - relroAddr, 0x1 /* PROT_READ */);
+        klog_fmt("loadProgram64: PT_GNU_RELRO 0x%llx..0x%llx -> RO",
+                 (unsigned long long)relroAddr,
+                 (unsigned long long)relroEnd);
+    }
 
     *rip = r.entry + reloc;
     klog_fmt("loadProgram64: exe RIP=0x%llx (pages mapped: %llu)",

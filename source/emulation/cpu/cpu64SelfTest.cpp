@@ -4703,6 +4703,95 @@ int runX64SelfTest() {
         fflush(stdout);
     }
 
+    // T: KMemory64::mprotect flips writable pages to read-only and is a
+    // no-op on holes. Verifies the foundation under PT_GNU_RELRO before
+    // exercising the loader-level integration below.
+    {
+        KMemory64 mem(nullptr);
+        const U64 BASE = 0x40000000;
+        mem.mmapAnonymousFixed(BASE, 0x3000, 3); // RW (prot=0x3)
+        // Before: WRITE bit set.
+        U32 before = mem.getPageFlags(BASE >> K64_PAGE_SHIFT);
+        bool wasWritable = (before & K64_PAGE_WRITE) != 0;
+        // Flip middle page to read-only.
+        mem.mprotect(BASE + K64_PAGE_SIZE, K64_PAGE_SIZE, 0x1);
+        U32 mid   = mem.getPageFlags((BASE + K64_PAGE_SIZE) >> K64_PAGE_SHIFT);
+        U32 first = mem.getPageFlags(BASE >> K64_PAGE_SHIFT);
+        U32 last  = mem.getPageFlags((BASE + 0x2000) >> K64_PAGE_SHIFT);
+        bool ok = wasWritable
+                  && (mid & K64_PAGE_READ)
+                  && !(mid & K64_PAGE_WRITE)
+                  && (first & K64_PAGE_WRITE)   // neighbours untouched
+                  && (last & K64_PAGE_WRITE);
+        // Calling mprotect on an unmapped hole must not crash and must not
+        // create new pages (per header semantics).
+        U64 sizeBefore = mem.mappedPageCount();
+        mem.mprotect(0x90000000, 0x1000, 0x1);
+        U64 sizeAfter = mem.mappedPageCount();
+        ok = ok && (sizeBefore == sizeAfter);
+        if (ok) {
+            printf("  PASS: KMemory64::mprotect flips flags, skips holes\n");
+            r.passed++;
+        } else {
+            printf("  FAIL: KMemory64::mprotect (was_w=%d mid=0x%x first=0x%x last=0x%x sizes %llu->%llu)\n",
+                   (int)wasWritable, mid, first, last,
+                   (unsigned long long)sizeBefore,
+                   (unsigned long long)sizeAfter);
+            r.failed++;
+        }
+        fflush(stdout);
+    }
+
+    // T: parseBuffer captures PT_GNU_RELRO vaddr/memsz. Minimum-shape ELF
+    // with a single PT_LOAD plus one PT_GNU_RELRO phdr.
+    {
+        // Layout: Ehdr(64) + 2 Phdrs(2*56=112) at offset 64.
+        // PT_LOAD covers full file; PT_GNU_RELRO points at offset 0x100, size 0x40.
+        const U64 PT_GNU_RELRO_VAL = 0x6474E552;
+        std::vector<U8> elf(0x200, 0);
+        // Ehdr ident + minimum fields.
+        elf[0] = 0x7F; elf[1] = 'E'; elf[2] = 'L'; elf[3] = 'F';
+        elf[4] = 2; elf[5] = 1; elf[6] = 1;
+        // e_type=ET_EXEC=2, e_machine=0x3E (x86_64), e_version=1
+        elf[16] = 2; elf[18] = 0x3E; elf[20] = 1;
+        // e_phoff = 64
+        elf[32] = 64;
+        // e_ehsize=64, e_phentsize=56, e_phnum=2
+        elf[52] = 64; elf[54] = 56; elf[56] = 2;
+        // Phdr[0] PT_LOAD at file off 64.
+        U64 phOff = 64;
+        elf[phOff + 0] = 1; // PT_LOAD
+        elf[phOff + 4] = 7; // RWX flags
+        // p_filesz/p_memsz = 0x200, p_align = 0x1000
+        elf[phOff + 32] = 0x00; elf[phOff + 33] = 0x02; // filesz
+        elf[phOff + 40] = 0x00; elf[phOff + 41] = 0x02; // memsz
+        elf[phOff + 48] = 0x00; elf[phOff + 49] = 0x10; // align
+        // Phdr[1] PT_GNU_RELRO at file off 64+56 = 120
+        U64 ph1 = 120;
+        elf[ph1 + 0] = (U8)(PT_GNU_RELRO_VAL & 0xFF);
+        elf[ph1 + 1] = (U8)((PT_GNU_RELRO_VAL >> 8) & 0xFF);
+        elf[ph1 + 2] = (U8)((PT_GNU_RELRO_VAL >> 16) & 0xFF);
+        elf[ph1 + 3] = (U8)((PT_GNU_RELRO_VAL >> 24) & 0xFF);
+        // p_vaddr = 0x100, p_memsz = 0x40
+        elf[ph1 + 16] = 0x00; elf[ph1 + 17] = 0x01;
+        elf[ph1 + 40] = 0x40;
+        Elf64ParseResult res = ElfLoader64::parseBuffer(elf.data(), elf.size());
+        bool ok = res.ok && res.relro.present && res.relro.vaddr == 0x100 && res.relro.memsz == 0x40;
+        if (ok) {
+            printf("  PASS: parseBuffer: PT_GNU_RELRO captured (vaddr=0x%llx memsz=0x%llx)\n",
+                   (unsigned long long)res.relro.vaddr,
+                   (unsigned long long)res.relro.memsz);
+            r.passed++;
+        } else {
+            printf("  FAIL: parseBuffer: PT_GNU_RELRO (ok=%d present=%d vaddr=0x%llx memsz=0x%llx)\n",
+                   (int)res.ok, (int)res.relro.present,
+                   (unsigned long long)res.relro.vaddr,
+                   (unsigned long long)res.relro.memsz);
+            r.failed++;
+        }
+        fflush(stdout);
+    }
+
     printf("=== self-test summary: %d passed, %d failed ===\n\n", r.passed, r.failed);
     return r.failed == 0 ? 0 : 1;
 }

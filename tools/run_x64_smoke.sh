@@ -80,6 +80,7 @@ run_one arraySum       "$ROOT/tools/buildArraySumElf64.py"     36         || fai
 run_one indirectCall   "$ROOT/tools/buildIndirectCallElf64.py" 119        || fail=$((fail+1))
 run_one tlsImage       "$ROOT/tools/buildTlsImageElf64.py"     171        || fail=$((fail+1))
 run_one integration    "$ROOT/tools/buildIntegrationElf64.py"  75         || fail=$((fail+1))
+run_one relro          "$ROOT/tools/buildRelroElf64.py"        90         || fail=$((fail+1))
 
-echo "=== summary: $((15 - fail))/15 passed ==="
+echo "=== summary: $((16 - fail))/16 passed ==="
 exit $fail

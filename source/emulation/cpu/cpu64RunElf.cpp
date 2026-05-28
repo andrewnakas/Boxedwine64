@@ -289,6 +289,18 @@ extern "C" int runX64RunElf(const char* path) {
                (unsigned long long)applied);
     }
 
+    // PT_GNU_RELRO: mark RELRO region read-only after relocations land,
+    // matching loadProgram64. Pages on disk that don't declare RELRO are
+    // unaffected.
+    if (parsed.relro.present && parsed.relro.memsz) {
+        U64 relroAddr = (parsed.relro.vaddr + reloc) & ~K64_PAGE_MASK;
+        U64 relroEnd  = (parsed.relro.vaddr + reloc + parsed.relro.memsz + K64_PAGE_MASK) & ~K64_PAGE_MASK;
+        mem.mprotect(relroAddr, relroEnd - relroAddr, 0x1);
+        printf("--x64-run-elf: PT_GNU_RELRO 0x%llx..0x%llx -> RO\n",
+               (unsigned long long)relroAddr,
+               (unsigned long long)relroEnd);
+    }
+
     // Build the SysV initial stack so glibc-style _start sees the right
     // frame. AT_BASE is 0 here — interpreter loading isn't wired in the
     // runner yet, so dynamic binaries that need ld-linux won't get past

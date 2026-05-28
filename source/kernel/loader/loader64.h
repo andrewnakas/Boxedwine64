@@ -48,6 +48,21 @@ struct Elf64TlsInfo {
     U64 align = 0;
 };
 
+// Captured PT_GNU_RELRO region — the loader marks these pages read-only
+// AFTER relocations have been applied, matching the contract ld.so
+// honors at runtime. Without enforcement a guest write to .got.plt
+// silently succeeds; with it the page flags reflect read-only protection.
+//
+// Note: actual fault delivery on a write to a non-writable page is a
+// separate gap — KMemory64::memcpy* / writeb still bypass flag checks
+// today. RELRO here is recorded correctly so when fault enforcement
+// lands, RELRO will work automatically without re-touching the loader.
+struct Elf64RelroInfo {
+    bool present = false;
+    U64 vaddr = 0;
+    U64 memsz = 0;
+};
+
 struct Elf64ParseResult {
     bool ok = false;
     U64 entry = 0;            // e_entry
@@ -61,6 +76,7 @@ struct Elf64ParseResult {
     BString interpreter;      // PT_INTERP contents (empty if none)
     Elf64DynamicInfo dynamic; // PT_DYNAMIC vaddr/memsz (empty if none)
     Elf64TlsInfo tls;         // PT_TLS template info (empty if none)
+    Elf64RelroInfo relro;     // PT_GNU_RELRO region (empty if none)
 };
 
 class ElfLoader64 {

@@ -75,6 +75,28 @@ U64 KMemory64::mmapAnonymousFixed(U64 addr, U64 len, U32 prot) {
     return addr;
 }
 
+U64 KMemory64::mprotect(U64 addr, U64 len, U32 prot) {
+    if (addr & K64_PAGE_MASK) return (U64)-K_EINVAL;
+    if (len == 0) return addr;
+
+    U32 newFlags = K64_PAGE_MAPPED;
+    if (prot & 0x1) newFlags |= K64_PAGE_READ;
+    if (prot & 0x2) newFlags |= K64_PAGE_WRITE | K64_PAGE_READ; // write implies read
+    if (prot & 0x4) newFlags |= K64_PAGE_EXEC;
+
+    U64 pageStart = addr >> K64_PAGE_SHIFT;
+    U64 pageCount = (len + K64_PAGE_SIZE - 1) >> K64_PAGE_SHIFT;
+    for (U64 i = 0; i < pageCount; i++) {
+        // Preserve SHARED bit if it was set; everything else is replaced
+        // wholesale. Holes (no page) are skipped — see header comment.
+        auto it = pages.find(pageStart + i);
+        if (it == pages.end()) continue;
+        U32 preserved = it->second->flags & K64_PAGE_SHARED;
+        it->second->flags = newFlags | preserved;
+    }
+    return addr;
+}
+
 void KMemory64::memcpyToGuest(U64 dstGuest, const void* src, U64 len) {
     const U8* s = (const U8*)src;
     while (len) {

@@ -59,6 +59,19 @@ public:
     // non-zero (no address-picking in v1).
     U64 mmapAnonymousFixed(U64 addr, U64 len, U32 prot);
 
+    // Change page permissions on already-mapped pages. addr must be page-
+    // aligned. prot bits follow K_PROT_READ/WRITE/EXEC (0x1/0x2/0x4) — same
+    // convention as mmapAnonymousFixed. Pages within [addr, addr+len) that
+    // are NOT mapped are silently skipped (matches the Linux semantics
+    // where partial mprotect on holes returns -ENOMEM, but our v1 callers
+    // only invoke this against fully-mapped ranges — RELRO enforcement on
+    // the GOT, and eventually JIT page-write tracking).
+    //
+    // Returns the requested addr on success, (U64)-errno on failure (only
+    // failure mode today is addr not page-aligned). Does NOT touch page
+    // data. Used by the loader to honor PT_GNU_RELRO after relocations.
+    U64 mprotect(U64 addr, U64 len, U32 prot);
+
     // Permission query / page state.
     bool isPageMapped(U64 pageNum) const;
     U32  getPageFlags(U64 pageNum) const;
