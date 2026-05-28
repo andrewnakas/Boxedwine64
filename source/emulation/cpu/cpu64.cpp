@@ -3609,6 +3609,88 @@ U32 CPU64::step() {
                 }
                 memory->writed(m.effAddr, (U32)v);
                 if (sub == 3) fpu.FPOP();
+            } else if (op == 0xDB && sub == 7) {
+                // FSTP m80fp — store TOS as 80-bit extended precision, pop.
+                // musl printf promotes double->long double here even when the
+                // user format spec is %f. We synthesize an f80 from our f64
+                // because the fast path's regCache is double-precision; we
+                // accept the precision loss because everything else in the
+                // CPU64 path is f64 anyway. 80-bit layout: 10 bytes LE,
+                // bytes 0..7 = explicit-bit mantissa, bytes 8..9 = sign(15)
+                // | biased exponent(14..0). Normalized doubles map cleanly.
+                double d = fpu.isRegCached[fpu.top]
+                         ? fpu.regCache[fpu.top].d
+                         : fpu.getF64(fpu.top);
+                union { double d; U64 u; } u; u.d = d;
+                U64 sign     = (u.u >> 63) & 0x1;
+                U64 expBiased64 = (u.u >> 52) & 0x7FF;
+                U64 mant52   = u.u & 0xFFFFFFFFFFFFFULL;
+                U64 mant64;
+                U16 expBiased80;
+                if (expBiased64 == 0 && mant52 == 0) {
+                    // ±0
+                    mant64 = 0;
+                    expBiased80 = 0;
+                } else if (expBiased64 == 0x7FF) {
+                    // inf or NaN: exp all-ones, integer bit set
+                    expBiased80 = 0x7FFF;
+                    mant64 = (1ULL << 63) | (mant52 << 11);
+                } else if (expBiased64 == 0) {
+                    // subnormal — promote to f80 normalized form
+                    // find leading 1 in mant52
+                    int shift = 0;
+                    U64 m = mant52;
+                    while (((m >> 51) & 1) == 0 && shift < 52) { m <<= 1; shift++; }
+                    int trueExp = -1022 - shift;
+                    mant64 = (m << 12); // explicit integer bit lands in bit 63
+                    expBiased80 = (U16)(trueExp + 16383);
+                } else {
+                    // normal: set explicit integer bit, shift 52-bit mantissa
+                    // into the top 53 bits of a 64-bit field
+                    mant64 = (1ULL << 63) | (mant52 << 11);
+                    int trueExp = (int)expBiased64 - 1023;
+                    expBiased80 = (U16)(trueExp + 16383);
+                }
+                memory->writeq(m.effAddr, mant64);
+                memory->writew(m.effAddr + 8, (U16)((sign << 15) | (expBiased80 & 0x7FFF)));
+                fpu.FPOP();
+            } else if (op == 0xDB && sub == 5) {
+                // FLD m80fp — load 80-bit extended precision, push as f64.
+                // Inverse of FSTP m80; converts back to double for our cache.
+                U64 mant = memory->readq(m.effAddr);
+                U16 se   = memory->readw(m.effAddr + 8);
+                U64 sign = (se >> 15) & 1;
+                U16 expBiased80 = se & 0x7FFF;
+                double d;
+                if (expBiased80 == 0 && mant == 0) {
+                    d = sign ? -0.0 : 0.0;
+                } else if (expBiased80 == 0x7FFF) {
+                    // inf/NaN — preserve quiet NaN payload coarsely
+                    union { U64 u; double d; } u;
+                    u.u = (sign << 63) | (0x7FFULL << 52)
+                        | ((mant & 0x7FFFFFFFFFFFFFFFULL) >> 11);
+                    d = u.d;
+                } else {
+                    int trueExp = (int)expBiased80 - 16383;
+                    // drop explicit integer bit, take top 52 bits of remaining
+                    U64 mant52 = (mant & 0x7FFFFFFFFFFFFFFFULL) >> 11;
+                    int expBiased64 = trueExp + 1023;
+                    if (expBiased64 >= 0x7FF) {
+                        union { U64 u; double d; } u;
+                        u.u = (sign << 63) | (0x7FFULL << 52);
+                        d = u.d;
+                    } else if (expBiased64 <= 0) {
+                        // subnormal or underflow — flush to ±0 to keep this simple
+                        d = sign ? -0.0 : 0.0;
+                    } else {
+                        union { U64 u; double d; } u;
+                        u.u = (sign << 63) | ((U64)expBiased64 << 52) | mant52;
+                        d = u.d;
+                    }
+                }
+                fpu.PREP_PUSH();
+                union { double d; U64 u; } u2; u2.d = d;
+                fpu.FLD_F64(u2.u, fpu.STV(0));
             } else if (op == 0xDF && sub == 0) {
                 // FILD m16int — load signed 16-bit, push as f64
                 S16 v = (S16)memory->readw(m.effAddr);
@@ -3751,9 +3833,12 @@ U32 CPU64::step() {
                 }
                 fpu.FPOP();
                 fpu.FPOP();
-            } else if ((op == 0xDB || op == 0xDA) && (modrmByte & 0xF8) == 0xF0) {
+            } else if ((op == 0xDB || op == 0xDA) && ((modrmByte & 0xF8) == 0xF0 || (modrmByte & 0xF8) == 0xE8)) {
                 // DB F0+i = FCOMI ST(0), ST(i) — set ZF/PF/CF in rflags.
                 // DA F0+i = FUCOMI — same impl (we don't distinguish QNaN signaling).
+                // DB E8+i = FUCOMI ST(0), ST(i). DA E8+i is reserved/invalid but
+                // we accept it for symmetry; we don't distinguish signaling vs
+                // quiet NaN here.
                 // SDM table: unordered -> ZF=PF=CF=1; equal -> ZF=1, PF=CF=0;
                 // ST(0)<ST(i) -> CF=1; ST(0)>ST(i) -> all zero. Other flags
                 // (OF/SF/AF) are cleared per spec.
