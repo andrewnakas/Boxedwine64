@@ -13,6 +13,16 @@ history under "Milestone D").
   `/lib64/`. Verified false against the existing 32-bit zips
   (TinyCore16, Wine7.0, Wine9.0).
 
+- **UI launcher hook** (D4). New `FsZip::detectGuestIs64(zipFile)`
+  static helper runs the same sniff against the central directory
+  without constructing a full FsZip; `GlobalSettings::lookForFileSystems`
+  calls it for each `.zip` it discovers and sets
+  `FileSystemZip::guestIs64`. The version dropdown
+  (`BaseView::createFileSystemVersionCombobox`) appends a
+  ` (Wine64)` suffix when the flag is set, and
+  `BoxedContainer::isWine64()` exposes the same bit to the launch
+  path. The 32-bit selftest still reports 209/209 PASS on macOS.
+
 ## Blocked on Linux build environment
 
 The remaining D items each require a Linux box with a working x86_64
@@ -70,13 +80,7 @@ macOS, and shipping them sight-unseen would be irresponsible.
    target). Without it, the 64-bit interpreter and `--x64-selftest`
    harness are excluded at compile time.
 
-4. **UI launcher hook** — `source/ui/data/globalSettings.cpp` and
-   `source/ui/controls/installView.cpp` currently auto-pick the
-   32-bit container for any installed Wine zip. Add a branch: if
-   the FsZip's `guestIs64` flag is true, set the container's
-   `is64Bit` flag (and surface a "Wine64" badge in the install
-   view). The detection is already in place (D1); only the consumer
-   side is missing.
+4. ~~**UI launcher hook**~~ — done (see "Done" section above).
 
 ## Exit criterion (per roadmap)
 

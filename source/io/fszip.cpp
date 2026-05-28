@@ -337,6 +337,40 @@ bool FsZip::iterateFiles(BString zipFile, std::function<void(BString)> it) {
     return true;
 }
 
+bool FsZip::detectGuestIs64(BString zipFile) {
+    // Mirrors FsZip::init's layout sniff (see fszip.cpp ~line 99) but stops
+    // at the first hit and avoids constructing a full FsZip / opening every
+    // entry. Used by the UI launcher to badge installed Wine zips before
+    // any container is created.
+    unzFile z = unzOpen(zipFile.c_str());
+    if (!z) {
+        return false;
+    }
+    unz_global_info global_info = {};
+    if (unzGetGlobalInfo(z, &global_info) != UNZ_OK) {
+        unzClose(z);
+        return false;
+    }
+    bool result = false;
+    for (U32 i = 0; i < global_info.number_entry; ++i) {
+        unz_file_info file_info;
+        char tmp[MAX_FILEPATH_LEN];
+        if (unzGetCurrentFileInfo(z, &file_info, tmp, MAX_FILEPATH_LEN, nullptr, 0, nullptr, 0) != UNZ_OK) {
+            break;
+        }
+        if (strstr(tmp, "x86_64-linux-gnu/") != nullptr
+         || strstr(tmp, "x86_64-unix/")      != nullptr
+         || strstr(tmp, "x86_64-windows/")   != nullptr
+         || strstr(tmp, "/lib64/")           != nullptr) {
+            result = true;
+            break;
+        }
+        unzGoToNextFile(z);
+    }
+    unzClose(z);
+    return result;
+}
+
 BString FsZip::unzip(BString zipFile, BString path, std::function<void(U32, BString fileName)> percentDone) {
     unzFile z = unzOpen(zipFile.c_str());
     unz_global_info global_info = {};

@@ -303,6 +303,7 @@ void GlobalSettings::lookForFileSystems(BString path) {
                 }
                 FsZip::readFileFromZip(filepath, B("packages.txt"), packages);
                 std::shared_ptr<FileSystemZip> fs = std::make_shared<FileSystemZip>(name, wineVersion, fsVersion, filepath, B(""), depend);
+                fs->guestIs64 = FsZip::detectGuestIs64(filepath);
                 GlobalSettings::fileSystemVersions.push_back(fs);
                 packages.split("\r\n", fs->tinyCorePackages);
                 if (fs->tinyCorePackages.size()) {

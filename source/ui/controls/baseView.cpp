@@ -132,7 +132,14 @@ std::shared_ptr<LayoutComboboxControl> BaseView::createWindowsVersionCombobox(co
 std::shared_ptr<LayoutComboboxControl> BaseView::createFileSystemVersionCombobox(const std::shared_ptr<LayoutSection>& section) {
     std::vector<ComboboxItem> wineVersions;
     for (auto& ver : GlobalSettings::getFileSystemVersions()) {
-        wineVersions.push_back(ComboboxItem(ver->name));
+        // Surface the rootfs bitness next to the name. The string value
+        // (used for lookups elsewhere) stays as ver->name; only the
+        // displayed label gets the suffix.
+        BString label = ver->name;
+        if (ver->guestIs64) {
+            label = label + B(" (Wine64)");
+        }
+        wineVersions.push_back(ComboboxItem(label, ver->name));
     }
     std::shared_ptr<LayoutComboboxControl> result = section->addComboboxRow(Msg::COMMON_FILESYSTEM_VERSION_LABEL, Msg::COMMON_FILESYSTEM_VERSION_HELP, wineVersions, 0);
     result->setWidth((int)GlobalSettings::scaleFloatUIAndFont(300));

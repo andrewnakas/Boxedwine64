@@ -72,6 +72,13 @@ public:
     static BString unzip(BString zipFile, BString path, std::function<void(U32, BString)> percentDone);
     static bool iterateFiles(BString zipFile, std::function<void(BString)> it);
     static bool doesFileExist(BString zipFile, BString file);
+
+    // Walks a zip's entry names looking for the same x86_64 layout markers
+    // FsZip::init uses (x86_64-linux-gnu/, x86_64-unix/, x86_64-windows/,
+    // /lib64/). Stops at the first hit. Cheap enough to call from the UI
+    // launcher's lookForFileSystems scan because it only reads the central
+    // directory, not entry contents.
+    static bool detectGuestIs64(BString zipFile);
 private:
     BString deleteFilePath;
 };

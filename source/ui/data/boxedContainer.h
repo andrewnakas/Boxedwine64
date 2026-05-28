@@ -46,6 +46,10 @@ public:
     BString getDir() { return this->dirPath; }
     std::weak_ptr<FileSystemZip> getFileSystem() {return this->fileSystem;}
     void setFileSystem(std::shared_ptr<FileSystemZip> fileSystem) { this->fileSystem = fileSystem; this->fileSystemZipName = fileSystem->name; }
+    // True if the bound rootfs zip was detected as an x86_64 layout.
+    // Reads through the weak_ptr each call; returns false if the
+    // filesystem hasn't been resolved yet.
+    bool isWine64() const { auto fs = this->fileSystem.lock(); return fs && fs->guestIs64; }
     BString getFileSystemName();
     BString getSize() {return this->cachedSize;}
 

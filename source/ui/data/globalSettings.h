@@ -89,6 +89,11 @@ public:
     BString tinyCoreBackupURL;
     BString dist;
     U32 size;
+    // True when this zip contains an x86_64 rootfs (set by lookForFileSystems
+    // via FsZip::detectGuestIs64). Surfaced in the version dropdown as a
+    // "(Wine64)" suffix and propagated to BoxedContainer::isWine64 so the
+    // launcher can route 64-bit guests through the cpu64 interpreter.
+    bool guestIs64 = false;
     bool operator<(const FileSystemZip& rhs) const { 
         if (wineMajorVersion && rhs.wineMajorVersion) {
             if (wineMajorVersion != rhs.wineMajorVersion) {
