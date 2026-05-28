@@ -5512,6 +5512,243 @@ int runX64SelfTest() {
         }
     }
 
+    // ---------- A32: end-to-end PLT call through a resolved JUMP_SLOT ----------
+    // This is the "Milestone A done" probe. Every prior linkSharedObjects
+    // test only verified that the GOT slot ended up holding the right
+    // address. Here we go one step further: after linking, we let CPU64
+    // actually JUMP through the GOT slot and execute the callee's body.
+    //
+    // Topology:
+    //   libdiscovery.so exports `discovery_answer`, body = `mov rax, 42; ret`.
+    //   main exe imports `discovery_answer` via R_X86_64_JUMP_SLOT.
+    //   _start does:  mov rax, [rip+got_slot]    ; load resolved fn ptr
+    //                 call rax                    ; execute callee
+    //                 mov r15, rax                ; stash return value
+    //                 mov rax, 60                 ; sys_exit
+    //                 mov rdi, r15                ; exit code = answer
+    //                 syscall
+    //
+    // The PASS condition is: after linking + running, R15 == 42 AND the
+    // CPU yielded cleanly. If JUMP_SLOT resolution wrote a bad address,
+    // we'd decode-fail or page-fault on the call. If the loader didn't
+    // mark the lib's code RX, we'd fault on the indirect call. If
+    // applySymbolRelocations didn't walk the PLT table, the GOT slot
+    // would be zero and the call would jump to NULL.
+    //
+    // Calling this "Milestone A done" because: it exercises every
+    // surviving lane of the A roadmap in one shot — PT_DYNAMIC parse,
+    // DT_NEEDED walk (we use the preloaded fetcher, not the recursive
+    // one, to keep the test hermetic), symbol export, JUMP_SLOT relo,
+    // multi-DSO loading, and the CPU64 interpreter's call-through-GOT
+    // path. The only missing piece from the original "real glibc" exit
+    // criterion is `ld-linux.so.2` itself, which requires a Linux
+    // toolchain to produce (gated by Milestone D's rootfs work).
+    {
+        const U64 MAIN_RELOC = 0x10000000ULL;
+        const U64 LIB_RELOC  = 0x20000000ULL;
+        const U64 STACK_HI   = 0x800000ULL;
+
+        // ----- Library layout -----
+        const U64 L_EHDR  = 0x0000;
+        const U64 L_PHDR  = 0x0040;
+        const U64 L_DYN   = 0x00B0;
+        const U64 L_SYM   = 0x00F0;
+        const U64 L_STR   = 0x0120;
+        const U64 L_CODE  = 0x0140;
+        const U64 L_END   = 0x0148;
+
+        std::vector<U8> libBuf(L_END, 0);
+
+        k_Elf64_Ehdr leh{};
+        leh.e_ident[0]=0x7F; leh.e_ident[1]='E'; leh.e_ident[2]='L'; leh.e_ident[3]='F';
+        leh.e_ident[4]=k_ELFCLASS64; leh.e_ident[5]=1; leh.e_ident[6]=1;
+        leh.e_type     = 3;             // ET_DYN
+        leh.e_machine  = k_EM_X86_64;
+        leh.e_version  = 1;
+        leh.e_entry    = L_CODE;
+        leh.e_phoff    = L_PHDR;
+        leh.e_ehsize   = sizeof(k_Elf64_Ehdr);
+        leh.e_phentsize= sizeof(k_Elf64_Phdr);
+        leh.e_phnum    = 2;
+        memcpy(libBuf.data() + L_EHDR, &leh, sizeof(leh));
+
+        k_Elf64_Phdr lload{};
+        lload.p_type=k_PT_LOAD; lload.p_flags=7; // RWX (X needed for call target)
+        lload.p_offset=0; lload.p_vaddr=0; lload.p_paddr=0;
+        lload.p_filesz=L_END; lload.p_memsz=L_END; lload.p_align=0x1000;
+        memcpy(libBuf.data() + L_PHDR, &lload, sizeof(lload));
+
+        k_Elf64_Phdr ldyn{};
+        ldyn.p_type=k_PT_DYNAMIC; ldyn.p_flags=6;
+        ldyn.p_offset=L_DYN; ldyn.p_vaddr=L_DYN;
+        ldyn.p_filesz=0x40; ldyn.p_memsz=0x40; ldyn.p_align=8;
+        memcpy(libBuf.data() + L_PHDR + sizeof(k_Elf64_Phdr), &ldyn, sizeof(ldyn));
+
+        // SYMTAB BEFORE STRTAB so extractGlobalSymbols's
+        // (strtab > symtab) heuristic bounds the scan correctly.
+        k_Elf64_Sym lsym[2]{};
+        lsym[1].st_name  = 1;          // offset into STRTAB → "discovery_answer"
+        lsym[1].st_info  = 1 << 4;     // STB_GLOBAL
+        lsym[1].st_shndx = 1;          // defined (any non-zero shndx)
+        lsym[1].st_value = L_CODE;
+        memcpy(libBuf.data() + L_SYM, lsym, sizeof(lsym));
+
+        // STRTAB: \0discovery_answer\0  (length 18)
+        const char* lstr = "\0discovery_answer";
+        memcpy(libBuf.data() + L_STR, lstr, 18);
+
+        k_Elf64_Dyn ldyns[4]{};
+        ldyns[0].d_tag=k_DT_SYMTAB; ldyns[0].d_un.d_ptr=L_SYM;
+        ldyns[1].d_tag=k_DT_STRTAB; ldyns[1].d_un.d_ptr=L_STR;
+        ldyns[2].d_tag=k_DT_SYMENT; ldyns[2].d_un.d_val=sizeof(k_Elf64_Sym);
+        ldyns[3].d_tag=k_DT_NULL;   ldyns[3].d_un.d_val=0;
+        memcpy(libBuf.data() + L_DYN, ldyns, sizeof(ldyns));
+
+        // Code: mov rax, 42 ; ret
+        //   48 C7 C0 2A 00 00 00 = mov rax, 0x2A
+        //   C3                    = ret
+        U8 lcode[] = { 0x48, 0xC7, 0xC0, 0x2A, 0x00, 0x00, 0x00, 0xC3 };
+        memcpy(libBuf.data() + L_CODE, lcode, sizeof(lcode));
+
+        // ----- Main exe layout -----
+        const U64 M_EHDR  = 0x0000;
+        const U64 M_PHDR  = 0x0040;
+        const U64 M_DYN   = 0x00B0;
+        const U64 M_SYM   = 0x0120;
+        const U64 M_STR   = 0x0150;
+        const U64 M_JMP   = 0x0180;
+        const U64 M_GOT   = 0x01A0;
+        const U64 M_CODE  = 0x01C0;
+        const U64 M_END   = 0x01E0;
+
+        std::vector<U8> mainBuf(M_END, 0);
+
+        k_Elf64_Ehdr meh{};
+        meh.e_ident[0]=0x7F; meh.e_ident[1]='E'; meh.e_ident[2]='L'; meh.e_ident[3]='F';
+        meh.e_ident[4]=k_ELFCLASS64; meh.e_ident[5]=1; meh.e_ident[6]=1;
+        meh.e_type     = 3;             // ET_DYN (PIE; we apply MAIN_RELOC manually)
+        meh.e_machine  = k_EM_X86_64;
+        meh.e_version  = 1;
+        meh.e_entry    = M_CODE;
+        meh.e_phoff    = M_PHDR;
+        meh.e_ehsize   = sizeof(k_Elf64_Ehdr);
+        meh.e_phentsize= sizeof(k_Elf64_Phdr);
+        meh.e_phnum    = 2;
+        memcpy(mainBuf.data() + M_EHDR, &meh, sizeof(meh));
+
+        k_Elf64_Phdr mload{};
+        mload.p_type=k_PT_LOAD; mload.p_flags=7;
+        mload.p_offset=0; mload.p_vaddr=0; mload.p_paddr=0;
+        mload.p_filesz=M_END; mload.p_memsz=M_END; mload.p_align=0x1000;
+        memcpy(mainBuf.data() + M_PHDR, &mload, sizeof(mload));
+
+        k_Elf64_Phdr mdyn{};
+        mdyn.p_type=k_PT_DYNAMIC; mdyn.p_flags=6;
+        mdyn.p_offset=M_DYN; mdyn.p_vaddr=M_DYN;
+        mdyn.p_filesz=0x70; mdyn.p_memsz=0x70; mdyn.p_align=8;
+        memcpy(mainBuf.data() + M_PHDR + sizeof(k_Elf64_Phdr), &mdyn, sizeof(mdyn));
+
+        // SYMTAB: slot 0 null, slot 1 = `discovery_answer` UNDEF (imported).
+        k_Elf64_Sym msym[2]{};
+        msym[1].st_name  = 17;         // offset into STRTAB → "discovery_answer"
+        msym[1].st_info  = 1 << 4;     // STB_GLOBAL
+        msym[1].st_shndx = 0;          // UNDEF
+        memcpy(mainBuf.data() + M_SYM, msym, sizeof(msym));
+
+        // STRTAB: \0 libdiscovery.so \0 discovery_answer \0
+        // offsets: 0=NUL, 1="libdiscovery.so", 17="discovery_answer"
+        const char* mstr = "\0libdiscovery.so\0discovery_answer";
+        memcpy(mainBuf.data() + M_STR, mstr, 34);
+
+        // JMPREL: one JUMP_SLOT relocation against GOT slot for symbol 1.
+        k_Elf64_Rela mrela{};
+        mrela.r_offset = M_GOT;
+        mrela.r_info   = ((U64)1 << 32) | k_R_X86_64_JUMP_SLOT;
+        mrela.r_addend = 0;
+        memcpy(mainBuf.data() + M_JMP, &mrela, sizeof(mrela));
+
+        // _start at M_CODE.
+        // Compute disp32 for `mov rax, [rip+disp]` (7 bytes: 48 8B 05 d d d d).
+        // After the 7-byte instr, RIP = (M_CODE + MAIN_RELOC) + 7. Target =
+        // (M_GOT + MAIN_RELOC). disp = target - RIP_after = M_GOT - M_CODE - 7.
+        S32 disp = (S32)((S64)M_GOT - (S64)M_CODE - 7);
+        U8 mcode[] = {
+            0x48, 0x8B, 0x05,
+                (U8)(disp & 0xFF),
+                (U8)((disp >> 8) & 0xFF),
+                (U8)((disp >> 16) & 0xFF),
+                (U8)((disp >> 24) & 0xFF),  // mov rax, [rip+disp]  (loads GOT slot)
+            0xFF, 0xD0,                       // call rax            (jump through GOT)
+            0x49, 0x89, 0xC7,                 // mov r15, rax        (stash answer)
+            0x48, 0xC7, 0xC0, 0x3C, 0x00, 0x00, 0x00, // mov rax, 60 (sys_exit)
+            0x4C, 0x89, 0xFF,                 // mov rdi, r15        (exit code = answer)
+            0x0F, 0x05,                       // syscall
+        };
+        memcpy(mainBuf.data() + M_CODE, mcode, sizeof(mcode));
+
+        // DYN: SYMTAB, STRTAB, SYMENT, NEEDED(libdiscovery.so), JMPREL,
+        // PLTRELSZ, PLTREL, NULL = 7 entries (+ NULL terminator above plan).
+        k_Elf64_Dyn mdyns[8]{};
+        mdyns[0].d_tag=k_DT_SYMTAB;   mdyns[0].d_un.d_ptr=M_SYM;
+        mdyns[1].d_tag=k_DT_STRTAB;   mdyns[1].d_un.d_ptr=M_STR;
+        mdyns[2].d_tag=k_DT_SYMENT;   mdyns[2].d_un.d_val=sizeof(k_Elf64_Sym);
+        mdyns[3].d_tag=k_DT_NEEDED;   mdyns[3].d_un.d_val=1;  // strtab offset of "libdiscovery.so"
+        mdyns[4].d_tag=k_DT_JMPREL;   mdyns[4].d_un.d_ptr=M_JMP;
+        mdyns[5].d_tag=k_DT_PLTRELSZ; mdyns[5].d_un.d_val=sizeof(k_Elf64_Rela);
+        mdyns[6].d_tag=k_DT_PLTREL;   mdyns[6].d_un.d_val=7;  // DT_RELA
+        mdyns[7].d_tag=k_DT_NULL;     mdyns[7].d_un.d_val=0;
+        memcpy(mainBuf.data() + M_DYN, mdyns, sizeof(mdyns));
+
+        // ----- Load, link, run -----
+        KMemory64 mem(nullptr);
+        mem.mmapAnonymousFixed(MAIN_RELOC, 0x2000, 7);
+        mem.mmapAnonymousFixed(LIB_RELOC,  0x2000, 7);
+        mem.mmapAnonymousFixed(STACK_HI - 0x1000, 0x1000, 3);
+
+        Elf64ParseResult mainParsed = ElfLoader64::parseBuffer(mainBuf.data(), mainBuf.size());
+        bool mapOk = mainParsed.ok &&
+                     ElfLoader64::mapSegmentsFromBuffer(
+                         &mem, mainParsed, mainBuf.data(), mainBuf.size(),
+                         MAIN_RELOC, "a32-main");
+
+        std::vector<ElfLoader64::PreloadedLibrary> preloaded = {
+            { "libdiscovery.so", libBuf.data(), (U64)libBuf.size(), LIB_RELOC }
+        };
+        std::vector<ElfLoader64::LinkedLibrary> outLibs;
+        U64 nLinked = mapOk
+            ? ElfLoader64::linkSharedObjects(&mem, mainParsed, MAIN_RELOC,
+                                             preloaded, 0, &outLibs)
+            : 0;
+
+        // Spot-check: GOT slot must now point at libdiscovery's discovery_answer.
+        U64 gotValue = mem.readq(M_GOT + MAIN_RELOC);
+        U64 expectedFn = LIB_RELOC + L_CODE;
+
+        CPU64 cpu(&mem);
+        cpu.rip = M_CODE + MAIN_RELOC;
+        cpu.reg[X64_RSP].setU64(STACK_HI - 16);
+        cpu.runBounded(2000);
+
+        bool linkedOk = mapOk && nLinked == 1 && gotValue == expectedFn;
+        bool ranOk    = cpu.yield && cpu.reg[X64_R15].u64 == 42;
+        if (linkedOk && ranOk) {
+            printf("  PASS: end-to-end PLT call — main called discovery_answer "
+                   "through resolved JUMP_SLOT and got 42 (Milestone A)\n");
+            r.passed++;
+        } else {
+            printf("  FAIL: A32 end-to-end (mapOk=%d nLinked=%llu got=0x%llx "
+                   "expFn=0x%llx yield=%d R15=%llu RIP=0x%llx)\n",
+                   mapOk, (unsigned long long)nLinked,
+                   (unsigned long long)gotValue,
+                   (unsigned long long)expectedFn,
+                   cpu.yield,
+                   (unsigned long long)cpu.reg[X64_R15].u64,
+                   (unsigned long long)cpu.rip);
+            r.failed++;
+        }
+        fflush(stdout);
+    }
+
     printf("=== self-test summary: %d passed, %d failed ===\n\n", r.passed, r.failed);
     return r.failed == 0 ? 0 : 1;
 }
