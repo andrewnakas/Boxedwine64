@@ -903,6 +903,40 @@ bool ElfLoader64::loadProgram(KThread* thread, FsOpenNode* openNode, U64* rip) {
     klog_fmt("loadProgram64: stack built, RSP=0x%llx argc=%u envc=%u auxc=%u",
              (unsigned long long)sp, (U32)argv.size(), (U32)envp.size(), (U32)aux.size());
 
+    // -------------------------------------------------------------------
+    // Install the initial-thread TLS block.
+    //
+    // setupStaticTls already exists (and is unit-tested) but until now the
+    // loader only *parsed* PT_TLS — the block was never created and the
+    // CPU's FS base stayed 0. That meant any ld-linux that touches its
+    // FS-relative errno slot (which it does almost immediately after rseq
+    // init) read random memory at offset zero.
+    //
+    // Place the TLS block in the gap between stack-top-minus-8MB and the
+    // interpreter at 0x7FFFF7FCE000 — 1 MB at 0x7FFFF7800000 is well clear
+    // of both. Skip this step when no PT_TLS segment is present (static
+    // hello-world ELFs don't have one).
+    // -------------------------------------------------------------------
+    U64 fsBaseToSet = 0;
+    if (r.tls.present && r.tls.memsz) {
+        const U64 TLS_BLOCK_BASE = 0x7FFFF7800000ULL;
+        const U64 TLS_BLOCK_SIZE = 0x100000ULL; // 1 MiB — far more than enough
+        U64 tlsMapped = mem->mmapAnonymousFixed(TLS_BLOCK_BASE, TLS_BLOCK_SIZE,
+                                                K_PROT_READ | K_PROT_WRITE);
+        if (tlsMapped != TLS_BLOCK_BASE) {
+            klog_fmt("loadProgram64: TLS block mmap failed (got 0x%llx)",
+                     (unsigned long long)tlsMapped);
+            return false;
+        }
+        // PT_TLS image lives at r.tls.vaddr in the exe — adjust for the PIE
+        // relocation offset, since the segment was loaded at vaddr+reloc.
+        U64 imageBase = r.tls.vaddr + reloc;
+        fsBaseToSet = setupStaticTls(mem, r.tls, imageBase, TLS_BLOCK_BASE);
+        klog_fmt("loadProgram64: PT_TLS installed at 0x%llx, fsBase=0x%llx",
+                 (unsigned long long)TLS_BLOCK_BASE,
+                 (unsigned long long)fsBaseToSet);
+    }
+
     // Create the CPU64 and seed RIP/RSP. The thread's eip field stays at 0
     // because ELF64 processes don't use the 32-bit CPU — the schedule path
     // (when we add it) must branch on KProcess::is64Bit to pick which
@@ -918,6 +952,9 @@ bool ElfLoader64::loadProgram(KThread* thread, FsOpenNode* openNode, U64* rip) {
     // System V calls _start with RDX = pointer to a function to register
     // with atexit, or 0 if none. Linux passes 0.
     process->cpu64->reg[X64_RDX].setU64(0);
+    if (fsBaseToSet) {
+        process->cpu64->fsbase = fsBaseToSet;
+    }
 
     return true;
 }

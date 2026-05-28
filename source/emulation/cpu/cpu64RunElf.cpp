@@ -297,11 +297,33 @@ extern "C" int runX64RunElf(const char* path) {
     U64 sp = buildSysVStack(&mem, STACK_TOP, parsed, reloc, /*interpBase=*/0,
                             path ? path : "/boxedwine/embedded");
 
+    // Install initial-thread TLS block when the binary has a PT_TLS phdr.
+    // Mirrors loadProgram64 so on-disk probes that exercise FS-relative
+    // accesses see the same setup a real-loader-launched program would.
+    U64 fsBaseToSet = 0;
+    if (parsed.tls.present && parsed.tls.memsz) {
+        const U64 TLS_BLOCK_BASE = 0x7FFFF7800000ULL;
+        const U64 TLS_BLOCK_SIZE = 0x100000ULL;
+        U64 mapped = mem.mmapAnonymousFixed(TLS_BLOCK_BASE, TLS_BLOCK_SIZE, 3);
+        if (mapped == TLS_BLOCK_BASE) {
+            U64 imageBase = parsed.tls.vaddr + reloc;
+            fsBaseToSet = ElfLoader64::setupStaticTls(
+                &mem, parsed.tls, imageBase, TLS_BLOCK_BASE);
+            printf("--x64-run-elf: PT_TLS installed at 0x%llx, fsBase=0x%llx\n",
+                   (unsigned long long)TLS_BLOCK_BASE,
+                   (unsigned long long)fsBaseToSet);
+        } else {
+            printf("--x64-run-elf: PT_TLS block mmap failed (got 0x%llx)\n",
+                   (unsigned long long)mapped);
+        }
+    }
+
     CPU64 cpu(&mem);
     cpu.rip = parsed.entry + reloc;
     cpu.reg[X64_RSP].setU64(sp);
     // SysV ABI: RDX at entry holds atexit-callback pointer or 0.
     cpu.reg[X64_RDX].setU64(0);
+    if (fsBaseToSet) cpu.fsbase = fsBaseToSet;
 
     // Bounded run. 4M instructions is way more than the embedded payload
     // needs (it's ~7 instructions) but plenty of headroom for a real

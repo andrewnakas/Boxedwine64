@@ -78,6 +78,7 @@ run_one repMovsb       "$ROOT/tools/buildRepMovsbElf64.py"     13         || fai
 run_one shiftBranch    "$ROOT/tools/buildShiftBranchElf64.py"  80         || fail=$((fail+1))
 run_one arraySum       "$ROOT/tools/buildArraySumElf64.py"     36         || fail=$((fail+1))
 run_one indirectCall   "$ROOT/tools/buildIndirectCallElf64.py" 119        || fail=$((fail+1))
+run_one tlsImage       "$ROOT/tools/buildTlsImageElf64.py"     171        || fail=$((fail+1))
 
-echo "=== summary: $((13 - fail))/13 passed ==="
+echo "=== summary: $((14 - fail))/14 passed ==="
 exit $fail
