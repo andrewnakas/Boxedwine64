@@ -569,9 +569,22 @@ U32 CPU64::step() {
         return used;
     }
 
+    // MOV r/m8, imm8 (C6 /0). Discovered via real musl-static hello: the
+    // x86_64-linux-musl startup sets a static byte flag (often
+    // __environ_locked or a TLS-init guard) with this exact encoding.
+    if (op == 0xC6) {
+        ModRM m = decodeModRM(rip + opOff + 1, p, 1);
+        if ((m.regField & 0x7) == 0) {
+            U8 imm = fetchByte(rip + opOff + 1 + m.length);
+            storeRM(m, 1, imm, rexPresent);
+            U32 used = opOff + 1 + m.length + 1;
+            rip += used;
+            return used;
+        }
+    }
+
     // MOV r/m, imm  (C7 /0). imm is imm32 sign-extended for 64-bit, or
-    // imm32 zero-extended for 32-bit, or imm16 for 16-bit. (We don't
-    // support C6 /0 imm8 here yet — symmetric add if needed.)
+    // imm32 zero-extended for 32-bit, or imm16 for 16-bit.
     if (op == 0xC7) {
         ModRM m = decodeModRM(rip + opOff + 1, p, opSize == 2 ? 2 : 4);
         // /0 is the only defined sub-op for C7; any other reg field falls
