@@ -4232,6 +4232,167 @@ int runX64SelfTest() {
         });
     }
 
+    // ----- rt_sigreturn frame restore (Milestone B2) -----
+    //
+    // Hand-build a ucontext_t at a known stack address whose saved gprs are
+    // recognisable sentinels, saved RIP points into our same code buffer at
+    // a "landing pad" that copies a restored register into R15 then exits,
+    // and saved RAX is a known marker. Then we set RSP to point at that
+    // ucontext_t and invoke rt_sigreturn (15). The restore writes our
+    // sentinels into the live regs; the landing-pad code observes one of
+    // them and exits with the verifier checking R15.
+    //
+    // gregs[] indices into ucontext_t (mctx starts at +40):
+    //   8=RDI 12=RDX 13=RAX 16=RIP 17=EFL
+    //
+    // Layout we write at FRAME_BASE (must be 8-aligned, lives on the
+    // pre-mapped stack page):
+    //   FRAME_BASE + 0       : siginfo+header pad (zeroed; we don't touch)
+    //   FRAME_BASE + 136     : ucontext_t starts here  (this is what RSP
+    //                          must point at when rt_sigreturn fires)
+    //   uctx + 40            : gregs[0..22]
+    //   uctx + 296           : sigmask
+    //
+    // We set RBX=sentinel via gregs[X64_GREG_RBX]=0xCAFEBABE12345678 and
+    // expect that after sigreturn returns, the landing-pad sees the
+    // restored RBX and moves it to R15.
+    {
+        // Landing pad bytes: mov r15, rbx; mov rax,60; syscall (exit)
+        // 0x4C 0x89 0xDF                  ; mov r15, rbx
+        // 0x48 0xC7 0xC0 0x3C 0x00 0x00 0x00  ; mov rax, 60
+        // 0x0F 0x05                       ; syscall
+        // Total: 12 bytes for the landing pad.
+        // We place the landing pad at CODE_BASE+0x100 (well past the
+        // prologue's ~160 bytes of writeq_imm sequences) so we know its
+        // absolute address up front.
+        const U64 LANDING_PAD = CODE_BASE + 0x100;
+        const U64 FRAME_BASE  = STACK_TOP - 0x1000 + 0x100; // inside RW stack page
+        const U64 UCTX_BASE   = FRAME_BASE + 136;
+        const U64 GREGS_BASE  = UCTX_BASE + 40;
+
+        // Helper to emit "mov qword [imm64-addr], rax" via [rip+disp] is messy.
+        // Instead use absolute addressing through R10 (we own it freely here).
+        // Pattern per slot:
+        //   mov rax, value64                ; 10 bytes (0x48,0xB8,...)
+        //   mov r10, addr64                 ; 10 bytes (0x49,0xBA,...)
+        //   mov [r10], rax                  ; 3 bytes  (0x49,0x89,0x02)
+        auto writeq_imm = [](std::vector<U8>& buf, U64 addr, U64 value) {
+            buf.push_back(0x48); buf.push_back(0xB8);
+            for (int i = 0; i < 8; i++) buf.push_back((U8)(value >> (8*i)));
+            buf.push_back(0x49); buf.push_back(0xBA);
+            for (int i = 0; i < 8; i++) buf.push_back((U8)(addr  >> (8*i)));
+            buf.push_back(0x49); buf.push_back(0x89); buf.push_back(0x02);
+        };
+
+        std::vector<U8> code;
+        // Sentinel values we'll place in the frame:
+        const U64 sRBX = 0xCAFEBABE12345678ULL;
+        const U64 sRDI = 0x1111111111111111ULL;
+        const U64 sRIP = LANDING_PAD;
+        const U64 sRAX = 0xDEADC0DEDEADC0DEULL; // becomes syscall return → into RAX
+
+        // Frame setup: write the gregs slots we care about (others stay 0
+        // from the stack-page zero-init since we mmap'd anon RW).
+        writeq_imm(code, GREGS_BASE + 8 * 11 /*RBX*/,  sRBX);
+        writeq_imm(code, GREGS_BASE + 8 * 8  /*RDI*/,  sRDI);
+        writeq_imm(code, GREGS_BASE + 8 * 15 /*RSP*/,  STACK_TOP - 32); // restored SP
+        writeq_imm(code, GREGS_BASE + 8 * 16 /*RIP*/,  sRIP);
+        writeq_imm(code, GREGS_BASE + 8 * 17 /*EFL*/,  0x202);
+        writeq_imm(code, GREGS_BASE + 8 * 13 /*RAX*/,  sRAX);
+
+        // Now: set RSP = UCTX_BASE, then `mov rax, 15; syscall` (rt_sigreturn).
+        // mov rsp, imm64 has no 1-instruction form; use mov r11, imm64; mov rsp, r11.
+        code.push_back(0x49); code.push_back(0xBB);
+        for (int i = 0; i < 8; i++) code.push_back((U8)(UCTX_BASE >> (8*i)));
+        code.push_back(0x4C); code.push_back(0x89); code.push_back(0xDC); // mov rsp, r11
+
+        // syscall rt_sigreturn
+        code.push_back(0x48); code.push_back(0xC7); code.push_back(0xC0);
+        code.push_back(15); code.push_back(0x00); code.push_back(0x00); code.push_back(0x00);
+        code.push_back(0x0F); code.push_back(0x05);
+
+        // Pad up to LANDING_PAD (CODE_BASE+0x100) with NOPs, then emit the pad.
+        size_t prologueLen = code.size();
+        if (prologueLen > 0x100) {
+            // If this happens, increase LANDING_PAD or shrink prologue.
+            printf("  FAIL: rt_sigreturn test prologue (%zu bytes) > 0x100\n", prologueLen);
+            r.failed++;
+        } else {
+            while (code.size() < 0x100) code.push_back(0x90);
+            // landing pad
+            code.push_back(0x49); code.push_back(0x89); code.push_back(0xDF); // mov r15, rbx
+            code.push_back(0x48); code.push_back(0xC7); code.push_back(0xC0);
+            code.push_back(0x3C); code.push_back(0x00); code.push_back(0x00); code.push_back(0x00);
+            code.push_back(0x0F); code.push_back(0x05);
+
+            // Note: do NOT withExit; we provide our own exit in the landing pad.
+            runAndCheck(r, "rt_sigreturn restores gprs from frame", code,
+                [sRBX](CPU64& c) {
+                    // R15 must hold the restored RBX sentinel.
+                    return c.reg[X64_R15].u64 == sRBX;
+                });
+        }
+    }
+
+    // T: rt_sigreturn also restores RAX to the saved-RAX, not to the syscall
+    // return value. We exit with rax=60 inside the landing pad — the dispatch
+    // already wrote savedRax into rax before the landing pad ran, but the
+    // landing pad immediately overwrites rax. So this test is identical in
+    // shape to the previous one but additionally checks RFLAGS restore.
+    // For RFLAGS: save 0x246 (IF | PF | ZF) and verify ZF is set post-restore
+    // by branching on it before exit.
+    {
+        const U64 LANDING_PAD = CODE_BASE + 0x80;
+        const U64 FRAME_BASE  = STACK_TOP - 0x1000 + 0x200;
+        const U64 UCTX_BASE   = FRAME_BASE + 136;
+        const U64 GREGS_BASE  = UCTX_BASE + 40;
+
+        auto writeq_imm = [](std::vector<U8>& buf, U64 addr, U64 value) {
+            buf.push_back(0x48); buf.push_back(0xB8);
+            for (int i = 0; i < 8; i++) buf.push_back((U8)(value >> (8*i)));
+            buf.push_back(0x49); buf.push_back(0xBA);
+            for (int i = 0; i < 8; i++) buf.push_back((U8)(addr  >> (8*i)));
+            buf.push_back(0x49); buf.push_back(0x89); buf.push_back(0x02);
+        };
+
+        std::vector<U8> code;
+        // Place a known canary in RBX via the frame; landing pad re-uses it.
+        writeq_imm(code, GREGS_BASE + 8 * 11 /*RBX*/, 0x33);
+        writeq_imm(code, GREGS_BASE + 8 * 15 /*RSP*/, STACK_TOP - 32);
+        writeq_imm(code, GREGS_BASE + 8 * 16 /*RIP*/, LANDING_PAD);
+        // EFL = ZF (0x40) | IF (0x200) | reserved bit 1 (0x2) = 0x242
+        writeq_imm(code, GREGS_BASE + 8 * 17 /*EFL*/, 0x242);
+
+        code.push_back(0x49); code.push_back(0xBB);
+        for (int i = 0; i < 8; i++) code.push_back((U8)(UCTX_BASE >> (8*i)));
+        code.push_back(0x4C); code.push_back(0x89); code.push_back(0xDC);
+        code.push_back(0x48); code.push_back(0xC7); code.push_back(0xC0);
+        code.push_back(15); code.push_back(0x00); code.push_back(0x00); code.push_back(0x00);
+        code.push_back(0x0F); code.push_back(0x05);
+
+        if (code.size() > 0x80) {
+            printf("  FAIL: rt_sigreturn RFLAGS test prologue overflow\n");
+            r.failed++;
+        } else {
+            while (code.size() < 0x80) code.push_back(0x90);
+            // Landing pad: branch on ZF. If ZF set (as restored), set r15=0xA5.
+            // Otherwise r15 stays 0. Then exit.
+            //   74 03            jz +3 (skip the "xor rbx,rbx" no-op? no — jump over a r15-clobber)
+            // Simpler: use SETZ (0F 94 c0) on AL, mov r15, rax.
+            code.push_back(0x0F); code.push_back(0x94); code.push_back(0xC0); // setz al
+            code.push_back(0x48); code.push_back(0x0F); code.push_back(0xB6); code.push_back(0xC0); // movzx rax, al
+            code.push_back(0x49); code.push_back(0x89); code.push_back(0xC7); // mov r15, rax
+            code.push_back(0x48); code.push_back(0xC7); code.push_back(0xC0);
+            code.push_back(0x3C); code.push_back(0x00); code.push_back(0x00); code.push_back(0x00);
+            code.push_back(0x0F); code.push_back(0x05);
+
+            runAndCheck(r, "rt_sigreturn restores RFLAGS (ZF preserved)", code,
+                [](CPU64& c) {
+                    return c.reg[X64_R15].u64 == 1; // SETZ produced 1
+                });
+        }
+    }
+
     // ----- sched_getaffinity / sched_setaffinity (Milestone B2) -----
 
     // T: sched_getaffinity(0, 8, [rsp]) returns 8 and mask[0]=1.
