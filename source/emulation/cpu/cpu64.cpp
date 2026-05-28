@@ -2041,6 +2041,55 @@ U32 CPU64::step() {
             rip += used;
             return used;
         }
+        // PSHUFLW xmm, xmm/m128, imm8 — F2 0F 70 /r ib. Shuffles the four
+        // low words (lo qword) per imm8; copies hi qword through unchanged.
+        // PSHUFHW xmm, xmm/m128, imm8 — F3 0F 70 /r ib. Same but for hi.
+        // Discovered in musl strchr/strlen path — the byte-search uses
+        // PSHUFLW to broadcast a search byte across the low half of an XMM
+        // register before a 16-byte PCMPEQB.
+        if (op2 == 0x70 && (p.rep == 0xF2 || p.rep == 0xF3)) {
+            ModRM m = decodeModRM(rip + opOff + 2, p, 1);
+            U64 srcLo, srcHi;
+            if (m.isReg) {
+                srcLo = xmm[m.rmIndex].lo;
+                srcHi = xmm[m.rmIndex].hi;
+            } else {
+                srcLo = memory->readq(m.effAddr);
+                srcHi = memory->readq(m.effAddr + 8);
+            }
+            U8 imm = fetchByte(rip + opOff + 2 + m.length);
+            if (p.rep == 0xF2) {
+                // PSHUFLW: shuffle low 4 words from srcLo by imm; hi passes through.
+                U16 w[4] = {
+                    (U16)(srcLo & 0xFFFF),
+                    (U16)((srcLo >> 16) & 0xFFFF),
+                    (U16)((srcLo >> 32) & 0xFFFF),
+                    (U16)((srcLo >> 48) & 0xFFFF)
+                };
+                U16 out[4];
+                for (int i = 0; i < 4; i++) out[i] = w[(imm >> (i * 2)) & 0x3];
+                xmm[m.regField].lo = (U64)out[0] | ((U64)out[1] << 16)
+                                   | ((U64)out[2] << 32) | ((U64)out[3] << 48);
+                xmm[m.regField].hi = srcHi;
+            } else {
+                // PSHUFHW: shuffle high 4 words from srcHi by imm; lo passes through.
+                U16 w[4] = {
+                    (U16)(srcHi & 0xFFFF),
+                    (U16)((srcHi >> 16) & 0xFFFF),
+                    (U16)((srcHi >> 32) & 0xFFFF),
+                    (U16)((srcHi >> 48) & 0xFFFF)
+                };
+                U16 out[4];
+                for (int i = 0; i < 4; i++) out[i] = w[(imm >> (i * 2)) & 0x3];
+                xmm[m.regField].lo = srcLo;
+                xmm[m.regField].hi = (U64)out[0] | ((U64)out[1] << 16)
+                                   | ((U64)out[2] << 32) | ((U64)out[3] << 48);
+            }
+            U32 used = opOff + 2 + m.length + 1;
+            rip += used;
+            return used;
+        }
+
         // PSHUFD xmm, xmm/m128, imm8 — 66 0F 70 /r ib.
         // imm8 picks four 2-bit indices selecting which source dword goes to
         // each destination dword position. Common forms: imm=0 (broadcast
