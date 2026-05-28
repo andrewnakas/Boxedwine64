@@ -53,6 +53,15 @@ public:
     U64 lastZipOffset = 0xFFFFFFFFFFFFFFFFl;
     U64 lastZipFileOffset = 0;
 
+    // Set by init() when the zip layout indicates an x86_64-linux/wine64
+    // rootfs: presence of any of `x86_64-linux-gnu/`, `wine/x86_64-unix/`,
+    // `wine/x86_64-windows/`, or `/lib64/` in any entry path. Consumed by
+    // KProcess::is64Bit selection at exec time (wiring lives in the
+    // launcher; see ui/data/boxedContainer.cpp and the loader dispatch
+    // in source/kernel/loader/loader.cpp). v1 detection only; the actual
+    // exec routing landed alongside Milestone D rootfs work.
+    bool guestIs64 = false;
+
     BOXEDWINE_MUTEX readMutex;
 
     void setupZipRead(U64 zipOffset, U64 zipFileOffset);

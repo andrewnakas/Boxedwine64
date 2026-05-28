@@ -27,7 +27,8 @@ extern "C"
 #include "fsfilenode.h"
 #include "fszip.h"
 #include "fszipnode.h"
-#include <time.h> 
+#include <time.h>
+#include <string.h>
 
 void FsZip::setupZipRead(U64 zipOffset, U64 zipFileOffset) {
 #ifdef BOXEDWINE_ZLIB    
@@ -89,6 +90,29 @@ bool FsZip::init(BString zipPath, BString mount) {
             zipInfo[i].filename = BString::copy(tmp);
             zipInfo[i].offset = unzGetOffset64(this->zipfile);
             Fs::remoteNameToLocal(zipInfo[i].filename); // converts special characters like :
+
+            // Layout sniff: a single x86_64 path anywhere in the archive
+            // flips guestIs64. We don't `break` because (a) we still need to
+            // process every entry, and (b) seeing the marker repeatedly is
+            // harmless. Patterns we look for (in priority order — all are
+            // strong signals):
+            //   - "x86_64-linux-gnu/"     glibc multiarch dir
+            //   - "x86_64-unix/"          Wine64's unix-side modules
+            //   - "x86_64-windows/"       Wine64's PE-side modules
+            //   - "lib64/"                generic 64-bit libdir
+            // 32-bit-only zips contain `i386-linux-gnu/`, `i386-unix/`,
+            // `i386-windows/`, and `lib/i386-*` paths but never any of the
+            // markers above — so this check has no false positives against
+            // existing TinyCore16 / Wine7.0 / Wine9.0 32-bit rootfs zips.
+            if (!guestIs64) {
+                const char* fn = zipInfo[i].filename.c_str();
+                if (strstr(fn, "x86_64-linux-gnu/") != nullptr
+                 || strstr(fn, "x86_64-unix/")      != nullptr
+                 || strstr(fn, "x86_64-windows/")   != nullptr
+                 || strstr(fn, "/lib64/")           != nullptr) {
+                    guestIs64 = true;
+                }
+            }
 
             if (zipInfo[i].filename.endsWith("/")) {
                 zipInfo[i].filename = zipInfo[i].filename.substr(0, zipInfo[i].filename.length() - 1);
