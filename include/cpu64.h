@@ -14,6 +14,7 @@
 
 #include "reg64.h"
 #include "../source/emulation/cpu/common/fpu.h"
+#include <unordered_map>
 
 class KThread;
 class KMemory64;
@@ -92,6 +93,17 @@ public:
         U64 ssSize = 0;
     };
     SigAltStack sigAltStack;
+
+    // Futex bookkeeping. Maps the guest U64 address of a futex word to the
+    // number of waiters parked on it. In a single-threaded world we never
+    // *block* — but the count lets WAKE return a non-zero answer when a
+    // previous WAIT-blocked entry would have parked, which is what glibc's
+    // condvar implementation compares against to decide whether to spin.
+    //
+    // We keep the map per-CPU64 (i.e. per-process here, since CPU64 is
+    // one-per-process for v1). When real KThread64 lands, the right home
+    // is on KProcess64, but the storage shape stays identical.
+    std::unordered_map<U64, U32> futexWaiters;
 
     KThread*   thread = nullptr;
     KMemory64* memory = nullptr;

@@ -2891,6 +2891,111 @@ int runX64SelfTest() {
         });
     }
 
+    // Real waiter-count: do two WAIT-on-match (each parks one would-be waiter
+    // in cpu->futexWaiters[uaddr]), then WAKE with val=10 — must drain 2.
+    // This is the Milestone B1 contract that distinguishes real bookkeeping
+    // from the old "always 0" stub.
+    {
+        U64 dst = STACK_TOP - 0x808;
+        std::vector<U8> code = {
+            // *uaddr = 7
+            0x48, 0xBF,
+                (U8)(dst), (U8)(dst >> 8), (U8)(dst >> 16), (U8)(dst >> 24),
+                (U8)(dst >> 32), (U8)(dst >> 40), (U8)(dst >> 48), (U8)(dst >> 56),
+            0xC7, 0x07, 0x07, 0x00, 0x00, 0x00,
+            // First FUTEX_WAIT (op=0x80) with val=7 → matches → bump waiter to 1
+            0x48, 0xC7, 0xC0, 0xCA, 0x00, 0x00, 0x00,                     // mov rax, 202
+            0x48, 0xC7, 0xC6, 0x80, 0x00, 0x00, 0x00,                     // mov rsi, WAIT_PRIVATE
+            0x48, 0xC7, 0xC2, 0x07, 0x00, 0x00, 0x00,                     // mov rdx, 7
+            0x4D, 0x31, 0xD2,                                             // xor r10, r10
+            0x0F, 0x05,
+            // Second FUTEX_WAIT (same addr) → waiter count → 2
+            0x48, 0xC7, 0xC0, 0xCA, 0x00, 0x00, 0x00,
+            0x48, 0xC7, 0xC6, 0x80, 0x00, 0x00, 0x00,
+            0x48, 0xC7, 0xC2, 0x07, 0x00, 0x00, 0x00,
+            0x4D, 0x31, 0xD2,
+            0x0F, 0x05,
+            // FUTEX_WAKE (op=0x81) val=10 → must return 2 (drained both)
+            0x48, 0xC7, 0xC0, 0xCA, 0x00, 0x00, 0x00,
+            0x48, 0xC7, 0xC6, 0x81, 0x00, 0x00, 0x00,                     // mov rsi, WAKE_PRIVATE
+            0x48, 0xC7, 0xC2, 0x0A, 0x00, 0x00, 0x00,                     // mov rdx, 10
+            0x0F, 0x05,
+        };
+        runAndCheck(r, "futex WAKE drains accumulated waiters", withExit(code), [](CPU64& c) {
+            return c.reg[X64_R15].u64 == 2;
+        });
+    }
+
+    // Per-address isolation: WAIT on addr A then WAKE on addr B must NOT
+    // consume A's waiter. Verifies the futexWaiters map is actually keyed.
+    {
+        U64 dstA = STACK_TOP - 0x810;
+        U64 dstB = STACK_TOP - 0x820;
+        std::vector<U8> code = {
+            // *dstA = 5
+            0x48, 0xBF,
+                (U8)(dstA), (U8)(dstA >> 8), (U8)(dstA >> 16), (U8)(dstA >> 24),
+                (U8)(dstA >> 32), (U8)(dstA >> 40), (U8)(dstA >> 48), (U8)(dstA >> 56),
+            0xC7, 0x07, 0x05, 0x00, 0x00, 0x00,
+            // WAIT on dstA, val=5 → bumps waiter[dstA]=1
+            0x48, 0xC7, 0xC0, 0xCA, 0x00, 0x00, 0x00,
+            0x48, 0xC7, 0xC6, 0x80, 0x00, 0x00, 0x00,
+            0x48, 0xC7, 0xC2, 0x05, 0x00, 0x00, 0x00,
+            0x4D, 0x31, 0xD2,
+            0x0F, 0x05,
+            // WAKE on dstB, val=10 → no waiter on dstB → returns 0
+            0x48, 0xC7, 0xC0, 0xCA, 0x00, 0x00, 0x00,
+            0x48, 0xBF,
+                (U8)(dstB), (U8)(dstB >> 8), (U8)(dstB >> 16), (U8)(dstB >> 24),
+                (U8)(dstB >> 32), (U8)(dstB >> 40), (U8)(dstB >> 48), (U8)(dstB >> 56),
+            0x48, 0xC7, 0xC6, 0x81, 0x00, 0x00, 0x00,
+            0x48, 0xC7, 0xC2, 0x0A, 0x00, 0x00, 0x00,
+            0x0F, 0x05,
+        };
+        runAndCheck(r, "futex WAKE addr-keyed (no cross-addr drain)", withExit(code), [](CPU64& c) {
+            return c.reg[X64_R15].u64 == 0;
+        });
+    }
+
+    // Partial drain: stack two WAITs then WAKE with val=1 → returns 1, leaves 1.
+    // Then a second WAKE drains the remainder.
+    {
+        U64 dst = STACK_TOP - 0x830;
+        std::vector<U8> code = {
+            // *uaddr = 3
+            0x48, 0xBF,
+                (U8)(dst), (U8)(dst >> 8), (U8)(dst >> 16), (U8)(dst >> 24),
+                (U8)(dst >> 32), (U8)(dst >> 40), (U8)(dst >> 48), (U8)(dst >> 56),
+            0xC7, 0x07, 0x03, 0x00, 0x00, 0x00,
+            // Two WAIT-match calls → waiters=2
+            0x48, 0xC7, 0xC0, 0xCA, 0x00, 0x00, 0x00,
+            0x48, 0xC7, 0xC6, 0x80, 0x00, 0x00, 0x00,
+            0x48, 0xC7, 0xC2, 0x03, 0x00, 0x00, 0x00,
+            0x4D, 0x31, 0xD2,
+            0x0F, 0x05,
+            0x48, 0xC7, 0xC0, 0xCA, 0x00, 0x00, 0x00,
+            0x48, 0xC7, 0xC6, 0x80, 0x00, 0x00, 0x00,
+            0x48, 0xC7, 0xC2, 0x03, 0x00, 0x00, 0x00,
+            0x4D, 0x31, 0xD2,
+            0x0F, 0x05,
+            // WAKE val=1 → returns 1, leaves 1 parked. Result goes to RBX.
+            0x48, 0xC7, 0xC0, 0xCA, 0x00, 0x00, 0x00,
+            0x48, 0xC7, 0xC6, 0x81, 0x00, 0x00, 0x00,
+            0x48, 0xC7, 0xC2, 0x01, 0x00, 0x00, 0x00,
+            0x0F, 0x05,
+            0x48, 0x89, 0xC3,                                             // mov rbx, rax
+            // WAKE val=10 → returns 1 (drains the 1 remaining). Add to rbx.
+            0x48, 0xC7, 0xC0, 0xCA, 0x00, 0x00, 0x00,
+            0x48, 0xC7, 0xC6, 0x81, 0x00, 0x00, 0x00,
+            0x48, 0xC7, 0xC2, 0x0A, 0x00, 0x00, 0x00,
+            0x0F, 0x05,
+            0x48, 0x01, 0xD8,                                             // add rax, rbx → rax = 2
+        };
+        runAndCheck(r, "futex WAKE partial drain (val=1, then val=10)", withExit(code), [](CPU64& c) {
+            return c.reg[X64_R15].u64 == 2;
+        });
+    }
+
     // FUTEX_REQUEUE (op=3) — should return 0 (no waiters to move).
     {
         U64 dst = STACK_TOP - 0x800;
