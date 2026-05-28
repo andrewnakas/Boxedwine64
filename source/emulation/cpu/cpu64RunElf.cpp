@@ -337,11 +337,13 @@ extern "C" int runX64RunElf(const char* path) {
     cpu.reg[X64_RDX].setU64(0);
     if (fsBaseToSet) cpu.fsbase = fsBaseToSet;
 
-    // Bounded run. 4M instructions is way more than the embedded payload
-    // needs (it's ~7 instructions) but plenty of headroom for a real
-    // glibc-startup binary to reveal the first unimplemented opcode via
-    // the unimpl-tracer at cpu64.cpp:3654.
-    const U64 INSN_LIMIT = 4ULL * 1024 * 1024;
+    // Bounded run. 64M instructions: enough for non-trivial static-PIE
+    // workloads (recursive fib(30) is ~13M; musl printf %f is in the low
+    // hundreds of K), still small enough that a runaway loop fails the
+    // test in a few seconds on a modern host. The unimpl-tracer at
+    // cpu64.cpp:3654 still prints the first opcode that decode-fails
+    // before we ever hit the cap.
+    const U64 INSN_LIMIT = 64ULL * 1024 * 1024;
     cpu.runBounded(INSN_LIMIT);
 
     printf("--x64-run-elf: stopped after %llu instructions (yield=%d RIP=0x%llx RAX=0x%llx)\n",
