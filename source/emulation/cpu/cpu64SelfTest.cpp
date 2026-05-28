@@ -1974,6 +1974,213 @@ int runX64SelfTest() {
         fflush(stdout);
     }
 
+    // Test: linkSharedObjectsRecursive — transitive DT_NEEDED resolution.
+    //
+    // Topology:
+    //   main exe imports `foo` from libA (DT_NEEDED libA)
+    //   libA imports `bar` from libB (DT_NEEDED libB)
+    //   libB exports `bar`
+    //   libA exports `foo`
+    //
+    // The recursive linker must:
+    //   1. Walk main's DT_NEEDED → load libA
+    //   2. Walk libA's DT_NEEDED → load libB transitively
+    //   3. Build merged symbol table {foo: libA+codeA, bar: libB+codeB}
+    //   4. Apply symbol relocations on main, libA, libB
+    //
+    // We verify both GOT slots (main's `foo` slot and libA's `bar` slot)
+    // hold the right resolved addresses. This is the single tightest probe
+    // we have of transitive DT_NEEDED short of a real glibc binary.
+    {
+        // Helper: build a single synthetic ET_DYN library with:
+        //   - one exported global symbol (`exportName`, code offset E_CODE)
+        //   - up to one imported symbol via JUMP_SLOT GOT slot
+        //   - one DT_NEEDED entry (optional)
+        // Returns the raw ELF bytes.
+        auto buildLib = [](const char* exportName,
+                           const char* importName,    // nullptr for none
+                           const char* neededName)    // nullptr for none
+            -> std::vector<U8>
+        {
+            // Layout — keep generous: many sections, each on its own slot.
+            //   0x0000 Ehdr
+            //   0x0040 Phdr[0] PT_LOAD
+            //   0x0078 Phdr[1] PT_DYNAMIC
+            //   0x00B0 DYN (10 entries × 16 = 160)
+            //   0x0150 SYMTAB (3 entries × 24 = 72)
+            //   0x0198 STRTAB (up to 64 bytes)
+            //   0x01E0 JMPREL (1 entry × 24 = 24)
+            //   0x0200 GOT slot (8 bytes)
+            //   0x0210 code
+            //   0x0220 end
+            const U64 EHDR=0x0000, PHDR=0x0040, DYN=0x00B0;
+            const U64 SYM=0x0150, STR=0x0198, JMP=0x01E0;
+            const U64 GOT=0x0200, CODE=0x0210, END=0x0220;
+            std::vector<U8> buf(END, 0);
+
+            // STRTAB layout: leading NUL, exportName\0, importName\0, neededName\0
+            U32 expOff = 1;
+            U32 impOff = 0;
+            U32 needOff = 0;
+            std::string strs;
+            strs.push_back('\0');
+            strs += exportName; strs.push_back('\0');
+            if (importName) {
+                impOff = (U32)strs.size();
+                strs += importName; strs.push_back('\0');
+            }
+            if (neededName) {
+                needOff = (U32)strs.size();
+                strs += neededName; strs.push_back('\0');
+            }
+            memcpy(buf.data() + STR, strs.data(), strs.size());
+
+            // SYMTAB: slot 0 null, slot 1 = export (defined), slot 2 = import (undef).
+            k_Elf64_Sym syms[3]{};
+            syms[1].st_name = expOff;
+            syms[1].st_info = 1 << 4;     // GLOBAL
+            syms[1].st_shndx = 1;
+            syms[1].st_value = CODE;      // exported at offset CODE
+            if (importName) {
+                syms[2].st_name = impOff;
+                syms[2].st_info = 1 << 4;
+                syms[2].st_shndx = 0;     // UNDEF
+            }
+            memcpy(buf.data() + SYM, syms, sizeof(syms));
+
+            // JMPREL: one entry (only if we have an import).
+            k_Elf64_Rela rela{};
+            if (importName) {
+                rela.r_offset = GOT;
+                rela.r_info   = ((U64)2 << 32) | k_R_X86_64_JUMP_SLOT;
+                rela.r_addend = 0;
+            }
+            memcpy(buf.data() + JMP, &rela, sizeof(rela));
+
+            // DYN array.
+            k_Elf64_Dyn dyn[10]{};
+            int di = 0;
+            dyn[di].d_tag = k_DT_SYMTAB;   dyn[di++].d_un.d_ptr = SYM;
+            dyn[di].d_tag = k_DT_STRTAB;   dyn[di++].d_un.d_ptr = STR;
+            dyn[di].d_tag = k_DT_SYMENT;   dyn[di++].d_un.d_val = sizeof(k_Elf64_Sym);
+            if (importName) {
+                dyn[di].d_tag = k_DT_JMPREL;   dyn[di++].d_un.d_ptr = JMP;
+                dyn[di].d_tag = k_DT_PLTRELSZ; dyn[di++].d_un.d_val = sizeof(k_Elf64_Rela);
+            }
+            if (neededName) {
+                dyn[di].d_tag = k_DT_NEEDED;   dyn[di++].d_un.d_val = needOff;
+            }
+            dyn[di].d_tag = k_DT_NULL;     dyn[di++].d_un.d_val = 0;
+            memcpy(buf.data() + DYN, dyn, sizeof(dyn));
+
+            // Ehdr.
+            k_Elf64_Ehdr eh{};
+            eh.e_ident[0]=0x7F; eh.e_ident[1]='E'; eh.e_ident[2]='L'; eh.e_ident[3]='F';
+            eh.e_ident[4]=k_ELFCLASS64; eh.e_ident[5]=1; eh.e_ident[6]=1;
+            eh.e_type=3; // ET_DYN
+            eh.e_machine=k_EM_X86_64;
+            eh.e_version=1;
+            eh.e_entry=CODE;
+            eh.e_phoff=PHDR;
+            eh.e_ehsize=sizeof(k_Elf64_Ehdr);
+            eh.e_phentsize=sizeof(k_Elf64_Phdr);
+            eh.e_phnum=2;
+            memcpy(buf.data() + EHDR, &eh, sizeof(eh));
+
+            // Phdr[0] PT_LOAD covers full file.
+            k_Elf64_Phdr ld{};
+            ld.p_type=k_PT_LOAD; ld.p_flags=7;
+            ld.p_offset=0; ld.p_vaddr=0; ld.p_paddr=0;
+            ld.p_filesz=END; ld.p_memsz=END; ld.p_align=0x1000;
+            memcpy(buf.data() + PHDR, &ld, sizeof(ld));
+            // Phdr[1] PT_DYNAMIC.
+            k_Elf64_Phdr pd{};
+            pd.p_type=k_PT_DYNAMIC; pd.p_flags=6;
+            pd.p_offset=DYN; pd.p_vaddr=DYN;
+            pd.p_filesz=sizeof(dyn); pd.p_memsz=sizeof(dyn); pd.p_align=8;
+            memcpy(buf.data() + PHDR + sizeof(k_Elf64_Phdr), &pd, sizeof(pd));
+
+            // Code: trivial ret (we don't run it — only check resolved GOT slots).
+            buf[CODE] = 0xC3;
+            return buf;
+        };
+
+        // Build libB (exports `bar`, no imports, no deps).
+        auto libBBytes = buildLib("bar", nullptr, nullptr);
+        // Build libA (exports `foo`, imports `bar`, DT_NEEDED libB).
+        auto libABytes = buildLib("foo", "bar", "libB.so");
+        // Build main (exports nothing useful, imports `foo`, DT_NEEDED libA).
+        // We reuse the same buildLib helper — `exportName` will be a stray
+        // symbol that nothing imports, which is harmless.
+        auto mainBytes = buildLib("__main_dummy__", "foo", "libA.so");
+
+        // Capture the GOT offset in the helper layout (same in every blob).
+        const U64 GOT_OFF = 0x0200;
+        const U64 CODE_OFF = 0x0210;
+
+        // Place main at MAIN_RELOC; libraries at LIB_BASE + N * 16 MiB.
+        const U64 MAIN_RELOC = 0x60000000;
+        const U64 LIB_BASE   = 0x70000000;
+
+        KMemory64 mem(nullptr);
+        mem.mmapAnonymousFixed(MAIN_RELOC, 0x1000, 7);
+        // Pre-map enough space for two libs at 16 MiB stride.
+        mem.mmapAnonymousFixed(LIB_BASE, 0x1000, 7);
+        mem.mmapAnonymousFixed(LIB_BASE + 0x1000000, 0x1000, 7);
+
+        Elf64ParseResult mainParsed = ElfLoader64::parseBuffer(mainBytes.data(),
+                                                                mainBytes.size());
+        bool mainMapOk = mainParsed.ok &&
+                         ElfLoader64::mapSegmentsFromBuffer(&mem, mainParsed,
+                             mainBytes.data(), mainBytes.size(),
+                             MAIN_RELOC, "main");
+
+        // Fetcher: name -> blob. Returns empty for unknown names.
+        ElfLoader64::LibFetcher fetcher = [&](const std::string& name)
+            -> ElfLoader64::FetchedLibrary
+        {
+            ElfLoader64::FetchedLibrary out;
+            if (name == "libA.so") out.bytes = libABytes;
+            else if (name == "libB.so") out.bytes = libBBytes;
+            return out;
+        };
+
+        std::vector<ElfLoader64::LinkedLibrary> linked;
+        U64 nLinked = mainMapOk ? ElfLoader64::linkSharedObjectsRecursive(
+            &mem, mainParsed, MAIN_RELOC, fetcher, LIB_BASE, &linked) : 0;
+
+        // Locate the two libs by name in the linked vector.
+        U64 libAReloc = 0, libBReloc = 0;
+        for (const auto& lib : linked) {
+            if (lib.name == "libA.so") libAReloc = lib.reloc;
+            if (lib.name == "libB.so") libBReloc = lib.reloc;
+        }
+
+        // Main's GOT slot must contain libA+CODE_OFF (foo).
+        U64 mainGot = mem.readq(MAIN_RELOC + GOT_OFF);
+        U64 expectMainGot = libAReloc + CODE_OFF;
+        // libA's GOT slot must contain libB+CODE_OFF (bar).
+        U64 libAGot = mem.readq(libAReloc + GOT_OFF);
+        U64 expectLibAGot = libBReloc + CODE_OFF;
+
+        bool ok = mainMapOk && nLinked == 2 &&
+                  libAReloc != 0 && libBReloc != 0 &&
+                  mainGot == expectMainGot &&
+                  libAGot == expectLibAGot;
+        if (ok) {
+            printf("  PASS: linkSharedObjectsRecursive: transitive DT_NEEDED resolved foo->libA, bar->libB\n");
+            r.passed++;
+        } else {
+            printf("  FAIL: A29 transitive link (mapOk=%d nLinked=%llu libA=0x%llx libB=0x%llx mainGot=0x%llx exp=0x%llx libAGot=0x%llx exp=0x%llx)\n",
+                   mainMapOk, (unsigned long long)nLinked,
+                   (unsigned long long)libAReloc, (unsigned long long)libBReloc,
+                   (unsigned long long)mainGot, (unsigned long long)expectMainGot,
+                   (unsigned long long)libAGot, (unsigned long long)expectLibAGot);
+            r.failed++;
+        }
+        fflush(stdout);
+    }
+
     // Test: extractGlobalSymbols — missing SYMTAB returns empty without
     // dereferencing nullptr.
     {

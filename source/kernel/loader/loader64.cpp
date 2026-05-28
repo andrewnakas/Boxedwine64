@@ -665,6 +665,111 @@ U64 ElfLoader64::linkSharedObjects(KMemory64* mem,
     return linkedCount;
 }
 
+// Transitive DT_NEEDED orchestrator. BFS over the dependency graph rooted
+// at the main exe's DT_NEEDED list. Each visited library:
+//   1. is fetched via the caller's callback
+//   2. is parsed + mapped + RELATIVE-relocated
+//   3. has its own DT_NEEDED entries enqueued (deduped by name)
+// After the BFS finishes, the merged symbol table is built and the
+// symbol-bound relocations are applied on the main exe AND every loaded
+// library, matching ld.so's load-order scope.
+U64 ElfLoader64::linkSharedObjectsRecursive(KMemory64* mem,
+                                            const Elf64ParseResult& mainParsed,
+                                            U64 mainReloc,
+                                            const LibFetcher& fetcher,
+                                            U64 firstLibBase,
+                                            std::vector<LinkedLibrary>* outLibs) {
+    // BFS state.
+    std::vector<std::string> queue =
+        extractNeededLibraries(mem, mainParsed.dynamic, mainReloc);
+    std::unordered_map<std::string, U64> visited; // name -> reloc base
+    std::vector<LinkedLibrary> linked;
+    // We keep the raw bytes alive until linking finishes (we may need to
+    // re-walk them, and the parser's substring views point into them).
+    std::vector<std::vector<U8>> retainedBlobs;
+
+    U64 nextBase = firstLibBase;
+    const U64 LIB_STEP = 16ULL * 1024 * 1024;
+
+    for (size_t qi = 0; qi < queue.size(); qi++) {
+        // COPY the name out of the queue — pushing into `queue` later in
+        // this iteration can resize the vector and invalidate any reference
+        // we hold into it. A dangling string here looks like a successful
+        // load with a garbage `name` field in the linked vector.
+        std::string name = queue[qi];
+        if (visited.count(name)) continue;
+
+        FetchedLibrary fetched = fetcher(name);
+        if (fetched.bytes.empty()) {
+            klog_fmt("linkSharedObjectsRecursive: fetcher returned empty for '%s'",
+                     name.c_str());
+            // Still mark visited so we don't keep re-asking.
+            visited.emplace(name, 0);
+            continue;
+        }
+
+        retainedBlobs.push_back(std::move(fetched.bytes));
+        const std::vector<U8>& blob = retainedBlobs.back();
+
+        Elf64ParseResult r = parseBuffer(blob.data(), blob.size());
+        if (!r.ok) {
+            klog_fmt("linkSharedObjectsRecursive: parse failed for '%s'",
+                     name.c_str());
+            visited.emplace(name, 0);
+            continue;
+        }
+
+        U64 reloc = nextBase;
+        if (!mapSegmentsFromBuffer(mem, r, blob.data(), blob.size(), reloc,
+                                   name.c_str())) {
+            klog_fmt("linkSharedObjectsRecursive: map failed for '%s'",
+                     name.c_str());
+            visited.emplace(name, 0);
+            continue;
+        }
+        applyRelativeRelocations(mem, r.dynamic, reloc, name.c_str());
+        // Enqueue this library's own DT_NEEDED entries (BFS).
+        auto deps = extractNeededLibraries(mem, r.dynamic, reloc);
+        for (const std::string& dep : deps) {
+            if (!visited.count(dep)) queue.push_back(dep);
+        }
+
+        visited.emplace(name, reloc);
+        linked.push_back({name, reloc, r});
+        nextBase += LIB_STEP;
+    }
+
+    // Build the merged symbol table from the main exe + every linked lib.
+    std::unordered_map<std::string, U64> globals =
+        extractGlobalSymbols(mem, mainParsed.dynamic, mainReloc);
+    for (const LinkedLibrary& lib : linked) {
+        auto libGlobals = extractGlobalSymbols(mem, lib.parsed.dynamic, lib.reloc);
+        for (auto& [n, addr] : libGlobals) globals.emplace(n, addr);
+    }
+
+    // Apply symbol-bound relocations on main + every lib.
+    U64 totalResolved = 0, totalUnresolved = 0;
+    U64 resolved = 0, unresolved = 0;
+    applySymbolRelocations(mem, mainParsed.dynamic, mainReloc, globals,
+                           "exe", &resolved, &unresolved);
+    totalResolved += resolved; totalUnresolved += unresolved;
+    for (const LinkedLibrary& lib : linked) {
+        resolved = unresolved = 0;
+        applySymbolRelocations(mem, lib.parsed.dynamic, lib.reloc, globals,
+                               lib.name.c_str(), &resolved, &unresolved);
+        totalResolved += resolved; totalUnresolved += unresolved;
+    }
+    klog_fmt("linkSharedObjectsRecursive: %zu libs linked (transitive), "
+             "%llu resolved, %llu unresolved",
+             linked.size(),
+             (unsigned long long)totalResolved,
+             (unsigned long long)totalUnresolved);
+
+    U64 count = linked.size();
+    if (outLibs) *outLibs = std::move(linked);
+    return count;
+}
+
 // glibc x86-64 TLS layout (variant II, the only one glibc uses on amd64):
 //
 //   [ static TLS image (memsz bytes) ][ TCB (≥ tcbhead_t) ]

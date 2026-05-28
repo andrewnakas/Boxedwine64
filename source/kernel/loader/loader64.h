@@ -14,6 +14,7 @@
 #include <vector>
 #include <string>
 #include <unordered_map>
+#include <functional>
 
 class FsOpenNode;
 class KThread;
@@ -216,6 +217,38 @@ public:
                                  const std::vector<PreloadedLibrary>& preloaded,
                                  U64 firstLibBase,
                                  std::vector<LinkedLibrary>* outLibs = nullptr);
+
+    // One blob returned by the LibFetcher callback. `bytes` may be empty
+    // to signal "not found" (the recursive linker treats that as a soft
+    // failure: the symbol becomes unresolved, but linking continues).
+    struct FetchedLibrary {
+        std::vector<U8> bytes;
+    };
+    using LibFetcher = std::function<FetchedLibrary(const std::string& name)>;
+
+    // Transitive DT_NEEDED orchestrator. Starts from `mainParsed`'s
+    // DT_NEEDED entries, walks each requested library via `fetcher`, then
+    // recurses into each library's own DT_NEEDED entries BFS-style. Avoids
+    // loading the same library twice (keyed by name).
+    //
+    // Layout: each loaded library is placed at firstLibBase + N * 16 MiB,
+    // matching linkSharedObjects's step. Caller MUST ensure the address
+    // region [firstLibBase, firstLibBase + 16MiB * MAX_LIBS) is free.
+    //
+    // After all libraries are mapped and RELATIVE-relocated, the merged
+    // symbol table is built and applySymbolRelocations is invoked on the
+    // main exe and every loaded library.
+    //
+    // Public so self-tests can drive it with an in-memory fetcher; the
+    // real production caller (loadProgram64) wires it to openGuestPath.
+    //
+    // Returns the number of libraries successfully loaded (transitively).
+    static U64 linkSharedObjectsRecursive(class KMemory64* mem,
+                                          const Elf64ParseResult& mainParsed,
+                                          U64 mainReloc,
+                                          const LibFetcher& fetcher,
+                                          U64 firstLibBase,
+                                          std::vector<LinkedLibrary>* outLibs = nullptr);
 
     // Map every PT_LOAD segment from a contiguous in-memory ELF buffer
     // into guest memory at the given relocation base. Mirrors the file-
