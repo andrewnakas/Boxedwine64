@@ -141,6 +141,12 @@ run_one_prebuilt helloFp     "$ROOT/tools/testdata/hello_fp.elf"     45  || fail
 # decimal string is tee'd to host stdout. Last-place drift is correct
 # IEEE-754 behaviour, not an emulator bug.
 run_one_prebuilt helloFmt    "$ROOT/tools/testdata/hello_fmt.elf"    6   || fail=$((fail+1))
+# REAL glibc 2.36 — a gcc-compiled, statically-linked glibc hello-world (not
+# hand-crafted, not -nostdlib). Runs full __libc_start_main → malloc arena
+# init → printf → exit(42), ~127K instructions. This is the Milestone D
+# foundation: real glibc startup runs end-to-end. Exit 42. Guard against
+# regressing the PUNPCKLQDQ / ENDBR64 / runner-brk fixes that unblocked it.
+run_one_prebuilt glibcStatic "$ROOT/tools/testdata/hello_glibc_static.elf" 42 || fail=$((fail+1))
 # Signal-delivery probe — installs SIGUSR1 handler, raises via tgkill, the
 # handler writes a sentinel, sigreturn restores, main exits with sentinel.
 # Exit 77 means the entire deliverSignalSync → handler → restorer → rt_sigreturn
@@ -205,5 +211,5 @@ run_one_dynamic helloDynlink "$ROOT/tools/testdata/hello_dynlink.elf" "$ROOT/too
 # or the flat symbol table missed leaf-DSO exports during A's relocation.
 run_one_dynamic helloChain "$ROOT/tools/testdata/hello_chain.elf" "$ROOT/tools/testdata" 48 || fail=$((fail+1))
 
-echo "=== summary: $((26 - fail))/26 passed ==="
+echo "=== summary: $((27 - fail))/27 passed ==="
 exit $fail

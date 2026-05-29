@@ -413,6 +413,18 @@ extern "C" int runX64RunElf(const char* path) {
     }
 
     CPU64 cpu(&mem);
+
+    // Seed the standalone-runner program break just past the loaded image so
+    // sys_brk64 can grow a real heap. glibc's malloc calls brk(0) to learn
+    // the heap base, then brk(base+n) to grow; without a working brk it falls
+    // back to an mmap arena whose layout mismatches its own sbrk bookkeeping
+    // and the heap metadata corrupts ("smallbin double linked list
+    // corrupted") a few thousand instructions into startup. One page of gap
+    // keeps the first heap chunk clear of the last RELRO/bss page.
+    cpu.runnerBrk = ((parsed.baseAddrHigh + reloc) + 0xFFFF) & ~0xFFFULL;
+    printf("--x64-run-elf: runnerBrk (heap base) = 0x%llx\n",
+           (unsigned long long)cpu.runnerBrk);
+
     // Hand control to ld.so when we have one — it'll resolve IFUNCs,
     // run _dl_init across DT_NEEDED libs, then jump to AT_ENTRY (the
     // exe's _start). Without an interp, jump straight to the exe entry.

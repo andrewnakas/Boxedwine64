@@ -728,6 +728,22 @@ U32 CPU64::step() {
         return opOff + 2;
     }
 
+    // ENDBR64 (F3 0F 1E FA) / ENDBR32 (F3 0F 1E FB) — CET indirect-branch
+    // landing pads. We don't model shadow stacks / IBT, so they're NOPs.
+    // glibc 2.36 emits ENDBR64 at the top of nearly every function, so this
+    // is hit constantly the moment real glibc code runs. Also accept the
+    // RDSSPQ/INCSSP-adjacent NOP form F3 0F 1E /r generically (modrm reg/reg)
+    // as a NOP since none of the CET state is observable here.
+    if (op == 0x0F && fetchByte(rip + opOff + 1) == 0x1E && p.rep == 0xF3) {
+        U8 modrm = fetchByte(rip + opOff + 2);
+        // ENDBR64=FA, ENDBR32=FB, plus the general reg/reg NOP-equivalent form.
+        if (modrm == 0xFA || modrm == 0xFB || (modrm & 0xC0) == 0xC0) {
+            U32 used = opOff + 3;
+            rip += used;
+            return used;
+        }
+    }
+
     // Multi-byte NOP: 0F 1F /0 (any ModR/M form, any length).
     if (op == 0x0F && fetchByte(rip + opOff + 1) == 0x1F) {
         ModRM m = decodeModRM(rip + opOff + 2, p, 0);
@@ -2289,14 +2305,26 @@ U32 CPU64::step() {
             }
             U64 dLo = xmm[m.regField].lo;
             U64 dHi = xmm[m.regField].hi;
-            // For low forms we read the low 8 bytes of each; for high forms,
-            // the high 8 bytes. Result occupies all 16 bytes.
-            bool isHigh = (op2 >= 0x68);
+            // Opcode map (PUNPCK): LOW forms take the low halves of each
+            // operand, HIGH forms the high halves.
+            //   LOW : 60=LBW 61=LWD 62=LDQ 6C=LQDQ
+            //   HIGH: 68=HBW 69=HWD 6A=HDQ 6D=HQDQ
+            // NOTE 0x6C (PUNPCKLQDQ) is numerically >= 0x68 but is a LOW
+            // form — classifying by ">= 0x68" wrongly buckets it as HIGH and
+            // reads the (often-zero) high halves, which silently corrupted
+            // glibc's malloc bin self-pointers. Classify explicitly.
+            bool isHigh = (op2 == 0x68 || op2 == 0x69 || op2 == 0x6A || op2 == 0x6D);
             U64 dSrc = isHigh ? dHi : dLo;
             U64 sSrc = isHigh ? srcHi : srcLo;
             U64 oLo = 0, oHi = 0;
-            U8 sub = isHigh ? (op2 - 0x68) : (op2 - 0x60);
-            // sub: 0=byte 1=word 2=dword 4=qword (6C/6D); coerce 4 to dword index 3.
+            // Map opcode -> element-width index: 0=byte 1=word 2=dword 4=qword.
+            U8 sub;
+            switch (op2) {
+                case 0x60: case 0x68: sub = 0; break; // byte
+                case 0x61: case 0x69: sub = 1; break; // word
+                case 0x62: case 0x6A: sub = 2; break; // dword
+                default:              sub = 4; break; // 6C/6D qword
+            }
             if (sub == 0) { // byte interleave: 16 bytes out, 8 from each input
                 for (int i = 0; i < 8; i++) {
                     U64 db = (dSrc >> (i*8)) & 0xFF;
@@ -4471,7 +4499,31 @@ unhandled:
 }
 
 void CPU64::run() {
+    // Optional instruction tracer for bring-up debugging. Gated on env so it
+    // never costs anything in normal runs. BOXEDWINE64_TRACE_FROM/TO bound the
+    // instructionCount window; each traced step prints RIP + the leading
+    // opcode bytes + the GPRs most relevant to pointer-corruption hunts.
+    static const char* tf = std::getenv("BOXEDWINE64_TRACE_FROM");
+    static const char* tt = std::getenv("BOXEDWINE64_TRACE_TO");
+    U64 traceFrom = tf ? std::strtoull(tf, nullptr, 0) : (U64)-1;
+    U64 traceTo   = tt ? std::strtoull(tt, nullptr, 0) : 0;
+    bool tracing = (tf != nullptr);
+
     while (!yield) {
+        if (tracing && instructionCount >= traceFrom && instructionCount <= traceTo) {
+            U64 r = rip;
+            klog_fmt("TRACE #%llu RIP=0x%llx %02x %02x %02x %02x  "
+                     "rax=%llx rbx=%llx rcx=%llx rdx=%llx rsi=%llx rdi=%llx rsp=%llx rbp=%llx "
+                     "xmm0=%llx:%llx xmm1=%llx:%llx",
+                     (unsigned long long)instructionCount, (unsigned long long)r,
+                     fetchByte(r), fetchByte(r+1), fetchByte(r+2), fetchByte(r+3),
+                     (unsigned long long)reg[X64_RAX].u64, (unsigned long long)reg[X64_RBX].u64,
+                     (unsigned long long)reg[X64_RCX].u64, (unsigned long long)reg[X64_RDX].u64,
+                     (unsigned long long)reg[X64_RSI].u64, (unsigned long long)reg[X64_RDI].u64,
+                     (unsigned long long)reg[X64_RSP].u64, (unsigned long long)reg[X64_RBP].u64,
+                     (unsigned long long)xmm[0].hi, (unsigned long long)xmm[0].lo,
+                     (unsigned long long)xmm[1].hi, (unsigned long long)xmm[1].lo);
+        }
         U32 n = step();
         if (n == 0) break;
         instructionCount++;
@@ -4479,8 +4531,28 @@ void CPU64::run() {
 }
 
 U64 CPU64::runBounded(U64 maxInsn) {
+    static const char* tf = std::getenv("BOXEDWINE64_TRACE_FROM");
+    static const char* tt = std::getenv("BOXEDWINE64_TRACE_TO");
+    U64 traceFrom = tf ? std::strtoull(tf, nullptr, 0) : (U64)-1;
+    U64 traceTo   = tt ? std::strtoull(tt, nullptr, 0) : 0;
+    bool tracing = (tf != nullptr);
+
     U64 ran = 0;
     while (!yield && ran < maxInsn) {
+        if (tracing && instructionCount >= traceFrom && instructionCount <= traceTo) {
+            U64 r = rip;
+            klog_fmt("TRACE #%llu RIP=0x%llx %02x %02x %02x %02x  "
+                     "rax=%llx rbx=%llx rcx=%llx rdx=%llx rsi=%llx rdi=%llx rsp=%llx rbp=%llx "
+                     "xmm0=%llx:%llx xmm1=%llx:%llx",
+                     (unsigned long long)instructionCount, (unsigned long long)r,
+                     fetchByte(r), fetchByte(r+1), fetchByte(r+2), fetchByte(r+3),
+                     (unsigned long long)reg[X64_RAX].u64, (unsigned long long)reg[X64_RBX].u64,
+                     (unsigned long long)reg[X64_RCX].u64, (unsigned long long)reg[X64_RDX].u64,
+                     (unsigned long long)reg[X64_RSI].u64, (unsigned long long)reg[X64_RDI].u64,
+                     (unsigned long long)reg[X64_RSP].u64, (unsigned long long)reg[X64_RBP].u64,
+                     (unsigned long long)xmm[0].hi, (unsigned long long)xmm[0].lo,
+                     (unsigned long long)xmm[1].hi, (unsigned long long)xmm[1].lo);
+        }
         U32 n = step();
         if (n == 0) break;
         instructionCount++;

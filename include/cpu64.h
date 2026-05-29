@@ -108,6 +108,15 @@ public:
     KThread*   thread = nullptr;
     KMemory64* memory = nullptr;
 
+    // Standalone-runner heap pointer. The full kernel tracks the program
+    // break on KProcess::brkEnd64; the --x64-run-elf path has no KProcess,
+    // so sys_brk64 falls back to this when thread/process is null. Set by
+    // the runner to just past the loaded image so glibc's malloc can grow
+    // a real heap via brk (without it, brk returns 0, glibc's MORECORE
+    // mismatches its own sbrk base, and the heap metadata corrupts).
+    // 0 means "not a standalone run" — sys_brk64 keeps its old behaviour.
+    U64 runnerBrk = 0;
+
     bool yield = false;
     U64  instructionCount = 0;
 

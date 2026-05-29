@@ -918,6 +918,47 @@ int runX64SelfTest() {
             return c.reg[X64_R15].u64 == 0xBB04AA0399028801ULL;
         });
     }
+    // Test 38a: PUNPCKLQDQ xmm0, xmm1 — result = {xmm0.lo, xmm1.lo}.
+    // This is the op that broke real glibc malloc: 0x6C is numerically >=
+    // 0x68 but is a LOW unpack, and a ">= 0x68 means high" classifier read
+    // the (zero) high halves, zeroing the bin self-pointers. Here we set
+    // xmm0.lo=AAAA, xmm1.lo=BBBB, run punpcklqdq, then move the HIGH lane
+    // down with punpckhqdq xmm0,xmm0 and read it: must be BBBB (xmm1.lo),
+    // proving the high lane got xmm1.lo and was not zeroed.
+    {
+        std::vector<U8> code = {
+            0x48, 0xB8, 0xAA, 0xAA, 0xAA, 0xAA, 0xAA, 0xAA, 0xAA, 0xAA,  // rax=0xAAAA...
+            0x66, 0x48, 0x0F, 0x6E, 0xC0,                                // movq xmm0, rax
+            0x48, 0xB8, 0xBB, 0xBB, 0xBB, 0xBB, 0xBB, 0xBB, 0xBB, 0xBB,  // rax=0xBBBB...
+            0x66, 0x48, 0x0F, 0x6E, 0xC8,                                // movq xmm1, rax
+            0x66, 0x0F, 0x6C, 0xC1,                                      // punpcklqdq xmm0, xmm1 -> {AAAA,BBBB}
+            0x66, 0x0F, 0x6D, 0xC0,                                      // punpckhqdq xmm0, xmm0 -> {BBBB,BBBB}
+            0x66, 0x48, 0x0F, 0x7E, 0xC0,                                // movq rax, xmm0
+        };
+        runAndCheck(r, "punpcklqdq sets high lane to src.lo (glibc malloc bug)", withExit(code), [](CPU64& c) {
+            return c.reg[X64_R15].u64 == 0xBBBBBBBBBBBBBBBBULL;
+        });
+    }
+
+    // Test 38b: PUNPCKHQDQ xmm0, xmm1 — result = {xmm0.hi, xmm1.hi}.
+    // Build distinct hi lanes via punpcklqdq first, then verify the low lane
+    // of the result equals xmm0.hi. xmm0={hi=0x1111,lo=0}, via punpcklqdq
+    // xmm0,xmm2 where xmm2.lo=0x1111: xmm0={lo=0,hi=0x1111}. Then
+    // punpckhqdq xmm0,xmm1 -> low lane = xmm0.hi = 0x1111.
+    {
+        std::vector<U8> code = {
+            0x48, 0xB8, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11,  // rax=0x1111...
+            0x66, 0x48, 0x0F, 0x6E, 0xD0,                                // movq xmm2, rax
+            0x66, 0x0F, 0xEF, 0xC0,                                      // pxor xmm0, xmm0 -> {0,0}
+            0x66, 0x0F, 0x6C, 0xC2,                                      // punpcklqdq xmm0, xmm2 -> {0, 0x1111}
+            0x66, 0x0F, 0x6D, 0xC0,                                      // punpckhqdq xmm0, xmm0 -> {0x1111,0x1111}
+            0x66, 0x48, 0x0F, 0x7E, 0xC0,                                // movq rax, xmm0
+        };
+        runAndCheck(r, "punpckhqdq selects high lanes", withExit(code), [](CPU64& c) {
+            return c.reg[X64_R15].u64 == 0x1111111111111111ULL;
+        });
+    }
+
     // Test 39: PSLLD xmm0, 4 — shift each dword left by 4.
     // xmm0.lo = 0x00000001_00000002 → 0x00000010_00000020.
     {

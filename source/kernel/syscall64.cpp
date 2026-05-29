@@ -222,11 +222,20 @@ static U64 sys_arch_prctl64(CPU64* cpu, U64 code, U64 addr) {
 // per-process on KProcess::brkEnd in the 32-bit path; we put it on the
 // thread's process the same way.
 static U64 sys_brk64(CPU64* cpu, U64 newBrk) {
-    if (!cpu->thread || !cpu->thread->process) {
+    // Resolve where the current break lives. Full kernel: KProcess::brkEnd64.
+    // Standalone runner (no process): CPU64::runnerBrk, seeded by the runner
+    // to just past the loaded image. If neither is available there's no heap
+    // to manage, so report 0 (the historical no-process behaviour).
+    bool hasProcess = (cpu->thread && cpu->thread->process);
+    U64 oldBrk;
+    if (hasProcess) {
+        oldBrk = cpu->thread->process->brkEnd64;
+    } else if (cpu->runnerBrk) {
+        oldBrk = cpu->runnerBrk;
+    } else {
         return 0;
     }
-    KProcess* p = cpu->thread->process.get();
-    U64 oldBrk = p->brkEnd64;
+
     if (newBrk == 0 || newBrk < oldBrk) {
         return oldBrk;
     }
@@ -240,7 +249,8 @@ static U64 sys_brk64(CPU64* cpu, U64 newBrk) {
             return oldBrk;
         }
     }
-    p->brkEnd64 = newBrk;
+    if (hasProcess) cpu->thread->process->brkEnd64 = newBrk;
+    else            cpu->runnerBrk = newBrk;
     return newBrk;
 }
 
