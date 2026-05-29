@@ -118,6 +118,20 @@ int main(void){
 }
 ' "OK"
 
+compile_and_run printf_int '
+#include <stdio.h>
+int main(void){
+    int n=0;
+    n+=printf("decimal: %d\n",12345);
+    n+=printf("hex: %x %X\n",0xCAFE,0xBEEF);
+    n+=printf("oct: %o\n",0755);
+    n+=printf("str+int: %s=%d\n","answer",42);
+    n+=printf("char+ld: %c %ld\n",(int)0x51,9999999999L);
+    fflush(stdout);
+    return n & 0xFF;
+}
+' "char+ld: Q 9999999999"
+
 compile_and_run libm '
 #include <math.h>
 #include <unistd.h>
