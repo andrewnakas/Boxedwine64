@@ -281,12 +281,57 @@ extern "C" int runX64RunElf(const char* path) {
     }
 
     // Apply R_X86_64_RELATIVE relocations against the exe's PT_DYNAMIC.
-    // Symbol-bound relocations are deferred to ld-linux (when we add
-    // DT_NEEDED file-loading recursion).
     if (parsed.dynamic.present) {
         U64 applied = ElfLoader64::applyRelativeRelocations(&mem, parsed.dynamic, reloc, tag);
         printf("--x64-run-elf: applied %llu RELATIVE relocations\n",
                (unsigned long long)applied);
+    }
+
+    // DT_NEEDED file-loading. If the env var BOXEDWINE64_LIBPATH is set,
+    // we treat it as a colon-separated host search path for shared
+    // libraries referenced by the main ELF's DT_NEEDED entries. This
+    // turns --x64-run-elf into a poor-man's ld.so: dynamic ELFs load
+    // their dependencies straight from the host filesystem.
+    //
+    // This is the Milestone A3 verification path. We deliberately do
+    // NOT pull in the full kernel FS layer — fopen() against the host
+    // is enough to validate that linkSharedObjectsRecursive works on
+    // real `.so` blobs (musl libc.so.6, libm.so.6, …) rather than just
+    // the synthesized in-memory libraries the selftest covers.
+    if (parsed.dynamic.present) {
+        const char* libpath = std::getenv("BOXEDWINE64_LIBPATH");
+        if (libpath && libpath[0]) {
+            std::vector<std::string> searchDirs;
+            std::string cur;
+            for (const char* p = libpath; *p; p++) {
+                if (*p == ':') { if (!cur.empty()) { searchDirs.push_back(cur); cur.clear(); } }
+                else cur.push_back(*p);
+            }
+            if (!cur.empty()) searchDirs.push_back(cur);
+
+            auto fetcher = [&](const std::string& name) -> ElfLoader64::FetchedLibrary {
+                ElfLoader64::FetchedLibrary out;
+                for (const std::string& dir : searchDirs) {
+                    std::string full = dir + "/" + name;
+                    if (readFileAll(full.c_str(), out.bytes)) {
+                        printf("--x64-run-elf: DT_NEEDED '%s' -> %s (%zu bytes)\n",
+                               name.c_str(), full.c_str(), out.bytes.size());
+                        return out;
+                    }
+                }
+                printf("--x64-run-elf: DT_NEEDED '%s' NOT FOUND in $BOXEDWINE64_LIBPATH\n",
+                       name.c_str());
+                out.bytes.clear();
+                return out;
+            };
+
+            std::vector<ElfLoader64::LinkedLibrary> linked;
+            U64 firstLibBase = 0x7FFFE0000000ULL;
+            U64 nLinked = ElfLoader64::linkSharedObjectsRecursive(
+                &mem, parsed, reloc, fetcher, firstLibBase, &linked);
+            printf("--x64-run-elf: linked %llu shared libraries\n",
+                   (unsigned long long)nLinked);
+        }
     }
 
     // PT_GNU_RELRO: mark RELRO region read-only after relocations land,
