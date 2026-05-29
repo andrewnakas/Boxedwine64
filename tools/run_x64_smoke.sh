@@ -141,6 +141,11 @@ run_one_prebuilt helloFp     "$ROOT/tools/testdata/hello_fp.elf"     45  || fail
 # loop worked end-to-end. This is the closest reachable proof of Milestone B's
 # signal-delivery primitive (clone is still ENOSYS pending KThread64).
 run_one_prebuilt helloSignal "$ROOT/tools/testdata/hello_signal.elf" 77  || fail=$((fail+1))
+# Multi-signal probe — two distinct handlers (SIGUSR1=10, SIGUSR2=12), each
+# verifies it received the correct sig arg in RDI, two sequential
+# deliver→handle→sigreturn cycles. Exit 22 (=10+12) proves sig-arg passing
+# and sigreturn-restore generalize beyond the single-signal case.
+run_one_prebuilt helloSig2   "$ROOT/tools/testdata/hello_sig2.elf"   22  || fail=$((fail+1))
 # SSE3/SSSE3 vector-intrinsics probe — real clang emits PSHUFB/PALIGNR/
 # PABSD/PHADDD/PSIGND; exits 42 if they all decode+run without tripping the
 # unimpl-tracer. The opcodes' exact semantics are pinned separately by the
@@ -194,5 +199,5 @@ run_one_dynamic helloDynlink "$ROOT/tools/testdata/hello_dynlink.elf" "$ROOT/too
 # or the flat symbol table missed leaf-DSO exports during A's relocation.
 run_one_dynamic helloChain "$ROOT/tools/testdata/hello_chain.elf" "$ROOT/tools/testdata" 48 || fail=$((fail+1))
 
-echo "=== summary: $((24 - fail))/24 passed ==="
+echo "=== summary: $((25 - fail))/25 passed ==="
 exit $fail
