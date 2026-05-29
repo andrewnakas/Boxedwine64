@@ -3197,6 +3197,100 @@ U32 CPU64::step() {
             return used;
         }
 
+        // Packed double-precision FP arithmetic — 66 0F prefix selects the
+        // packed-double form. Operates on two doubles in parallel (low qword
+        // and high qword of the XMM regs). Discovered via musl libm
+        // (sqrt/sin/cos use packed double pairs internally for table-based
+        // polynomial evaluation).
+        //   ADDPD  66 0F 58
+        //   MULPD  66 0F 59
+        //   SUBPD  66 0F 5C
+        //   DIVPD  66 0F 5E
+        //   SQRTPD 66 0F 51
+        //   MINPD  66 0F 5D
+        //   MAXPD  66 0F 5F
+        if (osize66 &&
+            (op2 == 0x58 || op2 == 0x59 || op2 == 0x5C || op2 == 0x5E ||
+             op2 == 0x51 || op2 == 0x5D || op2 == 0x5F)) {
+            ModRM m = decodeModRM(rip + opOff + 2, p, 0);
+            U64 srcLo, srcHi;
+            if (m.isReg) {
+                srcLo = xmm[m.rmIndex].lo;
+                srcHi = xmm[m.rmIndex].hi;
+            } else {
+                srcLo = memory->readq(m.effAddr);
+                srcHi = memory->readq(m.effAddr + 8);
+            }
+            double aLo = u64ToDouble(xmm[m.regField].lo);
+            double aHi = u64ToDouble(xmm[m.regField].hi);
+            double bLo = u64ToDouble(srcLo);
+            double bHi = u64ToDouble(srcHi);
+            double rLo, rHi;
+            switch (op2) {
+                case 0x58: rLo = aLo + bLo; rHi = aHi + bHi; break;
+                case 0x59: rLo = aLo * bLo; rHi = aHi * bHi; break;
+                case 0x5C: rLo = aLo - bLo; rHi = aHi - bHi; break;
+                case 0x5E: rLo = aLo / bLo; rHi = aHi / bHi; break;
+                case 0x51: rLo = std::sqrt(bLo); rHi = std::sqrt(bHi); break;
+                case 0x5D: rLo = (aLo < bLo) ? aLo : bLo;
+                           rHi = (aHi < bHi) ? aHi : bHi; break;
+                case 0x5F: rLo = (aLo > bLo) ? aLo : bLo;
+                           rHi = (aHi > bHi) ? aHi : bHi; break;
+                default:   rLo = aLo; rHi = aHi; break;
+            }
+            xmm[m.regField].lo = doubleToU64(rLo);
+            xmm[m.regField].hi = doubleToU64(rHi);
+            U32 used = opOff + 2 + m.length;
+            rip += used;
+            return used;
+        }
+
+        // Packed single-precision FP arithmetic — no prefix selects PS form.
+        //   ADDPS  0F 58, MULPS 0F 59, SUBPS 0F 5C, DIVPS 0F 5E,
+        //   SQRTPS 0F 51, MINPS 0F 5D, MAXPS 0F 5F
+        // Operates on 4 floats packed in the XMM register.
+        if (!osize66 && p.rep == 0 &&
+            (op2 == 0x58 || op2 == 0x59 || op2 == 0x5C || op2 == 0x5E ||
+             op2 == 0x51 || op2 == 0x5D || op2 == 0x5F)) {
+            ModRM m = decodeModRM(rip + opOff + 2, p, 0);
+            U64 srcLo, srcHi;
+            if (m.isReg) {
+                srcLo = xmm[m.rmIndex].lo;
+                srcHi = xmm[m.rmIndex].hi;
+            } else {
+                srcLo = memory->readq(m.effAddr);
+                srcHi = memory->readq(m.effAddr + 8);
+            }
+            auto u32f = [](U32 b){ float f; std::memcpy(&f,&b,4); return f; };
+            auto fu32 = [](float f){ U32 b; std::memcpy(&b,&f,4); return b; };
+            float a[4], b[4], r[4];
+            a[0] = u32f((U32)(xmm[m.regField].lo & 0xFFFFFFFFULL));
+            a[1] = u32f((U32)(xmm[m.regField].lo >> 32));
+            a[2] = u32f((U32)(xmm[m.regField].hi & 0xFFFFFFFFULL));
+            a[3] = u32f((U32)(xmm[m.regField].hi >> 32));
+            b[0] = u32f((U32)(srcLo & 0xFFFFFFFFULL));
+            b[1] = u32f((U32)(srcLo >> 32));
+            b[2] = u32f((U32)(srcHi & 0xFFFFFFFFULL));
+            b[3] = u32f((U32)(srcHi >> 32));
+            for (int i = 0; i < 4; i++) {
+                switch (op2) {
+                    case 0x58: r[i] = a[i] + b[i]; break;
+                    case 0x59: r[i] = a[i] * b[i]; break;
+                    case 0x5C: r[i] = a[i] - b[i]; break;
+                    case 0x5E: r[i] = a[i] / b[i]; break;
+                    case 0x51: r[i] = std::sqrt(b[i]); break;
+                    case 0x5D: r[i] = (a[i] < b[i]) ? a[i] : b[i]; break;
+                    case 0x5F: r[i] = (a[i] > b[i]) ? a[i] : b[i]; break;
+                    default:   r[i] = a[i]; break;
+                }
+            }
+            xmm[m.regField].lo = (U64)fu32(r[0]) | ((U64)fu32(r[1]) << 32);
+            xmm[m.regField].hi = (U64)fu32(r[2]) | ((U64)fu32(r[3]) << 32);
+            U32 used = opOff + 2 + m.length;
+            rip += used;
+            return used;
+        }
+
         // CVTSI2SD xmm, r/m32   F2 0F 2A /r       (REX.W → r/m64)
         // Convert int to double; result in low 64 of dst, high unchanged.
         if (op2 == 0x2A && p.rep == 0xF2) {
@@ -3383,6 +3477,43 @@ U32 CPU64::step() {
             ModRM m = decodeModRM(rip + opOff + 2, p, 0);
             U64 sLo = m.isReg ? xmm[m.rmIndex].lo : memory->readq(m.effAddr);
             xmm[m.regField].hi = sLo;
+            U32 used = opOff + 2 + m.length;
+            rip += used;
+            return used;
+        }
+
+        // UNPCKHPD xmm, xmm/m128  66 0F 15 /r — interleave high qwords.
+        //   dst.lo = dst.hi;  dst.hi = src.hi.
+        // Used by musl libm to pull the high double out of a packed pair
+        // for follow-up scalar operations.
+        if (op2 == 0x15 && osize66) {
+            ModRM m = decodeModRM(rip + opOff + 2, p, 0);
+            U64 sHi;
+            if (m.isReg) sHi = xmm[m.rmIndex].hi;
+            else         sHi = memory->readq(m.effAddr + 8);
+            xmm[m.regField].lo = xmm[m.regField].hi;
+            xmm[m.regField].hi = sHi;
+            U32 used = opOff + 2 + m.length;
+            rip += used;
+            return used;
+        }
+
+        // UNPCKLPS xmm, xmm/m128  0F 14 /r — interleave 32-bit floats from
+        // low half: dst = {dst[0], src[0], dst[1], src[1]} (each 32-bit).
+        // UNPCKHPS xmm, xmm/m128  0F 15 /r — from high half.
+        if ((op2 == 0x14 || op2 == 0x15) && !osize66 && p.rep == 0) {
+            ModRM m = decodeModRM(rip + opOff + 2, p, 0);
+            U64 sLo, sHi;
+            if (m.isReg) { sLo = xmm[m.rmIndex].lo; sHi = xmm[m.rmIndex].hi; }
+            else         { sLo = memory->readq(m.effAddr); sHi = memory->readq(m.effAddr + 8); }
+            U64 dLo = xmm[m.regField].lo, dHi = xmm[m.regField].hi;
+            U32 d[4] = {(U32)dLo,(U32)(dLo>>32),(U32)dHi,(U32)(dHi>>32)};
+            U32 s[4] = {(U32)sLo,(U32)(sLo>>32),(U32)sHi,(U32)(sHi>>32)};
+            U32 r[4];
+            if (op2 == 0x14) { r[0]=d[0]; r[1]=s[0]; r[2]=d[1]; r[3]=s[1]; }
+            else             { r[0]=d[2]; r[1]=s[2]; r[2]=d[3]; r[3]=s[3]; }
+            xmm[m.regField].lo = (U64)r[0] | ((U64)r[1] << 32);
+            xmm[m.regField].hi = (U64)r[2] | ((U64)r[3] << 32);
             U32 used = opOff + 2 + m.length;
             rip += used;
             return used;
