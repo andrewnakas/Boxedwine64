@@ -21,10 +21,31 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 if [ -n "${1:-}" ]; then
     BOXEDWINE="$1"
 else
-    BOXEDWINE="$(ls -t \
-        "$ROOT/project/mac-xcode/Boxedwine/build/Debug/Boxedwine.app/Contents/MacOS/Boxedwine" \
-        "$HOME/Library/Developer/Xcode/DerivedData"/Boxedwine-*/Build/Products/Debug/Boxedwine.app/Contents/MacOS/Boxedwine \
-        2>/dev/null | head -1)"
+    # Build a candidate list and pick the freshest *existing* binary. Two
+    # quirks we have to dodge here:
+    #   1) Either path may not exist (in-tree was deleted; DerivedData was
+    #      cleaned). `ls -t` returns non-zero in that case, and combined
+    #      with set -euo pipefail the script exits silently with no error
+    #      output, which is brutal to debug. We pre-filter to existing
+    #      paths so `ls` never sees a missing one.
+    #   2) The DerivedData entry is a glob; if no DerivedData build exists
+    #      the literal pattern `Boxedwine-*/...` doesn't expand and trips
+    #      `ls` on a bogus literal path.
+    CANDIDATES=()
+    INTREE="$ROOT/project/mac-xcode/Boxedwine/build/Debug/Boxedwine.app/Contents/MacOS/Boxedwine"
+    if [ -x "$INTREE" ]; then
+        CANDIDATES+=("$INTREE")
+    fi
+    for p in "$HOME/Library/Developer/Xcode/DerivedData"/Boxedwine-*/Build/Products/Debug/Boxedwine.app/Contents/MacOS/Boxedwine; do
+        if [ -x "$p" ]; then
+            CANDIDATES+=("$p")
+        fi
+    done
+    if [ "${#CANDIDATES[@]}" -gt 0 ]; then
+        BOXEDWINE="$(ls -t "${CANDIDATES[@]}" | head -1)"
+    else
+        BOXEDWINE=""
+    fi
 fi
 
 if [ -z "$BOXEDWINE" ] || [ ! -x "$BOXEDWINE" ]; then
@@ -62,6 +83,36 @@ run_one() {
     fi
 }
 
+# Variant for prebuilt ELFs (real-compiler output). Same exit-check shape
+# as run_one but skips the python3 gen step. Used for testdata/*.elf
+# artifacts produced by tools/buildHelloRealElf.sh and friends — those
+# binaries depend on clang+lld, not python, so we keep them in-tree
+# rather than regenerating on every smoke run.
+run_one_prebuilt() {
+    local name="$1"
+    local elf="$2"
+    local expected_status="$3"
+
+    if [ ! -f "$elf" ]; then
+        printf "  SKIP: %-24s (missing: %s)\n" "$name" "$elf"
+        return 0
+    fi
+    local out
+    out="$("$BOXEDWINE" --x64-run-elf "$elf" 2>&1 || true)"
+    local got
+    got="$(echo "$out" | grep -oE 'exit syscall, status=[0-9]+' | head -1 | grep -oE '[0-9]+$' || echo "?")"
+    if [ "$got" = "$expected_status" ]; then
+        printf "  PASS: %-24s (exit=%s)\n" "$name" "$got"
+        return 0
+    else
+        printf "  FAIL: %-24s expected=%s got=%s\n" "$name" "$expected_status" "$got"
+        echo "    --- output ---"
+        echo "$out" | sed 's/^/    /'
+        echo "    --- end ---"
+        return 1
+    fi
+}
+
 echo "=== x64 runtime smoke tests ==="
 
 fail=0
@@ -81,6 +132,7 @@ run_one indirectCall   "$ROOT/tools/buildIndirectCallElf64.py" 119        || fai
 run_one tlsImage       "$ROOT/tools/buildTlsImageElf64.py"     171        || fail=$((fail+1))
 run_one integration    "$ROOT/tools/buildIntegrationElf64.py"  75         || fail=$((fail+1))
 run_one relro          "$ROOT/tools/buildRelroElf64.py"        90         || fail=$((fail+1))
+run_one_prebuilt helloReal "$ROOT/tools/testdata/hello_real.elf" 98         || fail=$((fail+1))
 
-echo "=== summary: $((16 - fail))/16 passed ==="
+echo "=== summary: $((17 - fail))/17 passed ==="
 exit $fail
