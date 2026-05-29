@@ -40,22 +40,28 @@ Dynamic linking needs a real guest filesystem, which lives in the FULL
 kernel (`Fs::initFileSystem` + `KProcess::startProcess` + `runSlice`), not
 the bare `--x64-run-elf` runner.
 
-BLOCKER discovered: the **Boxedwine64 Xcode target is a minimal diagnostic
-build**. Its synchronized `source/` group compiles cpu64/syscall64/loader64/
-kprocess, but `kscheduler.cpp` (and X11 / full audio / full FS) are NOT
-linked into this target — a headless `--x64-run-root` that calls `runSlice()`
-fails to link (`Undefined symbols: runSlice()`).
+BLOCKER discovered (precise): the Boxedwine64 Xcode target compiles the FULL
+kernel — kscheduler.cpp builds (413 .o files, including kprocess/fs/x11). The
+link failure for a headless `--x64-run-root` was NOT a missing file. It's that
+this target defines **`BOXEDWINE_MULTI_THREADED`**, and `runSlice()` only
+exists in the single-threaded `#else` branch of kscheduler.cpp (line 213,
+inside the `#ifdef BOXEDWINE_MULTI_THREADED ... #else ... #endif`). In MT mode
+there is no `runSlice()`: each guest thread runs on its own HOST thread via
+`KThread::runThreadSlice`, orchestrated by `sdl/multiThreaded/threadedMainloop.cpp`.
 
-NEXT STEP (build-system task, do deliberately to avoid regressing the green
-224/27 baseline): either
-  (a) expand the Boxedwine64 Xcode target to compile the full kernel
-      (kscheduler + FS + minimal X11 stubs), then add a headless
-      `--x64-run-root <hostRootDir> <guestPath>` entry that mounts this
-      `root/` tree and drives `runSlice()` until the process exits; or
-  (b) run via the existing full Boxedwine app build (the non-minimal target)
-      with `-root tools/rootfs64/root /bin/hello_glibc`, which already routes
-      64-bit ELFs through `loadProgram64` (loader.cpp:265) — that path is
-      wired, it just needs the GUI build + a way to run headless.
+NEXT STEP (do deliberately; keep the green 224/27 baseline):
+  (a) RECOMMENDED — run via the normal app path: `Boxedwine -root
+      tools/rootfs64/root /bin/hello_glibc`. The exec path is already wired
+      for 64-bit (loader.cpp:265 → loadProgram64, which loads PT_INTERP via
+      openGuestPath and builds the SysV stack). This boots SDL/UI though, so
+      it needs either a display or a headless-friendly video option
+      (startupArgs.videoOption) — try the existing `-nozip`/console options.
+  (b) Headless MT driver: a `--x64-run-root` that, after startProcess, drives
+      the *multi-threaded* mainloop (sdl/multiThreaded/threadedMainloop.cpp)
+      rather than `runSlice()`. Must use the MT scheduling entry, not the ST
+      one. Heavier; only if (a) proves unworkable headless.
+  Verify first that `loadProgram64`'s openGuestPath finds
+  /lib64/ld-linux-x86-64.so.2 against this root/ tree.
 
 ## Rebuilding the artifacts
 
