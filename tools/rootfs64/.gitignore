@@ -1,0 +1,6 @@
+# The work/ dir holds raw docker-extracted artifacts (large, reproducible via
+# README). Commit only the source and the usable root/ tree.
+work/*.so.6
+work/ld-linux-x86-64.so.2
+work/hello_glibc
+work/hello_static
