@@ -1301,7 +1301,9 @@ void ksyscall64(CPU64* cpu) {
             // getcwd(buf, size) — copy current directory string out. Returns
             // a pointer to buf on success, -ERANGE if size is too small.
             if (!a1 || a2 == 0) { ret = (U64)-K_EFAULT; break; }
-            BString cwd = cpu->thread->process->currentDirectory;
+            // No-process standalone runner: default cwd to "/".
+            BString cwd = (cpu->thread && cpu->thread->process)
+                              ? cpu->thread->process->currentDirectory : B("/");
             if (!cwd.length()) cwd = B("/");
             U64 need = (U64)cwd.length() + 1;
             if (need > a2) { ret = (U64)-34; /* -ERANGE */ break; }
@@ -1421,6 +1423,12 @@ void ksyscall64(CPU64* cpu) {
         case X64_SYS_access: {
             // access(path, mode) — resolve path; we don't model EUID perms yet
             // so existence is the only check (mode bits ignored).
+            // Standalone runner (no KProcess) has no filesystem to consult —
+            // report ENOENT, which is what ld.so expects for its probe paths
+            // (/etc/ld.so.preload, /etc/ld.so.cache, ...). Dereferencing the
+            // null process shared_ptr here was crashing the host (SIGSEGV at
+            // operator-> offset 0x28) during dynamic-glibc startup.
+            if (!cpu->thread || !cpu->thread->process) { ret = (U64)-2; break; }
             char path[1024] = {0};
             cpu->memory->memcpyFromGuest(path, a1, sizeof(path) - 1);
             std::shared_ptr<FsNode> n = Fs::getNodeFromLocalPath(
