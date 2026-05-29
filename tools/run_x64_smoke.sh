@@ -141,6 +141,12 @@ run_one_prebuilt helloFp     "$ROOT/tools/testdata/hello_fp.elf"     45  || fail
 # loop worked end-to-end. This is the closest reachable proof of Milestone B's
 # signal-delivery primitive (clone is still ENOSYS pending KThread64).
 run_one_prebuilt helloSignal "$ROOT/tools/testdata/hello_signal.elf" 77  || fail=$((fail+1))
+# SSE3/SSSE3 vector-intrinsics probe — real clang emits PSHUFB/PALIGNR/
+# PABSD/PHADDD/PSIGND; exits 42 if they all decode+run without tripping the
+# unimpl-tracer. The opcodes' exact semantics are pinned separately by the
+# cpu64SelfTest PABS/PHADD/PSIGN cases; this asserts the compiler-emitted
+# forms decode end-to-end.
+run_one_prebuilt helloVec    "$ROOT/tools/testdata/hello_vec.elf"    42  || fail=$((fail+1))
 
 # Dynamic-link probe — exits with status from libtiny.so::tiny_compute(10).
 # Requires BOXEDWINE64_LIBPATH to point at testdata/ so the in-tree
@@ -183,5 +189,5 @@ run_one_dynamic helloDynlink "$ROOT/tools/testdata/hello_dynlink.elf" "$ROOT/too
 # or the flat symbol table missed leaf-DSO exports during A's relocation.
 run_one_dynamic helloChain "$ROOT/tools/testdata/hello_chain.elf" "$ROOT/tools/testdata" 48 || fail=$((fail+1))
 
-echo "=== summary: $((22 - fail))/22 passed ==="
+echo "=== summary: $((23 - fail))/23 passed ==="
 exit $fail

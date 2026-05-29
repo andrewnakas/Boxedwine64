@@ -3119,6 +3119,112 @@ U32 CPU64::step() {
                 rip += used;
                 return used;
             }
+            // ---- SSSE3 packed integer ops sharing 66 0F 38 /r ----
+            //
+            // PABSB/W/D (1C/1D/1E): packed absolute value of signed bytes/
+            // words/dwords. PHADDW/D (01/02): horizontal add of adjacent
+            // element pairs across dest then src. PSIGNB/W/D (08/09/0A):
+            // apply the sign of each src element to the corresponding dest
+            // element (negate if src<0, zero if src==0, keep if src>0).
+            // All are reg/reg or reg/mem, no immediate. clang emits these
+            // for vectorised abs()/reductions and libc++ ranges code.
+            if (op2 == 0x38 && (op3 == 0x1C || op3 == 0x1D || op3 == 0x1E ||
+                                op3 == 0x01 || op3 == 0x02 ||
+                                op3 == 0x08 || op3 == 0x09 || op3 == 0x0A)) {
+                ModRM m = decodeModRM(rip + opOff + 3, p, 0);
+                U64 sLo, sHi;
+                if (m.isReg) {
+                    sLo = xmm[m.rmIndex].lo; sHi = xmm[m.rmIndex].hi;
+                } else {
+                    sLo = memory->readq(m.effAddr);
+                    sHi = memory->readq(m.effAddr + 8);
+                }
+                U64 dLo = xmm[m.regField].lo;
+                U64 dHi = xmm[m.regField].hi;
+
+                // Unpack dest and src into element arrays at the right width.
+                auto unpackB = [](U64 lo, U64 hi, S8 out[16]) {
+                    for (int i = 0; i < 8; i++) out[i]   = (S8)(U8)(lo >> (i*8));
+                    for (int i = 0; i < 8; i++) out[i+8] = (S8)(U8)(hi >> (i*8));
+                };
+                auto unpackW = [](U64 lo, U64 hi, S16 out[8]) {
+                    for (int i = 0; i < 4; i++) out[i]   = (S16)(U16)(lo >> (i*16));
+                    for (int i = 0; i < 4; i++) out[i+4] = (S16)(U16)(hi >> (i*16));
+                };
+                auto unpackD = [](U64 lo, U64 hi, S32 out[4]) {
+                    out[0] = (S32)(U32)lo; out[1] = (S32)(U32)(lo >> 32);
+                    out[2] = (S32)(U32)hi; out[3] = (S32)(U32)(hi >> 32);
+                };
+                auto packB = [](S8 in[16], U64& lo, U64& hi) {
+                    lo = hi = 0;
+                    for (int i = 0; i < 8; i++) lo |= ((U64)(U8)in[i])   << (i*8);
+                    for (int i = 0; i < 8; i++) hi |= ((U64)(U8)in[i+8]) << (i*8);
+                };
+                auto packW = [](S16 in[8], U64& lo, U64& hi) {
+                    lo = hi = 0;
+                    for (int i = 0; i < 4; i++) lo |= ((U64)(U16)in[i])   << (i*16);
+                    for (int i = 0; i < 4; i++) hi |= ((U64)(U16)in[i+4]) << (i*16);
+                };
+                auto packD = [](S32 in[4], U64& lo, U64& hi) {
+                    lo = ((U64)(U32)in[0]) | (((U64)(U32)in[1]) << 32);
+                    hi = ((U64)(U32)in[2]) | (((U64)(U32)in[3]) << 32);
+                };
+
+                U64 nLo = 0, nHi = 0;
+                if (op3 == 0x1C) {            // PABSB
+                    S8 d[16]; unpackB(dLo, dHi, d);
+                    S8 r[16];
+                    for (int i = 0; i < 16; i++) r[i] = (S8)(d[i] < 0 ? -d[i] : d[i]);
+                    packB(r, nLo, nHi);
+                } else if (op3 == 0x1D) {     // PABSW
+                    S16 d[8]; unpackW(dLo, dHi, d);
+                    S16 r[8];
+                    for (int i = 0; i < 8; i++) r[i] = (S16)(d[i] < 0 ? -d[i] : d[i]);
+                    packW(r, nLo, nHi);
+                } else if (op3 == 0x1E) {     // PABSD
+                    S32 d[4]; unpackD(dLo, dHi, d);
+                    S32 r[4];
+                    for (int i = 0; i < 4; i++) r[i] = (d[i] < 0 ? -d[i] : d[i]);
+                    packD(r, nLo, nHi);
+                } else if (op3 == 0x01) {     // PHADDW
+                    S16 d[8], s[8]; unpackW(dLo, dHi, d); unpackW(sLo, sHi, s);
+                    S16 r[8];
+                    r[0]=(S16)(d[0]+d[1]); r[1]=(S16)(d[2]+d[3]);
+                    r[2]=(S16)(d[4]+d[5]); r[3]=(S16)(d[6]+d[7]);
+                    r[4]=(S16)(s[0]+s[1]); r[5]=(S16)(s[2]+s[3]);
+                    r[6]=(S16)(s[4]+s[5]); r[7]=(S16)(s[6]+s[7]);
+                    packW(r, nLo, nHi);
+                } else if (op3 == 0x02) {     // PHADDD
+                    S32 d[4], s[4]; unpackD(dLo, dHi, d); unpackD(sLo, sHi, s);
+                    S32 r[4];
+                    r[0]=d[0]+d[1]; r[1]=d[2]+d[3];
+                    r[2]=s[0]+s[1]; r[3]=s[2]+s[3];
+                    packD(r, nLo, nHi);
+                } else if (op3 == 0x08) {     // PSIGNB
+                    S8 d[16], s[16]; unpackB(dLo, dHi, d); unpackB(sLo, sHi, s);
+                    S8 r[16];
+                    for (int i = 0; i < 16; i++)
+                        r[i] = (S8)(s[i] < 0 ? -d[i] : (s[i] == 0 ? 0 : d[i]));
+                    packB(r, nLo, nHi);
+                } else if (op3 == 0x09) {     // PSIGNW
+                    S16 d[8], s[8]; unpackW(dLo, dHi, d); unpackW(sLo, sHi, s);
+                    S16 r[8];
+                    for (int i = 0; i < 8; i++)
+                        r[i] = (S16)(s[i] < 0 ? -d[i] : (s[i] == 0 ? 0 : d[i]));
+                    packW(r, nLo, nHi);
+                } else {                       // PSIGND (0x0A)
+                    S32 d[4], s[4]; unpackD(dLo, dHi, d); unpackD(sLo, sHi, s);
+                    S32 r[4];
+                    for (int i = 0; i < 4; i++)
+                        r[i] = (s[i] < 0 ? -d[i] : (s[i] == 0 ? 0 : d[i]));
+                    packD(r, nLo, nHi);
+                }
+                xmm[m.regField].lo = nLo;
+                xmm[m.regField].hi = nHi;
+                U32 used = opOff + 3 + m.length;
+                rip += used;
+                return used;
+            }
             // Other 0F 38 / 0F 3A forms — fall through to default panic.
         }
 

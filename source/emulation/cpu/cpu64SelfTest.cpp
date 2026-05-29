@@ -2539,6 +2539,123 @@ int runX64SelfTest() {
         });
     }
 
+    // ---- SSSE3 packed PABS / PHADD / PSIGN ----
+    //
+    // Inputs go in via movq into the low qword of xmm0 (the dest). For the
+    // two-source ops we also load xmm1 (the src). The high qword is zeroed
+    // by movq, so we reason only about the low 8 bytes and read .lo back.
+
+    // Test 75a — PABSD: dwords {-3, 5} (lo = 0x00000005FFFFFFFD) → {3, 5}
+    //   result.lo = 0x0000000500000003
+    {
+        std::vector<U8> code = {
+            0x48, 0xB8, 0xFD, 0xFF, 0xFF, 0xFF, 0x05, 0x00, 0x00, 0x00, // mov rax, 0x00000005FFFFFFFD
+            0x66, 0x48, 0x0F, 0x6E, 0xC0,                               // movq xmm0, rax
+            0x66, 0x0F, 0x38, 0x1E, 0xC0,                               // pabsd xmm0, xmm0
+            0x66, 0x48, 0x0F, 0x7E, 0xC0,                               // movq rax, xmm0
+        };
+        runAndCheck(r, "pabsd |{-3,5}| = {3,5}", withExit(code), [](CPU64& c) {
+            return c.reg[X64_R15].u64 == 0x0000000500000003ULL;
+        });
+    }
+
+    // Test 75b — PABSW: words {-1, 2, -3, 4} (lo = 0x0004FFFD0002FFFF)
+    //   → {1, 2, 3, 4} = 0x0004000300020001
+    {
+        std::vector<U8> code = {
+            0x48, 0xB8, 0xFF, 0xFF, 0x02, 0x00, 0xFD, 0xFF, 0x04, 0x00, // mov rax, 0x0004FFFD0002FFFF
+            0x66, 0x48, 0x0F, 0x6E, 0xC0,                               // movq xmm0, rax
+            0x66, 0x0F, 0x38, 0x1D, 0xC0,                               // pabsw xmm0, xmm0
+            0x66, 0x48, 0x0F, 0x7E, 0xC0,                               // movq rax, xmm0
+        };
+        runAndCheck(r, "pabsw |{-1,2,-3,4}| = {1,2,3,4}", withExit(code), [](CPU64& c) {
+            return c.reg[X64_R15].u64 == 0x0004000300020001ULL;
+        });
+    }
+
+    // Test 75c — PABSB: bytes {-1,-2,3,-4,5,6,-7,8}
+    //   lo = 0x08F906050C FD FE FF ... build: byte0=0xFF(-1),1=0xFE(-2),
+    //   2=0x03,3=0xFC(-4),4=0x05,5=0x06,6=0xF9(-7),7=0x08
+    //   → {1,2,3,4,5,6,7,8} = 0x0807060504030201
+    {
+        std::vector<U8> code = {
+            0x48, 0xB8, 0xFF, 0xFE, 0x03, 0xFC, 0x05, 0x06, 0xF9, 0x08, // mov rax, ...
+            0x66, 0x48, 0x0F, 0x6E, 0xC0,                               // movq xmm0, rax
+            0x66, 0x0F, 0x38, 0x1C, 0xC0,                               // pabsb xmm0, xmm0
+            0x66, 0x48, 0x0F, 0x7E, 0xC0,                               // movq rax, xmm0
+        };
+        runAndCheck(r, "pabsb |signed bytes| = magnitudes", withExit(code), [](CPU64& c) {
+            return c.reg[X64_R15].u64 == 0x0807060504030201ULL;
+        });
+    }
+
+    // Test 75d — PHADDD xmm0, xmm0: dwords loaded only in low qword via movq,
+    //   so the full vector is d = {3, 10, 0, 0} (lanes 2,3 zeroed by movq).
+    //   PHADDD result = {d0+d1, d2+d3, s0+s1, s2+s3}; src==dst here, so
+    //   lanes = {13, 0, 13, 0}. Reading back .lo (lanes 0,1) = 0x000000000000000D.
+    {
+        std::vector<U8> code = {
+            0x48, 0xB8, 0x03, 0x00, 0x00, 0x00, 0x0A, 0x00, 0x00, 0x00, // mov rax, 0x0000000A00000003
+            0x66, 0x48, 0x0F, 0x6E, 0xC0,                               // movq xmm0, rax
+            0x66, 0x0F, 0x38, 0x02, 0xC0,                               // phaddd xmm0, xmm0
+            0x66, 0x48, 0x0F, 0x7E, 0xC0,                               // movq rax, xmm0
+        };
+        runAndCheck(r, "phaddd {3,10,0,0} self → low lanes {13,0}", withExit(code), [](CPU64& c) {
+            return c.reg[X64_R15].u64 == 0x000000000000000DULL;
+        });
+    }
+
+    // Test 75e — PHADDW xmm0, xmm0: words loaded only in low qword via movq,
+    //   so full vector w = {1,2,3,4, 0,0,0,0}. PHADDW lanes =
+    //   {w0+w1, w2+w3, w4+w5, w6+w7, s0+s1, s2+s3, s4+s5, s6+s7}; src==dst →
+    //   {3, 7, 0, 0, 3, 7, 0, 0}. Reading .lo (lanes 0..3) = {3,7,0,0}
+    //   = 0x0000000000070003.
+    {
+        std::vector<U8> code = {
+            0x48, 0xB8, 0x01, 0x00, 0x02, 0x00, 0x03, 0x00, 0x04, 0x00, // mov rax, 0x0004000300020001
+            0x66, 0x48, 0x0F, 0x6E, 0xC0,                               // movq xmm0, rax
+            0x66, 0x0F, 0x38, 0x01, 0xC0,                               // phaddw xmm0, xmm0
+            0x66, 0x48, 0x0F, 0x7E, 0xC0,                               // movq rax, xmm0
+        };
+        runAndCheck(r, "phaddw {1,2,3,4,0,0,0,0} self → low lanes {3,7,0,0}", withExit(code), [](CPU64& c) {
+            return c.reg[X64_R15].u64 == 0x0000000000070003ULL;
+        });
+    }
+
+    // Test 75f — PSIGND dst={10,10}, src={-1, 0}:
+    //   lane0: src<0 → -dst = -10 = 0xFFFFFFF6
+    //   lane1: src==0 → 0
+    //   result.lo = 0x00000000FFFFFFF6
+    {
+        std::vector<U8> code = {
+            0x48, 0xB8, 0x0A, 0x00, 0x00, 0x00, 0x0A, 0x00, 0x00, 0x00, // mov rax, 0x0000000A0000000A (dst)
+            0x66, 0x48, 0x0F, 0x6E, 0xC0,                               // movq xmm0, rax
+            0x48, 0xB8, 0xFF, 0xFF, 0xFF, 0xFF, 0x00, 0x00, 0x00, 0x00, // mov rax, 0x00000000FFFFFFFF (src)
+            0x66, 0x48, 0x0F, 0x6E, 0xC8,                               // movq xmm1, rax
+            0x66, 0x0F, 0x38, 0x0A, 0xC1,                               // psignd xmm0, xmm1
+            0x66, 0x48, 0x0F, 0x7E, 0xC0,                               // movq rax, xmm0
+        };
+        runAndCheck(r, "psignd {10,10} by {-1,0} → {-10,0}", withExit(code), [](CPU64& c) {
+            return c.reg[X64_R15].u64 == 0x00000000FFFFFFF6ULL;
+        });
+    }
+
+    // Test 75g — PSIGND keep case: dst={5,5}, src={1,1} (both positive) →
+    //   dst unchanged = {5,5}. result.lo = 0x0000000500000005.
+    {
+        std::vector<U8> code = {
+            0x48, 0xB8, 0x05, 0x00, 0x00, 0x00, 0x05, 0x00, 0x00, 0x00, // mov rax, 0x0000000500000005 (dst)
+            0x66, 0x48, 0x0F, 0x6E, 0xC0,                               // movq xmm0, rax
+            0x48, 0xB8, 0x01, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, // mov rax, 0x0000000100000001 (src)
+            0x66, 0x48, 0x0F, 0x6E, 0xC8,                               // movq xmm1, rax
+            0x66, 0x0F, 0x38, 0x0A, 0xC1,                               // psignd xmm0, xmm1
+            0x66, 0x48, 0x0F, 0x7E, 0xC0,                               // movq rax, xmm0
+        };
+        runAndCheck(r, "psignd {5,5} by {1,1} keeps dst", withExit(code), [](CPU64& c) {
+            return c.reg[X64_R15].u64 == 0x0000000500000005ULL;
+        });
+    }
+
     // ---- SSE scalar single-precision FP (MOVSS + ADDSS family) ----
     //
     // Pattern: load 32-bit float bits into low dword of an xmm via movd,
