@@ -80,7 +80,12 @@ clang -target x86_64-linux-gnu -nostdlib -fno-stack-protector -fPIC \
       -O2 -c -o "$TMP/$NAME.o" "$SRC"
 
 if [ "$MODE" = "shared" ]; then
-    "$LD_LLD" -shared -nostdlib -soname="$NAME.so" -o "$OUT" "$TMP/$NAME.o"
+    # A DSO may itself depend on other DSOs (DT_NEEDED *of* a DSO). When
+    # --link-against is passed for a shared build, link the named libs in
+    # so the resulting .so gets its own DT_NEEDED entries. This is what
+    # makes a two-hop dynamic chain (exe -> libA -> libB) verifiable.
+    "$LD_LLD" -shared -nostdlib -soname="$NAME.so" -o "$OUT" \
+              "$TMP/$NAME.o" "${LINK_AGAINST[@]}"
 else
     # exe: dynamic if --link-against deps were given, else static.
     if [ ${#LINK_AGAINST[@]} -gt 0 ]; then

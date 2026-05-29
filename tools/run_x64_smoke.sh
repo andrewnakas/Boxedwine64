@@ -175,5 +175,13 @@ run_one_dynamic() {
 }
 run_one_dynamic helloDynlink "$ROOT/tools/testdata/hello_dynlink.elf" "$ROOT/tools/testdata" 125 || fail=$((fail+1))
 
-echo "=== summary: $((21 - fail))/21 passed ==="
+# Two-hop dynamic chain — exe -> libchainA -> libchainB. Proves the flat
+# symbol table resolves cross-DSO calls *between libraries* (libchainA
+# imports chain_leaf from libchainB; the exe never references libchainB
+# directly). chain_compute(5) = chain_leaf(5) + 5*2 = (5*7+3) + 10 = 48.
+# A wrong exit status here means either DT_NEEDED-of-a-DSO didn't recurse
+# or the flat symbol table missed leaf-DSO exports during A's relocation.
+run_one_dynamic helloChain "$ROOT/tools/testdata/hello_chain.elf" "$ROOT/tools/testdata" 48 || fail=$((fail+1))
+
+echo "=== summary: $((22 - fail))/22 passed ==="
 exit $fail
