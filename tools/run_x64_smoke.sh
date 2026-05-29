@@ -133,6 +133,7 @@ run_one tlsImage       "$ROOT/tools/buildTlsImageElf64.py"     171        || fai
 run_one integration    "$ROOT/tools/buildIntegrationElf64.py"  75         || fail=$((fail+1))
 run_one relro          "$ROOT/tools/buildRelroElf64.py"        90         || fail=$((fail+1))
 run_one_prebuilt helloReal "$ROOT/tools/testdata/hello_real.elf" 98         || fail=$((fail+1))
+run_one_prebuilt helloWide "$ROOT/tools/testdata/hello_wide.elf" 242        || fail=$((fail+1))
 
-echo "=== summary: $((17 - fail))/17 passed ==="
+echo "=== summary: $((18 - fail))/18 passed ==="
 exit $fail
