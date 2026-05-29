@@ -3498,6 +3498,59 @@ U32 CPU64::step() {
             return used;
         }
 
+        // MOVLPD/MOVLPS xmm, m64  66 0F 12 /r  /  0F 12 /r — load m64 to
+        //   xmm.lo, leave xmm.hi unchanged.
+        // MOVHPD/MOVHPS xmm, m64  66 0F 16 /r  /  0F 16 /r — load m64 to
+        //   xmm.hi, leave xmm.lo unchanged.
+        // MOVDDUP        xmm, xmm/m64  F2 0F 12 /r — load m64, broadcast to
+        //   BOTH halves of xmm. ld.so + libm use this heavily for scalar
+        //   doubles fed into packed math.
+        // Register-form 66 0F 12 /r and 0F 12 /r is MOVHLPS/MOVLPS-reg
+        //   (dst.lo = src.hi for 0F 12 reg; dst.lo = src.lo for 66 0F 12 reg).
+        if ((op2 == 0x12 || op2 == 0x16) && p.rep == 0) {
+            ModRM m = decodeModRM(rip + opOff + 2, p, 0);
+            U64 val;
+            if (m.isReg) {
+                // 0F 12 reg-form is MOVHLPS: dst.lo = src.hi
+                // 66 0F 12 reg-form is MOVLPD (treated as MOVAPD low): dst.lo = src.lo
+                // 0F 16 reg-form is MOVLHPS: dst.hi = src.lo
+                // 66 0F 16 reg-form is MOVHPD (treated as MOVAPD high): dst.hi = src.hi
+                if (op2 == 0x12) val = osize66 ? xmm[m.rmIndex].lo : xmm[m.rmIndex].hi;
+                else             val = osize66 ? xmm[m.rmIndex].hi : xmm[m.rmIndex].lo;
+            } else {
+                val = memory->readq(m.effAddr);
+            }
+            if (op2 == 0x12) xmm[m.regField].lo = val;
+            else             xmm[m.regField].hi = val;
+            U32 used = opOff + 2 + m.length;
+            rip += used;
+            return used;
+        }
+        if (op2 == 0x12 && p.rep == 0xF2) {
+            // MOVDDUP: load m64 (or src.lo if reg), duplicate to both halves
+            ModRM m = decodeModRM(rip + opOff + 2, p, 0);
+            U64 val = m.isReg ? xmm[m.rmIndex].lo : memory->readq(m.effAddr);
+            xmm[m.regField].lo = val;
+            xmm[m.regField].hi = val;
+            U32 used = opOff + 2 + m.length;
+            rip += used;
+            return used;
+        }
+
+        // MOVLPD m64, xmm  66 0F 13 /r  /  0F 13 /r — store xmm.lo to m64.
+        // MOVHPD m64, xmm  66 0F 17 /r  /  0F 17 /r — store xmm.hi to m64.
+        // (No register form for 0F 13 / 17.)
+        if ((op2 == 0x13 || op2 == 0x17) && p.rep == 0) {
+            ModRM m = decodeModRM(rip + opOff + 2, p, 0);
+            if (!m.isReg) {
+                U64 val = (op2 == 0x13) ? xmm[m.regField].lo : xmm[m.regField].hi;
+                memory->writeq(m.effAddr, val);
+            }
+            U32 used = opOff + 2 + m.length;
+            rip += used;
+            return used;
+        }
+
         // UNPCKLPS xmm, xmm/m128  0F 14 /r — interleave 32-bit floats from
         // low half: dst = {dst[0], src[0], dst[1], src[1]} (each 32-bit).
         // UNPCKHPS xmm, xmm/m128  0F 15 /r — from high half.

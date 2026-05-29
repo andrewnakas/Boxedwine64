@@ -298,6 +298,7 @@ extern "C" int runX64RunElf(const char* path) {
     // is enough to validate that linkSharedObjectsRecursive works on
     // real `.so` blobs (musl libc.so.6, libm.so.6, …) rather than just
     // the synthesized in-memory libraries the selftest covers.
+    std::vector<ElfLoader64::LinkedLibrary> linked;
     if (parsed.dynamic.present) {
         const char* libpath = std::getenv("BOXEDWINE64_LIBPATH");
         if (libpath && libpath[0]) {
@@ -311,8 +312,14 @@ extern "C" int runX64RunElf(const char* path) {
 
             auto fetcher = [&](const std::string& name) -> ElfLoader64::FetchedLibrary {
                 ElfLoader64::FetchedLibrary out;
+                // Try basename + every search dir. PT_INTERP paths arrive
+                // as e.g. "ld-linux-x86-64.so.2" (we strip the dir below);
+                // DT_NEEDED entries are usually basenames already.
+                std::string base = name;
+                size_t slash = name.find_last_of('/');
+                if (slash != std::string::npos) base = name.substr(slash + 1);
                 for (const std::string& dir : searchDirs) {
-                    std::string full = dir + "/" + name;
+                    std::string full = dir + "/" + base;
                     if (readFileAll(full.c_str(), out.bytes)) {
                         printf("--x64-run-elf: DT_NEEDED '%s' -> %s (%zu bytes)\n",
                                name.c_str(), full.c_str(), out.bytes.size());
@@ -325,7 +332,6 @@ extern "C" int runX64RunElf(const char* path) {
                 return out;
             };
 
-            std::vector<ElfLoader64::LinkedLibrary> linked;
             U64 firstLibBase = 0x7FFFE0000000ULL;
             U64 nLinked = ElfLoader64::linkSharedObjectsRecursive(
                 &mem, parsed, reloc, fetcher, firstLibBase, &linked);
@@ -346,12 +352,43 @@ extern "C" int runX64RunElf(const char* path) {
                (unsigned long long)relroEnd);
     }
 
-    // Build the SysV initial stack so glibc-style _start sees the right
-    // frame. AT_BASE is 0 here — interpreter loading isn't wired in the
-    // runner yet, so dynamic binaries that need ld-linux won't get past
-    // _dl_start. That's fine for static binaries and informative for
-    // dynamic ones (the unimpl-tracer will report exactly where they die).
-    U64 sp = buildSysVStack(&mem, STACK_TOP, parsed, reloc, /*interpBase=*/0,
+    // Find the dynamic linker among the loaded libraries (if any). When
+    // PT_INTERP is present and the matching lib was pulled in by the
+    // recursive fetcher, control transfers to ld.so's entry — not the
+    // exe's — and AT_BASE points at ld.so's load base. This is what
+    // glibc's _start expects: ld.so runs _dl_start → _dl_init → THEN
+    // jumps to the exe entry, so without it libc's TLS/IFUNC setup
+    // never happens and the exe spins on uninitialized globals.
+    U64 interpBase = 0;
+    U64 interpEntry = 0;
+    if (parsed.interpreter.length() && !linked.empty()) {
+        std::string interpPath = parsed.interpreter.c_str();
+        std::string interpBase_s = interpPath;
+        size_t slash = interpPath.find_last_of('/');
+        if (slash != std::string::npos) interpBase_s = interpPath.substr(slash + 1);
+        for (const auto& lib : linked) {
+            std::string libBase_s = lib.name;
+            size_t s2 = lib.name.find_last_of('/');
+            if (s2 != std::string::npos) libBase_s = lib.name.substr(s2 + 1);
+            if (libBase_s == interpBase_s) {
+                interpBase  = lib.reloc;
+                interpEntry = lib.parsed.entry + lib.reloc;
+                printf("--x64-run-elf: PT_INTERP '%s' -> base=0x%llx entry=0x%llx\n",
+                       interpPath.c_str(),
+                       (unsigned long long)interpBase,
+                       (unsigned long long)interpEntry);
+                break;
+            }
+        }
+        if (!interpBase) {
+            printf("--x64-run-elf: PT_INTERP '%s' declared but not among linked libs\n",
+                   interpPath.c_str());
+        }
+    }
+
+    // Build the SysV initial stack. interpBase populates AT_BASE so ld.so
+    // knows its own load address.
+    U64 sp = buildSysVStack(&mem, STACK_TOP, parsed, reloc, interpBase,
                             path ? path : "/boxedwine/embedded");
 
     // Install initial-thread TLS block when the binary has a PT_TLS phdr.
@@ -376,7 +413,10 @@ extern "C" int runX64RunElf(const char* path) {
     }
 
     CPU64 cpu(&mem);
-    cpu.rip = parsed.entry + reloc;
+    // Hand control to ld.so when we have one — it'll resolve IFUNCs,
+    // run _dl_init across DT_NEEDED libs, then jump to AT_ENTRY (the
+    // exe's _start). Without an interp, jump straight to the exe entry.
+    cpu.rip = interpEntry ? interpEntry : (parsed.entry + reloc);
     cpu.reg[X64_RSP].setU64(sp);
     // SysV ABI: RDX at entry holds atexit-callback pointer or 0.
     cpu.reg[X64_RDX].setU64(0);
