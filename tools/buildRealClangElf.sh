@@ -19,18 +19,43 @@
 #   tools/buildRealClangElf.sh hello_real   # builds testdata/hello_real.{c,elf}
 #   tools/buildRealClangElf.sh hello_wide
 #   tools/buildRealClangElf.sh hello_wide /custom/out.elf
+#   tools/buildRealClangElf.sh --shared libtiny  # builds testdata/libtiny.so
+#   tools/buildRealClangElf.sh --link-against libtiny.so hello_dynlink
+#       (links against testdata/libtiny.so during the final ld step;
+#        produces hello_dynlink.elf with a DT_NEEDED entry pointing at
+#        libtiny.so — runnable via $BOXEDWINE64_LIBPATH)
 
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 
+# Parse optional flags.
+MODE="exe"
+LINK_AGAINST=()
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --shared)
+            MODE="shared"
+            shift ;;
+        --link-against)
+            LINK_AGAINST+=("$ROOT/tools/testdata/$2")
+            shift 2 ;;
+        *)
+            break ;;
+    esac
+done
+
 if [ $# -lt 1 ]; then
-    echo "usage: $0 <name> [out.elf]" >&2
+    echo "usage: $0 [--shared] [--link-against <lib.so>] <name> [out]" >&2
     exit 1
 fi
 NAME="$1"
 SRC="$ROOT/tools/testdata/$NAME.c"
-OUT="${2:-$ROOT/tools/testdata/$NAME.elf}"
+if [ "$MODE" = "shared" ]; then
+    OUT="${2:-$ROOT/tools/testdata/$NAME.so}"
+else
+    OUT="${2:-$ROOT/tools/testdata/$NAME.elf}"
+fi
 
 if [ ! -f "$SRC" ]; then
     echo "error: missing source: $SRC" >&2
@@ -51,10 +76,20 @@ fi
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
 
-clang -target x86_64-linux-gnu -nostdlib -fno-stack-protector \
+clang -target x86_64-linux-gnu -nostdlib -fno-stack-protector -fPIC \
       -O2 -c -o "$TMP/$NAME.o" "$SRC"
 
-"$LD_LLD" -static -nostdlib -e _start -o "$OUT" "$TMP/$NAME.o"
+if [ "$MODE" = "shared" ]; then
+    "$LD_LLD" -shared -nostdlib -soname="$NAME.so" -o "$OUT" "$TMP/$NAME.o"
+else
+    # exe: dynamic if --link-against deps were given, else static.
+    if [ ${#LINK_AGAINST[@]} -gt 0 ]; then
+        "$LD_LLD" -nostdlib -dynamic-linker /lib64/ld-linux-x86-64.so.2 \
+                  -e _start -o "$OUT" "$TMP/$NAME.o" "${LINK_AGAINST[@]}"
+    else
+        "$LD_LLD" -static -nostdlib -e _start -o "$OUT" "$TMP/$NAME.o"
+    fi
+fi
 
 chmod +x "$OUT"
 echo "wrote $OUT ($(stat -f %z "$OUT") bytes)"
