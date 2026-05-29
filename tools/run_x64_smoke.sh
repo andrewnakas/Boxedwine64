@@ -135,6 +135,12 @@ run_one relro          "$ROOT/tools/buildRelroElf64.py"        90         || fai
 run_one_prebuilt helloReal   "$ROOT/tools/testdata/hello_real.elf"   98  || fail=$((fail+1))
 run_one_prebuilt helloWide   "$ROOT/tools/testdata/hello_wide.elf"   242 || fail=$((fail+1))
 run_one_prebuilt helloFp     "$ROOT/tools/testdata/hello_fp.elf"     45  || fail=$((fail+1))
+# Float-formatting probe — Milestone C exit-criterion kernel: turn a double
+# into a decimal string via repeated MULSD/SUBSD/CVTTSD2SI/CVTSI2SD (the
+# arithmetic glibc's __printf_fp performs). Exits 6 (digit count); the
+# decimal string is tee'd to host stdout. Last-place drift is correct
+# IEEE-754 behaviour, not an emulator bug.
+run_one_prebuilt helloFmt    "$ROOT/tools/testdata/hello_fmt.elf"    6   || fail=$((fail+1))
 # Signal-delivery probe — installs SIGUSR1 handler, raises via tgkill, the
 # handler writes a sentinel, sigreturn restores, main exits with sentinel.
 # Exit 77 means the entire deliverSignalSync → handler → restorer → rt_sigreturn
@@ -199,5 +205,5 @@ run_one_dynamic helloDynlink "$ROOT/tools/testdata/hello_dynlink.elf" "$ROOT/too
 # or the flat symbol table missed leaf-DSO exports during A's relocation.
 run_one_dynamic helloChain "$ROOT/tools/testdata/hello_chain.elf" "$ROOT/tools/testdata" 48 || fail=$((fail+1))
 
-echo "=== summary: $((25 - fail))/25 passed ==="
+echo "=== summary: $((26 - fail))/26 passed ==="
 exit $fail
