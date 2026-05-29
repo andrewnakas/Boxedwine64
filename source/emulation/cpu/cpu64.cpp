@@ -3397,6 +3397,126 @@ U32 CPU64::step() {
             return used;
         }
 
+        // ---- SSE3 horizontal FP: HADDPS/HSUBPS (F2 0F 7C/7D),
+        //      HADDPD/HSUBPD (66 0F 7C/7D) ----
+        //
+        // HADD pairs adjacent lanes: for HADDPS the result is
+        //   { d0+d1, d2+d3, s0+s1, s2+s3 }  (singles)
+        // HADDPD:
+        //   { d0+d1, s0+s1 }                (doubles)
+        // HSUB is the same with subtraction (lane0-lane1, etc). clang emits
+        // these for std::accumulate / reduction loops over float arrays.
+        if ((op2 == 0x7C || op2 == 0x7D) &&
+            (p.rep == 0xF2 || osize66)) {
+            ModRM m = decodeModRM(rip + opOff + 2, p, 0);
+            U64 srcLo, srcHi;
+            if (m.isReg) { srcLo = xmm[m.rmIndex].lo; srcHi = xmm[m.rmIndex].hi; }
+            else { srcLo = memory->readq(m.effAddr); srcHi = memory->readq(m.effAddr + 8); }
+            bool isSub = (op2 == 0x7D);
+            if (osize66) {
+                // packed double
+                double d0 = u64ToDouble(xmm[m.regField].lo);
+                double d1 = u64ToDouble(xmm[m.regField].hi);
+                double s0 = u64ToDouble(srcLo);
+                double s1 = u64ToDouble(srcHi);
+                double r0 = isSub ? (d0 - d1) : (d0 + d1);
+                double r1 = isSub ? (s0 - s1) : (s0 + s1);
+                xmm[m.regField].lo = doubleToU64(r0);
+                xmm[m.regField].hi = doubleToU64(r1);
+            } else {
+                // packed single (F2 prefix)
+                auto u32f = [](U32 b){ float f; std::memcpy(&f,&b,4); return f; };
+                auto fu32 = [](float f){ U32 b; std::memcpy(&b,&f,4); return b; };
+                float d[4], s[4];
+                d[0]=u32f((U32)xmm[m.regField].lo); d[1]=u32f((U32)(xmm[m.regField].lo>>32));
+                d[2]=u32f((U32)xmm[m.regField].hi); d[3]=u32f((U32)(xmm[m.regField].hi>>32));
+                s[0]=u32f((U32)srcLo); s[1]=u32f((U32)(srcLo>>32));
+                s[2]=u32f((U32)srcHi); s[3]=u32f((U32)(srcHi>>32));
+                float r[4];
+                r[0]=isSub?(d[0]-d[1]):(d[0]+d[1]);
+                r[1]=isSub?(d[2]-d[3]):(d[2]+d[3]);
+                r[2]=isSub?(s[0]-s[1]):(s[0]+s[1]);
+                r[3]=isSub?(s[2]-s[3]):(s[2]+s[3]);
+                xmm[m.regField].lo = (U64)fu32(r[0]) | ((U64)fu32(r[1]) << 32);
+                xmm[m.regField].hi = (U64)fu32(r[2]) | ((U64)fu32(r[3]) << 32);
+            }
+            U32 used = opOff + 2 + m.length;
+            rip += used;
+            return used;
+        }
+
+        // ---- SSE3 MOVSHDUP (F3 0F 16) / MOVSLDUP (F3 0F 12) ----
+        //   MOVSHDUP {a0,a1,a2,a3} -> {a1,a1,a3,a3} (duplicate odd lanes)
+        //   MOVSLDUP {a0,a1,a2,a3} -> {a0,a0,a2,a2} (duplicate even lanes)
+        // Used in complex-arithmetic and broadcast patterns. Note 0F 12 with
+        // F3 is MOVSLDUP, distinct from MOVLPS (no prefix) / MOVDDUP (F2).
+        if (p.rep == 0xF3 && (op2 == 0x16 || op2 == 0x12)) {
+            ModRM m = decodeModRM(rip + opOff + 2, p, 0);
+            U64 sLo, sHi;
+            if (m.isReg) { sLo = xmm[m.rmIndex].lo; sHi = xmm[m.rmIndex].hi; }
+            else { sLo = memory->readq(m.effAddr); sHi = memory->readq(m.effAddr + 8); }
+            U32 e0 = (U32)sLo, e1 = (U32)(sLo >> 32);
+            U32 e2 = (U32)sHi, e3 = (U32)(sHi >> 32);
+            U32 r0, r1, r2, r3;
+            if (op2 == 0x16) { r0 = e1; r1 = e1; r2 = e3; r3 = e3; }   // SHDUP
+            else             { r0 = e0; r1 = e0; r2 = e2; r3 = e2; }   // SLDUP
+            xmm[m.regField].lo = (U64)r0 | ((U64)r1 << 32);
+            xmm[m.regField].hi = (U64)r2 | ((U64)r3 << 32);
+            U32 used = opOff + 2 + m.length;
+            rip += used;
+            return used;
+        }
+
+        // ---- SSE4.1 packed dword min/max/mul: 66 0F 38 38/39/3D/3C/40 ----
+        //   PMINSD 39, PMAXSD 3D, PMINSB 38, PMAXSB 3C, PMULLD 40
+        // (the byte forms 38/3C round out the signed min/max family). All
+        // are 66 0F 38 /r with a standard ModRM. clang emits PMULLD for
+        // int-vector multiply and PMIN/PMAXSD for std::min/max over int[].
+        if (osize66 && op2 == 0x38) {
+            U8 op3b = fetchByte(rip + opOff + 2);
+            if (op3b == 0x39 || op3b == 0x3D || op3b == 0x40 ||
+                op3b == 0x38 || op3b == 0x3C) {
+                ModRM m = decodeModRM(rip + opOff + 3, p, 0);
+                U64 sLo, sHi;
+                if (m.isReg) { sLo = xmm[m.rmIndex].lo; sHi = xmm[m.rmIndex].hi; }
+                else { sLo = memory->readq(m.effAddr); sHi = memory->readq(m.effAddr + 8); }
+                U64 dLo = xmm[m.regField].lo, dHi = xmm[m.regField].hi;
+                U64 nLo, nHi;
+                if (op3b == 0x38 || op3b == 0x3C) {
+                    // signed byte min(38)/max(3C)
+                    auto doByte = [&](U64 dq, U64 sq) -> U64 {
+                        U64 out = 0;
+                        for (int i = 0; i < 8; i++) {
+                            S8 dv = (S8)(U8)(dq >> (i*8));
+                            S8 sv = (S8)(U8)(sq >> (i*8));
+                            S8 rv = (op3b == 0x38) ? (dv < sv ? dv : sv)
+                                                   : (dv > sv ? dv : sv);
+                            out |= ((U64)(U8)rv) << (i*8);
+                        }
+                        return out;
+                    };
+                    nLo = doByte(dLo, sLo); nHi = doByte(dHi, sHi);
+                } else {
+                    // dword min(39)/max(3D)/mullo(40)
+                    auto doDword = [&](U64 dq, U64 sq) -> U64 {
+                        S32 d0 = (S32)(U32)dq, d1 = (S32)(U32)(dq >> 32);
+                        S32 s0 = (S32)(U32)sq, s1 = (S32)(U32)(sq >> 32);
+                        S32 r0, r1;
+                        if (op3b == 0x39) { r0 = d0 < s0 ? d0 : s0; r1 = d1 < s1 ? d1 : s1; }
+                        else if (op3b == 0x3D) { r0 = d0 > s0 ? d0 : s0; r1 = d1 > s1 ? d1 : s1; }
+                        else { r0 = (S32)((U32)d0 * (U32)s0); r1 = (S32)((U32)d1 * (U32)s1); }
+                        return ((U64)(U32)r0) | (((U64)(U32)r1) << 32);
+                    };
+                    nLo = doDword(dLo, sLo); nHi = doDword(dHi, sHi);
+                }
+                xmm[m.regField].lo = nLo;
+                xmm[m.regField].hi = nHi;
+                U32 used = opOff + 3 + m.length;
+                rip += used;
+                return used;
+            }
+        }
+
         // CVTSI2SD xmm, r/m32   F2 0F 2A /r       (REX.W → r/m64)
         // Convert int to double; result in low 64 of dst, high unchanged.
         if (op2 == 0x2A && p.rep == 0xF2) {

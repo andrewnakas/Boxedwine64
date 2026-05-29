@@ -2656,6 +2656,85 @@ int runX64SelfTest() {
         });
     }
 
+    // ---- SSE4.1 packed dword PMULLD / PMINSD / PMAXSD ----
+
+    // Test 75h — PMULLD {2,3} * {7,7} = {14,21} → 0x000000150000000E
+    {
+        std::vector<U8> code = {
+            0x48, 0xB8, 0x02, 0x00, 0x00, 0x00, 0x03, 0x00, 0x00, 0x00, // mov rax, 0x0000000300000002
+            0x66, 0x48, 0x0F, 0x6E, 0xC0,                               // movq xmm0, rax
+            0x48, 0xB8, 0x07, 0x00, 0x00, 0x00, 0x07, 0x00, 0x00, 0x00, // mov rax, 0x0000000700000007
+            0x66, 0x48, 0x0F, 0x6E, 0xC8,                               // movq xmm1, rax
+            0x66, 0x0F, 0x38, 0x40, 0xC1,                               // pmulld xmm0, xmm1
+            0x66, 0x48, 0x0F, 0x7E, 0xC0,                               // movq rax, xmm0
+        };
+        runAndCheck(r, "pmulld {2,3}*{7,7} = {14,21}", withExit(code), [](CPU64& c) {
+            return c.reg[X64_R15].u64 == 0x000000150000000EULL;
+        });
+    }
+
+    // Test 75i — PMINSD {10,-5} min {4,4}: lane0 min(10,4)=4,
+    //   lane1 min(-5,4)=-5 → {4,-5} = 0xFFFFFFFB00000004
+    {
+        std::vector<U8> code = {
+            0x48, 0xB8, 0x0A, 0x00, 0x00, 0x00, 0xFB, 0xFF, 0xFF, 0xFF, // mov rax, 0xFFFFFFFB0000000A (dst {10,-5})
+            0x66, 0x48, 0x0F, 0x6E, 0xC0,                               // movq xmm0, rax
+            0x48, 0xB8, 0x04, 0x00, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00, // mov rax, 0x0000000400000004 (src {4,4})
+            0x66, 0x48, 0x0F, 0x6E, 0xC8,                               // movq xmm1, rax
+            0x66, 0x0F, 0x38, 0x39, 0xC1,                               // pminsd xmm0, xmm1
+            0x66, 0x48, 0x0F, 0x7E, 0xC0,                               // movq rax, xmm0
+        };
+        runAndCheck(r, "pminsd {10,-5} min {4,4} = {4,-5}", withExit(code), [](CPU64& c) {
+            return c.reg[X64_R15].u64 == 0xFFFFFFFB00000004ULL;
+        });
+    }
+
+    // Test 75j — PMAXSD {10,-5} max {4,4}: lane0 max(10,4)=10,
+    //   lane1 max(-5,4)=4 → {10,4} = 0x000000040000000A
+    {
+        std::vector<U8> code = {
+            0x48, 0xB8, 0x0A, 0x00, 0x00, 0x00, 0xFB, 0xFF, 0xFF, 0xFF, // mov rax, 0xFFFFFFFB0000000A (dst {10,-5})
+            0x66, 0x48, 0x0F, 0x6E, 0xC0,                               // movq xmm0, rax
+            0x48, 0xB8, 0x04, 0x00, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00, // mov rax, 0x0000000400000004 (src {4,4})
+            0x66, 0x48, 0x0F, 0x6E, 0xC8,                               // movq xmm1, rax
+            0x66, 0x0F, 0x38, 0x3D, 0xC1,                               // pmaxsd xmm0, xmm1
+            0x66, 0x48, 0x0F, 0x7E, 0xC0,                               // movq rax, xmm0
+        };
+        runAndCheck(r, "pmaxsd {10,-5} max {4,4} = {10,4}", withExit(code), [](CPU64& c) {
+            return c.reg[X64_R15].u64 == 0x000000040000000AULL;
+        });
+    }
+
+    // Test 75k — MOVSHDUP {1,2,3,4} → {2,2,4,4}; reading .lo (lanes 0,1)
+    //   = {2,2}. Inputs are integers placed in float lanes via movq — the
+    //   op is a pure lane shuffle, so integer bit patterns work fine.
+    //   dst.lo lanes {1,2} = 0x0000000200000001, dst.hi {3,4}.
+    //   result lanes {2,2,4,4}; .lo = 0x0000000200000002.
+    {
+        std::vector<U8> code = {
+            0x48, 0xB8, 0x01, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, // mov rax, {1,2}
+            0x66, 0x48, 0x0F, 0x6E, 0xC8,                               // movq xmm1, rax
+            0xF3, 0x0F, 0x16, 0xC1,                                     // movshdup xmm0, xmm1
+            0x66, 0x48, 0x0F, 0x7E, 0xC0,                               // movq rax, xmm0
+        };
+        runAndCheck(r, "movshdup {1,2,..} → {2,2,..}", withExit(code), [](CPU64& c) {
+            return c.reg[X64_R15].u64 == 0x0000000200000002ULL;
+        });
+    }
+
+    // Test 75l — MOVSLDUP {1,2,..} → {1,1,..}; .lo = 0x0000000100000001.
+    {
+        std::vector<U8> code = {
+            0x48, 0xB8, 0x01, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, // mov rax, {1,2}
+            0x66, 0x48, 0x0F, 0x6E, 0xC8,                               // movq xmm1, rax
+            0xF3, 0x0F, 0x12, 0xC1,                                     // movsldup xmm0, xmm1
+            0x66, 0x48, 0x0F, 0x7E, 0xC0,                               // movq rax, xmm0
+        };
+        runAndCheck(r, "movsldup {1,2,..} → {1,1,..}", withExit(code), [](CPU64& c) {
+            return c.reg[X64_R15].u64 == 0x0000000100000001ULL;
+        });
+    }
+
     // ---- SSE scalar single-precision FP (MOVSS + ADDSS family) ----
     //
     // Pattern: load 32-bit float bits into low dword of an xmm via movd,

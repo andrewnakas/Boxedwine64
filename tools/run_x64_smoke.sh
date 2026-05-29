@@ -147,6 +147,11 @@ run_one_prebuilt helloSignal "$ROOT/tools/testdata/hello_signal.elf" 77  || fail
 # cpu64SelfTest PABS/PHADD/PSIGN cases; this asserts the compiler-emitted
 # forms decode end-to-end.
 run_one_prebuilt helloVec    "$ROOT/tools/testdata/hello_vec.elf"    42  || fail=$((fail+1))
+# Second vector probe — SSE3 FP-horizontal (HADDPS/HADDPD/MOVSHDUP/
+# MOVSLDUP) + SSE4.1 packed dword (PMULLD/PMINSD). Exits 24 clean if all
+# decode+run. PMULLD/PMINSD/PMAXSD/MOVSHDUP/MOVSLDUP semantics pinned by
+# cpu64SelfTest; HADDPS/HADDPD covered by this probe's end-to-end run.
+run_one_prebuilt helloVec2   "$ROOT/tools/testdata/hello_vec2.elf"   24  || fail=$((fail+1))
 
 # Dynamic-link probe — exits with status from libtiny.so::tiny_compute(10).
 # Requires BOXEDWINE64_LIBPATH to point at testdata/ so the in-tree
@@ -189,5 +194,5 @@ run_one_dynamic helloDynlink "$ROOT/tools/testdata/hello_dynlink.elf" "$ROOT/too
 # or the flat symbol table missed leaf-DSO exports during A's relocation.
 run_one_dynamic helloChain "$ROOT/tools/testdata/hello_chain.elf" "$ROOT/tools/testdata" 48 || fail=$((fail+1))
 
-echo "=== summary: $((23 - fail))/23 passed ==="
+echo "=== summary: $((24 - fail))/24 passed ==="
 exit $fail
