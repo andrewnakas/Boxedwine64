@@ -132,9 +132,15 @@ run_one indirectCall   "$ROOT/tools/buildIndirectCallElf64.py" 119        || fai
 run_one tlsImage       "$ROOT/tools/buildTlsImageElf64.py"     171        || fail=$((fail+1))
 run_one integration    "$ROOT/tools/buildIntegrationElf64.py"  75         || fail=$((fail+1))
 run_one relro          "$ROOT/tools/buildRelroElf64.py"        90         || fail=$((fail+1))
-run_one_prebuilt helloReal "$ROOT/tools/testdata/hello_real.elf" 98         || fail=$((fail+1))
-run_one_prebuilt helloWide "$ROOT/tools/testdata/hello_wide.elf" 242        || fail=$((fail+1))
-run_one_prebuilt helloFp   "$ROOT/tools/testdata/hello_fp.elf"   45         || fail=$((fail+1))
+run_one_prebuilt helloReal   "$ROOT/tools/testdata/hello_real.elf"   98  || fail=$((fail+1))
+run_one_prebuilt helloWide   "$ROOT/tools/testdata/hello_wide.elf"   242 || fail=$((fail+1))
+run_one_prebuilt helloFp     "$ROOT/tools/testdata/hello_fp.elf"     45  || fail=$((fail+1))
+# Signal-delivery probe — installs SIGUSR1 handler, raises via tgkill, the
+# handler writes a sentinel, sigreturn restores, main exits with sentinel.
+# Exit 77 means the entire deliverSignalSync → handler → restorer → rt_sigreturn
+# loop worked end-to-end. This is the closest reachable proof of Milestone B's
+# signal-delivery primitive (clone is still ENOSYS pending KThread64).
+run_one_prebuilt helloSignal "$ROOT/tools/testdata/hello_signal.elf" 77  || fail=$((fail+1))
 
 # Dynamic-link probe — exits with status from libtiny.so::tiny_compute(10).
 # Requires BOXEDWINE64_LIBPATH to point at testdata/ so the in-tree
@@ -169,5 +175,5 @@ run_one_dynamic() {
 }
 run_one_dynamic helloDynlink "$ROOT/tools/testdata/hello_dynlink.elf" "$ROOT/tools/testdata" 125 || fail=$((fail+1))
 
-echo "=== summary: $((20 - fail))/20 passed ==="
+echo "=== summary: $((21 - fail))/21 passed ==="
 exit $fail

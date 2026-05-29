@@ -1069,14 +1069,23 @@ static bool deliverSignalSync(CPU64* cpu, U32 sig) {
 
     U64 uctxPtr = buildSignalFrame(cpu, frameBase);
 
+    // x86-64 signal-frame ABI: the kernel pushes the restorer address *below*
+    // the ucontext so the handler's terminating `ret` pops it and jumps to
+    // the restorer. The restorer then issues `syscall rt_sigreturn` with RSP
+    // pointing at the ucontext (== uctxPtr). Without this, the handler's
+    // `ret` pops the first qword of ucontext as garbage and crashes.
+    U64 retSlot = uctxPtr - 8;
+    cpu->memory->writeq(retSlot, sa.restorer);
+
     // Mask the signal during handler execution (unless SA_NODEFER=0x40000000).
     if ((sa.flags & 0x40000000) == 0) {
         cpu->sigMask |= (1ULL << (sig - 1));
     }
     cpu->sigMask |= sa.mask;
 
-    // Hand off to the handler.
-    cpu->reg[X64_RSP].setU64(uctxPtr);  // sigreturn reads from RSP
+    // Hand off to the handler. RSP points at restorer_addr so `ret` pops it
+    // and leaves RSP = uctxPtr, which is what rt_sigreturn expects.
+    cpu->reg[X64_RSP].setU64(retSlot);
     cpu->reg[X64_RDI].setU64(sig);      // arg1: signal number
     cpu->reg[X64_RSI].setU64(0);        // arg2: siginfo (we don't synth one)
     cpu->reg[X64_RDX].setU64(uctxPtr);  // arg3: ucontext pointer
@@ -1319,6 +1328,11 @@ void ksyscall64(CPU64* cpu) {
                 ret = (U64)-K_ESRCH;
                 break;
             }
+            // Set RAX to the syscall's return value *before* building the
+            // signal frame so the frame captures RAX=0 (success). Otherwise
+            // rt_sigreturn restores RAX to whatever was in it at entry
+            // (the syscall number 234), and userspace sees tgkill "fail".
+            cpu->reg[X64_RAX].setU64(0);
             if (deliverSignalSync(cpu, sig)) {
                 // Handler will run next; ret=0 (kernel reports success
                 // *before* handler runs, and the syscall return value is
@@ -1334,12 +1348,15 @@ void ksyscall64(CPU64* cpu) {
             break;
         }
         case X64_SYS_rt_sigreturn: {
-            // x86-64 ABI: at the moment rt_sigreturn is invoked, RSP points
-            // at the ucontext_t of the frame the kernel built when it
-            // delivered the signal. We read all gprs/rip/rflags/sigmask
-            // out of it and overwrite our state. The saved RAX becomes
-            // the syscall return value (kernel restores the pre-signal
-            // RAX, *not* a sigreturn status).
+            // x86-64 ABI: at signal-delivery time the kernel set
+            //   RSP = uctxPtr - 8     // points at pushed restorer_addr
+            // The handler's terminating `ret` pops that slot, leaving
+            //   RSP = uctxPtr         // which is what the restorer sees
+            // before issuing `syscall rt_sigreturn`. The ucontext_t
+            // therefore lives at the *current* RSP. We read all
+            // gprs/rip/rflags/sigmask out of it and overwrite our state.
+            // The saved RAX becomes the syscall return value (kernel
+            // restores the pre-signal RAX, *not* a sigreturn status).
             if (!cpu->memory) { ret = (U64)-K_EFAULT; break; }
             U64 uctxPtr = cpu->reg[X64_RSP].u64;
             ret = restoreSignalFrame(cpu, uctxPtr);

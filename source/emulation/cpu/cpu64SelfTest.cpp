@@ -4465,6 +4465,17 @@ int runX64SelfTest() {
             //   mov rax, 0xCAFE              48 B8 FE CA 00 00 00 00 00 00
             //   mov r10, MARK_ADDR            49 BA <8 bytes>
             //   mov [r10], rax                49 89 02
+            //   add rsp, 8                    48 83 C4 08  (pop the restorer
+            //                                              slot the kernel
+            //                                              pushed below the
+            //                                              ucontext — we
+            //                                              skip the restorer
+            //                                              and syscall
+            //                                              directly, but
+            //                                              rt_sigreturn
+            //                                              expects RSP to
+            //                                              point at the
+            //                                              ucontext)
             //   mov rax, 15                   48 C7 C0 0F 00 00 00
             //   syscall                       0F 05
             code.push_back(0x48); code.push_back(0xB8);
@@ -4473,6 +4484,7 @@ int runX64SelfTest() {
             code.push_back(0x49); code.push_back(0xBA);
             for (int i = 0; i < 8; i++) code.push_back((U8)(MARK_ADDR >> (8*i)));
             code.push_back(0x49); code.push_back(0x89); code.push_back(0x02);
+            code.push_back(0x48); code.push_back(0x83); code.push_back(0xC4); code.push_back(0x08);
             code.push_back(0x48); code.push_back(0xC7); code.push_back(0xC0);
             code.push_back(15); code.push_back(0); code.push_back(0); code.push_back(0);
             code.push_back(0x0F); code.push_back(0x05);
