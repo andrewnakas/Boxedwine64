@@ -39,7 +39,7 @@ compile_and_run() {
     local name="$1"; local src="$2"; local expected="$3"
     total=$((total+1))
     printf "%s\n" "$src" > "$WORK/$name.c"
-    if ! zig cc -target x86_64-linux-musl -static -O2 "$WORK/$name.c" -o "$WORK/$name" 2>"$WORK/$name.err"; then
+    if ! zig cc -target x86_64-linux-musl -static -O2 "$WORK/$name.c" -lm -o "$WORK/$name" 2>"$WORK/$name.err"; then
         echo "FAIL $name — compile error"
         cat "$WORK/$name.err"
         fail=$((fail+1))
@@ -117,6 +117,58 @@ int main(void){
     write(1,"OK\n",3); return 0;
 }
 ' "OK"
+
+compile_and_run libm '
+#include <math.h>
+#include <unistd.h>
+int main(void){
+    double s = 0;
+    for (int i = 1; i <= 100; i++) s += sqrt((double)i) + sin((double)i*0.01) + cos((double)i*0.01);
+    long h = (long)(s * 1000.0);
+    return (int)(h & 0xFFFF);
+}
+' "exit syscall, status=15337"
+
+compile_and_run mmap '
+#include <sys/mman.h>
+#include <unistd.h>
+int main(void){
+    size_t n = 256*1024;
+    void *p = mmap(0,n,PROT_READ|PROT_WRITE,MAP_PRIVATE|MAP_ANON,-1,0);
+    if (p==MAP_FAILED){write(1,"FAIL\n",5); return 1;}
+    unsigned char *b=p;
+    for (size_t i=0;i<n;i++) b[i]=(unsigned char)(i*31u);
+    if (munmap(p,n)!=0){write(1,"FAIL\n",5); return 2;}
+    write(1,"OK\n",3); return 0;
+}
+' "OK"
+
+compile_and_run sigjmp '
+#include <setjmp.h>
+#include <unistd.h>
+static jmp_buf env; static int sum;
+static void inner(int n){ if(n==5)longjmp(env,42); sum+=n; inner(n+1); }
+int main(void){
+    if(setjmp(env)==0){inner(0); write(1,"NO\n",3); return 1;}
+    if(sum!=10){write(1,"BAD\n",4); return 2;}
+    write(1,"OK\n",3); return 0;
+}
+' "OK"
+
+compile_and_run crc32 '
+#include <unistd.h>
+int main(void){
+    static unsigned tab[256];
+    for (unsigned i=0;i<256;i++){unsigned c=i; for(int k=0;k<8;k++)c=(c>>1)^(0xEDB88320u & -(c&1u)); tab[i]=c;}
+    static unsigned char b[4096]; unsigned s=1;
+    for(int i=0;i<4096;i++){s=s*1664525u+1013904223u; b[i]=(unsigned char)(s>>16);}
+    unsigned crc=0xFFFFFFFFu;
+    for(int i=0;i<4096;i++) crc=(crc>>8)^tab[(crc^b[i])&0xFF];
+    crc=~crc;
+    write(1,"OK\n",3);
+    return (int)(crc & 0xFFFF);
+}
+' "exit syscall, status=36217"
 
 compile_and_run hash '
 #include <unistd.h>
