@@ -18,6 +18,9 @@
 
 #include "boxedwine.h"
 #include "knativesystem.h"
+#ifdef BOXEDWINE_GUEST_X64
+#include "cpu64.h"
+#endif
 
 #if defined(BOXEDWINE_MULTI_THREADED)
 
@@ -30,6 +33,47 @@ static void platformThread(CPU* cpu) {
 #endif
     KThread::setCurrentThread(cpu->thread);
     KProcessPtr process = KSystem::getProcess(cpu->thread->process->id);
+
+#ifdef BOXEDWINE_GUEST_X64
+    // 64-bit guest: this host thread drives the CPU64 interpreter, not the
+    // 32-bit CPU. The 32-bit `cpu` is still allocated (and carries the
+    // thread/signal bookkeeping) but its decoder/run-loop must never touch a
+    // 64-bit address space — getNextOp() would decode the (truncated) 32-bit
+    // eip and page-fault at the real 64-bit entry. Branch before any 32-bit
+    // setup runs.
+    if (cpu->thread->process->is64Bit && cpu->thread->process->cpu64) {
+        CPU64* cpu64 = cpu->thread->process->cpu64;
+        while (true) {
+            cpu64->yield = false;
+            try {
+                cpu64->run();
+            } catch (...) {
+                // CPU64 has no nextOp to re-arm; loop re-enters run().
+            }
+            if (cpu->thread->process->terminated) {
+                BOXEDWINE_CRITICAL_SECTION_WITH_MUTEX(cpu->memory->mutex);
+                cpu->memory->cleanup();
+            }
+            if (cpu->thread->terminating) {
+                break;
+            }
+            // CPU64::run() returns on a clean exit syscall (yield=true) with
+            // no pending work; if the process isn't terminating, there's
+            // nothing left for this thread to do, so leave the loop.
+            if (cpu64->yield) {
+                break;
+            }
+        }
+        cpu->thread->cleanup();
+        platformThreadCount--;
+        process->deleteThread(cpu->thread);
+        if (platformThreadCount == 0) {
+            KSystem::shutingDown = true;
+            KNativeSystem::postQuit();
+        }
+        return;
+    }
+#endif
 
     cpu->nextOp = cpu->getNextOp();
     if (!cpu->nextOp) {

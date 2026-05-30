@@ -27,6 +27,7 @@
 #define X64_SYS_lstat             6
 #define X64_SYS_poll              7
 #define X64_SYS_lseek             8
+#define X64_SYS_pread64           17
 #define X64_SYS_mmap              9
 #define X64_SYS_mprotect          10
 #define X64_SYS_munmap            11
