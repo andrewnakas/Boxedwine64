@@ -6045,6 +6045,31 @@ int runX64SelfTest() {
         fflush(stdout);
     }
 
+    // T: FXSAVE/FXRSTOR round-trip preserves XMM0. This is the regression
+    // guard for the "first %f prints 0.00000" bug: glibc's lazy PLT resolver
+    // (_dl_runtime_resolve_fxsave) FXSAVEs the FP arg registers, runs the
+    // symbol resolver (which clobbers XMM0), then FXRSTORs them. When
+    // FXSAVE/FXRSTOR were no-ops, the first float-taking libc call through the
+    // PLT lost its XMM0 argument and read 0.0. Here we load a sentinel double
+    // into XMM0, FXSAVE, clobber XMM0 with PXOR, FXRSTOR, and require the
+    // sentinel to survive.
+    {
+        const U64 SENTINEL = 0x400921FB54442D18ULL; // double ~ pi
+        std::vector<U8> code = {
+            0x48, 0xB8, 0x18, 0x2D, 0x44, 0x54, 0xFB, 0x21, 0x09, 0x40, // mov rax, SENTINEL
+            0x66, 0x48, 0x0F, 0x6E, 0xC0,                               // movq xmm0, rax
+            0x48, 0x81, 0xEC, 0x00, 0x02, 0x00, 0x00,                   // sub rsp, 512
+            0x0F, 0xAE, 0x04, 0x24,                                     // fxsave [rsp]
+            0x66, 0x0F, 0xEF, 0xC0,                                     // pxor xmm0, xmm0  (clobber)
+            0x0F, 0xAE, 0x0C, 0x24,                                     // fxrstor [rsp]
+            0x66, 0x48, 0x0F, 0x7E, 0xC0,                               // movq rax, xmm0
+            0x48, 0x81, 0xC4, 0x00, 0x02, 0x00, 0x00,                   // add rsp, 512
+        };
+        runAndCheck(r, "FXSAVE/FXRSTOR preserves XMM0 (PLT-resolver FP arg)", withExit(code), [SENTINEL](CPU64& c) {
+            return c.reg[X64_R15].u64 == SENTINEL;
+        });
+    }
+
     printf("=== self-test summary: %d passed, %d failed ===\n\n", r.passed, r.failed);
     return r.failed == 0 ? 0 : 1;
 }

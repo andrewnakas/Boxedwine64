@@ -67,7 +67,18 @@ BString KSystem::showWindowTimestamp;
 U32 KSystem::pageSize = 4096;
 bool KSystem::canJitUse4KPage = false;
 
-#if defined(BOXEDWINE_X64) && !defined(BOXEDWINE_USE_SSE_FOR_FPU)
+// useF64=true drives the x87 FPU through a double-precision fast cache
+// (FPU::regCache). That is fine for most x86 programs, but it silently
+// rounds 80-bit extended values down to double. glibc's __printf_fp
+// generates high-precision %f digits in true long double and spills via
+// FSTP m80, so the double cache collapses those prints (e.g. %.5f of
+// 3.14159 -> 0.00000). The full SoftFloat 80-bit path (FPU::regs[]) is
+// already implemented and selected by useF64=false, so the 64-bit guest
+// must use it. (See cpu64.cpp x87 block — the regCache-direct stores there
+// honor isRegCached so they fall through to the f80 helpers when uncached.)
+#if defined(BOXEDWINE_GUEST_X64)
+bool KSystem::useF64 = false;
+#elif defined(BOXEDWINE_X64) && !defined(BOXEDWINE_USE_SSE_FOR_FPU)
 bool KSystem::useF64 = false;
 #else
 bool KSystem::useF64 = true;
