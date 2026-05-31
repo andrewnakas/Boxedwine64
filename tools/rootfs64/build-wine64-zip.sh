@@ -1,0 +1,107 @@
+#!/bin/bash
+# build-wine64-zip.sh — assemble the x86_64 Wine + glibc rootfs zips that
+# Boxedwine64 mounts to run wine64 headless. Produces two layered zips that
+# FsZip mounts at "/" (later layers override earlier):
+#
+#   glibc-rootfs64.zip   base: glibc dynamic linker + libc + wine64's lib deps
+#   wine64.zip           overlay: the wine64 loader, wineserver, and the
+#                        x86_64-unix / x86_64-windows Wine module trees
+#
+# At least one path in each trips FsZip::guestIs64 (x86_64-linux-gnu/, /lib64/,
+# x86_64-unix/, x86_64-windows/) so the launcher treats the guest as 64-bit.
+#
+# The heavy apt-get is done ONCE into a committed image
+# (boxedwine64/wine64-debian:bookworm); this script only stages + zips from it,
+# so it is fast and repeatable. To rebuild the image from scratch:
+#
+#   docker run --name wine64build --platform linux/amd64 debian:bookworm sh -c \
+#     'export DEBIAN_FRONTEND=noninteractive; apt-get update -qq && \
+#      apt-get install -y -qq wine64'
+#   docker commit wine64build boxedwine64/wine64-debian:bookworm
+#   docker rm wine64build
+#
+# Output zips land in tools/rootfs64/dist/ (gitignored — 600MB+, build artifact).
+set -euo pipefail
+
+IMAGE="boxedwine64/wine64-debian:bookworm"
+HERE="$(cd "$(dirname "$0")" && pwd)"
+DIST="$HERE/dist"
+mkdir -p "$DIST"
+
+echo "=== staging wine64 rootfs from $IMAGE (linux/amd64) ==="
+
+STAGEHOST="$DIST/stage"
+rm -rf "$STAGEHOST"; mkdir -p "$STAGEHOST"
+
+# Run a container that stages a clean guest "/" tree into the mounted volume,
+# computing the full runtime dependency closure of the wine64 loader,
+# wineserver, and every x86_64-unix module via ldd, so the guest ld.so resolves
+# every DT_NEEDED. We stage in the container (Linux paths/symlinks) but ZIP on
+# the macOS host afterward (the image has no `zip`; it does have python3, but
+# host zip keeps the artifact build off the slow emulated container).
+docker run --rm --platform linux/amd64 -v "$DIST":/dist "$IMAGE" bash -c '
+set -euo pipefail
+STAGE=/dist/stage
+mkdir -p "$STAGE"
+
+# Collect the dependency closure: start from the wine64 ELF binaries + unix
+# modules, ldd each, and copy every resolved host library (dedup via sort -u).
+seeds=(
+  /usr/lib/wine/wine64
+  /usr/lib/wine/wineserver64
+  /lib64/ld-linux-x86-64.so.2
+)
+for so in /usr/lib/x86_64-linux-gnu/wine/x86_64-unix/*.so; do seeds+=("$so"); done
+
+# Resolve the transitive .so closure.
+libs=$(
+  for f in "${seeds[@]}"; do
+    ldd "$f" 2>/dev/null | awk "/=>/ {print \$3} /ld-linux/ {print \$1}"
+  done | grep -E "^/" | sort -u
+)
+
+copy() {  # copy a file preserving its absolute path under $STAGE, deref symlinks
+  local src="$1"
+  [ -e "$src" ] || return 0
+  local real; real="$(readlink -f "$src")"
+  local dstdir="$STAGE$(dirname "$src")"
+  mkdir -p "$dstdir"
+  cp -aL "$real" "$STAGE$src"
+}
+
+echo "--- copying glibc + lib closure ---"
+for l in $libs; do copy "$l"; done
+copy /lib64/ld-linux-x86-64.so.2
+copy /lib/x86_64-linux-gnu/libc.so.6
+mkdir -p "$STAGE/etc"; : > "$STAGE/etc/ld.so.cache"
+
+echo "--- copying wine64 loader + wineserver + module trees ---"
+copy /usr/lib/wine/wine64
+copy /usr/lib/wine/wineserver64
+copy /usr/lib/wine/wineserver
+copy /usr/lib/wine/wineapploader
+mkdir -p "$STAGE/usr/lib/x86_64-linux-gnu/wine"
+cp -aL /usr/lib/x86_64-linux-gnu/wine/x86_64-unix    "$STAGE/usr/lib/x86_64-linux-gnu/wine/"
+cp -aL /usr/lib/x86_64-linux-gnu/wine/x86_64-windows "$STAGE/usr/lib/x86_64-linux-gnu/wine/"
+# i386-windows is the 32-bit PE side; not needed for a pure wine64 boot.
+
+# Convenience launch symlinks at canonical wine paths.
+mkdir -p "$STAGE/usr/bin"
+ln -sf /usr/lib/wine/wine64      "$STAGE/usr/bin/wine64"
+ln -sf /usr/lib/wine/wineserver64 "$STAGE/usr/bin/wineserver"
+
+# A minimal HOME so wine has somewhere to create its prefix.
+mkdir -p "$STAGE/root"
+
+echo "--- staged tree ready ---"
+du -sh "$STAGE"
+'
+
+echo "=== zipping on host (macOS zip preserves the symlinks) ==="
+rm -f "$DIST/glibc-rootfs64.zip" "$DIST/wine64.zip"
+# Base: glibc + deps. Overlay: wine trees + launchers. -y keeps symlinks as links.
+( cd "$STAGEHOST" && zip -qry9 "$DIST/glibc-rootfs64.zip" lib64 lib etc )
+( cd "$STAGEHOST" && zip -qry9 "$DIST/wine64.zip" usr root )
+echo "=== zip sizes ==="
+ls -lh "$DIST"/*.zip
+echo "=== done. zips in $DIST ==="

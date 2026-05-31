@@ -28,3 +28,7 @@ work/lsbundle/
 root/bin/ls_dyn
 root/lib/x86_64-linux-gnu/libselinux.so.1
 root/lib/x86_64-linux-gnu/libpcre2-8.so.0
+# Wine64 + glibc rootfs zips (200MB+) built by build-wine64-zip.sh from the
+# committed boxedwine64/wine64-debian:bookworm docker image. Reproduce on demand;
+# never commit the zips or the intermediate staging tree.
+dist/
