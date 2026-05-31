@@ -2776,6 +2776,53 @@ int runX64SelfTest() {
         });
     }
 
+    // ANDPD (66 0F 54): dst &= src. dst=0xFFFF..FF, src=0x7FFF..FF (the fabs
+    // sign-clear mask glibc __printf_fp uses for %f) -> 0x7FFF..FF. This op
+    // was the unimpl-opcode blocker for dynamic %f (probe2).
+    {
+        std::vector<U8> code = {
+            0x48, 0xC7, 0xC0, 0xFF, 0xFF, 0xFF, 0xFF,                     // mov rax, -1
+            0x66, 0x48, 0x0F, 0x6E, 0xC0,                                 // movq xmm0, rax
+            0x48, 0xB8, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x7F,   // mov rax, 0x7FFF..FF
+            0x66, 0x48, 0x0F, 0x6E, 0xC8,                                 // movq xmm1, rax
+            0x66, 0x0F, 0x54, 0xC1,                                       // andpd xmm0, xmm1
+            0x66, 0x48, 0x0F, 0x7E, 0xC0,                                 // movq rax, xmm0
+        };
+        runAndCheck(r, "andpd masks sign bit (fabs idiom)", withExit(code), [](CPU64& c) {
+            return c.reg[X64_R15].u64 == 0x7FFFFFFFFFFFFFFFULL;
+        });
+    }
+
+    // ORPD (66 0F 56): 0x0F | 0xF0..00 = 0xF0..0F.
+    {
+        std::vector<U8> code = {
+            0x48, 0xB8, 0x0F, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,   // rax = 0x0F
+            0x66, 0x48, 0x0F, 0x6E, 0xC0,                                 // movq xmm0, rax
+            0x48, 0xB8, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xF0,   // rax = 0xF0..00
+            0x66, 0x48, 0x0F, 0x6E, 0xC8,                                 // movq xmm1, rax
+            0x66, 0x0F, 0x56, 0xC1,                                       // orpd xmm0, xmm1
+            0x66, 0x48, 0x0F, 0x7E, 0xC0,                                 // movq rax, xmm0
+        };
+        runAndCheck(r, "orpd ors low qword", withExit(code), [](CPU64& c) {
+            return c.reg[X64_R15].u64 == 0xF00000000000000FULL;
+        });
+    }
+
+    // ANDNPD (66 0F 55): ~dst & src. ~0x00FF & 0x0FF0 = 0x0F00.
+    {
+        std::vector<U8> code = {
+            0x48, 0xC7, 0xC0, 0xFF, 0x00, 0x00, 0x00,                     // rax = 0x00FF
+            0x66, 0x48, 0x0F, 0x6E, 0xC0,                                 // movq xmm0, rax
+            0x48, 0xC7, 0xC0, 0xF0, 0x0F, 0x00, 0x00,                     // rax = 0x0FF0
+            0x66, 0x48, 0x0F, 0x6E, 0xC8,                                 // movq xmm1, rax
+            0x66, 0x0F, 0x55, 0xC1,                                       // andnpd xmm0, xmm1
+            0x66, 0x48, 0x0F, 0x7E, 0xC0,                                 // movq rax, xmm0
+        };
+        runAndCheck(r, "andnpd computes ~dst & src", withExit(code), [](CPU64& c) {
+            return c.reg[X64_R15].u64 == 0x0000000000000F00ULL;
+        });
+    }
+
     // ---- SSE scalar single-precision FP (MOVSS + ADDSS family) ----
     //
     // Pattern: load 32-bit float bits into low dword of an xmm via movd,
