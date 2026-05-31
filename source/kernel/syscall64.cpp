@@ -41,6 +41,8 @@
 #define X64_SYS_readlinkat        267
 #define X64_SYS_faccessat         269
 #define X64_SYS_faccessat2        439
+#define X64_SYS_mkdir             83
+#define X64_SYS_mkdirat           258
 #define X64_SYS_getpid            39
 #define X64_SYS_exit              60
 #define X64_SYS_uname             63
@@ -1677,6 +1679,22 @@ void ksyscall64(CPU64* cpu) {
             std::shared_ptr<FsNode> n = Fs::getNodeFromLocalPath(
                 cpu->thread->process->currentDirectory, BString::copy(path), true);
             ret = n ? 0 : (U64)-2;
+            break;
+        }
+        case X64_SYS_mkdir:
+        case X64_SYS_mkdirat: {
+            // mkdir(path, mode) / mkdirat(dirfd, path, mode). wineboot creates
+            // its prefix tree (WINEPREFIX, drive_c, windows, ...) through these.
+            // path is arg1 (mkdir) or arg2 (mkdirat); dirfd is AT_FDCWD or the
+            // path is absolute. Routes to the existing KProcess mkdir, which
+            // writes into the native (writable) root overlay.
+            if (!cpu->thread || !cpu->thread->process) { ret = (U64)-K_ENOSYS; break; }
+            U64 pathArg = (nr == X64_SYS_mkdir) ? a1 : a2;
+            char path[1024] = {0};
+            cpu->memory->memcpyFromGuest(path, pathArg, sizeof(path) - 1);
+            ret = (U64)(S64)(S32)cpu->thread->process->mkdir(
+                BString(Fs::getFullPath(cpu->thread->process->currentDirectory,
+                                        BString::copy(path))));
             break;
         }
         case X64_SYS_uname:

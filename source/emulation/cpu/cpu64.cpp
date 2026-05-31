@@ -622,6 +622,40 @@ U32 CPU64::step() {
         return used;
     }
 
+    // MOV r/m16, Sreg (8C /r) and MOV Sreg, r/m16 (8E /r). In 64-bit long mode
+    // the segment registers are vestigial: CS/SS/DS/ES carry the flat user-mode
+    // selectors and FS/GS bases are set via arch_prctl (the selector value is
+    // 0). The ModRM `reg` field selects the segment: 0=ES 1=CS 2=SS 3=DS 4=FS
+    // 5=GS. wine's PE loader reads %cs (8C /1) to confirm it's running 64-bit,
+    // so we must return the canonical Linux user selectors. Stores are 16-bit
+    // (a register destination is zero-extended to the operand size per the SDM,
+    // but the common encoding here targets memory or a 16-bit slot).
+    if (op == 0x8C || op == 0x8E) {
+        ModRM m = decodeModRM(rip + opOff + 1, p, 0);
+        // Linux x86-64 user-mode selectors. FS/GS selectors are 0 (base via MSR).
+        static const U16 kSegSel[6] = { 0x2b, 0x33, 0x2b, 0x2b, 0x00, 0x00 };
+        U8 segIdx = m.regField & 0x7;
+        if (op == 0x8C) {
+            U16 sel = (segIdx < 6) ? kSegSel[segIdx] : 0;
+            // Destination width: for a memory operand it's 16-bit; for a register
+            // operand the selector is zero-extended to the operand size.
+            if (m.isReg) {
+                storeRM(m, opSize == 8 ? 8 : (opSize == 4 ? 4 : 2), (U64)sel, rexPresent);
+            } else {
+                storeRM(m, 2, (U64)sel, rexPresent);
+            }
+        } else {
+            // MOV Sreg, r/m16 — loading a segment selector. In long mode this is
+            // effectively a no-op for CS/SS/DS/ES (the descriptor cache is flat);
+            // we read (and discard) the operand to advance correctly. Loading
+            // FS/GS selector doesn't change the base (that's arch_prctl's job).
+            (void)loadRM(m, 2, rexPresent);
+        }
+        U32 used = opOff + 1 + m.length;
+        rip += used;
+        return used;
+    }
+
     // MOV r/m8, imm8 (C6 /0). Discovered via real musl-static hello: the
     // x86_64-linux-musl startup sets a static byte flag (often
     // __environ_locked or a TLS-init guard) with this exact encoding.
