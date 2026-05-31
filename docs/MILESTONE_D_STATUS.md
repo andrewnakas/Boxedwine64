@@ -5,6 +5,31 @@ contributor needs to do to finish Milestone D of the 64-bit roadmap
 (see `docs/PLAN_64BIT.md` §3.9 and the production roadmap in commit
 history under "Milestone D").
 
+## UPDATE: docker block lifted; real coreutils now run
+
+The "docker unavailable" hard block below is **stale**. Docker works on the
+dev Mac (`docker run --platform linux/amd64 ...`). As of commit `ee512d8f`,
+real x86-64 programs run from a 64-bit rootfs through the full kernel:
+
+```
+tools/run_x64_root.sh /bin/busybox ls -la /   # static coreutils, long format
+tools/run_x64_root.sh /bin/dirprobe /bin       # dynamic glibc getdents64
+```
+
+This reaches the *engine* half of D's first exit criterion (run a coreutils
+program from a 64-bit rootfs). Required: real guest argv/envp (was hardcoded
+to 1 element), a real `getdents64`, and `setuid/setgid/prctl/time` — all in
+`ee512d8f`. busybox (static, from debian:bookworm) lives in
+`tools/rootfs64/root/bin/`; `dirprobe.c` is a libc-only ls.
+
+**Remaining engine blocker before wine64:** multi-DSO **symbol versioning**.
+Dynamic GNU `ls` (libselinux+libpcre2) and any 2-DSO test fail in the guest
+ld.so with `unsupported version 0 of Verneed record`. Narrowed to an l_addr /
+link_map issue for the 2nd+ DSO (the Verneed bytes are provably correct in
+guest memory), NOT segment-copy corruption. See the
+`project_boxedwine64_coreutils` memory for the exact diagnosis and where to
+look next (`sys_mmap64_file` reservation-vs-FIXED base agreement).
+
 ## Done (in-tree, no external deps)
 
 - **`fszip.cpp` x86_64 layout detection** — commit `26e5e10f`.
