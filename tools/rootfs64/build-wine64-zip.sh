@@ -93,6 +93,14 @@ ln -sf /usr/lib/wine/wineserver64 "$STAGE/usr/bin/wineserver"
 # A minimal HOME so wine has somewhere to create its prefix.
 mkdir -p "$STAGE/root"
 
+# Standard writable scratch dirs a Linux rootfs must have. wineserver creates
+# its socket tmpdir under /tmp (falling back from /run/user/<uid>), and wine
+# chdir/stat the prefix HOME. Without these the guest mkdir(/tmp/wine-XXX)
+# fails ENOENT (no parent) and wineserver setup aborts. Ship them in the zip so
+# the parent node always exists; the kernel overlays the writable native root
+# on top for the actual file creation.
+mkdir -p "$STAGE/tmp" "$STAGE/run/user/1000" "$STAGE/home" "$STAGE/var/tmp"
+
 echo "--- staged tree ready ---"
 du -sh "$STAGE"
 '
@@ -100,7 +108,7 @@ du -sh "$STAGE"
 echo "=== zipping on host (macOS zip preserves the symlinks) ==="
 rm -f "$DIST/glibc-rootfs64.zip" "$DIST/wine64.zip"
 # Base: glibc + deps. Overlay: wine trees + launchers. -y keeps symlinks as links.
-( cd "$STAGEHOST" && zip -qry9 "$DIST/glibc-rootfs64.zip" lib64 lib etc )
+( cd "$STAGEHOST" && zip -qry9 "$DIST/glibc-rootfs64.zip" lib64 lib etc tmp run home var )
 ( cd "$STAGEHOST" && zip -qry9 "$DIST/wine64.zip" usr root )
 echo "=== zip sizes ==="
 ls -lh "$DIST"/*.zip

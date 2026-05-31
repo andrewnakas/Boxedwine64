@@ -43,6 +43,8 @@
 #define X64_SYS_faccessat2        439
 #define X64_SYS_mkdir             83
 #define X64_SYS_mkdirat           258
+#define X64_SYS_symlink           88
+#define X64_SYS_symlinkat         266
 #define X64_SYS_getpid            39
 #define X64_SYS_exit              60
 #define X64_SYS_uname             63
@@ -577,6 +579,11 @@ static U64 sys_stat_path64(CPU64* cpu, U64 pathAddr, U64 statbuf, bool followSym
     BString bpath = BString::copy(path);
     std::shared_ptr<FsNode> node = Fs::getNodeFromLocalPath(
         cpu->thread->process->currentDirectory, bpath, followSymlink);
+    if (getenv("BW64_SYSTRACE")) {
+        klog_fmt("sys_stat_path64: '%s' (cwd='%s') -> %s", path,
+                 cpu->thread->process->currentDirectory.c_str(),
+                 node ? "OK" : "ENOENT");
+    }
     if (!node) return (U64)-2; // -ENOENT
     U64 size  = node->length();
     U32 mode  = node->getMode();
@@ -605,6 +612,10 @@ static U64 sys_newfstatat64(CPU64* cpu, U64 dirfd, U64 pathAddr, U64 statbuf, U6
     char path[1024] = {0};
     cpu->memory->memcpyFromGuest(path, pathAddr, sizeof(path) - 1);
     bool isAbs = (path[0] == '/');
+    if (getenv("BW64_SYSTRACE")) {
+        klog_fmt("sys_newfstatat64: dirfd=%d path='%s' flags=0x%llx",
+                 (int)(S32)dirfd, path, (unsigned long long)flags);
+    }
     if (!isAbs && (S32)dirfd != K_AT_FDCWD) {
         return (U64)-2;
     }
@@ -1503,10 +1514,20 @@ void ksyscall64(CPU64* cpu) {
         case X64_SYS_set_robust_list:
         case X64_SYS_ioctl:
         case X64_SYS_madvise:
-        case X64_SYS_chdir:
             // ld-linux makes these calls before main; safe to no-op.
             ret = 0;
             break;
+        case X64_SYS_chdir: {
+            // chdir(path) — MUST be real: wine chdir's into its WINEPREFIX and
+            // then stats "." to validate it. A no-op left cwd at the (missing)
+            // default /home/username, so that "." stat failed with ENOENT and
+            // wine reported "could not find the prefix". Route to KProcess::chdir.
+            if (!cpu->thread || !cpu->thread->process) { ret = (U64)-K_ENOSYS; break; }
+            char path[1024] = {0};
+            cpu->memory->memcpyFromGuest(path, a1, sizeof(path) - 1);
+            ret = (U64)(S64)(S32)cpu->thread->process->chdir(BString::copy(path));
+            break;
+        }
         case X64_SYS_mremap:
             // mremap(old, oldlen, newlen, flags, newaddr). v1: return old
             // address — glibc malloc only resizes when MREMAP_MAYMOVE is set
@@ -1692,9 +1713,31 @@ void ksyscall64(CPU64* cpu) {
             U64 pathArg = (nr == X64_SYS_mkdir) ? a1 : a2;
             char path[1024] = {0};
             cpu->memory->memcpyFromGuest(path, pathArg, sizeof(path) - 1);
-            ret = (U64)(S64)(S32)cpu->thread->process->mkdir(
+            BString full = Fs::getFullPath(cpu->thread->process->currentDirectory,
+                                           BString::copy(path));
+            ret = (U64)(S64)(S32)cpu->thread->process->mkdir(full);
+            if (getenv("BW64_SYSTRACE")) {
+                klog_fmt("sys_mkdir64: '%s' full='%s' -> %d", path, full.c_str(),
+                         (int)(S32)ret);
+            }
+            break;
+        }
+        case X64_SYS_symlink:
+        case X64_SYS_symlinkat: {
+            // symlink(target, linkpath) / symlinkat(target, dirfd, linkpath).
+            // wineboot builds dosdevices/c: -> ../drive_c and z: -> / symlinks
+            // when initializing the prefix. target is arg1; linkpath is arg2
+            // (symlink) or arg3 (symlinkat, dirfd=arg2 is AT_FDCWD/absolute).
+            if (!cpu->thread || !cpu->thread->process) { ret = (U64)-K_ENOSYS; break; }
+            char target[1024] = {0};
+            char linkpath[1024] = {0};
+            cpu->memory->memcpyFromGuest(target, a1, sizeof(target) - 1);
+            U64 linkArg = (nr == X64_SYS_symlink) ? a2 : a3;
+            cpu->memory->memcpyFromGuest(linkpath, linkArg, sizeof(linkpath) - 1);
+            ret = (U64)(S64)(S32)cpu->thread->process->symlink(
+                BString::copy(target),
                 BString(Fs::getFullPath(cpu->thread->process->currentDirectory,
-                                        BString::copy(path))));
+                                        BString::copy(linkpath))));
             break;
         }
         case X64_SYS_uname:
