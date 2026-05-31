@@ -49,9 +49,16 @@ static void platformThread(CPU* cpu) {
         // threads (clone64) get a distinct CPU64 sharing memory64. Driving the
         // shared process->cpu64 from every host thread would race two threads
         // through one register file and corrupt guest state.
-        CPU64* cpu64 = cpu->thread->cpu64 ? cpu->thread->cpu64
-                                          : cpu->thread->process->cpu64;
         while (true) {
+            // Re-fetch the CPU64 each iteration: execve() tears down the old
+            // per-thread CPU64 and loadProgram64 installs a fresh one (new RIP /
+            // registers / memory64) on thread->cpu64. Caching it before the loop
+            // would keep running the FREED pre-execve CPU64 after a re-exec —
+            // which manifested as wine64's post-execve image never executing a
+            // single instruction (0 syscalls) and hanging. Always read the
+            // live per-thread pointer (main thread: == process->cpu64).
+            CPU64* cpu64 = cpu->thread->cpu64 ? cpu->thread->cpu64
+                                              : cpu->thread->process->cpu64;
             cpu64->yield = false;
             try {
                 cpu64->run();

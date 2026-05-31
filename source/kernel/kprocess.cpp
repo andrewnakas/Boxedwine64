@@ -809,8 +809,46 @@ U32 KProcess::execve(KThread* thread, BString path, std::vector<BString>& args, 
 
     // reset memory must come after we grab the args and env
     this->heap.freeAll(this->memory);
-    this->memory->execvReset(cloneVM);    
+    this->memory->execvReset(cloneVM);
     cloneVM = false;
+
+#ifdef BOXEDWINE_GUEST_X64
+    // 64-bit re-exec (wine64 re-execs itself / spawns wineserver). The prior
+    // program's KMemory64 still holds its pages and bump-allocator cursor, so
+    // give the process a FRESH memory64 for the new image. We must NOT delete
+    // the current CPU64: we are running *inside* its run-loop right now (the
+    // SYSCALL that invoked execve is on cpu64's call stack), so freeing it is a
+    // use-after-free. Instead keep the CPU64 object, point it at the new
+    // memory64, and let loadProgram64 (which reuses a non-null process->cpu64)
+    // re-seed RIP/RSP/fsbase. platformThread re-reads thread->cpu64 each loop
+    // iteration, so it picks up the re-seeded state on the next run() entry.
+    if (this->is64Bit) {
+        KMemory64* freshMem = new KMemory64(this);
+        delete this->memory64;
+        this->memory64 = freshMem;
+        if (this->cpu64) {
+            this->cpu64->memory = freshMem;
+            // Reset the image-specific CPU64 state for the new program. GPRs are
+            // re-seeded (RIP/RSP/RDX/fsbase) by loadProgram64; clear the rest so
+            // no stale mapping cursor, futex waiters, or signal handlers leak
+            // across the exec. mmapNext=0 makes the fresh memory64 hand out a
+            // clean MMAP64_BASE region.
+            for (int i = 0; i < X64_REG_COUNT; i++) this->cpu64->reg[i].setU64(0);
+            this->cpu64->rflags = 0x202;
+            this->cpu64->fsbase = 0;
+            this->cpu64->gsbase = 0;
+            this->cpu64->mmapNext = 0;
+            this->cpu64->sigMask = 0;
+            this->cpu64->futexWaiters.clear();
+            for (int i = 0; i < 65; i++) this->cpu64->sigActions[i] = CPU64::SigAction{};
+        }
+        // loadProgram64 keys "is this 64-bit?" off the ELF, not this flag, and
+        // reuses the existing non-null cpu64/memory64. Hand it the post-prepend
+        // argv/envp so the new SysV stack matches this exec.
+        this->startupArgs64 = args;
+        this->startupEnv64 = envs;
+    }
+#endif
 
     thread->reset();
     this->onExec(thread);

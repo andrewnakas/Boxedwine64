@@ -1021,7 +1021,13 @@ bool ElfLoader64::loadProgram(KThread* thread, FsOpenNode* openNode, U64* rip) {
         AT_PAGESZ = 6, AT_BASE = 7, AT_ENTRY = 9, AT_UID = 11,
         AT_EUID = 12, AT_GID = 13, AT_EGID = 14, AT_RANDOM = 25,
         AT_HWCAP = 16, AT_CLKTCK = 17, AT_PLATFORM = 15, AT_SECURE = 23,
+        AT_EXECFN = 31,
     };
+    // AT_EXECFN: guest address of the executable's pathname (argv[0]'s string).
+    // glibc exposes it and wine's loader derives its bindir/loader/module paths
+    // from it (via __progname / get_argv0). Without it wine falls back to a
+    // bogus "/proc"-derived path and fails to exec the wine loader.
+    U64 execfnAddr = argvPtrs.empty() ? 0 : argvPtrs[0];
     struct Aux { U64 k, v; };
     std::vector<Aux> aux = {
         { AT_PHDR,    process->phdr64 },
@@ -1038,6 +1044,7 @@ bool ElfLoader64::loadProgram(KThread* thread, FsOpenNode* openNode, U64* rip) {
         { AT_HWCAP,   0 },
         { AT_CLKTCK,  100 },
         { AT_SECURE,  0 },
+        { AT_EXECFN,  execfnAddr },
         { AT_NULL,    0 },
     };
 

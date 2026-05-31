@@ -38,6 +38,9 @@
 #define X64_SYS_writev            20
 #define X64_SYS_access            21
 #define X64_SYS_readlink          89
+#define X64_SYS_readlinkat        267
+#define X64_SYS_faccessat         269
+#define X64_SYS_faccessat2        439
 #define X64_SYS_getpid            39
 #define X64_SYS_exit              60
 #define X64_SYS_uname             63
@@ -101,6 +104,9 @@
 #define X64_SYS_chmod             90
 #define X64_SYS_fchmod            91
 #define X64_SYS_clone             56
+#define X64_SYS_fork              57
+#define X64_SYS_vfork             58
+#define X64_SYS_execve            59
 #define X64_SYS_wait4             61
 #define X64_SYS_pause             34
 #define X64_SYS_getitimer         36
@@ -407,13 +413,24 @@ static U64 sys_openat64(CPU64* cpu, U64 dirfd, U64 pathAddr, U64 flags, U64 /*mo
     if (!pathAddr) return (U64)-K_EFAULT;
     char path[1024] = {0};
     cpu->memory->memcpyFromGuest(path, pathAddr, sizeof(path) - 1);
+    KProcess* process = cpu->thread->process.get();
+    // /proc/self/exe (and /proc/<pid>/exe): the kernel exposes the executable as
+    // a magic symlink. wine's loader open()s/realpath()s it to find its install
+    // dir; redirect to the real backing file so it resolves to the loader path
+    // instead of a bogus "/proc"-derived prefix. (readlink/readlinkat handle the
+    // symlink-read form separately.)
+    BString self = B("/proc/self/exe");
+    BString selfPid = B("/proc/") + BString::valueOf(process->id) + B("/exe");
+    if (self == path || selfPid == path) {
+        std::memset(path, 0, sizeof(path));
+        std::strncpy(path, process->exe.c_str(), sizeof(path) - 1);
+    }
     bool isAbs = (path[0] == '/');
     if (!isAbs && (S32)dirfd != K_AT_FDCWD) {
         klog_fmt("sys_openat64: relative path '%s' with dirfd=%d not yet supported",
                  path, (int)(S32)dirfd);
         return (U64)-2;
     }
-    KProcess* process = cpu->thread->process.get();
     KFileDescriptorPtr result;
     U32 rc = process->openFile(process->currentDirectory, BString::copy(path),
                                (U32)flags, result);
@@ -675,6 +692,64 @@ static U64 sys_writev64(CPU64* cpu, U64 fd, U64 iov, U64 iovcnt) {
     return total;
 }
 
+// Read a NUL-terminated guest C-string at addr from 64-bit memory. Bounded so a
+// missing terminator can't loop forever; argv/env strings and paths are well
+// under this. Reads in small chunks to avoid a huge fixed stack buffer.
+static BString readGuestString64(CPU64* cpu, U64 addr) {
+    if (!addr) return BString();
+    std::string s;
+    const U64 MAX = 64 * 1024;
+    while (s.size() < MAX) {
+        char chunk[256];
+        cpu->memory->memcpyFromGuest(chunk, addr, sizeof(chunk));
+        U32 n = 0;
+        for (; n < sizeof(chunk); n++) {
+            if (chunk[n] == 0) { s.append(chunk, n); return BString::copy(s.c_str()); }
+        }
+        s.append(chunk, sizeof(chunk));
+        addr += sizeof(chunk);
+    }
+    return BString::copy(s.c_str());
+}
+
+// Walk a NULL-terminated array of 64-bit guest pointers (argv / envp) and read
+// each pointed-to C-string. The 64-bit ABI passes 8-byte pointers (unlike the
+// 32-bit execve's 4-byte readd walk).
+static void readStringArray64(CPU64* cpu, U64 arrayAddr, std::vector<BString>& out) {
+    if (!arrayAddr) return;
+    const U32 MAX_ENTRIES = 4096;
+    for (U32 i = 0; i < MAX_ENTRIES; i++) {
+        U64 p = cpu->memory->readq(arrayAddr);
+        if (!p) break;
+        arrayAddr += 8;
+        out.push_back(readGuestString64(cpu, p));
+    }
+}
+
+// execve(path, argv, envp) for 64-bit guests. wine64 re-execs itself and spawns
+// wineserver64 through this. Marshals the 8-byte-pointer argv/envp arrays out of
+// memory64, then drives the shared KProcess::execve, which resets memory and
+// re-runs the loader (ElfLoader::loadProgram routes ELF64 -> loadProgram64,
+// rebuilding memory64/cpu64 fresh — see KProcess::execve's 64-bit reset). On
+// success execve never returns to the caller (the image is replaced); it returns
+// -K_CONTINUE which the dispatcher must NOT write into RAX.
+static U64 sys_execve64(CPU64* cpu, U64 pathAddr, U64 argvAddr, U64 envpAddr) {
+    if (!cpu->thread || !cpu->thread->process) return (U64)-K_ENOSYS;
+    if (!pathAddr) return (U64)-K_EFAULT;
+    BString path = readGuestString64(cpu, pathAddr);
+    std::vector<BString> args;
+    std::vector<BString> envs;
+    readStringArray64(cpu, argvAddr, args);
+    readStringArray64(cpu, envpAddr, envs);
+    klog_fmt("sys_execve64: path='%s' argv0='%s' argc=%d envc=%d", path.c_str(),
+             args.empty() ? "" : args[0].c_str(), (int)args.size(), (int)envs.size());
+    for (auto& e : envs) {
+        if (strncmp(e.c_str(), "WINELOADER=", 11) == 0)
+            klog_fmt("sys_execve64:   env %s", e.c_str());
+    }
+    return (U64)(S64)(S32)cpu->thread->process->execve(cpu->thread, path, args, envs);
+}
+
 // readlink(path, buf, bufsize) — resolve a symlink. /proc/self/exe is the
 // big-ticket caller for glibc startup; everything else falls back to the
 // FsNode link field if present.
@@ -683,12 +758,23 @@ static U64 sys_readlink64(CPU64* cpu, U64 pathAddr, U64 buf, U64 sz) {
     if (!pathAddr || !buf || sz == 0) return (U64)-K_EFAULT;
     char path[1024] = {0};
     cpu->memory->memcpyFromGuest(path, pathAddr, sizeof(path) - 1);
+    KProcess* proc = cpu->thread->process.get();
+    BString pidExe = B("/proc/") + BString::valueOf(proc->id) + B("/exe");
     BString resolved;
-    if (std::strcmp(path, "/proc/self/exe") == 0 || std::strcmp(path, "/proc/thread-self/exe") == 0) {
-        resolved = cpu->thread->process->exe;
+    // The kernel's /proc magic symlinks. glibc/wine's realpath() walks
+    // /proc/self/exe component-by-component, so we must resolve BOTH the
+    // intermediate /proc/self (-> the numeric pid dir) and the terminal
+    // .../exe (-> the executable's real path). Without /proc/self resolving,
+    // realpath bails and wine derives a bogus "/proc"-based install dir.
+    if (std::strcmp(path, "/proc/self") == 0 || std::strcmp(path, "/proc/thread-self") == 0) {
+        resolved = BString::valueOf(proc->id);                 // relative target, like Linux
+    } else if (std::strcmp(path, "/proc/self/exe") == 0 ||
+               std::strcmp(path, "/proc/thread-self/exe") == 0 ||
+               pidExe == path) {
+        resolved = proc->exe;
     } else {
         std::shared_ptr<FsNode> n = Fs::getNodeFromLocalPath(
-            cpu->thread->process->currentDirectory, BString::copy(path), false);
+            proc->currentDirectory, BString::copy(path), false);
         if (!n || !n->isLink()) return (U64)-22; // -EINVAL on non-symlink
         resolved = n->link;
     }
@@ -1346,6 +1432,15 @@ void ksyscall64(CPU64* cpu) {
     U64 a6   = cpu->reg[X64_R9].u64;
     U64 ret  = (U64)-K_ENOSYS;
 
+    // Set BW64_SYSTRACE=1 to log every 64-bit syscall — invaluable for wine
+    // bring-up (finding where a guest stalls or which syscall is next missing).
+    if (getenv("BW64_SYSTRACE")) {
+        klog_fmt("SYS64 #%llu %s (a1=0x%llx a2=0x%llx a3=0x%llx)",
+                 (unsigned long long)nr, x64SyscallName(nr),
+                 (unsigned long long)a1, (unsigned long long)a2,
+                 (unsigned long long)a3);
+    }
+
     switch (nr) {
         case X64_SYS_write:
             ret = sys_write64(cpu, a1, a2, a3);
@@ -1556,17 +1651,29 @@ void ksyscall64(CPU64* cpu) {
         case X64_SYS_readlink:
             ret = sys_readlink64(cpu, a1, a2, a3);
             break;
-        case X64_SYS_access: {
-            // access(path, mode) — resolve path; we don't model EUID perms yet
-            // so existence is the only check (mode bits ignored).
-            // Standalone runner (no KProcess) has no filesystem to consult —
-            // report ENOENT, which is what ld.so expects for its probe paths
-            // (/etc/ld.so.preload, /etc/ld.so.cache, ...). Dereferencing the
-            // null process shared_ptr here was crashing the host (SIGSEGV at
-            // operator-> offset 0x28) during dynamic-glibc startup.
+        case X64_SYS_readlinkat:
+            // readlinkat(dirfd, path, buf, bufsiz). Modern glibc/wine ntdll use
+            // THIS, not readlink(89), to resolve /proc/self/exe (the basis for
+            // wine's loader/module dir derivation). dirfd is AT_FDCWD or the
+            // path is absolute (/proc/self/exe is), so we can ignore dirfd and
+            // reuse the readlink resolver on (path=a2, buf=a3, sz=a4).
+            ret = sys_readlink64(cpu, a2, a3, a4);
+            break;
+        case X64_SYS_access:
+        case X64_SYS_faccessat:
+        case X64_SYS_faccessat2: {
+            // access(path, mode) / faccessat(dirfd, path, mode[, flags]) /
+            // faccessat2(dirfd, path, mode, flags). We don't model EUID perms
+            // yet, so existence is the only check (mode/flags ignored). For the
+            // *at forms the path is arg2 (dirfd is AT_FDCWD or the path is
+            // absolute — wine probes ntdll.so by absolute path). wine uses
+            // faccessat/faccessat2 to confirm its module dir before loading
+            // ntdll, so without these it reports "cannot get path to ntdll.so".
+            // Standalone runner (no KProcess) -> ENOENT, matching ld.so probes.
             if (!cpu->thread || !cpu->thread->process) { ret = (U64)-2; break; }
+            U64 pathArg = (nr == X64_SYS_access) ? a1 : a2;
             char path[1024] = {0};
-            cpu->memory->memcpyFromGuest(path, a1, sizeof(path) - 1);
+            cpu->memory->memcpyFromGuest(path, pathArg, sizeof(path) - 1);
             std::shared_ptr<FsNode> n = Fs::getNodeFromLocalPath(
                 cpu->thread->process->currentDirectory, BString::copy(path), true);
             ret = n ? 0 : (U64)-2;
@@ -1681,6 +1788,12 @@ void ksyscall64(CPU64* cpu) {
                          (unsigned long long)a1);
                 ret = (U64)-K_ENOSYS;
             }
+            break;
+        case X64_SYS_execve:
+            // Replaces the process image. On success returns -K_CONTINUE (the
+            // new program's RAX is already set by loadProgram64); the dispatcher
+            // skips the RAX write for -K_CONTINUE so we don't clobber it.
+            ret = sys_execve64(cpu, a1, a2, a3);
             break;
         case X64_SYS_getitimer:
         case X64_SYS_setitimer:
@@ -1830,6 +1943,12 @@ void ksyscall64(CPU64* cpu) {
             break;
     }
 
+    // execve (and any future blocking/restart paths) return -K_CONTINUE to mean
+    // "the new image / restart already set the registers — do NOT overwrite RAX
+    // with this sentinel." Mirrors the 32-bit dispatcher (syscall.cpp).
+    if (ret == (U64)(S64)-K_CONTINUE || ret == (U64)(S64)-K_WAIT) {
+        return;
+    }
     cpu->reg[X64_RAX].setU64(ret);
 }
 
