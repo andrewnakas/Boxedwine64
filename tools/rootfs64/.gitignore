@@ -14,7 +14,17 @@ work/fprobe2
 work/fprobe3
 work/fpstress
 work/dirprobe
+# usefoo/libfoo: the versioned 2-DSO test (commit the .c/.map sources; the
+# compiled ELFs live in root/bin/usefoo + root/lib/libfoo.so).
+work/usefoo
+work/libfoo.so
 # Raw docker-extracted third-party binaries (busybox, coreutils ls, distro
 # .so libs). Reproduce with: docker run --platform linux/amd64 debian:bookworm-slim
 # (see README). The usable copies that probes need live in root/bin.
 work/extract/
+# Dynamic GNU `ls` bundle + its versioned deps (libselinux, libpcre2): large
+# redistributables, reproduced on demand via the README recipe. Not committed.
+work/lsbundle/
+root/bin/ls_dyn
+root/lib/x86_64-linux-gnu/libselinux.so.1
+root/lib/x86_64-linux-gnu/libpcre2-8.so.0

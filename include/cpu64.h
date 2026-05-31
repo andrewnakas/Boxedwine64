@@ -117,6 +117,19 @@ public:
     // 0 means "not a standalone run" — sys_brk64 keeps its old behaviour.
     U64 runnerBrk = 0;
 
+    // Unified bump allocator for mmap(NULL, ...) placements. BOTH anonymous
+    // and file-backed mmaps draw from this ONE pointer so they can never hand
+    // out overlapping addresses. Previously sys_mmap64 and sys_mmap64_file
+    // each had their own static counter seeded at 0x700000000, so an
+    // anonymous map (e.g. ld.so's malloc arena) and a file-backed map (e.g. a
+    // DSO span reservation) could be assigned the SAME base — and
+    // mmapAnonymousFixed zero-fills on (re)map, silently clobbering the other.
+    // That collision corrupted the second versioned DSO's version records,
+    // surfacing in the guest ld.so as "unsupported version 0 of Verneed
+    // record". One shared pointer per process makes mmap placements disjoint.
+    // 0 means "uninitialised" → first use seeds it to MMAP64_BASE.
+    U64 mmapNext = 0;
+
     bool yield = false;
     U64  instructionCount = 0;
 

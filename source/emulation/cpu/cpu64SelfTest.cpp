@@ -3329,6 +3329,47 @@ int runX64SelfTest() {
         });
     }
 
+    // ---- mmap(9) NULL-hint allocator: single monotonic bump ----
+    //
+    // Regression guard for the multi-DSO Verneed bug. sys_mmap64 (anonymous)
+    // and sys_mmap64_file (file-backed) MUST draw mmap(NULL,...) placements
+    // from ONE shared pointer (CPU64::mmapNext). Previously each had its own
+    // static seeded at the same base, so an anonymous map and a file-backed
+    // map could be handed the SAME address — and mmapAnonymousFixed zero-fills
+    // on map, clobbering one DSO's version records ("unsupported version 0 of
+    // Verneed record" in the guest ld.so for the 2nd versioned library).
+    //
+    // We can only reach the anonymous path from the FS-less self-test (no fd),
+    // but that path shares the very same allocator, so asserting two
+    // consecutive mmap(NULL, 0x1000) returns are disjoint and monotonic pins
+    // the single-pointer invariant. First base captured in R14, second in R15
+    // (via the exit suffix). Expect R15 == R14 + 0x1000 and R14 != 0.
+    {
+        auto mmapNull = [](std::vector<U8>& v) {
+            const U8 ins[] = {
+                0x48, 0xC7, 0xC0, 0x09, 0x00, 0x00, 0x00, // mov rax, 9 (mmap)
+                0x48, 0x31, 0xFF,                         // xor rdi, rdi (addr=NULL)
+                0x48, 0xC7, 0xC6, 0x00, 0x10, 0x00, 0x00, // mov rsi, 0x1000 (len)
+                0x48, 0xC7, 0xC2, 0x03, 0x00, 0x00, 0x00, // mov rdx, 3 (PROT_READ|WRITE)
+                0x49, 0xC7, 0xC2, 0x22, 0x00, 0x00, 0x00, // mov r10, 0x22 (MAP_PRIVATE|ANON)
+                0x49, 0xC7, 0xC0, 0xFF, 0xFF, 0xFF, 0xFF, // mov r8, -1 (fd)
+                0x4D, 0x31, 0xC9,                         // xor r9, r9 (offset=0)
+                0x0F, 0x05,                               // syscall
+            };
+            v.insert(v.end(), ins, ins + sizeof(ins));
+        };
+        std::vector<U8> code;
+        mmapNull(code);
+        code.insert(code.end(), {0x49, 0x89, 0xC6}); // mov r14, rax (1st base)
+        mmapNull(code);                              // 2nd base → RAX → R15 (exit suffix)
+        runAndCheck(r, "mmap NULL-hint: shared monotonic bump (disjoint maps)",
+                    withExit(code), [](CPU64& c) {
+            U64 first = c.reg[X64_R14].u64;
+            U64 second = c.reg[X64_R15].u64;
+            return first == 0x700000000ULL && second == first + 0x1000ULL;
+        });
+    }
+
     // ---- Milestone B5: signal-syscall stubs ----
 
     // pause(34) → -EINTR (we never deliver, so loop-retry is the honest answer)

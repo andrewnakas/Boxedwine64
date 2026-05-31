@@ -175,6 +175,22 @@
 #define K_MAP_FIXED 0x10
 #endif
 
+// Base address for mmap(NULL, ...) placements. High enough to never collide
+// with PIE-loaded segments (X64_PIE_BASE=0x400000000) or the program break.
+#define MMAP64_BASE 0x700000000ULL
+
+// Allocate `length` bytes of guest address space from the process-wide bump
+// allocator shared by BOTH the anonymous and file-backed mmap paths. Returns
+// a page-aligned base; advances cpu->mmapNext past it. Keeping a SINGLE
+// pointer is what prevents an anonymous map and a file-backed map from being
+// handed the same address (the bug behind the 2nd-DSO Verneed corruption).
+static U64 allocMmapRange(CPU64* cpu, U64 length) {
+    if (cpu->mmapNext == 0) cpu->mmapNext = MMAP64_BASE;
+    U64 addr = cpu->mmapNext;
+    cpu->mmapNext += (length + 0xFFF) & ~0xFFFULL;
+    return addr;
+}
+
 static U64 sys_write64(CPU64* cpu, U64 fd, U64 buf, U64 count) {
     if (count == 0) return 0;
     if (count > (1ULL << 20)) count = 1ULL << 20;
@@ -267,12 +283,9 @@ static U64 sys_mmap64(CPU64* cpu, U64 addr, U64 length, U64 prot, U64 flags, U64
         return sys_mmap64_file(cpu, addr, length, prot, flags, fd, offset);
     }
     if (addr == 0) {
-        // Anonymous mmap without MAP_FIXED: pick a high address. v1 uses
-        // a bump allocator on KProcess; for the skeleton we use a fixed
-        // base that won't collide with PIE-loaded segments.
-        static U64 anonBump = 0x700000000ULL;
-        addr = anonBump;
-        anonBump += (length + 0xFFF) & ~0xFFFULL;
+        // Anonymous mmap without MAP_FIXED: draw from the process-wide bump
+        // allocator shared with the file-backed path (see allocMmapRange).
+        addr = allocMmapRange(cpu, length);
     }
     U64 ret = cpu->memory->mmapAnonymousFixed(addr & ~0xFFFULL, length, (U32)prot);
     (void)offset;
@@ -603,9 +616,11 @@ static U64 sys_mmap64_file(CPU64* cpu, U64 addr, U64 length, U64 prot,
         return (U64)-K_ENOSYS;
     }
     if (addr == 0) {
-        static U64 anonBump = 0x700000000ULL;
-        addr = anonBump;
-        anonBump += (length + 0xFFF) & ~0xFFFULL;
+        // Shared bump allocator — see allocMmapRange. ld.so's DSO-span
+        // reservation (mmap(NULL, span, PROT_NONE, fd)) comes through here;
+        // it MUST draw from the same pointer as anonymous maps so the FIXED
+        // sub-segment maps that follow land on disjoint, uncorrupted pages.
+        addr = allocMmapRange(cpu, length);
     }
     U64 aligned = addr & ~0xFFFULL;
     U64 mapLen = (length + (addr - aligned) + 0xFFF) & ~0xFFFULL;

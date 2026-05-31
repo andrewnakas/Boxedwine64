@@ -1,0 +1,7 @@
+FOO_1.0 {
+  global:
+    foo_value;
+    foo_hello;
+  local:
+    *;
+};

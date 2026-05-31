@@ -79,6 +79,42 @@ docker run --rm --platform linux/amd64 -v "$PWD/tools/rootfs64/work:/w" \
 `dirprobe.c` is a libc-only directory lister (opendir/readdir/qsort) — the
 coreutils-`ls` essence, exercising `getdents64` through real dynamic glibc.
 
+### usefoo / libfoo — the versioned multi-DSO test
+
+`usefoo.c` + `libfoo.c` (+ `libfoo.map`) are a 2-DSO test where `libfoo.so`
+exports a *versioned* symbol (`FOO_1.0`) and `usefoo` binds to it. This forces
+the guest ld.so to process a Verneed record for a SECOND shared library — the
+path that was broken by the duplicate mmap bump allocators (an anonymous map
+and a file-backed map could be handed the same base, and `mmapAnonymousFixed`
+zero-fills on map, clobbering one DSO's version records → guest ld.so reported
+`unsupported version 0 of Verneed record`). Fixed by unifying the allocator on
+`CPU64::mmapNext`. Build + install:
+
+```sh
+docker run --rm --platform linux/amd64 -v "$PWD/tools/rootfs64/work:/w" \
+  gcc:13 bash -c 'cd /w && \
+    gcc -O2 -fPIC -shared -Wl,--version-script=libfoo.map \
+        -Wl,-soname,libfoo.so -o libfoo.so libfoo.c && \
+    gcc -O2 -o usefoo usefoo.c -L. -lfoo -Wl,-rpath,/lib'
+cp tools/rootfs64/work/usefoo     tools/rootfs64/root/bin/usefoo
+cp tools/rootfs64/work/libfoo.so  tools/rootfs64/root/lib/libfoo.so
+tools/run_x64_root.sh /bin/usefoo   # -> "foo_value()=42", exit 0
+```
+
+Dynamic GNU `ls` (3 versioned DSOs: libselinux + libpcre2 + libc) is the
+"real" version of this test. Its binaries are large redistributables, so they
+are gitignored, not committed; reproduce on demand:
+
+```sh
+docker run --rm --platform linux/amd64 -v "$PWD/tools/rootfs64/work:/w" \
+  debian:bookworm-slim bash -c 'mkdir -p /w/lsbundle/lib && cp -L /bin/ls /w/lsbundle/ls && \
+    for so in $(ldd /bin/ls | grep -oE "/[^ ]+\.so[^ ]*"); do cp -L "$so" /w/lsbundle/lib/; done'
+cp tools/rootfs64/work/lsbundle/ls                   tools/rootfs64/root/bin/ls_dyn
+cp tools/rootfs64/work/lsbundle/lib/libselinux.so.1  tools/rootfs64/root/lib/x86_64-linux-gnu/
+cp tools/rootfs64/work/lsbundle/lib/libpcre2-8.so.0  tools/rootfs64/root/lib/x86_64-linux-gnu/
+tools/run_x64_root.sh /bin/ls_dyn /   # -> directory listing, exit 0
+```
+
 `busybox` (in `root/bin/`) is a static x86-64 build pulled from Debian
 bookworm; it runs `busybox ls -la /`, `echo`, `pwd`, `cat`, etc. through the
 full 64-bit kernel. Refresh it (and the dynamic coreutils `ls` + its libs)
