@@ -158,14 +158,17 @@ U32 kgetpeername(KThread* thread, U32 socket, U32 address, U32 plen) {
     return s->getpeername(thread, fd, address, plen);
 }
 
-U32 ksocketpair(KThread* thread, U32 af, U32 type, U32 protocol, U32 socks, U32 flags) {
+// Create a connected AF_UNIX socket pair and return the two guest FDs via
+// outFd1/outFd2 — WITHOUT touching guest memory. Both the 32-bit ksocketpair
+// (writes the FDs into 32-bit KMemory) and the 64-bit path (writes into
+// KMemory64) share this so the socket-object wiring lives in one place.
+S32 ksocketpairFds(KThread* thread, U32 af, U32 type, U32 protocol, U32 flags, FD& outFd1, FD& outFd2) {
     FD fd1 = 0;
     FD fd2 = 0;
     KFileDescriptorPtr f1;
     KFileDescriptorPtr f2;
     std::shared_ptr<KUnixSocketObject> s1;
     std::shared_ptr<KUnixSocketObject> s2;
-    KMemory* memory = thread->memory;
 
     BOXEDWINE_CRITICAL_SECTION_WITH_MUTEX(thread->process->fdsMutex);
 
@@ -190,8 +193,6 @@ U32 ksocketpair(KThread* thread, U32 af, U32 type, U32 protocol, U32 socks, U32 
     s2->connected = true;
     f1->accessFlags = K_O_RDWR;
     f2->accessFlags = K_O_RDWR;
-    memory->writed(socks, fd1);
-    memory->writed(socks + 4, fd2);
 
     if ((flags & K_O_CLOEXEC)!=0) {
         thread->process->fcntrl(thread, fd1, K_F_SETFD, FD_CLOEXEC);
@@ -204,6 +205,19 @@ U32 ksocketpair(KThread* thread, U32 af, U32 type, U32 protocol, U32 socks, U32 
     if (flags & ~(K_O_CLOEXEC|K_O_NONBLOCK)) {
         kwarn_fmt("Unknow flags sent to pipe2: %X", flags);
     }
+    outFd1 = fd1;
+    outFd2 = fd2;
+    return 0;
+}
+
+// 32-bit socketpair: build the pair, then write the two FDs into 32-bit guest
+// memory at `socks`.
+U32 ksocketpair(KThread* thread, U32 af, U32 type, U32 protocol, U32 socks, U32 flags) {
+    FD fd1 = 0, fd2 = 0;
+    S32 rc = ksocketpairFds(thread, af, type, protocol, flags, fd1, fd2);
+    if (rc) return (U32)rc;
+    thread->memory->writed(socks, fd1);
+    thread->memory->writed(socks + 4, fd2);
     return 0;
 }
 

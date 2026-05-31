@@ -1726,9 +1726,12 @@ U32 KProcess::clone64(KThread* thread, U64 flags, U64 child_stack, U64 ptid, U64
     // glibc surfaces a clean failure instead of us kpanic'ing.
     const U64 THREAD_FLAGS = K_CLONE_VM | K_CLONE_THREAD | K_CLONE_SIGHAND;
     if ((flags & THREAD_FLAGS) != THREAD_FLAGS) {
-        klog_fmt("KProcess::clone64 - unsupported (non-thread) flags 0x%llx",
-                 (unsigned long long)flags);
-        return (U32)-K_ENOSYS;
+        // Non-thread clone == real fork(2). wine forks to spawn wineserver (and
+        // its services), then the child execve's the new image. Implement a real
+        // fork: a new KProcess with its own memory64 (a deep copy of ours) and a
+        // child CPU64 that returns 0. child_stack==0 here (fork keeps the same
+        // stack pointer), unlike thread-clone, so don't require it.
+        return this->forkProcess64(thread, flags, ctid, ptid);
     }
     if (child_stack == 0) {
         return (U32)-K_EINVAL;
@@ -1786,6 +1789,60 @@ U32 KProcess::clone364(KThread* thread, U64 argsAddr, U64 size) {
     U64 tls         = this->memory64->readq(argsAddr + 56);
     // clone3 passes the stack base + size; the child's RSP is the top.
     return clone64(thread, flags, stack + stack_size, parent_tid, tls, child_tid);
+}
+
+U32 KProcess::forkProcess64(KThread* thread, U64 flags, U64 ctid, U64 ptid) {
+    if (!this->memory64) {
+        return (U32)-K_ENOSYS;
+    }
+    CPU64* parentCpu = thread->cpu64 ? thread->cpu64 : this->cpu64;
+
+    // New process sharing nothing but a snapshot. KProcess::clone() copies the
+    // FD table, cwd, exe, sigActions, etc. (arch-neutral); we add the 64-bit
+    // bits (memory64 deep-copy, is64Bit, brk/phdr, CPU64) by hand.
+    KProcessPtr newProcess = KProcess::create();
+    newProcess->memory = KMemory::create(newProcess.get());  // unused 32-bit side
+    newProcess->clone(shared_from_this());                   // FDs, cwd, exe, sig...
+
+    newProcess->is64Bit = true;
+    newProcess->brkEnd64 = this->brkEnd64;
+    newProcess->entry64 = this->entry64;
+    newProcess->phdr64 = this->phdr64;
+    newProcess->phentsize64 = this->phentsize64;
+    newProcess->phnum64 = this->phnum64;
+    newProcess->startupArgs64 = this->startupArgs64;
+    newProcess->startupEnv64 = this->startupEnv64;
+
+    // Deep-copy the parent address space into the child's own KMemory64.
+    newProcess->memory64 = new KMemory64(newProcess.get());
+    newProcess->memory64->cloneFrom(this->memory64);
+
+    // The child's main thread + its CPU64 (own register file, shared with no
+    // one), seeded from the parent's registers. fork returns 0 in the child;
+    // RIP/RSP are inherited so it resumes right after the SYSCALL on the same
+    // (copied) stack.
+    KThread* newThread = newProcess->createThread();
+    CPU64* childCpu = new CPU64(newProcess->memory64);
+    childCpu->cloneRegistersFrom(parentCpu);
+    childCpu->thread = newThread;
+    childCpu->memory = newProcess->memory64;
+    childCpu->reg[X64_RAX].setU64(0);   // child sees fork() == 0
+    newProcess->cpu64 = childCpu;
+    newThread->cpu64 = childCpu;
+
+    if (flags & K_CLONE_CHILD_SETTID) {
+        // Write into the CHILD's address space (its own memory64 copy).
+        if (ctid) newProcess->memory64->writed(ctid, newThread->id);
+    }
+    if (flags & K_CLONE_CHILD_CLEARTID) {
+        newThread->clear_child_tid64 = ctid;
+    }
+    if (flags & K_CLONE_PARENT_SETTID) {
+        if (ptid) this->memory64->writed(ptid, newProcess->id);
+    }
+
+    scheduleThread(newThread);
+    return newProcess->id;   // parent sees the child pid
 }
 #endif
 

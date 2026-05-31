@@ -26,6 +26,27 @@
 KMemory64::KMemory64(KProcess* process) : process(process) {}
 KMemory64::~KMemory64() = default;
 
+void KMemory64::cloneFrom(const KMemory64* from) {
+    // Lock both sides: `from` may be a live address space (the forking parent),
+    // and we're populating `this` (the fresh child). The parent could fault new
+    // pages concurrently in MT mode; take its lock for a consistent snapshot.
+    // recursive_mutex is fine even if from==this (it never is for fork). Use
+    // explicit guards (the CRITICAL_SECTION macro hard-codes the name `lock`, so
+    // it can't be used twice in one scope).
+#ifdef BOXEDWINE_MULTI_THREADED
+    std::lock_guard<std::recursive_mutex> lockFrom(from->pagesMutex);
+    std::lock_guard<std::recursive_mutex> lockThis(pagesMutex);
+#endif
+    pages.clear();
+    pages.reserve(from->pages.size());
+    for (const auto& kv : from->pages) {
+        auto copy = std::make_unique<K64Page>();
+        ::memcpy(copy->data, kv.second->data, K64_PAGE_SIZE);
+        copy->flags = kv.second->flags;
+        pages.emplace(kv.first, std::move(copy));
+    }
+}
+
 K64Page* KMemory64::getPage(U64 pageNum) const {
     BOXEDWINE_CRITICAL_SECTION_WITH_MUTEX(pagesMutex);
     auto it = pages.find(pageNum);

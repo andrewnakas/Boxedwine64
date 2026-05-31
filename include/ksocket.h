@@ -131,6 +131,10 @@ U32 kaccept(KThread* thread, U32 socket, U32 address, U32 len, U32 flags);
 U32 kgetsockname(KThread* thread, U32 socket, U32 address, U32 len);
 U32 kgetpeername(KThread* thread, U32 socket, U32 address, U32 len);
 U32 ksocketpair(KThread* thread, U32 af, U32 type, U32 protocol, U32 socks, U32 flags);
+// Build a connected AF_UNIX socket pair, returning the two guest FDs via
+// outFd1/outFd2 without touching guest memory (so the 64-bit syscall path can
+// write them into KMemory64). Returns 0 on success, -errno otherwise.
+S32 ksocketpairFds(KThread* thread, U32 af, U32 type, U32 protocol, U32 flags, FD& outFd1, FD& outFd2);
 U32 ksend(KThread* thread, U32 socket, U32 buffer, U32 len, U32 flags);
 U32 krecv(KThread* thread, U32 socket, U32 buffer, U32 len, U32 flags);
 U32 kshutdown(KThread* thread, U32 socket, U32 how);

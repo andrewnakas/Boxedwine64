@@ -14,6 +14,7 @@
 #include "syscall64.h"
 #include "cpu64.h"
 #include "kmemory64.h"
+#include "ksocket.h"
 
 // x86-64 Linux syscall numbers used here. The canonical table lives in
 // arch/x86/entry/syscalls/syscall_64.tbl in the Linux source; the values
@@ -45,6 +46,12 @@
 #define X64_SYS_mkdirat           258
 #define X64_SYS_symlink           88
 #define X64_SYS_symlinkat         266
+#define X64_SYS_socketpair        53
+#define X64_SYS_shutdown          48
+#define X64_SYS_socket            41
+#define X64_SYS_unlink            87
+#define X64_SYS_unlinkat          263
+#define X64_SYS_setsid            112
 #define X64_SYS_getpid            39
 #define X64_SYS_exit              60
 #define X64_SYS_uname             63
@@ -1740,6 +1747,88 @@ void ksyscall64(CPU64* cpu) {
                                         BString::copy(linkpath))));
             break;
         }
+        case X64_SYS_socketpair: {
+            // socketpair(domain, type, protocol, sv[2]). wineserver's first IPC
+            // call — it creates the AF_UNIX request/reply channel. Reuse the
+            // socket-object wiring (ksocketpairFds, no guest-memory access) and
+            // write the two FDs into memory64 (pointer-free 4-byte ints, same
+            // layout 32/64). `type` carries SOCK_CLOEXEC/NONBLOCK flag bits.
+            if (!cpu->thread || !cpu->thread->process) { ret = (U64)-K_ENOSYS; break; }
+            U32 type = (U32)a2 & 0xFF;
+            U32 sockFlags = (U32)a2 & ~0xFFu; // SOCK_CLOEXEC(0x80000)/NONBLOCK(0x800)
+            U32 passFlags = 0;
+            if (sockFlags & 0x80000) passFlags |= K_O_CLOEXEC;
+            if (sockFlags & 0x800)   passFlags |= K_O_NONBLOCK;
+            FD fd1 = 0, fd2 = 0;
+            S32 rc = ksocketpairFds(cpu->thread, (U32)a1, type, (U32)a3, passFlags, fd1, fd2);
+            if (rc) { ret = (U64)(S64)rc; break; }
+            cpu->memory->writed(a4, (U32)fd1);
+            cpu->memory->writed(a4 + 4, (U32)fd2);
+            ret = 0;
+            break;
+        }
+        case X64_SYS_shutdown:
+            // shutdown(sockfd, how). No guest memory; reuse the 32-bit handler.
+            // wineserver's sock_check_pollhup shuts down one end of its pair to
+            // probe POLLHUP behaviour during init.
+            if (!cpu->thread) { ret = (U64)-K_ENOSYS; break; }
+            ret = (U64)(S64)(S32)kshutdown(cpu->thread, (U32)a1, (U32)a2);
+            break;
+        case X64_SYS_socket: {
+            // socket(domain, type, protocol). wineserver creates its listening
+            // AF_UNIX socket. ksocket takes no guest memory — call directly. The
+            // type's high bits are SOCK_CLOEXEC(0x80000)/SOCK_NONBLOCK(0x800);
+            // strip them for ksocket and apply via fcntl after.
+            if (!cpu->thread || !cpu->thread->process) { ret = (U64)-K_ENOSYS; break; }
+            U32 sockType = (U32)a2 & 0xFF;
+            FD sfd = (FD)(S32)ksocket((U32)a1, sockType, (U32)a3);
+            if ((S32)sfd >= 0) {
+                if ((U32)a2 & 0x80000) cpu->thread->process->fcntrl(cpu->thread, sfd, K_F_SETFD, FD_CLOEXEC);
+                if ((U32)a2 & 0x800)   cpu->thread->process->fcntrl(cpu->thread, sfd, K_F_SETFL, K_O_NONBLOCK);
+            }
+            ret = (U64)(S64)(S32)sfd;
+            break;
+        }
+        case X64_SYS_setsid:
+            // setsid() — new session; we don't model sessions, return the pid
+            // (matches the 32-bit stub). wineserver daemonizes with this.
+            ret = (cpu->thread && cpu->thread->process) ? (U64)cpu->thread->process->id : 1;
+            break;
+        case X64_SYS_unlink:
+        case X64_SYS_unlinkat: {
+            // unlink(path) / unlinkat(dirfd, path, flags). wine removes stale
+            // lock/socket files in its prefix. path is arg1 (unlink) or arg2
+            // (unlinkat, dirfd AT_FDCWD/absolute). Route to KProcess::unlinkFile.
+            if (!cpu->thread || !cpu->thread->process) { ret = (U64)-K_ENOSYS; break; }
+            U64 pathArg = (nr == X64_SYS_unlink) ? a1 : a2;
+            char path[1024] = {0};
+            cpu->memory->memcpyFromGuest(path, pathArg, sizeof(path) - 1);
+            ret = (U64)(S64)(S32)cpu->thread->process->unlinkFile(
+                BString(Fs::getFullPath(cpu->thread->process->currentDirectory,
+                                        BString::copy(path))));
+            break;
+        }
+        case X64_SYS_pipe:
+        case X64_SYS_pipe2: {
+            // pipe(fds) / pipe2(fds, flags). Boxedwine models pipes as a
+            // connected AF_UNIX stream pair (same as the 32-bit path). wineserver
+            // uses a pipe for its signal/wakeup fd. Write the two FDs to memory64.
+            // EFAULT before the process check: the bare --x64-selftest runner
+            // has no KProcess, and the pipe(NULL) self-test expects -EFAULT.
+            if (a1 == 0) { ret = (U64)-K_EFAULT; break; }  // pipefd must be valid
+            if (!cpu->thread || !cpu->thread->process) { ret = (U64)-K_ENOSYS; break; }
+            U32 pipeFlags = (nr == X64_SYS_pipe2) ? (U32)a2 : 0;
+            U32 passFlags = 0;
+            if (pipeFlags & 0x80000) passFlags |= K_O_CLOEXEC;  // O_CLOEXEC
+            if (pipeFlags & 0x800)   passFlags |= K_O_NONBLOCK; // O_NONBLOCK
+            FD fd1 = 0, fd2 = 0;
+            S32 rc = ksocketpairFds(cpu->thread, K_AF_UNIX, K_SOCK_STREAM, 0, passFlags, fd1, fd2);
+            if (rc) { ret = (U64)(S64)rc; break; }
+            cpu->memory->writed(a1, (U32)fd1);
+            cpu->memory->writed(a1 + 4, (U32)fd2);
+            ret = 0;
+            break;
+        }
         case X64_SYS_uname:
             ret = sys_uname64(cpu, a1);
             break;
@@ -1870,14 +1959,6 @@ void ksyscall64(CPU64* cpu) {
             } else {
                 ret = (U64)-K_ENOSYS;
             }
-            break;
-        case X64_SYS_pipe:
-        case X64_SYS_pipe2:
-            // No real pipe infra yet; glibc's posix_spawn and popen will
-            // observe ENOSYS and either skip or surface a clean failure.
-            // a1 (pipefd[2]) should be a writable user pointer if set.
-            if (a1 == 0) { ret = (U64)-K_EFAULT; break; }
-            ret = (U64)-K_ENOSYS;
             break;
         case X64_SYS_eventfd2:
             // Used by glibc for thread-pool wakeups, by GLib mainloop, etc.

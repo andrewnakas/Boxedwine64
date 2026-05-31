@@ -104,6 +104,13 @@ public:
     // practice; the check guards against a misaligned caller).
     U8* getRamPtr(U64 addr, U32 len);
 
+    // Deep-copy every mapped page from `from` into this (empty) address space.
+    // Used by fork (KProcess::clone64 non-thread): the child gets an independent
+    // snapshot of the parent's memory. Not copy-on-write — a plain page copy —
+    // which is correct (if not minimal) and fine for wine's fork-then-execve
+    // pattern where the child replaces its image almost immediately.
+    void cloneFrom(const KMemory64* from);
+
     // Diagnostics
     U64 mappedPageCount() const { return (U64)pages.size(); }
 
