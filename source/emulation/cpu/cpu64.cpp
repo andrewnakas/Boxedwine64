@@ -19,14 +19,34 @@
 #include <cstring>
 #include <mutex>
 
-// Global lock for CPU64 atomic read-modify-write memory ops (XCHG with memory,
-// CMPXCHG, XADD, LOCK-prefixed ALU). In the multi-threaded build each guest
-// thread runs on its own host thread over a shared KMemory64, so glibc's
+// Sharded locks for CPU64 atomic read-modify-write memory ops (XCHG with
+// memory, CMPXCHG, XADD, LOCK-prefixed ALU). In the multi-threaded build each
+// guest thread runs on its own host thread over a shared KMemory64, so glibc's
 // pthread mutexes/condvars — which rely on these instructions being atomic —
-// would race without this. Coarse (one mutex for all atomics) but correct;
-// mirrors the misaligned-fallback path in common_lock.cpp. Cheap in the
-// single-threaded build (uncontended).
-static std::recursive_mutex g_cpu64AtomicMutex;
+// would race without this.
+//
+// We keep the existing (verified) loadRM/runAlu/storeRM RMW logic intact and
+// only serialize it under a lock keyed on the operand's guest address. A single
+// global mutex would serialize EVERY locked op across all threads even when
+// they touch unrelated words (glibc hammers distinct futex/lock words from
+// different threads), so instead we hash the operand's page address into a
+// bank of locks: two threads working different pages take different locks and
+// run in parallel. Two ops on the same word always collide on the same lock,
+// which is exactly the atomicity we need. Recursive so a guest exception/signal
+// path that re-enters can't self-deadlock; cheap and uncontended in the
+// single-threaded build.
+//
+// CPU64_ATOMIC_LOCKS must be a power of two so the mask is a single AND.
+#define CPU64_ATOMIC_LOCKS 256
+static std::recursive_mutex g_cpu64AtomicLocks[CPU64_ATOMIC_LOCKS];
+
+// Pick the lock bank for a guest effective address. Shift by the page shift so
+// same-page accesses (the common contended case is a single lock word) share a
+// bank while distinct pages spread across banks; the low page bits carry no
+// useful entropy for sharding since a lock word sits at one offset.
+static inline std::recursive_mutex& cpu64AtomicLockFor(U64 effAddr) {
+    return g_cpu64AtomicLocks[(effAddr >> K64_PAGE_SHIFT) & (CPU64_ATOMIC_LOCKS - 1)];
+}
 
 // FPU status-word C0/C2/C3 bit positions (see Intel SDM Vol 1 §8.1.3).
 // We can't reuse the macros in fpu.cpp because they're file-local there.
@@ -699,7 +719,7 @@ U32 CPU64::step() {
         // XCHG with a memory operand is implicitly atomic on x86 (LOCK is
         // assumed); serialize it across host threads so glibc's spinlock
         // acquire (xchg [lock], eax) is correct under real threading.
-        std::unique_lock<std::recursive_mutex> atomicLock(g_cpu64AtomicMutex, std::defer_lock);
+        std::unique_lock<std::recursive_mutex> atomicLock(cpu64AtomicLockFor(m.effAddr), std::defer_lock);
         if (!m.isReg) atomicLock.lock();
         U64 a = loadRM(m, size, rexPresent);
         U64 b = (size == 1) ? readReg8(m.regField, rexPresent)
@@ -830,7 +850,7 @@ U32 CPU64::step() {
             ModRM m = decodeModRM(rip + opOff + 1, p, 0);
             // `lock add`/`lock or`/`lock and`/... on a memory dest must be an
             // atomic RMW across host threads (glibc futex/lock words use these).
-            std::unique_lock<std::recursive_mutex> atomicLock(g_cpu64AtomicMutex, std::defer_lock);
+            std::unique_lock<std::recursive_mutex> atomicLock(cpu64AtomicLockFor(m.effAddr), std::defer_lock);
             if (p.lock && destIsRM && !m.isReg) atomicLock.lock();
             U64 a, b;
             if (destIsRM) {
@@ -908,7 +928,7 @@ U32 CPU64::step() {
             }
         }
         // `lock orl/andl/addl $imm, [mem]` — atomic RMW across host threads.
-        std::unique_lock<std::recursive_mutex> atomicLock(g_cpu64AtomicMutex, std::defer_lock);
+        std::unique_lock<std::recursive_mutex> atomicLock(cpu64AtomicLockFor(m.effAddr), std::defer_lock);
         if (p.lock && !m.isReg) atomicLock.lock();
         U64 a = loadRM(m, size, rexPresent);
         runAlu(aluOp, size, true, a, imm, m, rexPresent);
@@ -1432,7 +1452,7 @@ U32 CPU64::step() {
             ModRM m = decodeModRM(rip + opOff + 2, p, 0);
             // CMPXCHG is glibc's mutex fast path; make the read-compare-write
             // atomic across host threads when the operand is in memory.
-            std::unique_lock<std::recursive_mutex> atomicLock(g_cpu64AtomicMutex, std::defer_lock);
+            std::unique_lock<std::recursive_mutex> atomicLock(cpu64AtomicLockFor(m.effAddr), std::defer_lock);
             if (!m.isReg) atomicLock.lock();
             U64 dest = loadRM(m, size, rexPresent);
             U64 acc = (size == 1) ? reg[X64_RAX].u8
@@ -1619,7 +1639,7 @@ U32 CPU64::step() {
             ModRM m = decodeModRM(rip + opOff + 2, p, 0);
             // XADD (LOCK XADD) backs glibc's atomic counters; serialize the
             // memory RMW across host threads.
-            std::unique_lock<std::recursive_mutex> atomicLock(g_cpu64AtomicMutex, std::defer_lock);
+            std::unique_lock<std::recursive_mutex> atomicLock(cpu64AtomicLockFor(m.effAddr), std::defer_lock);
             if (!m.isReg) atomicLock.lock();
             U64 d = loadRM(m, size, rexPresent);
             U64 s = (size == 1) ? readReg8(m.regField, rexPresent)

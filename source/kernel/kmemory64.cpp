@@ -27,11 +27,16 @@ KMemory64::KMemory64(KProcess* process) : process(process) {}
 KMemory64::~KMemory64() = default;
 
 K64Page* KMemory64::getPage(U64 pageNum) const {
+    BOXEDWINE_CRITICAL_SECTION_WITH_MUTEX(pagesMutex);
     auto it = pages.find(pageNum);
     return it == pages.end() ? nullptr : it->second.get();
 }
 
 K64Page* KMemory64::getOrAllocPage(U64 pageNum, U32 flagsIfNew) {
+    // Lock spans find+emplace so a concurrent allocator can't rehash the map
+    // under our iterator. The returned raw K64Page* stays valid after we drop
+    // the lock because the unique_ptr payload never moves (see header note).
+    BOXEDWINE_CRITICAL_SECTION_WITH_MUTEX(pagesMutex);
     auto it = pages.find(pageNum);
     if (it != pages.end()) {
         return it->second.get();
@@ -86,6 +91,7 @@ U64 KMemory64::mprotect(U64 addr, U64 len, U32 prot) {
 
     U64 pageStart = addr >> K64_PAGE_SHIFT;
     U64 pageCount = (len + K64_PAGE_SIZE - 1) >> K64_PAGE_SHIFT;
+    BOXEDWINE_CRITICAL_SECTION_WITH_MUTEX(pagesMutex);
     for (U64 i = 0; i < pageCount; i++) {
         // Preserve SHARED bit if it was set; everything else is replaced
         // wholesale. Holes (no page) are skipped — see header comment.

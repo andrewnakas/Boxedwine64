@@ -110,6 +110,16 @@ public:
 private:
     KProcess* process;
     std::unordered_map<U64, std::unique_ptr<K64Page>> pages;
+    // Guards every mutation/lookup of `pages`. In the multi-threaded build all
+    // guest threads share one KMemory64 and fault in pages concurrently; an
+    // unordered_map rehash on emplace racing a find from another thread is UB
+    // (it manifested as one thread's guest store landing on a stale K64Page*,
+    // corrupting another thread's stack → wild RIP / hang in mt_probe). The
+    // page payload (K64Page::data) never moves once allocated, so we only need
+    // to serialize map structure access, not the subsequent memcpy. Compiles
+    // away to nothing in the single-threaded build. Mutable so the const
+    // lookups (getPage/isPageMapped/getPageFlags) can lock.
+    mutable BOXEDWINE_MUTEX pagesMutex;
 
     K64Page* getOrAllocPage(U64 pageNum, U32 flagsIfNew);
     K64Page* getPage(U64 pageNum) const;
