@@ -1930,7 +1930,15 @@ U32 CPU64::step() {
         // XOR; bit pattern identical to PXOR. Discovered in musl printf
         // init — used to zero XMM0 before a varargs scalar-FP write.
         // XORPD xmm, xmm/m128 — 66 0F 57 /r. Same bit op, double-typed.
-        if ((op2 == 0xEF && osize66) || (op2 == 0x57)) {
+        // Packed bitwise-logical float ops — all operate on the full 128 bits;
+        // PS vs PD differ only in the 0x66 prefix, irrelevant to a bit op:
+        //   0F 54 ANDPS/ANDPD    dst &=  src
+        //   0F 55 ANDNPS/ANDNPD  dst = ~dst & src
+        //   0F 56 ORPS/ORPD      dst |=  src
+        //   0F 57 XORPS/XORPD    dst ^=  src   ;  66 0F EF PXOR (same op)
+        // glibc __printf_fp uses ANDPD to mask the sign bit (fabs) for %f.
+        if (op2 == 0x54 || op2 == 0x55 || op2 == 0x56 || op2 == 0x57 ||
+            (op2 == 0xEF && osize66)) {
             ModRM m = decodeModRM(rip + opOff + 2, p, 0);
             U64 srcLo, srcHi;
             if (m.isReg) {
@@ -1940,8 +1948,14 @@ U32 CPU64::step() {
                 srcLo = memory->readq(m.effAddr);
                 srcHi = memory->readq(m.effAddr + 8);
             }
-            xmm[m.regField].lo ^= srcLo;
-            xmm[m.regField].hi ^= srcHi;
+            U64 dLo = xmm[m.regField].lo;
+            U64 dHi = xmm[m.regField].hi;
+            switch (op2) {
+                case 0x54: xmm[m.regField].lo = dLo & srcLo;  xmm[m.regField].hi = dHi & srcHi;  break;
+                case 0x55: xmm[m.regField].lo = ~dLo & srcLo; xmm[m.regField].hi = ~dHi & srcHi; break;
+                case 0x56: xmm[m.regField].lo = dLo | srcLo;  xmm[m.regField].hi = dHi | srcHi;  break;
+                default:   xmm[m.regField].lo = dLo ^ srcLo;  xmm[m.regField].hi = dHi ^ srcHi;  break;
+            }
             U32 used = opOff + 2 + m.length;
             rip += used;
             return used;
