@@ -41,10 +41,14 @@
 #define X64_SYS_getpid            39
 #define X64_SYS_exit              60
 #define X64_SYS_uname             63
+#define X64_SYS_setuid            105
+#define X64_SYS_setgid            106
 #define X64_SYS_getuid            102
+#define X64_SYS_time              201
 #define X64_SYS_getgid            104
 #define X64_SYS_geteuid           107
 #define X64_SYS_getegid           108
+#define X64_SYS_prctl             157
 #define X64_SYS_arch_prctl        158
 #define X64_SYS_gettid            186
 #define X64_SYS_futex             202
@@ -394,6 +398,52 @@ static U64 sys_openat64(CPU64* cpu, U64 dirfd, U64 pathAddr, U64 flags, U64 /*mo
 static U64 sys_close64(CPU64* cpu, U64 fd) {
     if (!cpu->thread || !cpu->thread->process) return (U64)-K_ENOSYS;
     return (U64)(S64)(S32)cpu->thread->process->close((FD)fd);
+}
+
+// getdents64(fd, dirp, count) — read directory entries into the guest buffer
+// in Linux struct linux_dirent64 layout:
+//   u64 d_ino; s64 d_off; u16 d_reclen; u8 d_type; char d_name[]; (NUL-term)
+// each record padded to 8 bytes. Mirrors KProcess::getdents' is64 path but
+// writes through KMemory64 (the 32-bit version's dirp is a U32 address). The
+// FsOpenNode file pointer tracks how far we've iterated, so successive calls
+// page through the directory and a final call returns 0 (end).
+static U64 sys_getdents64_real(CPU64* cpu, U64 fd, U64 dirp, U64 count) {
+    // NULL buffer is EFAULT regardless of process state (matches the kernel
+    // contract and the existing self-test, which runs with no real process).
+    if (!dirp) return (U64)-K_EFAULT;
+    if (!cpu->thread || !cpu->thread->process) return (U64)-K_ENOSYS;
+    KFileDescriptorPtr fdesc = cpu->thread->process->getFileDescriptor((FD)fd);
+    if (!fdesc) return (U64)-9; // -EBADF
+    std::shared_ptr<KFile> kfile = std::dynamic_pointer_cast<KFile>(fdesc->kobject);
+    if (!kfile || !kfile->openFile || !kfile->openFile->node) return (U64)-K_ENOTDIR;
+    FsOpenNode* openNode = kfile->openFile;
+    if (!openNode->node->isDirectory()) return (U64)-K_ENOTDIR;
+
+    U32 entries = openNode->getDirectoryEntryCount();
+    U64 len = 0;
+    U64 pos = dirp;
+    for (U32 i = (U32)openNode->getFilePointer(); i < entries; i++) {
+        BString name;
+        std::shared_ptr<FsNode> entry = openNode->getDirectoryEntry(i, name);
+        if (!entry) continue;
+        U32 nameLen = (U32)strlen(name.c_str());
+        // d_ino(8) d_off(8) d_reclen(2) d_type(1) name(nameLen) NUL(1)
+        U32 recordLen = 20 + nameLen;        // 19 header bytes + name + NUL, but
+        recordLen = (recordLen + 7) / 8 * 8; // 8-byte aligned (d_off must align)
+        if (len + recordLen > count) {
+            if (len == 0) return (U64)-K_EINVAL; // buffer too small for one entry
+            break;                                // resume here next call
+        }
+        cpu->memory->writeq(pos,      (U64)entry->id);       // d_ino
+        cpu->memory->writeq(pos + 8,  (U64)(i + 1));         // d_off (next pos)
+        cpu->memory->writew(pos + 16, (U16)recordLen);       // d_reclen
+        cpu->memory->writeb(pos + 18, (U8)entry->getType(true)); // d_type
+        cpu->memory->memcpyToGuest(pos + 19, name.c_str(), nameLen + 1); // name+NUL
+        pos += recordLen;
+        len += recordLen;
+        openNode->seek(i + 1);
+    }
+    return len;
 }
 
 // lseek — wired straight to KObject::seek.
@@ -1192,6 +1242,9 @@ static const char* x64SyscallName(U64 nr) {
         case 98: return "getrusage";
         case 99: return "sysinfo";
         case 102: return "getuid";
+        case 105: return "setuid";
+        case 106: return "setgid";
+        case 201: return "time";
         case 104: return "getgid";
         case 107: return "geteuid";
         case 108: return "getegid";
@@ -1206,6 +1259,7 @@ static const char* x64SyscallName(U64 nr) {
         case 131: return "sigaltstack";
         case 137: return "statfs";
         case 138: return "fstatfs";
+        case 157: return "prctl";
         case 158: return "arch_prctl";
         case 186: return "gettid";
         case 202: return "futex";
@@ -1251,6 +1305,16 @@ void ksyscall64(CPU64* cpu) {
             break;
         case X64_SYS_writev:
             ret = sys_writev64(cpu, a1, a2, a3);
+            break;
+        case X64_SYS_prctl:
+            // prctl(option, ...). We don't model process control state
+            // (thread name, dumpable flag, seccomp, etc.). Return success for
+            // the common set-style options glibc/busybox issue at startup
+            // (PR_SET_NAME=15, PR_SET_DUMPABLE=4, PR_SET_PDEATHSIG=1,
+            // PR_SET_VMA=0x53564d41) so callers don't treat it as fatal;
+            // PR_CAPBSET_READ(23)/PR_GET_*(even) return 0. A blanket 0 is the
+            // pragmatic choice for a single-process interpreter.
+            ret = 0;
             break;
         case X64_SYS_arch_prctl:
             ret = sys_arch_prctl64(cpu, a1, a2);
@@ -1474,6 +1538,21 @@ void ksyscall64(CPU64* cpu) {
         case X64_SYS_getegid:
             ret = 1000; // pretend uid/gid 1000
             break;
+        case X64_SYS_setuid:
+        case X64_SYS_setgid:
+            // We model exactly one user (uid/gid 1000). Tools like coreutils
+            // ls/id call setuid/setgid to drop privileges at startup; accept
+            // any request to set our own id and reject others with EPERM, the
+            // same way a real kernel would for an unprivileged process.
+            ret = (a1 == 1000) ? 0 : (U64)-1; // -EPERM
+            break;
+        case X64_SYS_time: {
+            // time(tloc): seconds since epoch; writes to *tloc when non-null.
+            U64 sec = KSystem::getSystemTimeAsMicroSeconds() / 1000000ULL;
+            if (a1) cpu->memory->writeq(a1, sec);
+            ret = sec;
+            break;
+        }
         case X64_SYS_getpid:
         case X64_SYS_gettid:
             ret = cpu->thread ? cpu->thread->id : 1;
@@ -1590,11 +1669,7 @@ void ksyscall64(CPU64* cpu) {
             ret = (U64)-K_EBADF;
             break;
         case X64_SYS_getdents64:
-            // Directory iteration needs FsOpenNode + KMemory64 plumbing.
-            // EBADF on the assumption no dir was successfully opened yet
-            // (open() of a directory currently fails earlier).
-            if (a2 == 0) { ret = (U64)-K_EFAULT; break; }
-            ret = (U64)-K_ENOSYS;
+            ret = sys_getdents64_real(cpu, a1, a2, a3);
             break;
         case X64_SYS_pwrite64:
             // pwrite64(fd, buf, count, offset). No real impl; ENOSYS is

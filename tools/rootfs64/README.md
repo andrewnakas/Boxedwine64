@@ -71,6 +71,37 @@ Requires Docker Desktop running (`open -a Docker`). From repo root:
 docker run --rm --platform linux/amd64 -v "$PWD/tools/rootfs64/work:/w" \
   gcc:13 bash -c 'cd /w && gcc -O2 -o hello_glibc hello_glibc.c && \
                   gcc -O2 -static -o hello_static hello_glibc.c && \
+                  gcc -O2 -o dirprobe dirprobe.c && \
                   cp -L /lib64/ld-linux-x86-64.so.2 . && \
                   cp -L /lib/x86_64-linux-gnu/libc.so.6 .'
+```
+
+`dirprobe.c` is a libc-only directory lister (opendir/readdir/qsort) — the
+coreutils-`ls` essence, exercising `getdents64` through real dynamic glibc.
+
+`busybox` (in `root/bin/`) is a static x86-64 build pulled from Debian
+bookworm; it runs `busybox ls -la /`, `echo`, `pwd`, `cat`, etc. through the
+full 64-bit kernel. Refresh it (and the dynamic coreutils `ls` + its libs)
+with:
+
+```sh
+docker run --rm --platform linux/amd64 -v "$PWD/tools/rootfs64/work/extract:/out" \
+  debian:bookworm-slim bash -c \
+  'apt-get update -qq && apt-get install -y -qq busybox-static && \
+   cp /bin/busybox /out/ && cp /bin/ls /out/ && \
+   cp /lib/x86_64-linux-gnu/libselinux.so.1 /lib/x86_64-linux-gnu/libpcre2-8.so.0 /out/'
+```
+
+The dynamic GNU `ls` additionally needs `libselinux.so.1` + `libpcre2-8.so.0`;
+those currently trip the guest ld.so on a `DT_RELR` relocation our loader
+doesn't yet emit correctly, so only static busybox `ls` and `dirprobe` are
+committed as working fixtures. (`work/extract/` is gitignored.)
+
+## What runs today (64-bit rootfs, full kernel)
+
+```
+tools/run_x64_root.sh /bin/busybox ls -la /     # real coreutils, long format
+tools/run_x64_root.sh /bin/dirprobe /bin         # dynamic glibc getdents64
+tools/run_x64_root.sh /bin/hello_glibc           # exit 42
+tools/run_x64_root.sh /bin/probe2                # %f + malloc + qsort
 ```

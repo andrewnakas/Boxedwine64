@@ -584,7 +584,26 @@ KThread* KProcess::startProcess(BString currentDirectory, const std::vector<BStr
     FsOpenNode* openNode=ElfLoader::inspectNode(currentDirectory, node, loader, interpreter, interpreterArgs);
     if (!openNode) {
         return nullptr;
-    }    
+    }
+#ifdef BOXEDWINE_GUEST_X64
+    // The 64-bit loader builds the SysV init stack itself (before the 32-bit
+    // `args` vector below is assembled), so hand it the real argv/envp now.
+    // is64Bit isn't known until loadProgram parses the ELF, so populate these
+    // unconditionally — ElfLoader64::loadProgram is the only reader and it
+    // only runs for x86-64 ELFs. Guest argv[0] is the program's own path (not
+    // ld.so): glibc/_start expect argv[0] to be the executable, and ld-linux
+    // is found via PT_INTERP + AT_BASE, not via argv. argValues[1..] are the
+    // program's arguments.
+    this->startupArgs64.clear();
+    this->startupArgs64.push_back(BString(Fs::getFullPath(currentDirectory, argValues[0])));
+    for (U32 i = 1; i < argValues.size(); i++) {
+        this->startupArgs64.push_back(argValues[i]);
+    }
+    this->startupEnv64.clear();
+    for (U32 i = 0; i < envValues.size(); i++) {
+        this->startupEnv64.push_back(envValues[i]);
+    }
+#endif
     if (ElfLoader::loadProgram(thread, openNode, &thread->cpu->eip.u32)) {
         if (loader.length())
             args.push_back(loader);

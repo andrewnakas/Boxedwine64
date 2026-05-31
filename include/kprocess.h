@@ -295,6 +295,13 @@ public:
     U64 phdr64 = 0;
     U32 phnum64 = 0;
     U32 phentsize64 = 0;
+    // Full guest argv/envp for the 64-bit init stack. Unlike the 32-bit path
+    // (which builds the SysV stack in setupThreadStack *after* loadProgram),
+    // ElfLoader64::loadProgram builds the stack itself, so it needs the real
+    // arguments here rather than synthesizing a 1-element argv from the exe
+    // name. startProcess populates these before calling loadProgram.
+    std::vector<BString> startupArgs64;
+    std::vector<BString> startupEnv64;
 #endif
 
     BHashTable<U32, U32> glStrings;

@@ -13,3 +13,8 @@ work/fprobe
 work/fprobe2
 work/fprobe3
 work/fpstress
+work/dirprobe
+# Raw docker-extracted third-party binaries (busybox, coreutils ls, distro
+# .so libs). Reproduce with: docker run --platform linux/amd64 debian:bookworm-slim
+# (see README). The usable copies that probes need live in root/bin.
+work/extract/

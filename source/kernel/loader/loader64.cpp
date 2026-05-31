@@ -970,14 +970,19 @@ bool ElfLoader64::loadProgram(KThread* thread, FsOpenNode* openNode, U64* rip) {
         return false;
     }
 
-    // Build a minimal argv/envp: just the exe name. The real path will
-    // come from KProcess::startProcess once we wire that side up; for now
-    // a single-element argv lets us validate _start/_dl_start.
-    const char* exeName = process->name.length() ? process->name.c_str() : "boxedwine64.exe";
-    std::vector<BString> argv;
-    argv.push_back(BString::copy(exeName));
-    std::vector<BString> envp;
-    envp.push_back(BString::copy("PATH=/bin:/usr/bin"));
+    // Use the real argv/envp that KProcess::startProcess stashed for us. When
+    // they're empty (the bare --x64-run-elf test harness calls loadProgram
+    // directly, not through startProcess) fall back to a single-element argv
+    // so _start/_dl_start still validate.
+    std::vector<BString> argv = process->startupArgs64;
+    if (argv.empty()) {
+        const char* exeName = process->name.length() ? process->name.c_str() : "boxedwine64.exe";
+        argv.push_back(BString::copy(exeName));
+    }
+    std::vector<BString> envp = process->startupEnv64;
+    if (envp.empty()) {
+        envp.push_back(BString::copy("PATH=/bin:/usr/bin"));
+    }
 
     // First write all the strings near the top of stack, recording each
     // string's guest address.
