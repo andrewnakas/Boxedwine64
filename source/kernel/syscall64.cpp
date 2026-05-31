@@ -259,9 +259,6 @@ static U64 sys_mmap64_file(CPU64* cpu, U64 addr, U64 length, U64 prot,
                            U64 flags, U64 fd, U64 offset);
 
 static U64 sys_mmap64(CPU64* cpu, U64 addr, U64 length, U64 prot, U64 flags, U64 fd, U64 offset) {
-    klog_fmt("sys_mmap64: addr=0x%llx len=%llu prot=%llu flags=0x%llx fd=%lld off=%llu",
-             (unsigned long long)addr, (unsigned long long)length, (unsigned long long)prot,
-             (unsigned long long)flags, (long long)(S64)fd, (unsigned long long)offset);
     if (!(flags & K_MAP_ANONYMOUS)) {
         return sys_mmap64_file(cpu, addr, length, prot, flags, fd, offset);
     }
@@ -391,7 +388,6 @@ static U64 sys_openat64(CPU64* cpu, U64 dirfd, U64 pathAddr, U64 flags, U64 /*mo
         klog_fmt("sys_openat64: open('%s') -> %d", path, (int)(S32)rc);
         return (U64)(S64)(S32)rc;
     }
-    klog_fmt("sys_openat64: open('%s') -> fd %d", path, (int)result->handle);
     return (U64)result->handle;
 }
 
@@ -422,7 +418,8 @@ static U64 sys_lseek64(CPU64* cpu, U64 fd, U64 offset, U64 whence) {
 }
 
 // pread64(fd, buf, count, offset) — read at an absolute offset without moving
-// the file position. glibc's ld.so uses it to read a DSO's program headers.
+// the file position. glibc's ld.so uses it to read a DSO's program headers
+// before mmap. Emulated as save-pos/seek/read/restore over the KObject layer.
 static U64 sys_pread64(CPU64* cpu, U64 fd, U64 buf, U64 count, U64 offset) {
     if (!cpu->thread || !cpu->thread->process) return (U64)-K_ENOSYS;
     KFileDescriptorPtr fdesc = cpu->thread->process->getFileDescriptor((FD)fd);
@@ -435,8 +432,6 @@ static U64 sys_pread64(CPU64* cpu, U64 fd, U64 buf, U64 count, U64 offset) {
     std::vector<U8> tmp((size_t)count);
     U32 got = fdesc->kobject->readNative(tmp.data(), (U32)count);
     fdesc->kobject->seek(savedPos);
-    klog_fmt("sys_pread64: fd=%llu count=%llu off=%llu -> got=%d",
-             (unsigned long long)fd, (unsigned long long)count, (unsigned long long)offset, (int)(S32)got);
     if ((S32)got < 0) return (U64)(S64)(S32)got;
     if (got > 0) cpu->memory->memcpyToGuest(buf, tmp.data(), got);
     return (U64)got;
@@ -555,41 +550,20 @@ static U64 sys_mmap64_file(CPU64* cpu, U64 addr, U64 length, U64 prot,
     if (!fdesc) return (U64)-9; // -EBADF
     std::shared_ptr<KFile> kfile = std::dynamic_pointer_cast<KFile>(fdesc->kobject);
     if (!kfile || !kfile->openFile) {
-        klog_fmt("sys_mmap64_file: fd=%llu not a mappable KFile -> ENOSYS", (unsigned long long)fd);
         return (U64)-K_ENOSYS;
     }
-    // MAP_FIXED (0x10): caller demands the mapping land at exactly `addr`.
-    // glibc's ld.so reserves the whole DSO with one PROT_READ mapping, then
-    // MAP_FIXED-remaps each segment over sub-ranges with the right prot. We
-    // must honour the exact address in that case (a bump-allocated address
-    // would make ld.so retry and then fail). Without MAP_FIXED and addr==0,
-    // bump-allocate a fresh region.
-    const U64 K_MAP_FIXED = 0x10;
-    bool fixed = (flags & K_MAP_FIXED) != 0;
-    if (addr == 0 && !fixed) {
+    if (addr == 0) {
         static U64 anonBump = 0x700000000ULL;
         addr = anonBump;
         anonBump += (length + 0xFFF) & ~0xFFFULL;
     }
-    klog_fmt("sys_mmap64_file: fd=%llu addr=0x%llx len=%llu off=%llu prot=%llu fixed=%d",
-             (unsigned long long)fd, (unsigned long long)addr, (unsigned long long)length,
-             (unsigned long long)offset, (unsigned long long)prot, (int)fixed);
-
     U64 aligned = addr & ~0xFFFULL;
     U64 mapLen = (length + (addr - aligned) + 0xFFF) & ~0xFFFULL;
-    // Map (or, for an already-reserved FIXED range, re-map) the pages with the
-    // requested protection. mmapAnonymousFixed allocates fresh zeroed pages or
-    // re-flags+zeroes existing ones — both correct here since we then copy the
-    // file contents over the file-backed portion and leave the rest (bss) zero.
     U64 mapped = cpu->memory->mmapAnonymousFixed(aligned, mapLen, (U32)prot);
     if ((S64)mapped < 0) {
-        klog_fmt("sys_mmap64_file: mmapAnonymousFixed(0x%llx,%llu) failed -> %lld",
-                 (unsigned long long)aligned, (unsigned long long)mapLen, (long long)(S64)mapped);
         return mapped;
     }
-    // Copy the file-backed bytes [offset, offset+length) into [addr, addr+length).
-    // A short read (file smaller than the mapping, e.g. the last page of a
-    // segment) is normal — the remainder stays zero (bss semantics).
+    // Read [offset, offset+length) and copy into [addr, addr+length).
     std::vector<U8> buf((size_t)length);
     S64 saved = kfile->openFile->getFilePointer();
     kfile->openFile->seek((S64)offset);
@@ -598,6 +572,7 @@ static U64 sys_mmap64_file(CPU64* cpu, U64 addr, U64 length, U64 prot,
     if (got > 0) {
         cpu->memory->memcpyToGuest(addr, buf.data(), got);
     }
+    (void)flags;
     return addr;
 }
 
@@ -1427,9 +1402,6 @@ void ksyscall64(CPU64* cpu) {
         case X64_SYS_read:
             ret = sys_read64(cpu, a1, a2, a3);
             break;
-        case X64_SYS_pread64:
-            ret = sys_pread64(cpu, a1, a2, a3, a4);
-            break;
         case X64_SYS_open:
         case X64_SYS_openat:
             // open(path, flags, mode) — same arg layout once we shift one.
@@ -1461,6 +1433,9 @@ void ksyscall64(CPU64* cpu) {
             break;
         case X64_SYS_lseek:
             ret = sys_lseek64(cpu, a1, a2, a3);
+            break;
+        case X64_SYS_pread64:
+            ret = sys_pread64(cpu, a1, a2, a3, a4);
             break;
         case X64_SYS_readlink:
             ret = sys_readlink64(cpu, a1, a2, a3);
