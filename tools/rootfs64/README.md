@@ -141,3 +141,34 @@ tools/run_x64_root.sh /bin/dirprobe /bin         # dynamic glibc getdents64
 tools/run_x64_root.sh /bin/hello_glibc           # exit 42
 tools/run_x64_root.sh /bin/probe2                # %f + malloc + qsort
 ```
+
+## Threading (KThread64)
+
+`clone(2)`/`clone3(2)` create real threads (per-thread `CPU64` sharing one
+`KMemory64`), driven by the multi-threaded host-thread scheduler
+(`platformThread`), and `futex(2)` truly blocks/wakes across them. The x86-64
+atomic RMW instructions glibc's mutexes rely on (XCHG/CMPXCHG/XADD and
+`lock`-prefixed ALU) are serialized so locking is correct under real host
+threads.
+
+Threading probes live in `work/` (source only — build + drop in `root/bin/`
+to run):
+
+```sh
+# raw clone + shared counter + futex WAIT/WAKE join (no libc threading layer)
+gcc -O2 -static -nostartfiles -ffreestanding clone_ok.c -o clone_ok   # -> PASS
+# simplest: child sets a shared flag, parent observes it
+gcc -O2 -static -nostartfiles -ffreestanding clone_flag.c -o clone_flag # -> flag-set
+# real glibc pthreads: pthread_create + mutex-protected counter + join
+gcc -O2 -pthread pthread_probe.c -o pthread_probe
+```
+
+Build them under `docker run --rm --platform linux/amd64 debian:bookworm`
+(the `--platform` flag is required on Apple Silicon), then
+`tools/run_x64_root.sh /bin/clone_ok` etc.
+
+KNOWN LIMITS: the raw probes pass deterministically. Real glibc `pthread_probe`
+runs both threads through real mutexes but is slow (the atomic-RMW serialization
+is coarse) and full `pthread_join` completion is not yet confirmed end-to-end.
+See the project memory note for the two root-cause fixes and the remaining
+join/perf work.

@@ -41,8 +41,16 @@ static void platformThread(CPU* cpu) {
     // 64-bit address space — getNextOp() would decode the (truncated) 32-bit
     // eip and page-fault at the real 64-bit entry. Branch before any 32-bit
     // setup runs.
-    if (cpu->thread->process->is64Bit && cpu->thread->process->cpu64) {
-        CPU64* cpu64 = cpu->thread->process->cpu64;
+    if (cpu->thread->process->is64Bit &&
+        (cpu->thread->cpu64 || cpu->thread->process->cpu64)) {
+        // Each guest thread runs on its OWN host thread here, so it must drive
+        // its OWN per-thread CPU64 (thread->cpu64) — NOT the process-wide one.
+        // The main thread's cpu64 is the same object as process->cpu64; cloned
+        // threads (clone64) get a distinct CPU64 sharing memory64. Driving the
+        // shared process->cpu64 from every host thread would race two threads
+        // through one register file and corrupt guest state.
+        CPU64* cpu64 = cpu->thread->cpu64 ? cpu->thread->cpu64
+                                          : cpu->thread->process->cpu64;
         while (true) {
             cpu64->yield = false;
             try {

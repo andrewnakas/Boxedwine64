@@ -24,6 +24,20 @@
 #include "bufferaccess.h"
 #include "kstat.h"
 
+#ifdef BOXEDWINE_GUEST_X64
+#include "cpu64.h"
+#include "kmemory64.h"
+// cpu64.h -> reg64.h does `#undef u16/h16/u8/h8` to protect Reg64's real
+// fields from cpu.h's macros. The 32-bit signal code below (runSignal /
+// sigreturn) relies on those macros expanding the 32-bit Reg union's
+// .u16/.u8 accessors, so re-establish them after the 64-bit headers. Mirrors
+// the definitions in source/emulation/cpu/common/cpu.h.
+#define u16 word[0]
+#define h16 word[1]
+#define u8 byte[0]
+#define h8 byte[1]
+#endif
+
 thread_local KThread* KThread::runningThread;
 
 KThread::~KThread() {  
@@ -34,6 +48,15 @@ KThread::~KThread() {
     CPU* cpu = this->cpu;
     this->cpu = nullptr;
     delete cpu;
+#ifdef BOXEDWINE_GUEST_X64
+    // Free a cloned thread's CPU64. The main thread's cpu64 is the same object
+    // as process->cpu64, which is owned/torn down with the process — don't
+    // double-free it here.
+    if (this->cpu64 && (!this->process || this->cpu64 != this->process->cpu64)) {
+        delete this->cpu64;
+    }
+    this->cpu64 = nullptr;
+#endif
 }
 
 void KThread::cleanup() {
@@ -46,9 +69,18 @@ void KThread::internalCleanup() {
         BOXEDWINE_CRITICAL_SECTION_WITH_CONDITION(this->waitingForSignalToEndCond);
         BOXEDWINE_CONDITION_SIGNAL_ALL(this->waitingForSignalToEndCond);
     }
-    if (!KSystem::shutingDown && this->clear_child_tid && this->process && memory->canWrite(this->clear_child_tid, 4)) {
+#ifdef BOXEDWINE_GUEST_X64
+    if (!KSystem::shutingDown && this->clear_child_tid64 && this->process && this->process->is64Bit && this->process->memory64) {
+        // pthread join: the kernel zeroes clear_child_tid and wakes one waiter
+        // on the joiner's futex when a thread exits. The address is a 64-bit
+        // guest address into memory64.
+        this->process->memory64->writed(this->clear_child_tid64, 0);
+        this->futex64(this->clear_child_tid64, 1 /*FUTEX_WAKE*/, 1, 0, 0);
+    } else
+#endif
+    if (!KSystem::shutingDown && this->clear_child_tid && this->process && memory && memory->canWrite(this->clear_child_tid, 4)) {
         memory->writed(this->clear_child_tid, 0);
-        this->futex(this->clear_child_tid, 1, 0xffffffff, 0, 0, 0, false);        
+        this->futex(this->clear_child_tid, 1, 0xffffffff, 0, 0, 0, false);
     }
 	this->clear_child_tid = 0;
 #ifndef BOXEDWINE_MULTI_THREADED
@@ -459,6 +491,176 @@ U32 KThread::futex(U32 addr, U32 op, U32 value, U32 pTime, U32 val2, U32 val3, b
         return -1;
     }
 }
+
+#ifdef BOXEDWINE_GUEST_X64
+// 64-bit guest futex. Shares the global system_futex[] table and the same
+// BoxedWineCondition blocking machinery as the 32-bit futex() above. The only
+// real differences from the 32-bit path:
+//   - addresses are 64-bit and resolved against process->memory64;
+//   - the table is keyed on the stable host pointer KMemory64::getRamPtr
+//     returns (the page backing store never moves), so sibling threads sharing
+//     one KMemory64 see the same futex slot for the same guest word — exactly
+//     what FUTEX_PRIVATE within a process needs;
+//   - in single-threaded cooperative builds, a WAIT that must block parks this
+//     thread (cond->wait() returns -K_WAIT, unscheduling it) and returns the
+//     K_FUTEX64_PARKED sentinel so the syscall layer rewinds RIP and the
+//     SYSCALL re-executes on the next slice (where it observes f->wake).
+//
+// Only WAIT/WAKE (+_BITSET, +_PRIVATE) are real. REQUEUE/CMP_REQUEUE/WAKE_OP
+// return 0 (no kernel migration); anything else -ENOSYS.
+S64 KThread::futex64(U64 addr, U32 op, U32 value, U64 timeoutAddr, U32 val3) {
+    KMemory64* mem = process ? process->memory64 : nullptr;
+    if (!mem) return -K_ENOSYS;
+
+    U32 cmd = (op & FUTEX_CMD_MASK);
+
+    // Stable host pointer for the futex word — the table key. A 4-byte word
+    // never crosses a page boundary in practice; getRamPtr returns null only
+    // then, in which case there is nothing sane to wait on.
+    U64 ramAddress = (U64)mem->getRamPtr(addr, 4);
+    if (ramAddress == 0) {
+        return -K_EFAULT;
+    }
+
+    if (cmd == FUTEX_WAIT || cmd == FUTEX_WAIT_BITSET) {
+        struct futex* f = getFutex(this, ramAddress);
+
+        // Re-entry after being woken (single-threaded re-execution) or after a
+        // host-thread wakeup: the slot exists and was flagged. Consume it.
+        if (f) {
+            BOXEDWINE_CRITICAL_SECTION_WITH_CONDITION(f->cond);
+            if (f->wake) {
+                freeFutex(f);
+                return 0;
+            }
+            if (f->expireTimeInMillies < 0x7FFFFFFF) {
+                S32 diff = f->expireTimeInMillies - KSystem::getMilliesSinceStart();
+                if (diff <= 0) {
+                    freeFutex(f);
+                    return -K_ETIMEDOUT;
+                }
+            }
+            // Still parked (spurious re-entry). Fall through to block again.
+        } else {
+            // Fresh WAIT: compare the word; only park on an exact match.
+            U32 cur = mem->readd(addr);
+            if (cur != value) {
+                return -K_EWOULDBLOCK;
+            }
+            // A lone thread has no sibling that could ever FUTEX_WAKE it, so
+            // parking would deadlock the whole (cooperative) process. glibc's
+            // single-threaded fast paths tolerate a spurious EAGAIN here and
+            // retry, so behave like the threadless stub until a second thread
+            // exists. Once clone has run, real parking/waking is in play.
+            if (process->getThreadCount() <= 1) {
+                return -K_EWOULDBLOCK;
+            }
+            U32 expireTime = 0xFFFFFFFF;
+            if (timeoutAddr != 0) {
+                // struct timespec { i64 sec; i64 nsec; } — FUTEX_WAIT timeout
+                // is relative.
+                U64 seconds = mem->readq(timeoutAddr);
+                U64 nano = mem->readq(timeoutAddr + 8);
+                expireTime = (U32)(seconds * 1000 + nano / 1000000);
+                expireTime += KSystem::getMilliesSinceStart();
+            }
+            f = allocFutex(this, ramAddress, expireTime);
+            if (cmd == FUTEX_WAIT_BITSET) {
+                f->mask = val3;
+            }
+        }
+
+        // Park. In multi-threaded builds the WAIT loop blocks the host thread
+        // inline and only returns once woken/timed-out. In single-threaded
+        // builds cond->wait() unschedules this thread and returns -K_WAIT; we
+        // surface that as K_FUTEX64_PARKED so the SYSCALL re-executes later.
+        {
+            BOXEDWINE_CRITICAL_SECTION_WITH_CONDITION(f->cond);
+            // Re-check under the lock — a WAKE could have landed between the
+            // word compare and here.
+            if (f->wake) {
+                freeFutex(f);
+                return 0;
+            }
+            f->waiting = true;
+#ifdef BOXEDWINE_MULTI_THREADED
+            while (true) {
+                if (this->pendingSignals) {
+                    if (runSignals()) {
+                        freeFutex(f);
+                        return -K_EINTR;
+                    }
+                }
+                if (f->wake) {
+                    freeFutex(f);
+                    return 0;
+                }
+                if (f->expireTimeInMillies < 0x7FFFFFFF) {
+                    S32 diff = f->expireTimeInMillies - KSystem::getMilliesSinceStart();
+                    if (diff <= 0) {
+                        freeFutex(f);
+                        return -K_ETIMEDOUT;
+                    }
+                    f->cond->waitWithTimeout(boxedWineCriticalSection, (U32)diff);
+                } else {
+                    f->cond->wait(boxedWineCriticalSection);
+                }
+                if (this->terminating) {
+                    freeFutex(f);
+                    return -K_EINTR;
+                }
+            }
+#else
+            // Single-threaded: park on the condition (sets waitingCond,
+            // unschedules) and bail out to the scheduler. The SYSCALL re-runs
+            // when a WAKE reschedules us; this method is re-entered and the
+            // f->wake branch above returns 0.
+            if (f->expireTimeInMillies < 0x7FFFFFFF) {
+                S32 diff = f->expireTimeInMillies - KSystem::getMilliesSinceStart();
+                if (diff <= 0) {
+                    freeFutex(f);
+                    return -K_ETIMEDOUT;
+                }
+                f->cond->waitWithTimeout((U32)diff);
+            } else {
+                f->cond->wait();
+            }
+            return K_FUTEX64_PARKED;
+#endif
+        }
+    } else if (cmd == FUTEX_WAKE || cmd == FUTEX_WAKE_BITSET) {
+        U32 count = 0;
+        for (int i = 0; i < MAX_FUTEXES && count < value; i++) {
+            if (!system_futex[i].thread) {
+                continue;
+            }
+            BOXEDWINE_CRITICAL_SECTION_WITH_CONDITION(system_futex[i].cond);
+            if (!system_futex[i].thread) {
+                continue;
+            }
+            // Private futexes only match waiters in the same process — for
+            // 64-bit that's enforced naturally since the host pointer key is
+            // process-unique, but check process id too for parity with the
+            // 32-bit path (shared futexes would key on a global ram pointer).
+            bool processCheck = system_futex[i].thread->process->id == this->process->id;
+            bool addressCheck = system_futex[i].address == ramAddress;
+            bool maskCheck = ((cmd != FUTEX_WAKE_BITSET) || (system_futex[i].mask & val3));
+            if (processCheck && addressCheck && !system_futex[i].wake && maskCheck) {
+                if (!system_futex[i].waiting) {
+                    continue;
+                }
+                system_futex[i].wake = true;
+                BOXEDWINE_CONDITION_SIGNAL(system_futex[i].cond);
+                count++;
+            }
+        }
+        return count;
+    } else if (cmd == 3 /*REQUEUE*/ || cmd == 4 /*CMP_REQUEUE*/ || cmd == 5 /*WAKE_OP*/) {
+        return 0;
+    }
+    return -K_ENOSYS;
+}
+#endif
 
 /*
 struct robust_list {

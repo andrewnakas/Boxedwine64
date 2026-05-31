@@ -94,6 +94,16 @@ public:
     void writed(U64 addr, U32 value);
     void writeq(U64 addr, U64 value);
 
+    // Stable host pointer for a guest address range. The page backing store
+    // is a per-page unique_ptr<K64Page> whose data[] never moves for the life
+    // of the mapping, so the returned pointer is stable and usable as a
+    // cross-thread key (this is what the futex table keys on). The page is
+    // allocated on demand if not yet present. Returns nullptr only if the
+    // range would cross a page boundary (callers — futex words — are always
+    // 4-byte aligned within a 4096-byte page, so this never happens in
+    // practice; the check guards against a misaligned caller).
+    U8* getRamPtr(U64 addr, U32 len);
+
     // Diagnostics
     U64 mappedPageCount() const { return (U64)pages.size(); }
 

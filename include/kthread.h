@@ -46,6 +46,9 @@ typedef std::shared_ptr<OpenGLVetexPointer> OpenGLVetexPointerPtr;
 class KProcess;
 class Memory;
 class Wnd;
+#ifdef BOXEDWINE_GUEST_X64
+class CPU64;
+#endif
 
 class KThreadGlContext {
 public:
@@ -88,6 +91,15 @@ public:
 
     // syscalls
     U32 futex(U32 addr, U32 op, U32 value, U32 pTime, U32 val2, U32 val3, bool time64) ;
+#ifdef BOXEDWINE_GUEST_X64
+    // 64-bit guest futex. Blocks/wakes via the same global system_futex[]
+    // table as the 32-bit futex(), keyed on the stable host pointer that
+    // KMemory64::getRamPtr returns for the guest futex word. Only WAIT/WAKE
+    // (+ _BITSET, + _PRIVATE) are real; other ops return -ENOSYS so glibc
+    // takes its user-space fallback. timeoutAddr (when non-zero) points at a
+    // guest `struct timespec` for the relative WAIT timeout.
+    S64 futex64(U64 addr, U32 op, U32 value, U64 timeoutAddr, U32 val3);
+#endif
     U32 modify_ldt(U32 func, U32 ptr, U32 count);
     U32 signalstack(U32 ss, U32 oss);
     U32 sigprocmask(U32 how, U32 set, U32 oset, U32 sigsetSize);
@@ -107,6 +119,14 @@ public:
     U32 alternateStack = 0;
     U32 alternateStackSize = 0;
     CPU* cpu = nullptr;
+#ifdef BOXEDWINE_GUEST_X64
+    // 64-bit per-thread CPU. Only set for is64Bit processes; shares the one
+    // process->memory64 with every sibling thread. The main thread's cpu64
+    // also lives on KProcess::cpu64 (set by loadProgram64); clone64 allocates
+    // a fresh CPU64 here for each new thread. nullptr for 32-bit guests, where
+    // the `cpu` member above is the working path.
+    CPU64* cpu64 = nullptr;
+#endif
     KProcessPtr process;
     KMemory* const memory;
     bool interrupted = false;
@@ -120,7 +140,14 @@ public:
 #endif
     bool terminating = false;
     U32 clear_child_tid = 0;
-    
+#ifdef BOXEDWINE_GUEST_X64
+    // 64-bit CLONE_CHILD_CLEARTID address (set_tid_address / clone tls arg).
+    // Separate from the 32-bit U32 field above because guest addresses are
+    // 64-bit. On thread exit the kernel zeroes this word and wakes one futex
+    // waiter on it — that is how glibc's pthread_join observes child death.
+    U64 clear_child_tid64 = 0;
+#endif
+
     U64 getThreadUserTime();
 
     U64 kernelTime = 0;

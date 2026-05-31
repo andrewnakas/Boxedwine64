@@ -19,6 +19,14 @@
 class KThread;
 class KMemory64;
 
+// Sentinel returned by KThread::futex64 when a FUTEX_WAIT had to block and the
+// thread was parked on its condition (single-threaded cooperative mode). The
+// futex syscall translates this into cpu->reExecuteSyscall so the SYSCALL
+// instruction re-runs after the thread is woken. Chosen well outside any
+// plausible real return value or -errno. In BOXEDWINE_MULTI_THREADED builds
+// futex64 blocks inline and never returns this.
+#define K_FUTEX64_PARKED ((S64)0x4000000000000000LL)
+
 // x86-64 register indices. These match the encoding in the ModR/M and REX
 // bytes (REX.R/REX.X/REX.B extend the 3-bit field to 4 bits).
 enum X64Reg : U8 {
@@ -131,6 +139,18 @@ public:
     U64 mmapNext = 0;
 
     bool yield = false;
+    // Set by a syscall (futex WAIT) that parked this thread on a condition in
+    // single-threaded cooperative mode. The SYSCALL handler rewinds RIP back
+    // to the SYSCALL instruction and yields, so when the scheduler reschedules
+    // this thread (after a FUTEX_WAKE) the SYSCALL re-executes and the futex
+    // sees its wake flag. Mirrors the 32-bit -K_WAIT re-execution model where
+    // the syscall dispatcher leaves EIP unadvanced. Unused (always false) in
+    // BOXEDWINE_MULTI_THREADED builds, where futex WAIT blocks the host thread
+    // inline and the syscall completes normally.
+    bool reExecuteSyscall = false;
+    // RIP of the SYSCALL instruction currently being serviced. Captured before
+    // RIP is advanced so reExecuteSyscall can rewind to it.
+    U64  syscallRip = 0;
     U64  instructionCount = 0;
 
     void run();
@@ -138,6 +158,12 @@ public:
     // Returns the number actually executed. Used by the self-test harness
     // to avoid hanging the host on a buggy test program.
     U64 runBounded(U64 maxInsn);
+
+    // Copy the architectural register/FPU/signal state from another CPU64 into
+    // this one — used by clone64 to seed a new thread from its parent. Does
+    // NOT copy `memory`/`thread` (set by the caller), `runnerBrk` (standalone
+    // only), `futexWaiters`, or scheduling flags (yield/reExecuteSyscall).
+    void cloneRegistersFrom(const CPU64* from);
 
     void push64(U64 value);
     U64  pop64();
@@ -157,6 +183,7 @@ private:
         bool asize32 = false;   // 67h: address size override (truncate to 32)
         U8   seg = 0;     // 0 none, else 0x64 (FS) or 0x65 (GS); other segs ignored in long mode
         U8   rep = 0;     // 0 none, 0xF2 REPNE, 0xF3 REP/REPE
+        bool lock = false; // F0h LOCK prefix — RMW must be atomic across threads
     };
 
     // Effective operand of a ModR/M byte (excluding the "reg" field — that's

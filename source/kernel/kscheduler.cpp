@@ -159,20 +159,29 @@ static S32 increaseContextTime(S32 value) {
 
 void runThreadSlice(KThread* thread) {
 #ifdef BOXEDWINE_GUEST_X64
-    // 64-bit guest path: drive CPU64 directly. The 32-bit CPU instance on
-    // the thread is unused for is64Bit processes — we keep it allocated so
-    // pre-existing kthread bookkeeping (cpu->thread, signals, etc.) doesn't
-    // need to be made conditional everywhere yet. A KThread64 split is a
-    // follow-up.
-    if (thread->process && thread->process->is64Bit && thread->process->cpu64) {
-        CPU64* cpu64 = thread->process->cpu64;
-        cpu64->yield = false;
-        try {
-            cpu64->run();
-        } catch (...) {
-            // CPU64 has no nextOp; nothing to clear here.
+    // 64-bit guest path: drive this thread's CPU64. Each is64Bit thread has
+    // its own CPU64 (thread->cpu64) sharing the one process->memory64; the
+    // main thread's is also process->cpu64. The 32-bit CPU instance on the
+    // thread is unused for is64Bit processes — we keep it allocated so
+    // pre-existing kthread bookkeeping (signals, etc.) doesn't need to be made
+    // conditional everywhere yet.
+    if (thread->process && thread->process->is64Bit) {
+        CPU64* cpu64 = thread->cpu64 ? thread->cpu64 : thread->process->cpu64;
+        if (cpu64) {
+            cpu64->yield = false;
+            try {
+                // Bounded slice: run a slice and return so sibling threads get
+                // CPU time. Only `yield` (the exit/exit_group syscall) is
+                // terminal — hitting the instruction bound without yielding is
+                // normal; the thread stays scheduled and is re-entered next
+                // round. A futex WAIT blocks on its condition (off the run
+                // loop entirely), so it does not burn the slice spinning.
+                cpu64->runBounded((U64)contextTimeRemaining);
+            } catch (...) {
+                // CPU64 has no nextOp; nothing to clear here.
+            }
+            return;
         }
-        return;
     }
 #endif
 

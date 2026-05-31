@@ -1106,6 +1106,10 @@ bool ElfLoader64::loadProgram(KThread* thread, FsOpenNode* openNode, U64* rip) {
         process->cpu64 = new CPU64(mem);
     }
     process->cpu64->thread = thread;
+    // The main thread's per-thread CPU64 is the same instance as the
+    // process-wide one. clone64 allocates a distinct CPU64 (sharing memory64)
+    // for each additional thread, and the scheduler drives thread->cpu64.
+    thread->cpu64 = process->cpu64;
     // When an interpreter is present, *rip points at the interpreter entry,
     // not the executable entry — that's the correct first instruction.
     process->cpu64->rip = *rip;

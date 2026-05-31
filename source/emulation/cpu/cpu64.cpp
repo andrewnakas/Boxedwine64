@@ -17,6 +17,16 @@
 
 #include <cmath>
 #include <cstring>
+#include <mutex>
+
+// Global lock for CPU64 atomic read-modify-write memory ops (XCHG with memory,
+// CMPXCHG, XADD, LOCK-prefixed ALU). In the multi-threaded build each guest
+// thread runs on its own host thread over a shared KMemory64, so glibc's
+// pthread mutexes/condvars — which rely on these instructions being atomic —
+// would race without this. Coarse (one mutex for all atomics) but correct;
+// mirrors the misaligned-fallback path in common_lock.cpp. Cheap in the
+// single-threaded build (uncontended).
+static std::recursive_mutex g_cpu64AtomicMutex;
 
 // FPU status-word C0/C2/C3 bit positions (see Intel SDM Vol 1 §8.1.3).
 // We can't reuse the macros in fpu.cpp because they're file-local there.
@@ -33,6 +43,28 @@ CPU64::CPU64(KMemory64* memory) : memory(memory) {
 }
 
 CPU64::~CPU64() = default;
+
+void CPU64::cloneRegistersFrom(const CPU64* from) {
+    for (int i = 0; i < X64_REG_COUNT; i++) {
+        reg[i] = from->reg[i];
+    }
+    rip = from->rip;
+    rflags = from->rflags;
+    fsbase = from->fsbase;
+    gsbase = from->gsbase;
+    for (int i = 0; i < 16; i++) {
+        xmm[i] = from->xmm[i];
+    }
+    fpu = from->fpu;
+    // Signal state is process-wide in glibc's model; copy the parent's so the
+    // new thread observes the same handler/mask registrations (delivery across
+    // threads is a later milestone).
+    for (int i = 0; i < 65; i++) {
+        sigActions[i] = from->sigActions[i];
+    }
+    sigMask = from->sigMask;
+    sigAltStack = from->sigAltStack;
+}
 
 U8 CPU64::fetchByte(U64 addr) {
     return memory ? memory->readb(addr) : 0;
@@ -94,9 +126,10 @@ U32 CPU64::consumePrefixes(Prefixes& out) {
                 // are likewise non-architectural.
                 off++; continue;
             case 0xF0:
-                // LOCK — treat as no-op semantically; we're single-threaded
-                // at the guest level for now.
-                off++; continue;
+                // LOCK — record it so the RMW handler serializes the op across
+                // host threads (the multi-threaded build runs guest threads on
+                // real host threads sharing one KMemory64).
+                out.lock = true; off++; continue;
             case 0xF2: out.rep = 0xF2; off++; continue;
             case 0xF3: out.rep = 0xF3; off++; continue;
             default:
@@ -663,6 +696,11 @@ U32 CPU64::step() {
     if (op == 0x86 || op == 0x87) {
         U32 size = (op == 0x86) ? 1 : opSize;
         ModRM m = decodeModRM(rip + opOff + 1, p, 0);
+        // XCHG with a memory operand is implicitly atomic on x86 (LOCK is
+        // assumed); serialize it across host threads so glibc's spinlock
+        // acquire (xchg [lock], eax) is correct under real threading.
+        std::unique_lock<std::recursive_mutex> atomicLock(g_cpu64AtomicMutex, std::defer_lock);
+        if (!m.isReg) atomicLock.lock();
         U64 a = loadRM(m, size, rexPresent);
         U64 b = (size == 1) ? readReg8(m.regField, rexPresent)
               : (size == 2) ? (U64)reg[m.regField].u16
@@ -720,11 +758,21 @@ U32 CPU64::step() {
         // Per AMD64 ABI, SYSCALL clobbers RCX with the return RIP and R11
         // with RFLAGS. Userspace relies on this even when the syscall
         // succeeds — set both before transferring to the kernel layer.
+        U64 syscallStartRip = rip;
         U64 nextRip = rip + opOff + 2;
         reg[X64_RCX].setU64(nextRip);
         reg[X64_R11].setU64((U64)rflags);
         rip = nextRip;
+        syscallRip = syscallStartRip;
         ksyscall64(this);
+        // Single-threaded cooperative park: a futex WAIT that had to block set
+        // reExecuteSyscall and parked this thread. Rewind RIP to the SYSCALL so
+        // it re-runs when the thread is rescheduled (RAX was not written). yield
+        // has already been requested by the park so the run loop returns now.
+        if (reExecuteSyscall) {
+            reExecuteSyscall = false;
+            rip = syscallStartRip;
+        }
         return opOff + 2;
     }
 
@@ -780,6 +828,10 @@ U32 CPU64::step() {
             U32 size = (form & 1) ? opSize : 1;
             bool destIsRM = (form < 2);  // forms 0,1: dest is r/m; forms 2,3: dest is reg
             ModRM m = decodeModRM(rip + opOff + 1, p, 0);
+            // `lock add`/`lock or`/`lock and`/... on a memory dest must be an
+            // atomic RMW across host threads (glibc futex/lock words use these).
+            std::unique_lock<std::recursive_mutex> atomicLock(g_cpu64AtomicMutex, std::defer_lock);
+            if (p.lock && destIsRM && !m.isReg) atomicLock.lock();
             U64 a, b;
             if (destIsRM) {
                 a = loadRM(m, size, rexPresent);
@@ -855,6 +907,9 @@ U32 CPU64::step() {
                 imm = (U64)(S64)i32; immLen = 4;
             }
         }
+        // `lock orl/andl/addl $imm, [mem]` — atomic RMW across host threads.
+        std::unique_lock<std::recursive_mutex> atomicLock(g_cpu64AtomicMutex, std::defer_lock);
+        if (p.lock && !m.isReg) atomicLock.lock();
         U64 a = loadRM(m, size, rexPresent);
         runAlu(aluOp, size, true, a, imm, m, rexPresent);
         U32 used = opOff + 1 + m.length + immLen;
@@ -1375,6 +1430,10 @@ U32 CPU64::step() {
         if (op2 == 0xB0 || op2 == 0xB1) {
             U32 size = (op2 == 0xB0) ? 1 : opSize;
             ModRM m = decodeModRM(rip + opOff + 2, p, 0);
+            // CMPXCHG is glibc's mutex fast path; make the read-compare-write
+            // atomic across host threads when the operand is in memory.
+            std::unique_lock<std::recursive_mutex> atomicLock(g_cpu64AtomicMutex, std::defer_lock);
+            if (!m.isReg) atomicLock.lock();
             U64 dest = loadRM(m, size, rexPresent);
             U64 acc = (size == 1) ? reg[X64_RAX].u8
                     : (size == 2) ? (U64)reg[X64_RAX].u16
@@ -1558,6 +1617,10 @@ U32 CPU64::step() {
         if (op2 == 0xC0 || op2 == 0xC1) {
             U32 size = (op2 == 0xC0) ? 1 : opSize;
             ModRM m = decodeModRM(rip + opOff + 2, p, 0);
+            // XADD (LOCK XADD) backs glibc's atomic counters; serialize the
+            // memory RMW across host threads.
+            std::unique_lock<std::recursive_mutex> atomicLock(g_cpu64AtomicMutex, std::defer_lock);
+            if (!m.isReg) atomicLock.lock();
             U64 d = loadRM(m, size, rexPresent);
             U64 s = (size == 1) ? readReg8(m.regField, rexPresent)
                   : (size == 2) ? (U64)reg[m.regField].u16

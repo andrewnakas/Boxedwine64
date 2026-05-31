@@ -166,6 +166,19 @@ public:
     U32 chmod(BString path, U32 mode);
     U32 clone3(KThread* thread, U32 args, U32 size);
     U32 clone(KThread* thread, U32 flags, U32 child_stack, U32 ptid, U32 tls, U32 ctid);
+#ifdef BOXEDWINE_GUEST_X64
+    // 64-bit pthread clone. Mirrors the 32-bit thread branch of clone(): makes
+    // a new KThread sharing this process + memory64, allocates a CPU64 for it,
+    // copies the parent's register file, applies the clone ABI (child RAX=0,
+    // RSP=child_stack, fsbase=tls, RIP=parent's next insn), honors
+    // PARENT/CHILD_SETTID + CHILD_CLEARTID, and schedules it. Returns the new
+    // thread id, or (U32)-errno.
+    U32 clone64(KThread* thread, U64 flags, U64 child_stack, U64 ptid, U64 tls, U64 ctid);
+    // 64-bit clone3: reads the clone_args struct at argsAddr and routes to
+    // clone64. glibc 2.34+ prefers clone3, so implementing it avoids the
+    // fragile clone3->clone ENOSYS fallback path.
+    U32 clone364(KThread* thread, U64 argsAddr, U64 size);
+#endif
     U32 close(FD fildes);
     U32 dup(U32 fildes);    
     U32 dup2(FD fildes, FD fildes2);

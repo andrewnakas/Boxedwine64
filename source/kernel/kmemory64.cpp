@@ -166,6 +166,17 @@ void KMemory64::writeb(U64 addr, U8 value) {
     p->data[addr & K64_PAGE_MASK] = value;
 }
 
+U8* KMemory64::getRamPtr(U64 addr, U32 len) {
+    U64 offsetInPage = addr & K64_PAGE_MASK;
+    if (offsetInPage + len > K64_PAGE_SIZE) {
+        // Would span two pages — host pointer wouldn't be contiguous.
+        return nullptr;
+    }
+    K64Page* page = getOrAllocPage(addr >> K64_PAGE_SHIFT,
+                                   K64_PAGE_MAPPED | K64_PAGE_READ | K64_PAGE_WRITE);
+    return page->data + offsetInPage;
+}
+
 void KMemory64::writew(U64 addr, U16 value) { memcpyToGuest(addr, &value, 2); }
 void KMemory64::writed(U64 addr, U32 value) { memcpyToGuest(addr, &value, 4); }
 void KMemory64::writeq(U64 addr, U64 value) { memcpyToGuest(addr, &value, 8); }

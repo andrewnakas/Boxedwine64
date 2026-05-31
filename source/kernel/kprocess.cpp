@@ -29,6 +29,10 @@
 #include "../io/fsfilenode.h"
 #include "../x11/x11.h"
 #include "kunixsocket.h"
+#ifdef BOXEDWINE_GUEST_X64
+#include "cpu64.h"
+#include "kmemory64.h"
+#endif
 
 #include <stdlib.h>
 #include <string.h>
@@ -1675,6 +1679,77 @@ U32 KProcess::clone(KThread* thread, U32 flags, U32 child_stack, U32 ptid, U32 t
         return 0;
     }
 }
+
+#ifdef BOXEDWINE_GUEST_X64
+U32 KProcess::clone64(KThread* thread, U64 flags, U64 child_stack, U64 ptid, U64 tls, U64 ctid) {
+    // pthread_create issues clone with the thread-group flag set. We only
+    // support the thread case (shared VM/FS/files/sighand); a real fork() in
+    // 64-bit is a separate, larger effort. Anything else: log + ENOSYS so
+    // glibc surfaces a clean failure instead of us kpanic'ing.
+    const U64 THREAD_FLAGS = K_CLONE_VM | K_CLONE_THREAD | K_CLONE_SIGHAND;
+    if ((flags & THREAD_FLAGS) != THREAD_FLAGS) {
+        klog_fmt("KProcess::clone64 - unsupported (non-thread) flags 0x%llx",
+                 (unsigned long long)flags);
+        return (U32)-K_ENOSYS;
+    }
+    if (child_stack == 0) {
+        return (U32)-K_EINVAL;
+    }
+
+    KThread* newThread = this->createThread();
+    // New per-thread CPU64 sharing this process's one memory64.
+    CPU64* parentCpu = thread->cpu64 ? thread->cpu64 : this->cpu64;
+    CPU64* childCpu = new CPU64(this->memory64);
+    childCpu->cloneRegistersFrom(parentCpu);
+    childCpu->thread = newThread;
+    newThread->cpu64 = childCpu;
+
+    // clone ABI for the child:
+    //   - returns 0 in the child (parent gets the tid);
+    //   - resumes at the instruction after the parent's SYSCALL — the parent's
+    //     RIP already points there (SYSCALL advanced it before ksyscall64);
+    //   - RSP = child_stack (glibc passes the top of the new thread stack);
+    //   - fsbase = tls (CLONE_SETTLS — glibc's TLS/TCB pointer for the child).
+    childCpu->reg[X64_RAX].setU64(0);
+    childCpu->reg[X64_RSP].setU64(child_stack);
+    if (flags & K_CLONE_SETTLS) {
+        childCpu->fsbase = tls;
+    }
+    // childCpu->rip is already the parent's post-SYSCALL RIP via the register
+    // copy, which is exactly where the child should begin.
+
+    if (flags & K_CLONE_CHILD_CLEARTID) {
+        newThread->clear_child_tid64 = ctid;
+    }
+    if (flags & K_CLONE_CHILD_SETTID) {
+        this->memory64->writed(ctid, newThread->id);
+    }
+    if (flags & K_CLONE_PARENT_SETTID) {
+        this->memory64->writed(ptid, newThread->id);
+    }
+
+    scheduleThread(newThread);
+    return newThread->id;
+}
+
+U32 KProcess::clone364(KThread* thread, U64 argsAddr, U64 size) {
+    // Read the clone_args struct from guest memory64 (see the struct comment
+    // above). Modern glibc (2.34+) issues clone3 first and only falls back to
+    // clone on ENOSYS — that fallback path is fragile in our interpreter, so
+    // implement clone3 directly and route to clone64.
+    if (!this->memory64 || size < 8 * 8) {
+        return (U32)-K_EINVAL;
+    }
+    U64 flags       = this->memory64->readq(argsAddr);
+    U64 child_tid   = this->memory64->readq(argsAddr + 16);
+    U64 parent_tid  = this->memory64->readq(argsAddr + 24);
+    U64 stack       = this->memory64->readq(argsAddr + 40);
+    U64 stack_size  = this->memory64->readq(argsAddr + 48);
+    U64 tls         = this->memory64->readq(argsAddr + 56);
+    // clone3 passes the stack base + size; the child's RSP is the top.
+    return clone64(thread, flags, stack + stack_size, parent_tid, tls, child_tid);
+}
+#endif
 
 void KProcess::killAllThreads(KThread* exceptThisThread) {
     iterateThreadIds([this, exceptThisThread](U32 id) {

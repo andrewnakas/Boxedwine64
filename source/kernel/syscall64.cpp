@@ -292,9 +292,25 @@ static U64 sys_mmap64(CPU64* cpu, U64 addr, U64 length, U64 prot, U64 flags, U64
     return ret;
 }
 
-static U64 sys_exit64(CPU64* cpu, U64 status) {
-    klog_fmt("CPU64: exit syscall, status=%lld", (long long)status);
+// exit(2) — terminate the calling thread. If it's the last thread in the
+// process, this ends the process (exitgroup). `group` forces process-wide
+// termination regardless of thread count (exit_group(2)).
+static U64 sys_exit64(CPU64* cpu, U64 status, bool group) {
+    klog_fmt("CPU64: %s syscall, status=%lld",
+             group ? "exit_group" : "exit", (long long)status);
+    // Stop this thread's run loop now, whatever else happens below.
     cpu->yield = true;
+    if (cpu->thread && cpu->thread->process) {
+        KProcess* process = cpu->thread->process.get();
+        if (group) {
+            process->exitgroup(cpu->thread, (U32)status);
+        } else {
+            // KProcess::exit runs cleanup() (which zeroes clear_child_tid64 and
+            // futex-wakes the joiner) and terminates this thread; if it's the
+            // last thread it falls through to exitgroup and ends the process.
+            process->exit(cpu->thread, (U32)status);
+        }
+    }
     return 0;
 }
 
@@ -712,8 +728,28 @@ static U64 sys_readlink64(CPU64* cpu, U64 pathAddr, U64 buf, U64 sz) {
 //   Anything else: -ENOSYS so glibc takes the user-space fallback.
 //
 // uaddr==0 → -EFAULT for all ops (matches kernel).
-static U64 sys_futex64(CPU64* cpu, U64 uaddr, U32 op, U32 val) {
+static U64 sys_futex64(CPU64* cpu, U64 uaddr, U32 op, U32 val, U64 timeoutAddr, U32 val3) {
     if (uaddr == 0) return (U64)-K_EFAULT;
+
+    // Real path: when this CPU64 is driven by a scheduled KThread inside a
+    // process (the only way multiple threads exist), delegate to the shared
+    // futex table so WAIT actually blocks and WAKE actually wakes siblings.
+    if (cpu->thread && cpu->thread->process && cpu->thread->process->memory64) {
+        S64 r = cpu->thread->futex64(uaddr, op, val, timeoutAddr, val3);
+        if (r == K_FUTEX64_PARKED) {
+            // Single-threaded cooperative park: don't write RAX, rewind the
+            // SYSCALL on yield so it re-runs after we're woken.
+            cpu->reExecuteSyscall = true;
+            cpu->yield = true;
+            return cpu->reg[X64_RAX].u64; // unused; RAX left intact
+        }
+        return (U64)r;
+    }
+
+    // Threadless fallback for --x64-run-elf / selftest: no real thread to
+    // park, so keep the would-block bookkeeping stub (records WAIT-on-match
+    // so a later WAKE reports a non-zero count, letting glibc's condvar fast
+    // path make forward progress single-threaded).
     U32 baseOp = op & ~(X64_FUTEX_PRIVATE_FLAG | X64_FUTEX_CLOCK_REALTIME);
     switch (baseOp) {
         case X64_FUTEX_WAKE:
@@ -730,10 +766,6 @@ static U64 sys_futex64(CPU64* cpu, U64 uaddr, U32 op, U32 val) {
             if (!cpu->memory) return (U64)-K_EFAULT;
             U32 cur = cpu->memory->readd(uaddr);
             if (cur != val) return (U64)-K_EAGAIN;
-            // Word matches — in a real kernel we'd park here. Record the
-            // would-block so a subsequent WAKE returns 1 instead of 0,
-            // then return EAGAIN so the (single-threaded) caller makes
-            // forward progress via retry.
             cpu->futexWaiters[uaddr] += 1;
             return (U64)-K_EAGAIN;
         }
@@ -1353,8 +1385,13 @@ void ksyscall64(CPU64* cpu) {
             ret = 0;
             break;
         case X64_SYS_set_tid_address:
-            // Returns the tid; we don't track per-thread clear_child_tid
-            // yet, so just give back something plausible.
+            // set_tid_address(tidptr): records the address the kernel must
+            // zero + futex-wake when this thread exits (CLONE_CHILD_CLEARTID
+            // semantics). glibc calls this for every thread; pthread_join
+            // relies on the wake. Returns the caller's tid.
+            if (cpu->thread) {
+                cpu->thread->clear_child_tid64 = a1;
+            }
             ret = cpu->thread ? cpu->thread->id : 1;
             break;
         case X64_SYS_rt_sigaction:
@@ -1573,7 +1610,7 @@ void ksyscall64(CPU64* cpu) {
             ret = cpu->thread ? cpu->thread->id : 1;
             break;
         case X64_SYS_futex:
-            ret = sys_futex64(cpu, a1, (U32)a2, (U32)a3);
+            ret = sys_futex64(cpu, a1, (U32)a2, (U32)a3, a4, (U32)a6);
             break;
         case X64_SYS_poll:
             ret = 0; // timeout — nothing ready
@@ -1634,12 +1671,16 @@ void ksyscall64(CPU64* cpu) {
             ret = (U64)-K_ECHILD;
             break;
         case X64_SYS_clone:
-            // Real thread/process creation needs KThread64 (deferred). Log
-            // so we know when a binary tries — return -ENOSYS so glibc's
-            // pthread_create surfaces the failure cleanly instead of looping.
-            klog_fmt("ksyscall64: clone(flags=0x%llx) not implemented",
-                     (unsigned long long)a1);
-            ret = (U64)-K_ENOSYS;
+            // x86-64 clone arg order: (flags=rdi, stack=rsi, parent_tid=rdx,
+            // child_tid=r10, tls=r8). Create a real thread sharing this
+            // process + memory64. Falls back to -ENOSYS for non-thread clones.
+            if (cpu->thread && cpu->thread->process && cpu->thread->process->memory64) {
+                ret = cpu->thread->process->clone64(cpu->thread, a1, a2, a3, a5, a4);
+            } else {
+                klog_fmt("ksyscall64: clone(flags=0x%llx) with no process/memory64",
+                         (unsigned long long)a1);
+                ret = (U64)-K_ENOSYS;
+            }
             break;
         case X64_SYS_getitimer:
         case X64_SYS_setitimer:
@@ -1648,13 +1689,13 @@ void ksyscall64(CPU64* cpu) {
             ret = (U64)-K_ENOSYS;
             break;
         case X64_SYS_clone3:
-            // Newer glibc tries clone3 first then falls back to clone.
-            // Returning -ENOSYS by name (not via default) lets the fallback
-            // path engage cleanly.
-            klog_fmt("ksyscall64: clone3(args=0x%llx, size=%llu) not implemented",
-                     (unsigned long long)a1,
-                     (unsigned long long)a2);
-            ret = (U64)-K_ENOSYS;
+            // glibc 2.34+ prefers clone3. Implement it directly (its ENOSYS
+            // fallback to clone is fragile in our interpreter).
+            if (cpu->thread && cpu->thread->process && cpu->thread->process->memory64) {
+                ret = cpu->thread->process->clone364(cpu->thread, a1, a2);
+            } else {
+                ret = (U64)-K_ENOSYS;
+            }
             break;
         case X64_SYS_pipe:
         case X64_SYS_pipe2:
@@ -1769,8 +1810,10 @@ void ksyscall64(CPU64* cpu) {
             ret = (U64)-K_ENOSYS;
             break;
         case X64_SYS_exit:
+            ret = sys_exit64(cpu, a1, false);
+            break;
         case X64_SYS_exit_group:
-            ret = sys_exit64(cpu, a1);
+            ret = sys_exit64(cpu, a1, true);
             break;
         default:
             klog_fmt("ksyscall64: unimplemented syscall #%llu (%s) at RIP=0x%llx — RDI=0x%llx RSI=0x%llx RDX=0x%llx R10=0x%llx R8=0x%llx R9=0x%llx",
