@@ -22,6 +22,7 @@
 #include "ksocket.h"
 #include "kstat.h"
 #include "ksignal.h"
+#include "../x11wire/xwireserver.h"
 
 KUnixSocketObject::KUnixSocketObject(U32 domain, U32 type, U32 protocol) : KSocketObject(KTYPE_UNIX_SOCKET, domain, type, protocol), 
     lockCond(std::make_shared<BoxedWineCondition>(B("KUnixSocketObject::lockCond"))), recvBuffer(128)
@@ -180,49 +181,58 @@ U32 KUnixSocketObject::internal_write(KThread* thread, const std::shared_ptr<KUn
         con->recvBuffer.put(ram, len);
         return true;
         });
-  
     return len;
 }
 
 U32 KUnixSocketObject::writev(KThread* thread, U32 iov, S32 iovcnt) {
-    U32 len=0;
+    S32 len=0;
     std::shared_ptr<KUnixSocketObject> con = this->connection.lock();
     KMemory* memory = thread->memory;
+    bool wrote = false;
 
-    BOXEDWINE_CONDITION& cond = (con?con->lockCond:this->lockCond);
-    BOXEDWINE_CRITICAL_SECTION_WITH_CONDITION(cond);
+    {
+        BOXEDWINE_CONDITION& cond = (con?con->lockCond:this->lockCond);
+        BOXEDWINE_CRITICAL_SECTION_WITH_CONDITION(cond);
 
-    for (S32 i=0;i<iovcnt;i++) {
-        U32 buf = memory->readd(iov + i * 8);
-        U32 toWrite = memory->readd(iov + i * 8 + 4);
-        S32 result;
-        
-        if (toWrite) {
-            result = this->internal_write(thread, con, cond, buf, toWrite);
-            if (result < 0) {
-                if (i > 0) {
-                    return len;
+        for (S32 i=0;i<iovcnt;i++) {
+            U32 buf = memory->readd(iov + i * 8);
+            U32 toWrite = memory->readd(iov + i * 8 + 4);
+            S32 result;
+
+            if (toWrite) {
+                result = this->internal_write(thread, con, cond, buf, toWrite);
+                if (result < 0) {
+                    if (i == 0) len = result; // first segment failed: report errno
+                    break;
                 }
-                return result;
+                len += result;
             }
-            len += result;
         }
-    }    
-    if (con) {
-        BOXEDWINE_CONDITION_SIGNAL_ALL(cond);
+        if (con) {
+            BOXEDWINE_CONDITION_SIGNAL_ALL(cond);
+        }
+        wrote = (len > 0);
     }
-    return len;
+    // Notify a server peer (X11 wire server) outside the lock — see write().
+    if (con && wrote) con->onPeerWrote();
+    return (U32)len;
 }
 
 U32 KUnixSocketObject::write(KThread* thread, U32 buffer, U32 len) {
     this->pid = thread->process->id; // kind of a hack to do this here
     std::shared_ptr<KUnixSocketObject> con = this->connection.lock();
-    BOXEDWINE_CONDITION& cond = (con?con->lockCond:this->lockCond);
-    BOXEDWINE_CRITICAL_SECTION_WITH_CONDITION(cond);
-    U32 result = this->internal_write(thread, con, cond, buffer, len);    
-    if (con) {
-        BOXEDWINE_CONDITION_SIGNAL_ALL(con->lockCond);
+    U32 result;
+    {
+        BOXEDWINE_CONDITION& cond = (con?con->lockCond:this->lockCond);
+        BOXEDWINE_CRITICAL_SECTION_WITH_CONDITION(cond);
+        result = this->internal_write(thread, con, cond, buffer, len);
+        if (con) {
+            BOXEDWINE_CONDITION_SIGNAL_ALL(con->lockCond);
+        }
     }
+    // Notify a server peer (e.g. the X11 wire server) outside the lock so its
+    // synchronous request parsing can re-read this same recvBuffer.
+    if (con) con->onPeerWrote();
     return result;
 }
 
@@ -242,9 +252,12 @@ U32 KUnixSocketObject::writeNative(U8* buffer, U32 len) {
         return -K_EPIPE;
     }
 
-    BOXEDWINE_CRITICAL_SECTION_WITH_CONDITION(con->lockCond); 
-    con->recvBuffer.put(buffer, len);
-    BOXEDWINE_CONDITION_SIGNAL_ALL(con->lockCond);
+    {
+        BOXEDWINE_CRITICAL_SECTION_WITH_CONDITION(con->lockCond);
+        con->recvBuffer.put(buffer, len);
+        BOXEDWINE_CONDITION_SIGNAL_ALL(con->lockCond);
+    }
+    con->onPeerWrote();
     return len;
 }
 
@@ -265,11 +278,13 @@ U32 KUnixSocketObject::unixsocket_write_native_nowait(const std::shared_ptr<KObj
     if (s->outClosed || !con)
         return -K_EPIPE;
 
-    BOXEDWINE_CRITICAL_SECTION_WITH_CONDITION(con->lockCond);
-    //printf("SOCKET write len=%d bufferSize=%d pos=%d\n", len, s->connection->recvBufferLen, s->connection->recvBufferWritePos);
-    con->recvBuffer.put(value, len);
-    BOXEDWINE_CONDITION_SIGNAL_ALL(con->lockCond);
-
+    {
+        BOXEDWINE_CRITICAL_SECTION_WITH_CONDITION(con->lockCond);
+        //printf("SOCKET write len=%d bufferSize=%d pos=%d\n", len, s->connection->recvBufferLen, s->connection->recvBufferWritePos);
+        con->recvBuffer.put(value, len);
+        BOXEDWINE_CONDITION_SIGNAL_ALL(con->lockCond);
+    }
+    con->onPeerWrote();
     return len;
 }
 
@@ -493,6 +508,25 @@ U32 KUnixSocketObject::connect(KThread* thread, const KFileDescriptorPtr& fd, U3
             return -K_ENOENT;
         }
         if (this->domain==K_AF_UNIX) {
+            if (getenv("BW64_SCDUMP")) {
+                klog_fmt("KUnixSocket::connect AF_UNIX path='%s' isX=%d",
+                         this->destAddress.data,
+                         (int)XWireServer::isXDisplayPath(this->destAddress.data));
+            }
+            // In-process X11 wire server: a guest connect to /tmp/.X11-unix/X<n>
+            // is wine's real libX11 reaching for an X server. There is no real
+            // X server in the rootfs, so hand the connection to our SDL-backed
+            // wire server instead of returning ECONNREFUSED (which makes libX11
+            // fall back to a TCP :6000 probe and then run headless/spinning).
+            if (XWireServer::isXDisplayPath(this->destAddress.data)) {
+                std::shared_ptr<KUnixSocketObject> self = std::dynamic_pointer_cast<KUnixSocketObject>(shared_from_this());
+                if (XWireServer::instance().acceptConnection(self)) {
+                    this->connected = true;
+                    return 0;
+                }
+                this->destAddress.family = 0;
+                return -K_ECONNREFUSED;
+            }
             std::shared_ptr<FsNode> node = Fs::getNodeFromLocalPath(thread->process->currentDirectory, BString::copy(this->destAddress.data), true);
             std::shared_ptr<KObject> kobject;
             if (node) {

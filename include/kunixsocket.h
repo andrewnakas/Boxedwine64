@@ -76,7 +76,19 @@ public:
     static U32 unixsocket_write_native_nowait(const std::shared_ptr<KObject>& obj, U8* value, int len);
 
     void signalReadReady();
-private:        
+
+    // Called on the *receiving* peer after another socket appends bytes to this
+    // object's recvBuffer (the three put sites in internal_write/writeNative/
+    // unixsocket_write_native_nowait). Base is a no-op; the in-process X11 wire
+    // server (XWireServerSocket) overrides it to parse requests synchronously on
+    // the writer's thread and write replies/events straight back to the client.
+    virtual void onPeerWrote() {}
+
+    // Debug-only: bytes currently sitting in the recv buffer (for epoll spin
+    // diagnostics — BW64_EPDUMP).
+    size_t debugRecvUsed() { return recvBuffer.size_used(); }
+
+protected:
     std::list< std::weak_ptr<KUnixSocketObject> > pendingConnections; // weak, if object is destroyed it should remove itself from this list
     std::weak_ptr<KUnixSocketObject> connecting;
 

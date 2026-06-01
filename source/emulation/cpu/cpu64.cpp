@@ -1344,6 +1344,28 @@ U32 CPU64::step() {
         goto unhandled;
     }
 
+    // FE — group 4: INC r/m8 (/0) and DEC r/m8 (/1). Byte-only sibling of the
+    // FF group; all other /digit values are invalid encodings. wineserver's
+    // startup hits this (INC byte ptr [rip+disp32] on a refcount/flag byte).
+    if (op == 0xFE) {
+        ModRM m = decodeModRM(rip + opOff + 1, p, 1);
+        U8 sub = m.regField & 0x7;
+        if (sub == 0 || sub == 1) {
+            U64 a = loadRM(m, 1, rexPresent);
+            U64 r = (sub == 0) ? a + 1 : a - 1;
+            // INC/DEC preserve CF; other flags per ADD/SUB of 1.
+            U32 savedCF = rflags & X64_CF;
+            if (sub == 0) flagsAdd(rflags, a, 1, r, 1);
+            else          flagsSub(rflags, a, 1, r, 1);
+            rflags = (rflags & ~X64_CF) | savedCF;
+            storeRM(m, 1, r, rexPresent);
+            U32 used = opOff + 1 + m.length;
+            rip += used;
+            return used;
+        }
+        goto unhandled;
+    }
+
     // INC/DEC r/m via FF /0 and /1. (Single-byte 40-4F encodings are REX
     // in long mode and are already consumed by the prefix loop.)
     if (op == 0xFF) {
@@ -3793,6 +3815,24 @@ U32 CPU64::step() {
             return used;
         }
 
+        // CVTSD2SS xmm, xmm/m64   F2 0F 5A /r — narrow double (src low qword)
+        // to single, writing the result into dst's low 32 bits (high 32 of the
+        // low qword preserved, per Intel). winex11/win32u hits this on DPI/
+        // scaling math.
+        if (op2 == 0x5A && p.rep == 0xF2) {
+            ModRM m = decodeModRM(rip + opOff + 2, p, 0);
+            U64 srcBits = m.isReg ? xmm[m.rmIndex].lo : memory->readq(m.effAddr);
+            float r = (float)u64ToDouble(srcBits);
+            // float -> raw bits (u32ToFloat/floatToU32 helpers are declared
+            // further down in the F3 block, so bit-cast inline here).
+            U32 rBits; std::memcpy(&rBits, &r, sizeof(rBits));
+            U64 keep = xmm[m.regField].lo & 0xFFFFFFFF00000000ULL;
+            xmm[m.regField].lo = keep | (U64)rBits;
+            U32 used = opOff + 2 + m.length;
+            rip += used;
+            return used;
+        }
+
         // CVTSD2SI r32, xmm/m64   F2 0F 2D /r     (REX.W → r64)
         // CVTTSD2SI r32, xmm/m64  F2 0F 2C /r     (REX.W → r64) — truncate
         // Convert double to signed int. Compilers emit 2C (truncate) far
@@ -3807,6 +3847,35 @@ U32 CPU64::step() {
             if (rexW) reg[m.regField].setU64((U64)(S64)d);
             else      reg[m.regField].setU32((U32)(S32)d);
             U32 used = opOff + 2 + m.length;
+            rip += used;
+            return used;
+        }
+
+        // CMPSD xmm, xmm/m64, imm8   F2 0F C2 /r ib — compare two doubles per
+        // the imm8 predicate; write an all-ones (true) or all-zero (false)
+        // 64-bit mask into dst's low qword (high qword preserved). The 8 core
+        // predicates (imm8 & 7): 0 EQ, 1 LT, 2 LE, 3 UNORD, 4 NEQ, 5 NLT,
+        // 6 NLE, 7 ORD. winex11/win32u emits CMPSD ...,6 (NLE) for clamp math.
+        if (op2 == 0xC2 && p.rep == 0xF2) {
+            ModRM m = decodeModRM(rip + opOff + 2, p, 0);
+            U64 srcBits = m.isReg ? xmm[m.rmIndex].lo : memory->readq(m.effAddr);
+            U8 imm = fetchByte(rip + opOff + 2 + m.length);
+            double a = u64ToDouble(xmm[m.regField].lo);
+            double b = u64ToDouble(srcBits);
+            bool unordered = std::isnan(a) || std::isnan(b);
+            bool res;
+            switch (imm & 7) {
+                case 0: res = (a == b); break;                  // EQ
+                case 1: res = (a <  b); break;                  // LT
+                case 2: res = (a <= b); break;                  // LE
+                case 3: res = unordered; break;                 // UNORD
+                case 4: res = unordered || (a != b); break;     // NEQ
+                case 5: res = unordered || !(a <  b); break;    // NLT
+                case 6: res = unordered || !(a <= b); break;    // NLE
+                default: res = !unordered; break;               // ORD
+            }
+            xmm[m.regField].lo = res ? 0xFFFFFFFFFFFFFFFFULL : 0ULL;
+            U32 used = opOff + 2 + m.length + 1; // +imm8
             rip += used;
             return used;
         }
@@ -3938,6 +4007,21 @@ U32 CPU64::step() {
             return used;
         }
 
+        // CVTSS2SD xmm, xmm/m32   F3 0F 5A /r — widen single (src low 32 bits)
+        // to double, writing the full low qword of dst. winex11/win32u hits
+        // this converting single-precision metrics to double for layout math.
+        if (op2 == 0x5A && p.rep == 0xF3) {
+            ModRM m = decodeModRM(rip + opOff + 2, p, 0);
+            U32 srcBits = m.isReg
+                ? (U32)(xmm[m.rmIndex].lo & 0xFFFFFFFFULL)
+                : memory->readd(m.effAddr);
+            double d = (double)u32ToFloat(srcBits);
+            xmm[m.regField].lo = doubleToU64(d);
+            U32 used = opOff + 2 + m.length;
+            rip += used;
+            return used;
+        }
+
         // CVTSS2SI  r32/r64, xmm/m32  F3 0F 2D /r
         // CVTTSS2SI r32/r64, xmm/m32  F3 0F 2C /r  — truncating variant
         // Same rationale as F2 0x2C: compilers prefer the truncating form
@@ -3952,6 +4036,36 @@ U32 CPU64::step() {
             if (rexW) reg[m.regField].setU64((U64)(S64)f);
             else      reg[m.regField].setU32((U32)(S32)f);
             U32 used = opOff + 2 + m.length;
+            rip += used;
+            return used;
+        }
+
+        // CMPSS xmm, xmm/m32, imm8   F3 0F C2 /r ib — scalar single sibling of
+        // CMPSD; writes an all-ones/all-zero 32-bit mask into dst's low 32 bits
+        // (rest of the low qword preserved). Same imm8 predicates as CMPSD.
+        if (op2 == 0xC2 && p.rep == 0xF3) {
+            ModRM m = decodeModRM(rip + opOff + 2, p, 0);
+            U32 srcBits = m.isReg
+                ? (U32)(xmm[m.rmIndex].lo & 0xFFFFFFFFULL)
+                : memory->readd(m.effAddr);
+            U8 imm = fetchByte(rip + opOff + 2 + m.length);
+            float a = u32ToFloat((U32)(xmm[m.regField].lo & 0xFFFFFFFFULL));
+            float b = u32ToFloat(srcBits);
+            bool unordered = std::isnan(a) || std::isnan(b);
+            bool res;
+            switch (imm & 7) {
+                case 0: res = (a == b); break;
+                case 1: res = (a <  b); break;
+                case 2: res = (a <= b); break;
+                case 3: res = unordered; break;
+                case 4: res = unordered || (a != b); break;
+                case 5: res = unordered || !(a <  b); break;
+                case 6: res = unordered || !(a <= b); break;
+                default: res = !unordered; break;
+            }
+            U64 keep = xmm[m.regField].lo & 0xFFFFFFFF00000000ULL;
+            xmm[m.regField].lo = keep | (res ? 0xFFFFFFFFULL : 0ULL);
+            U32 used = opOff + 2 + m.length + 1; // +imm8
             rip += used;
             return used;
         }
@@ -4679,6 +4793,20 @@ U32 CPU64::step() {
                 }
                 fpu.FPOP();
                 fpu.FPOP();
+            } else if (op == 0xDB && modrmByte == 0xE2) {
+                // DB E2 = FNCLEX — clear the x87 exception flags. We don't model
+                // FPU exception bits, so this just clears the relevant status
+                // bits and is otherwise a no-op. winex11/win32u issues it before
+                // FLDCW when setting up its rounding mode.
+                fpu.SetSW(fpu.SW() & ~0x80ff); // clear ES + the 6 exception bits + SF
+            } else if (op == 0xDB && modrmByte == 0xE3) {
+                // DB E3 = FNINIT — reinitialize the x87 FPU to its default state.
+                fpu.FINIT();
+            } else if (op == 0xDB && (modrmByte == 0xE0 || modrmByte == 0xE1)) {
+                // DB E0 = FNENI, DB E1 = FNDISI — 8087 enable/disable interrupt;
+                // no-ops on all CPUs since the 80287. Accept and ignore.
+            } else if (op == 0xD9 && modrmByte == 0xD0) {
+                // D9 D0 = FNOP — explicit x87 no-op.
             } else {
                 goto unhandled;
             }

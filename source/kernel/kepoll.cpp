@@ -20,6 +20,7 @@
 
 #include "kepoll.h"
 #include "kscheduler.h"
+#include "kunixsocket.h"
 
 #include <string.h>
 
@@ -193,6 +194,30 @@ U32 KEPoll::wait(KThread* thread, U32 events, U32 maxevents, U32 timeout) {
         result = 0;
         for (KPollData& data : thread->pollData) {
             if (data.revents!=0) {
+                if (getenv("BW64_EPDUMP")) {
+                    KFileDescriptorPtr fd = thread->process->getFileDescriptor((FD)data.fd);
+                    const char* kind = "?";
+                    int inC = -1, outC = -1; long used = -1;
+                    if (fd && fd->kobject) {
+                        switch (fd->kobject->type) {
+                            case KTYPE_FILE: kind = "file"; break;
+                            case KTYPE_UNIX_SOCKET: {
+                                kind = "unixsock";
+                                std::shared_ptr<KUnixSocketObject> us = std::dynamic_pointer_cast<KUnixSocketObject>(fd->kobject);
+                                if (us) { inC = us->inClosed; outC = us->outClosed; used = (long)us->debugRecvUsed(); }
+                                break;
+                            }
+                            case KTYPE_NATIVE_SOCKET: kind = "natsock"; break;
+                            case KTYPE_EVENT: kind = "event"; break;
+                            case KTYPE_TIMER: kind = "timer"; break;
+                            case KTYPE_SIGNAL: kind = "signal"; break;
+                            default: kind = "other"; break;
+                        }
+                    }
+                    klog_fmt("EPDUMP wait: fd=%d data=0x%llx revents=0x%x kind=%s inClosed=%d outClosed=%d recvUsed=%ld",
+                             (int)data.fd, (unsigned long long)data.data,
+                             (unsigned)data.revents, kind, inC, outC, used);
+                }
                 memory->writed(events + result * 12, data.revents);
                 memory->writeq(events + result * 12 + 4, data.data);
                 result++;

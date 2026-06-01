@@ -1,0 +1,47 @@
+WINE REGISTRY Version 2
+;; All keys relative to REGISTRY\\Machine
+
+#arch=win64
+
+[Software\\Classes\\Wow6432Node] 1780296741
+#time=1dcf19331f82840
+
+[Software\\Microsoft\\Windows\\CurrentVersion\\RunServices] 1780296759
+#time=1dcf1933cb5a4ce
+
+[Software\\Microsoft\\Windows\\CurrentVersion\\RunServicesOnce] 1780296759
+#time=1dcf1933cb196c2
+
+[Software\\Microsoft\\Windows NT\\CurrentVersion\\Perflib\\009] 1780296741
+#time=1dcf19331f82840
+
+[Software\\Microsoft\\Windows NT\\CurrentVersion\\Time Zones] 1780296748
+#time=1dcf193362c8b72
+
+[System\\CurrentControlSet\\Control\\ComputerName\\ComputerName] 1780296759
+#time=1dcf1933ca680e8
+"ComputerName"="BOXEDWINE64"
+
+[System\\CurrentControlSet\\Control\\Nls\\Codepage] 1780296748
+#time=1dcf193364f8d16
+"ACP"="1252"
+"MACCP"="10000"
+"OEMCP"="437"
+
+[System\\CurrentControlSet\\Control\\Session Manager\\Environment] 1780296749
+#time=1dcf19336a2c6de
+"NUMBER_OF_PROCESSORS"="8"
+"PROCESSOR_ARCHITECTURE"="AMD64"
+"PROCESSOR_IDENTIFIER"="Intel64 Family 6 Model 15 Stepping 3, GenuineIntel"
+"PROCESSOR_LEVEL"="6"
+"PROCESSOR_REVISION"="0f03"
+
+[System\\CurrentControlSet\\Control\\TimeZoneInformation] 1780296748
+#time=1dcf1933640e450
+"StandardName"=""
+"TimeZoneKeyName"=""
+
+[System\\CurrentControlSet\\Services\\Tcpip\\Parameters] 1780296759
+#time=1dcf1933ca342d4
+"Domain"=""
+"Hostname"="boxedwine64"

@@ -1,0 +1,180 @@
+WINE REGISTRY Version 2
+;; All keys relative to REGISTRY\\User\\S-1-5-21-0-0-0-1000
+
+#arch=win64
+
+[Control Panel\\Accessibility\\AudioDescription] 1780332429
+#time=1dcf1e649929046
+"Locale"=dword:00000000
+"On"="0"
+
+[Control Panel\\Accessibility\\Blind Access] 1780332429
+#time=1dcf1e6499146e6
+"On"="0"
+
+[Control Panel\\Accessibility\\Keyboard Preference] 1780332429
+#time=1dcf1e6498fbdbc
+"On"="1"
+
+[Control Panel\\Accessibility\\ShowSounds] 1780332429
+#time=1dcf1e64991b950
+"On"="0"
+
+[Control Panel\\Desktop] 1780332429
+#time=1dcf1e649925612
+"ActiveWndTrackTimeout"=dword:00000000
+"BlockSendInputResets"="0"
+"CaretWidth"=dword:00000001
+"ClickLockTime"=dword:000004b0
+"DoubleClickHeight"="4"
+"DoubleClickWidth"="4"
+"DragFullWindows"="0"
+"DragHeight"="4"
+"DragWidth"="4"
+"FocusBorderHeight"=dword:00000001
+"FocusBorderWidth"=dword:00000001
+"FontSmoothing"="2"
+"FontSmoothingGamma"=dword:00000000
+"FontSmoothingOrientation"=dword:00000001
+"FontSmoothingType"=dword:00000001
+"ForegroundFlashCount"=dword:00000003
+"ForegroundLockTimeout"=dword:00000000
+"IconTitleWrap"="1"
+"LowPowerActive"="0"
+"MenuShowDelay"="400"
+"UserPreferencesMask"=hex:30,00,00,80,12,00,00,00
+"Wallpaper"=""
+"WheelScrollChars"="3"
+"WheelScrollLines"="3"
+
+[Control Panel\\Desktop\\WindowMetrics] 1780332429
+#time=1dcf1e64991fd70
+"BorderWidth"="-15"
+"CaptionHeight"="-270"
+"CaptionWidth"="-270"
+"IconSpacing"="-1125"
+"IconTitleWrap"="1"
+"IconVerticalSpacing"="-1125"
+"MenuHeight"="-270"
+"MenuWidth"="-270"
+"PaddedBorderWidth"="0"
+"ScrollHeight"="-240"
+"ScrollWidth"="-240"
+"SmCaptionHeight"="-225"
+"SmCaptionWidth"="-225"
+
+[Control Panel\\International] 1780296748
+#time=1dcf193364dc60c
+"iCalendarType"="1"
+"iCountry"="1"
+"iCurrDigits"="2"
+"iCurrency"="0"
+"iDate"="0"
+"iDigits"="2"
+"iFirstDayOfWeek"="6"
+"iFirstWeekOfYear"="0"
+"iLZero"="1"
+"iMeasure"="1"
+"iNegCurr"="0"
+"iNegNumber"="1"
+"iPaperSize"="1"
+"iTime"="0"
+"iTimePrefix"="0"
+"iTLZero"="0"
+"Locale"="00000409"
+"LocaleName"="en-US"
+"NumShape"="1"
+"s1159"="AM"
+"s2359"="PM"
+"sCountry"="United States"
+"sCurrency"="$"
+"sDate"="/"
+"sDecimal"="."
+"sGrouping"="3;0"
+"sLanguage"="ENU"
+"sList"=","
+"sLongDate"="dddd, MMMM d, yyyy"
+"sMonDecimalSep"="."
+"sMonGrouping"="3;0"
+"sMonThousandSep"=","
+"sNativeDigits"="0123456789"
+"sNegativeSign"="-"
+"sPositiveSign"=""
+"sShortDate"="M/d/yyyy"
+"sShortTime"="h:mm tt"
+"sThousand"=","
+"sTime"=":"
+"sTimeFormat"="h:mm:ss tt"
+"sYearMonth"="MMMM yyyy"
+
+[Control Panel\\International\\Geo] 1780296748
+#time=1dcf193364e51f8
+"Name"="US"
+"Nation"="244"
+
+[Control Panel\\International\\\xd83c\xdf0e\xd83c\xdf0f\xd83c\xdf0d] 1780296748
+#time=1dcf1933646dc7a
+"Currencies"="USD"
+
+[Control Panel\\Keyboard] 1780332429
+#time=1dcf1e6498fd284
+"KeyboardDelay"="1"
+"KeyboardSpeed"="31"
+
+[Control Panel\\Mouse] 1780332429
+#time=1dcf1e6499214e0
+"ActiveWindowTracking"=dword:00000000
+"DoubleClickHeight"="4"
+"DoubleClickSpeed"="500"
+"DoubleClickWidth"="4"
+"MouseHoverHeight"="4"
+"MouseHoverTime"="400"
+"MouseHoverWidth"="4"
+"MouseSensitivity"="10"
+"MouseSpeed"="1"
+"MouseThreshold1"="6"
+"MouseThreshold2"="10"
+"SnapToDefaultButton"="0"
+"SwapMouseButtons"="0"
+
+[Control Panel\\Sound] 1780332429
+#time=1dcf1e6498d171a
+"Beep"="Yes"
+
+[Environment] 1780296741
+#time=1dcf1933229b8a6
+
+[Keyboard Layout\\Preload] 1780332429
+#time=1dcf1e6498bc298
+"1"="00000409"
+
+[Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\Shell Folders] 1780332943
+#time=1dcf1e77bf2b894
+
+[Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\User Shell Folders] 1780332943
+#time=1dcf1e77bf2e6c0
+
+[Software\\Wine\\AppDefaults] 1780332434
+#time=1dcf1e64ca933ca
+
+[Software\\Wine\\DllOverrides] 1780332434
+#time=1dcf1e64ca67892
+
+[Software\\Wine\\Fonts] 1780332429
+#time=1dcf1e64982c0e4
+"Codepages"="1252,437"
+"LogPixels"=dword:00000060
+
+[Volatile Environment] 1780332943
+#time=1dcf1e77c1daf22
+"APPDATA"="C:\\users\\username\\AppData\\Roaming"
+"CLIENTNAME"="Console"
+"HOMEDRIVE"="C:"
+"HOMEPATH"="\\users\\username"
+"HOMESHARE"=""
+"LOCALAPPDATA"="C:\\users\\username\\AppData\\Local"
+"LOGONSERVER"="\\\\BOXEDWINE64"
+"SESSIONNAME"="Console"
+"USERDOMAIN"="BOXEDWINE64"
+"USERNAME"="username"
+"USERPROFILE"="C:\\users\\username"
