@@ -43,6 +43,27 @@ rm -f "$PREFIX"/regf*.tmp "$PREFIX/.update-timestamp" 2>/dev/null || true
 find "$BASE_ROOT/run/user/1000/wine" -maxdepth 1 -name 'server-1-*' \
     ! -name 'server-1-4ee' -exec rm -rf {} + 2>/dev/null || true
 
+# Self-heal an incomplete prefix. wineboot --init creates the registry +
+# dosdevices symlinks AND the drive_c Windows skeleton (windows/system32,
+# syswow64, ...). A prefix that has registry but no drive_c (e.g. an earlier
+# partial commit) makes wine spin forever on open("dosdevices/c:") -> ENOENT
+# because C:\ resolves to a non-existent target, and notepad never loads
+# winex11. If drive_c is absent, run a one-shot --init before the real launch.
+if [ ! -d "$PREFIX/drive_c/windows/system32" ]; then
+    echo "prefix: drive_c missing -> running wineboot --init"
+    "$BOX" \
+        -root "$BASE_ROOT" -zip "$GLIBC_ZIP" -zip "$WINE_ZIP" -novideo \
+        -env "HOME=/home/username" -env "USER=username" \
+        -env "WINEPREFIX=/home/username/.wine" \
+        -env "WINELOADER=/usr/lib/wine/wine64" \
+        -env "WINESERVER=/usr/lib/wine/wineserver64" \
+        -env "WINEDLLPATH=/usr/lib/x86_64-linux-gnu/wine" \
+        /usr/lib/wine/wine64 wineboot --init >/dev/null 2>&1 || true
+    rm -f "$PREFIX"/regf*.tmp "$PREFIX/.update-timestamp" 2>/dev/null || true
+    find "$BASE_ROOT/run/user/1000/wine" -maxdepth 1 -name 'server-1-*' \
+        ! -name 'server-1-4ee' -exec rm -rf {} + 2>/dev/null || true
+fi
+
 echo "using:   $BOX"
 echo "glibc:   $GLIBC_ZIP"
 echo "wine:    $WINE_ZIP"

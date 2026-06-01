@@ -1829,6 +1829,10 @@ static const char* x64SyscallName(U64 nr) {
         case 108: return "getegid";
         case 110: return "getppid";
         case 111: return "getpgrp";
+        case 117: return "setresuid";
+        case 118: return "getresuid";
+        case 119: return "setresgid";
+        case 120: return "getresgid";
         case 121: return "getpgid";
         case 124: return "getsid";
         case 127: return "rt_sigpending";
@@ -2664,6 +2668,28 @@ void ksyscall64(CPU64* cpu) {
             // any request to set our own id and reject others with EPERM, the
             // same way a real kernel would for an unprivileged process.
             ret = (a1 == 1000) ? 0 : (U64)-1; // -EPERM
+            break;
+        case 118: // getresuid(ruid*, euid*, suid*)
+        case 120: // getresgid(rgid*, egid*, sgid*)
+            // wine's ntdll queries these during process init. We model one
+            // user, so real==effective==saved==1000. Each arg is a uid_t* (4
+            // bytes); a NULL pointer would be EFAULT but wine always passes
+            // valid stack slots.
+            if (!a1 || !a2 || !a3) { ret = (U64)-K_EFAULT; break; }
+            cpu->memory->writed(a1, 1000);
+            cpu->memory->writed(a2, 1000);
+            cpu->memory->writed(a3, 1000);
+            ret = 0;
+            break;
+        case 117: // setresuid(ruid, euid, suid)
+        case 119: // setresgid(rgid, egid, sgid)
+            // Accept setting our own id (1000 or -1 = "unchanged"); reject any
+            // attempt to switch to a different user with EPERM, mirroring an
+            // unprivileged process. -1 (0xffffffff) means leave that id alone.
+            {
+                auto ok = [](U64 v){ return v == 1000 || v == 0xffffffffULL; };
+                ret = (ok(a1) && ok(a2) && ok(a3)) ? 0 : (U64)-1; // -EPERM
+            }
             break;
         case X64_SYS_time: {
             // time(tloc): seconds since epoch; writes to *tloc when non-null.

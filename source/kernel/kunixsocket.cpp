@@ -879,6 +879,38 @@ U32 KUnixSocketObject::sendmsg(KThread* thread, const KFileDescriptorPtr& fd, U3
             }
         }				
     }
+    // The X11 wire server is a raw byte-stream endpoint, not a datagram/SCM
+    // peer: winex11's libxcb writes core X requests through sendmsg(), but the
+    // wire parser (XWireServerSocket::readNativeNonBlocking) reads from
+    // recvBuffer and is driven by onPeerWrote() — exactly like write()/writev().
+    // Routing these bytes into the length-prefixed msgs queue (which never
+    // calls onPeerWrote) left the request bytes unparsed, so notepad blocked
+    // forever after connecting. Feed XWire peers as a contiguous stream and
+    // trigger the parser, the same wakeup path write() uses.
+    bool isXWirePeer = std::dynamic_pointer_cast<XWireServerSocket>(con) != nullptr;
+    if (isXWirePeer) {
+        for (U32 i = 0; i < hdr.msg_iovlen; i++) {
+            U32 p = memory->readd(hdr.msg_iov + 8 * i);
+            U32 len = memory->readd(hdr.msg_iov + 8 * i + 4);
+            while (len) {
+                U8 byte = memory->readb(p++);
+                con->recvBuffer.put(&byte, 1);
+                len--;
+                result++;
+            }
+        }
+        BOXEDWINE_CONDITION_SIGNAL_ALL(con->lockCond);
+        if (getenv("BW64_XWIRE")) {
+            klog_fmt("KUnixSocket::sendmsg datalen=%d to XWire peer via recvBuffer", (int)result);
+        }
+        // onPeerWrote() runs the parser, which reacquires con->lockCond inside
+        // readNativeNonBlocking. con->lockCond->m is a plain std::mutex, so we
+        // must drop our lock first or self-deadlock. boxedWineCriticalSection is
+        // the unique_lock created by BOXEDWINE_CRITICAL_SECTION_WITH_CONDITION.
+        boxedWineCriticalSection.unlock();
+        con->onPeerWrote();
+        return result;
+    }
     for (U32 i=0;i<hdr.msg_iovlen;i++) {
         U32 p = memory->readd(hdr.msg_iov + 8 * i);
         U32 len = memory->readd(hdr.msg_iov + 8 * i + 4);
