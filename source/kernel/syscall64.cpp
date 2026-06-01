@@ -488,6 +488,15 @@ static U64 sys_openat64(CPU64* cpu, U64 dirfd, U64 pathAddr, U64 flags, U64 /*mo
         }
         return (U64)(S64)(S32)rc;
     }
+    if (getenv("BW64_SCDUMP")) {
+        // Log successful opens of the GUI driver modules so we can see whether
+        // wine actually loads its x11 backend (winex11.so/.drv, win32u, the
+        // display drivers) vs falling back to the null driver.
+        if (strstr(path, "winex11") || strstr(path, "win32u") ||
+            strstr(path, ".drv")    || strstr(path, "x11")) {
+            klog_fmt("sys_openat64: OPENED '%s' -> fd %d", path, (int)result->handle);
+        }
+    }
     return (U64)result->handle;
 }
 
@@ -2212,6 +2221,15 @@ void ksyscall64(CPU64* cpu) {
             U32 s32 = bounceSockaddrTo32(cpu, a2, (U32)a3, nullptr);
             if (!s32) { ret = (U64)-K_EFAULT; break; }
             ret = (U64)(S64)(S32)kconnect(cpu->thread, (U32)a1, s32, (U32)a3);
+            if (getenv("BW64_SCDUMP")) {
+                // sockaddr_un: family@0 (2), sun_path@2. Log AF_UNIX paths so we
+                // can see wine's X11 socket connect (/tmp/.X11-unix/X0).
+                U16 fam = cpu->memory->readw(a2);
+                char sun[110] = {0};
+                if (fam == 1 /*AF_UNIX*/) cpu->memory->memcpyFromGuest(sun, a2 + 2, sizeof(sun) - 1);
+                klog_fmt("sys_connect64: fd=%d family=%d path='%s' -> %d",
+                         (int)a1, (int)fam, (fam == 1 ? sun : "(non-unix)"), (int)(S32)ret);
+            }
             break;
         }
         case X64_SYS_listen:
