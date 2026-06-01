@@ -532,6 +532,19 @@ static U64 sys_openat64(CPU64* cpu, U64 dirfd, U64 pathAddr, U64 flags, U64 /*mo
         }
         return (U64)(S64)(S32)rc;
     }
+    // Feed the GUI loading screen's activity log: surface the meaningful things
+    // wine loads during the boot storm (DLLs/EXEs, the graphics/font stack) so
+    // the user can SEE what's loading instead of a stuck bar. Cheap string
+    // checks; only fires while the loading screen is active (percent >= 0).
+    if (KSystem::bootProgressPercent >= 0) {
+        const char* base = strrchr(path, '/');
+        base = base ? base + 1 : path;
+        if (strstr(path, ".dll") || strstr(path, ".exe") ||
+            strstr(path, "winex11") || strstr(path, "freetype") ||
+            strstr(path, "fontconfig") || strstr(path, ".so")) {
+            KSystem::noteBootLog(B("Loading ") + BString::copy(base));
+        }
+    }
     if (getenv("BW64_SCDUMP")) {
         // Log successful opens of the GUI driver modules so we can see whether
         // wine actually loads its x11 backend (winex11.so/.drv, win32u, the

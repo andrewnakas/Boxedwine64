@@ -29,6 +29,8 @@
 #ifdef BOXEDWINE_GUEST_X64
 
 #include "xwirepresent.h"
+#include "xwireserver.h"
+#include "xwireconnection.h"
 #include "ksystem.h"
 #include "knativesystem.h"
 #include "knativescreen.h"
@@ -113,19 +115,23 @@ void fillRect(uint32_t* fb, int W, int H, int x, int y, int w, int h, uint32_t c
 }
 
 // Render a loading frame to a freshly-allocated ARGB buffer (caller presents it).
+// Shows the title, the current stage, a progress bar, and a live scrolling log
+// of recent boot activity (so the user sees what's actually loading).
 void renderLoadingFrame(std::vector<uint8_t>& out, int W, int H,
-                        const char* label, int pct) {
+                        const char* label, int pct,
+                        const std::vector<BString>& logLines) {
     out.assign((size_t)W * H * 4, 0);
     uint32_t* fb = reinterpret_cast<uint32_t*>(out.data());
     const uint32_t BG = 0xff1e1e28, FG = 0xffe0e0ec, DIM = 0xff8a8aa0;
+    const uint32_t LOGC = 0xff6f6f88;
     const uint32_t BAR_BG = 0xff343448, BAR_FG = 0xff5a9bf0;
     for (int i = 0; i < W*H; i++) fb[i] = BG;
 
-    drawText(fb, W, H, W/2 - 13*9, H/2 - 70, "BOXEDWINE64", FG, 3);
-    drawText(fb, W, H, W/2 - 15*6, H/2 - 40, "Starting Wine, please wait", DIM, 1);
+    drawText(fb, W, H, 60, 40, "BOXEDWINE64", FG, 3);
+    drawText(fb, W, H, 60, 72, "Starting Wine, please wait", DIM, 1);
 
     // progress bar
-    int bw = W - 120, bh = 22, bx = 60, by = H/2;
+    int bw = W - 120, bh = 22, bx = 60, by = 110;
     fillRect(fb, W, H, bx-2, by-2, bw+4, bh+4, DIM);
     fillRect(fb, W, H, bx, by, bw, bh, BAR_BG);
     if (pct < 0) pct = 0; if (pct > 100) pct = 100;
@@ -133,7 +139,17 @@ void renderLoadingFrame(std::vector<uint8_t>& out, int W, int H,
 
     char line[160];
     snprintf(line, sizeof(line), "%d%%  %s", pct, label ? label : "");
-    drawText(fb, W, H, bx, by + bh + 14, line, FG, 2);
+    drawText(fb, W, H, bx, by + bh + 12, line, FG, 2);
+
+    // live activity log
+    int ly = by + bh + 48;
+    drawText(fb, W, H, bx, ly, "ACTIVITY", DIM, 1);
+    ly += 14;
+    for (size_t i = 0; i < logLines.size(); i++) {
+        BString s = logLines[i];
+        if (s.length() > 64) s = s.substr(0, 64);
+        drawText(fb, W, H, bx, ly + (int)i * 12, s.c_str(), LOGC, 1);
+    }
 }
 
 // SDL scancode -> X11 keycode (evdev: X keycode == Linux evdev code + 8). Wine's
@@ -259,7 +275,7 @@ public:
         // chain execve()s each PE stage). The boot storm is tens of seconds under
         // the interpreter, so without this the host window is a blank gray void.
         if (!haveFrame && KSystem::bootProgressPercent >= 0) {
-            const int LW = 640, LH = 360;
+            const int LW = 720, LH = 520;
             if (!loadingShown) {
                 screen->setScreenSize(LW, LH);
                 screen->showWindow(true);
@@ -267,13 +283,10 @@ public:
             }
             BString label = KSystem::bootProgressLabel;
             int pct = KSystem::bootProgressPercent;
-            // Creep the bar within a stage so it never looks frozen during the
-            // long mid-boot stretches (capped just under the next stage's start).
-            if (pct == lastShownPct && pct < 99) creep = (creep + 1) % 30;
-            else { creep = 0; lastShownPct = pct; }
-            int shownPct = pct + creep / 10; // +0..2 jitter
+            std::vector<BString> log = KSystem::getBootLogTail(26);
             std::vector<uint8_t> lf;
-            renderLoadingFrame(lf, LW, LH, label.isEmpty() ? "Booting…" : label.c_str(), shownPct);
+            renderLoadingFrame(lf, LW, LH, label.isEmpty() ? "Booting…" : label.c_str(),
+                               pct, log);
             screen->putBitsOnWnd(0, lf.data(), 32, (U32)LW * 4, 0, 0, LW, LH, nullptr, true);
             screen->present();
         }
@@ -394,6 +407,10 @@ void xwireForwardSdlEvent(const SDL_Event& e) {
 void tickXWirePresent() {
     if (g_xwirePresentSink) {
         g_xwirePresentSink->tickMainThread();
+        // Flush any host input the SDL pump queued out to the guest, even if the
+        // app is idle (not sending requests). Safe from the main thread: the
+        // flush lands bytes in the client recvBuffer + signals its condition.
+        XWireServer::instance().pumpInput();
     }
 }
 

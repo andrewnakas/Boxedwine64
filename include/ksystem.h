@@ -184,6 +184,14 @@ public:
     static BString bootProgressLabel;
     // Called from sys_execve64 with the basename of each PE the boot chain runs.
     static void noteBootStage(const BString& peName);
+
+    // A rolling log of recent boot activity shown on the loading screen (and so
+    // the user can "see what's actually loading"). noteBootLog appends one line;
+    // the loading-screen renderer draws the last N. Guarded by bootLogMutex
+    // since guest threads append while the main thread reads.
+    static void noteBootLog(const BString& line);
+    static std::vector<BString> getBootLogTail(int maxLines);
+    static BString bootProgressDetail;          // current low-level detail line
 private:
     static void initDisplayModes();
     static void internalEraseProcess(U32 id);

@@ -18,6 +18,8 @@
 
 #include "boxedwine.h"
 
+#include <deque>
+#include <mutex>
 #include "bufferaccess.h"
 #include "kstat.h"
 #include "kscheduler.h"
@@ -66,40 +68,63 @@ bool KSystem::cacheReads = false;
 BString KSystem::showWindowTimestamp;
 volatile int KSystem::bootProgressPercent = -1;
 BString KSystem::bootProgressLabel;
+BString KSystem::bootProgressDetail;
+static std::mutex g_bootLogMutex;
+static std::deque<BString> g_bootLog;
 
-// Map each PE stage of the wine boot chain to a coarse progress %/label for the
-// GUI loading screen. The chain is roughly fixed: wineboot initializes the
-// prefix, services.exe + its helpers bring up the Win32 service host, winex11
-// loads the graphics driver, then the target app launches. Percentages are
-// hand-tuned to feel monotonic under emulation (each stage is much slower than
-// the last). Unknown PEs nudge the bar forward a little without a new label so
-// it never looks frozen during the long mid-boot stretches.
+void KSystem::noteBootLog(const BString& line) {
+    std::lock_guard<std::mutex> lk(g_bootLogMutex);
+    g_bootLog.push_back(line);
+    while (g_bootLog.size() > 200) g_bootLog.pop_front();
+    bootProgressDetail = line;
+}
+
+std::vector<BString> KSystem::getBootLogTail(int maxLines) {
+    std::lock_guard<std::mutex> lk(g_bootLogMutex);
+    std::vector<BString> out;
+    int n = (int)g_bootLog.size();
+    int start = n > maxLines ? n - maxLines : 0;
+    for (int i = start; i < n; i++) out.push_back(g_bootLog[i]);
+    return out;
+}
+
+// Advance the GUI loading screen. Wine launches its boot subprocesses by
+// re-exec'ing the SAME unix binary (wine64-preloader -> wine64) and loads the
+// actual PE (wineboot/services/winedevice/explorer/notepad) INTERNALLY, so the
+// PE name never reaches sys_execve64's argv — only "/usr/lib/wine/wine64" does.
+// We therefore drive progress off the COUNT of wine64 re-execs, which is a real
+// monotonic signal (each boot stage = one more re-exec). The boot chain is
+// fixed-ish, so a counter -> label table gives believable, always-advancing
+// feedback. `peName` is whatever execve saw (used only to special-case the
+// final app and to ignore the preloader half of each pair).
 void KSystem::noteBootStage(const BString& peName) {
-    BString n = peName;
-    int pct = bootProgressPercent;
-    BString label = bootProgressLabel;
-    if (n.contains(B("wineboot"))) {
-        if (pct < 15) { pct = 15; label = B("Initializing Wine prefix…"); }
-    } else if (n.contains(B("services"))) {
-        if (pct < 35) { pct = 35; label = B("Starting Windows services…"); }
-    } else if (n.contains(B("winedevice"))) {
-        if (pct < 45) { pct = 45; label = B("Loading device drivers…"); }
-    } else if (n.contains(B("plugplay"))) {
-        if (pct < 52) { pct = 52; label = B("Detecting devices…"); }
-    } else if (n.contains(B("rpcss"))) {
-        if (pct < 58) { pct = 58; label = B("Starting RPC service…"); }
-    } else if (n.contains(B("explorer"))) {
-        if (pct < 70) { pct = 70; label = B("Starting desktop…"); }
-    } else if (n.contains(B("rundll32"))) {
-        if (pct < 78) { pct = 78; label = B("Configuring display…"); }
-    } else if (n.contains(B("notepad")) || n.contains(B(".exe"))) {
-        // The target app (anything not matched above). Hold at 88 until the
-        // guest actually paints (the present tick clears the bar on first frame).
-        if (pct < 88) { pct = 88; label = B("Launching application…"); }
+    static int execCount = 0;
+    // Count the wine64 stage exec (not the preloader, which immediately re-execs
+    // wine64 — counting both would double every stage).
+    bool isPreloader = peName.contains("preloader");
+    if (isPreloader) return;
+    execCount++;
+
+    static const struct { int pct; const char* label; } stages[] = {
+        { 10, "Booting Wine…" },
+        { 20, "Initializing Wine prefix…" },
+        { 32, "Starting Windows services…" },
+        { 44, "Loading device drivers…" },
+        { 54, "Detecting devices…" },
+        { 64, "Starting desktop…" },
+        { 74, "Configuring display driver…" },
+        { 82, "Launching Notepad…" },
+        { 88, "Almost there…" },
+    };
+    int idx = execCount - 1;
+    if (idx < 0) idx = 0;
+    if (idx >= (int)(sizeof(stages)/sizeof(stages[0])))
+        idx = (int)(sizeof(stages)/sizeof(stages[0])) - 1;
+    int pct = stages[idx].pct;
+    if (pct > bootProgressPercent) {
+        bootProgressLabel = BString::copy(stages[idx].label);
+        bootProgressPercent = pct;
     }
-    if (pct < 5) { pct = 5; if (label.isEmpty()) label = B("Booting Wine…"); }
-    bootProgressLabel = label;
-    bootProgressPercent = pct;
 }
 
 U32 KSystem::pageSize = 4096;

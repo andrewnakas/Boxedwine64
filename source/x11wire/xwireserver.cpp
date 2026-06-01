@@ -56,9 +56,25 @@ bool XWireServer::acceptConnection(const std::shared_ptr<KUnixSocketObject>& cli
 
     auto conn = std::make_shared<XWireConnection>(client, serverPeer);
     serverPeer->owner = conn;
-    connections.push_back(conn);
+    size_t nconn;
+    {
+        std::lock_guard<std::mutex> lk(connMutex);
+        connections.push_back(conn);
+        nconn = connections.size();
+    }
 
     klog_fmt("XWireServer: accepted X11 client connection (now %d open)",
-             (int)connections.size());
+             (int)nconn);
     return true;
+}
+
+// Flush queued host input to every connection from the main thread's present
+// tick, so an idle app (not sending requests) still gets keystrokes/clicks.
+void XWireServer::pumpInput() {
+    std::vector<std::shared_ptr<XWireConnection>> snapshot;
+    {
+        std::lock_guard<std::mutex> lk(connMutex);
+        snapshot = connections;
+    }
+    for (auto& c : snapshot) c->pumpInputAndFlush();
 }

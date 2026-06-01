@@ -60,6 +60,12 @@ public:
     // pump). Honors the per-window event mask.
     void sendExpose(uint32_t window, uint16_t x, uint16_t y, uint16_t w, uint16_t h);
 
+    // Drain any queued host input to the client and flush, even with no incoming
+    // request. Called by XWireServer::pumpInput from the main-thread present tick
+    // so an idle app still receives keystrokes/clicks. flushReplies' writeNative
+    // path is the thread-safe client-wakeup (same as onPeerWrote).
+    void pumpInputAndFlush() { deliverInputEvents(); flushReplies(); }
+
 private:
     // ---- wire helpers ----
     void writeToClient(const void* data, uint32_t len);

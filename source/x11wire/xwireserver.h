@@ -82,8 +82,17 @@ public:
     // across connections).
     uint32_t allocClientIdBase();
 
+    // Flush any queued host input (from the SDL pump) out to the guest, even
+    // when the app is idle and isn't sending requests. Iterates connections and
+    // calls deliverInputEvents()+flushReplies(); the flush lands bytes in the
+    // client's recvBuffer and signals its poll/read condition (the same
+    // thread-safe wakeup path onPeerWrote uses), so it's safe to call from the
+    // main thread's present tick. No-op when nothing is queued.
+    void pumpInput();
+
 private:
     XWireServer() {}
+    std::mutex connMutex;   // guards `connections` (accept on guest threads)
     std::vector<std::shared_ptr<XWireConnection>> connections;
     uint32_t nextClientBase = 0x00400000;
 };
