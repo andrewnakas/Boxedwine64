@@ -84,6 +84,15 @@ public:
     // data. Used by the loader to honor PT_GNU_RELRO after relocations.
     U64 mprotect(U64 addr, U64 len, U32 prot);
 
+    // Unmap [addr, addr+len): drop the backing pages so the address range is
+    // genuinely free for reuse. A no-op munmap (the old behaviour) breaks wine:
+    // wine munmaps a view, removes it from its own views_tree, then maps a fresh
+    // view at the SAME address — but if the pages are still mapped, wine's
+    // create_view finds an overlapping NON-system view and aborts
+    // (virtual.c:1578 "assert(view->protect & VPROT_SYSTEM)"). addr must be
+    // page-aligned; partial pages at the tail are unmapped whole. Returns 0.
+    U64 munmap(U64 addr, U64 len);
+
     // Permission query / page state.
     bool isPageMapped(U64 pageNum) const;
     U32  getPageFlags(U64 pageNum) const;

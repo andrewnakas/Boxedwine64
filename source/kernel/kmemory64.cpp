@@ -156,6 +156,18 @@ U64 KMemory64::mprotect(U64 addr, U64 len, U32 prot) {
     return addr;
 }
 
+U64 KMemory64::munmap(U64 addr, U64 len) {
+    if (addr & K64_PAGE_MASK) return (U64)-K_EINVAL;
+    if (len == 0) return 0;
+    U64 pageStart = addr >> K64_PAGE_SHIFT;
+    U64 pageCount = (len + K64_PAGE_SIZE - 1) >> K64_PAGE_SHIFT;
+    BOXEDWINE_CRITICAL_SECTION_WITH_MUTEX(pagesMutex);
+    for (U64 i = 0; i < pageCount; i++) {
+        pages.erase(pageStart + i);
+    }
+    return 0;
+}
+
 // BW64_WATCH=0xADDR[,len] — log any guest write that overlaps [ADDR, ADDR+len).
 // Used to find who fills (or fails to fill) a runtime callback slot. The host
 // callstack isn't captured, but the value + the fact that a write happened at
