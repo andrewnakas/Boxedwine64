@@ -59,6 +59,18 @@ public:
     // non-zero (no address-picking in v1).
     U64 mmapAnonymousFixed(U64 addr, U64 len, U32 prot);
 
+    // Atomically pick a free address range AND map it, so two guest threads of
+    // the same process (sharing this KMemory64) can never be handed overlapping
+    // mmap(NULL,...) placements. The old split — allocMmapRange() scans for a
+    // gap, returns, then the caller mmapAnonymousFixed()s it — is a TOCTOU race
+    // under BOXEDWINE_MULTI_THREADED: both threads scan, both see the same gap
+    // free (neither has mapped yet), both map there, and the second map ZEROES
+    // the first → "malloc(): corrupted double linked list" in the guest heap
+    // (wineserver during the boot storm). Holding mmapMutex across scan+map
+    // closes it. `length` need not be page-aligned (rounded up). Returns the
+    // page-aligned base. prot follows K_PROT_* (0x1/0x2/0x4).
+    U64 mmapReserveAndMap(U64 length, U32 prot);
+
     // Change page permissions on already-mapped pages. addr must be page-
     // aligned. prot bits follow K_PROT_READ/WRITE/EXEC (0x1/0x2/0x4) — same
     // convention as mmapAnonymousFixed. Pages within [addr, addr+len) that
@@ -127,6 +139,14 @@ private:
     // away to nothing in the single-threaded build. Mutable so the const
     // lookups (getPage/isPageMapped/getPageFlags) can lock.
     mutable BOXEDWINE_MUTEX pagesMutex;
+
+    // Serializes mmap address-space allocation (mmapReserveAndMap): the gap scan
+    // and the reservation map must be one atomic step across sibling threads.
+    // Separate from pagesMutex so a long scan doesn't block unrelated page
+    // faults. Process-wide bump cursor (replaces the old per-CPU64 mmapNext so
+    // every thread of the process advances the same pointer). 0 = uninitialised.
+    BOXEDWINE_MUTEX mmapMutex;
+    U64 mmapNext = 0;
 
     K64Page* getOrAllocPage(U64 pageNum, U32 flagsIfNew);
     K64Page* getPage(U64 pageNum) const;

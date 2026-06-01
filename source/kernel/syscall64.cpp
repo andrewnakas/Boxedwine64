@@ -237,46 +237,14 @@
 // with PIE-loaded segments (X64_PIE_BASE=0x400000000) or the program break.
 #define MMAP64_BASE 0x700000000ULL
 
-// Allocate `length` bytes of guest address space from the process-wide bump
-// allocator shared by BOTH the anonymous and file-backed mmap paths. Returns
-// a page-aligned base; advances cpu->mmapNext past it. Keeping a SINGLE
-// pointer is what prevents an anonymous map and a file-backed map from being
-// handed the same address (the bug behind the 2nd-DSO Verneed corruption).
-//
-// The bump pointer alone is NOT sufficient: the guest also issues MAP_FIXED
-// maps (ld.so reserves a DSO span then fixed-maps each segment; wine fixed-maps
-// PE images at their ImageBase). Those fixed maps don't advance mmapNext, so a
-// later mmap(NULL, big) can be handed an address that overlaps an existing
-// fixed map — and mmapAnonymousFixed ZEROES it, wiping live code. (This is
-// exactly what killed services.exe: a 128MB PROT_NONE reservation landed on
-// 0x700000000 and zeroed the already-mapped unix ntdll.so/libwine there.)
-//
-// So scan from mmapNext for the first gap of `pageCount` consecutive UNMAPPED
-// pages, skipping over any region already populated by a fixed map.
-static U64 allocMmapRange(CPU64* cpu, U64 length) {
-    if (cpu->mmapNext == 0) cpu->mmapNext = MMAP64_BASE;
-    U64 pageCount = (length + 0xFFF) >> 12;
-    if (pageCount == 0) pageCount = 1;
-
-    KMemory64* mem = cpu->memory;
-    U64 candidate = cpu->mmapNext >> 12; // start page
-    for (;;) {
-        // Is [candidate, candidate+pageCount) entirely free? Scan backward from
-        // the end so a collision near the top skips the whole run at once.
-        U64 firstMapped = 0;
-        bool clash = false;
-        for (U64 p = candidate + pageCount; p-- > candidate; ) {
-            if (mem->isPageMapped(p)) { firstMapped = p; clash = true; break; }
-        }
-        if (!clash) {
-            U64 addr = candidate << 12;
-            cpu->mmapNext = (candidate + pageCount) << 12;
-            return addr;
-        }
-        // Resume the search just past the mapped page we hit.
-        candidate = firstMapped + 1;
-    }
-}
+// Address-space allocation for mmap(NULL,...) now lives in
+// KMemory64::mmapReserveAndMap, which scans for a free gap and maps it as ONE
+// atomic step under the process mmap lock. The old split here (allocMmapRange
+// returns an address, the caller maps it afterwards) was a TOCTOU race in the
+// multi-threaded build: two sibling threads scanned, both saw the same gap
+// free, both mapped there, and the second map zeroed the first → guest-heap
+// corruption ("malloc(): corrupted double linked list") in wineserver during
+// the boot storm. The shared bump cursor moved to KMemory64::mmapNext.
 
 static U64 sys_write64(CPU64* cpu, U64 fd, U64 buf, U64 count) {
     if (count == 0) return 0;
@@ -376,17 +344,22 @@ static U64 sys_mmap64(CPU64* cpu, U64 addr, U64 length, U64 prot, U64 flags, U64
     if (!(flags & K_MAP_ANONYMOUS)) {
         return sys_mmap64_file(cpu, addr, length, prot, flags, fd, offset);
     }
-    if (addr == 0) {
-        // Anonymous mmap without MAP_FIXED: draw from the process-wide bump
-        // allocator shared with the file-backed path (see allocMmapRange).
-        addr = allocMmapRange(cpu, length);
-    }
     if (getenv("BW64_MMAPDUMP") && length >= 0x1000000) {
         klog_fmt("MMAP [pid=%d] BIG anon enter addr=0x%llx len=0x%llx prot=0x%x",
                  (int)(cpu->thread ? cpu->thread->process->id : -1),
                  (unsigned long long)addr, (unsigned long long)length, (unsigned)prot);
     }
-    U64 ret = cpu->memory->mmapAnonymousFixed(addr & ~0xFFFULL, length, (U32)prot);
+    U64 ret;
+    if (addr == 0) {
+        // Anonymous mmap without MAP_FIXED: atomically reserve+map a free range.
+        // mmapReserveAndMap holds the process mmap lock across the gap scan AND
+        // the map, so two sibling threads can't be handed the same address (the
+        // old allocMmapRange-then-map split was a TOCTOU race → guest-heap
+        // corruption in wineserver during the MT boot storm).
+        ret = cpu->memory->mmapReserveAndMap(length, (U32)prot);
+    } else {
+        ret = cpu->memory->mmapAnonymousFixed(addr & ~0xFFFULL, length, (U32)prot);
+    }
     if (getenv("BW64_MMAPDUMP") && length >= 0x1000000) {
         klog_fmt("MMAP [pid=%d] BIG anon exit  -> 0x%llx",
                  (int)(cpu->thread ? cpu->thread->process->id : -1),
@@ -807,12 +780,15 @@ static U64 sys_mmap64_file(CPU64* cpu, U64 addr, U64 length, U64 prot,
     if (!kfile || !kfile->openFile) {
         return (U64)-K_ENOSYS;
     }
+    bool reserved = false;
     if (addr == 0) {
-        // Shared bump allocator — see allocMmapRange. ld.so's DSO-span
-        // reservation (mmap(NULL, span, PROT_NONE, fd)) comes through here;
-        // it MUST draw from the same pointer as anonymous maps so the FIXED
-        // sub-segment maps that follow land on disjoint, uncorrupted pages.
-        addr = allocMmapRange(cpu, length);
+        // ld.so's DSO-span reservation (mmap(NULL, span, PROT_NONE, fd)) comes
+        // through here; it MUST draw from the same process-wide cursor as
+        // anonymous maps so the FIXED sub-segment maps that follow land on
+        // disjoint, uncorrupted pages. Atomically reserve+map (closes the
+        // MT TOCTOU race two sibling threads hit via the old scan-then-map).
+        addr = cpu->memory->mmapReserveAndMap(length, (U32)prot);
+        reserved = true; // pages already mapped under the lock; don't re-map/zero
     }
     U64 aligned = addr & ~0xFFFULL;
     U64 mapLen = (length + (addr - aligned) + 0xFFF) & ~0xFFFULL;
@@ -835,32 +811,39 @@ static U64 sys_mmap64_file(CPU64* cpu, U64 addr, U64 length, U64 prot,
     // tail and never refills it (we only read file content into [addr, ...)),
     // corrupting live code/data. Preserve the leading partial-page bytes across
     // the (re)map: snapshot [aligned, addr) before, restore after.
-    U64 head = addr - aligned;
-    std::vector<U8> headSave;
-    if (head > 0 && cpu->memory->isPageMapped(aligned >> 12)) {
-        headSave.resize((size_t)head);
-        cpu->memory->memcpyFromGuest(headSave.data(), aligned, head);
-        if (dump) klog_fmt("FMMAP   preserving 0x%llx head bytes at 0x%llx",
-                           (unsigned long long)head, (unsigned long long)aligned);
+    // For a FIXED map (addr supplied by ld.so) the target pages may already hold
+    // valid bytes from a PRIOR overlapping mapping of the SAME DSO (glibc maps
+    // the first PT_LOAD over the whole span, then MAP_FIXED-remaps later segments
+    // whose file offset is not page-aligned — so [aligned, addr) is the tail of
+    // the previous segment). mmapAnonymousFixed ZEROES whole pages, so a blind
+    // zero wipes that tail and never refills it (we only read file content into
+    // [addr, ...)), corrupting live code/data. Preserve the partial-page head &
+    // tail across the (re)map. SKIPPED when `reserved`: mmapReserveAndMap already
+    // mapped a fresh, disjoint range under the lock — nothing to preserve.
+    if (!reserved) {
+        U64 head = addr - aligned;
+        std::vector<U8> headSave;
+        if (head > 0 && cpu->memory->isPageMapped(aligned >> 12)) {
+            headSave.resize((size_t)head);
+            cpu->memory->memcpyFromGuest(headSave.data(), aligned, head);
+            if (dump) klog_fmt("FMMAP   preserving 0x%llx head bytes at 0x%llx",
+                               (unsigned long long)head, (unsigned long long)aligned);
+        }
+        U64 fileEnd = addr + length;
+        U64 mapEnd  = aligned + mapLen;
+        U64 tail = (mapEnd > fileEnd) ? (mapEnd - fileEnd) : 0;
+        std::vector<U8> tailSave;
+        if (tail > 0 && cpu->memory->isPageMapped((fileEnd) >> 12)) {
+            tailSave.resize((size_t)tail);
+            cpu->memory->memcpyFromGuest(tailSave.data(), fileEnd, tail);
+        }
+        U64 mapped = cpu->memory->mmapAnonymousFixed(aligned, mapLen, (U32)prot);
+        if ((S64)mapped < 0) {
+            return mapped;
+        }
+        if (!headSave.empty()) cpu->memory->memcpyToGuest(aligned, headSave.data(), head);
+        if (!tailSave.empty()) cpu->memory->memcpyToGuest(fileEnd, tailSave.data(), tail);
     }
-    // Likewise the trailing partial page: file content covers only `length`
-    // bytes from `addr`, but mapLen rounds up to a page boundary. If the tail
-    // page overlapped a prior mapping, save+restore the bytes past the file
-    // content so we don't zero a neighbour segment that already lives there.
-    U64 fileEnd = addr + length;
-    U64 mapEnd  = aligned + mapLen;
-    U64 tail = (mapEnd > fileEnd) ? (mapEnd - fileEnd) : 0;
-    std::vector<U8> tailSave;
-    if (tail > 0 && cpu->memory->isPageMapped((fileEnd) >> 12)) {
-        tailSave.resize((size_t)tail);
-        cpu->memory->memcpyFromGuest(tailSave.data(), fileEnd, tail);
-    }
-    U64 mapped = cpu->memory->mmapAnonymousFixed(aligned, mapLen, (U32)prot);
-    if ((S64)mapped < 0) {
-        return mapped;
-    }
-    if (!headSave.empty()) cpu->memory->memcpyToGuest(aligned, headSave.data(), head);
-    if (!tailSave.empty()) cpu->memory->memcpyToGuest(fileEnd, tailSave.data(), tail);
     // Read [offset, offset+length) and copy into [addr, addr+length).
     std::vector<U8> buf((size_t)length);
     S64 saved = kfile->openFile->getFilePointer();

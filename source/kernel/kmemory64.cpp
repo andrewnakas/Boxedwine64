@@ -102,6 +102,37 @@ U64 KMemory64::mmapAnonymousFixed(U64 addr, U64 len, U32 prot) {
     return addr;
 }
 
+// Process-wide mmap base — must match MMAP64_BASE in syscall64.cpp. Anonymous
+// and file-backed mmap(NULL,...) both draw from here so they can't collide.
+#define K64_MMAP_BASE 0x700000000ULL
+
+U64 KMemory64::mmapReserveAndMap(U64 length, U32 prot) {
+    U64 pageCount = (length + K64_PAGE_MASK) >> K64_PAGE_SHIFT;
+    if (pageCount == 0) pageCount = 1;
+
+    BOXEDWINE_CRITICAL_SECTION_WITH_MUTEX(mmapMutex);
+    if (mmapNext == 0) mmapNext = K64_MMAP_BASE;
+    U64 candidate = mmapNext >> K64_PAGE_SHIFT;
+    for (;;) {
+        // Is [candidate, candidate+pageCount) entirely free? Scan from the top
+        // so a collision near the end skips the whole run at once.
+        U64 firstMapped = 0;
+        bool clash = false;
+        for (U64 p = candidate + pageCount; p-- > candidate; ) {
+            if (isPageMapped(p)) { firstMapped = p; clash = true; break; }
+        }
+        if (!clash) {
+            U64 addr = candidate << K64_PAGE_SHIFT;
+            // Map the range NOW, under mmapMutex, so a concurrent sibling's scan
+            // sees these pages taken and can't pick the same gap.
+            mmapAnonymousFixed(addr, pageCount << K64_PAGE_SHIFT, prot);
+            mmapNext = (candidate + pageCount) << K64_PAGE_SHIFT;
+            return addr;
+        }
+        candidate = firstMapped + 1;
+    }
+}
+
 U64 KMemory64::mprotect(U64 addr, U64 len, U32 prot) {
     if (addr & K64_PAGE_MASK) return (U64)-K_EINVAL;
     if (len == 0) return addr;
