@@ -73,6 +73,15 @@ echo "--- copying glibc + lib closure ---"
 for l in $libs; do copy "$l"; done
 copy /lib64/ld-linux-x86-64.so.2
 copy /lib/x86_64-linux-gnu/libc.so.6
+# libgcc_s.so.1 is dlopen'd LAZILY by glibc for stack unwinding on pthread_exit,
+# so ldd never lists it and it gets dropped — without it, every wine thread that
+# exits aborts with "libgcc_s.so.1 must be installed for pthread_exit to work",
+# which cascades into wineserver heap corruption during the registry save.
+copy /lib/x86_64-linux-gnu/libgcc_s.so.1
+copy /usr/lib/x86_64-linux-gnu/libgcc_s.so.1
+# libfreetype: wine probes it for font rendering ("Wine cannot find the FreeType
+# font library"); harmless to omit but cheap to ship.
+copy /usr/lib/x86_64-linux-gnu/libfreetype.so.6
 mkdir -p "$STAGE/etc"; : > "$STAGE/etc/ld.so.cache"
 
 echo "--- copying wine64 loader + wineserver + module trees ---"
@@ -108,9 +117,16 @@ mkdir -p "$STAGE/root"
 # getMode() allows); it must exist so wine can create $HOME/.wine and the
 # dosdevices/c: symlink (under /winePrefix those symlinks fail EACCES).
 mkdir -p "$STAGE/tmp" "$STAGE/run/user/1000" "$STAGE/home/username" "$STAGE/var/tmp"
-# /etc/localtime: wine queries it on every time op; ship a UTC symlink so it
-# resolves cleanly instead of spamming ENOENT (wine falls back to UTC anyway).
-ln -sf /usr/share/zoneinfo/UTC "$STAGE/etc/localtime" 2>/dev/null || true
+# /etc/localtime: wine/glibc reads this as a TZif file on every time op AND
+# RtlQueryTimeZoneInformation re-reads it from its idle loop. It must be a
+# VALID TZif2 file — a v1 block followed by a v2 block ending in a "\nUTC0\n"
+# POSIX footer — or glibc __tzfile_read keeps rejecting it and wine never
+# settles. A bare `ln -sf /usr/share/zoneinfo/UTC` produces a DANGLING symlink
+# (zoneinfo isn't shipped in the guest) and the container's own UTC file is a
+# truncated 57-byte stub, so embed a known-good 114-byte UTC TZif inline.
+printf %s \
+  "VFppZjIAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAQAAAAQAAAAAAABVVEMAVFppZjIAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAQAAAAQAAAAAAABVVEMAClVUQzAK" \
+  | base64 -d > "$STAGE/etc/localtime"
 
 echo "--- staged tree ready ---"
 du -sh "$STAGE"

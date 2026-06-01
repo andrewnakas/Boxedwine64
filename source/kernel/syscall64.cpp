@@ -1509,24 +1509,35 @@ static bool deliverSignalSync(CPU64* cpu, U32 sig) {
 // Returns the 32-bit scratch address holding `len` bytes copied from `src64`,
 // or 0 on failure. `outLenAddr` (optional) gets a 4-byte slot holding `len`
 // for the helpers that take a pointer-to-socklen_t.
-// The scratch must be PER PROCESS: each KProcess has its own 32-bit KMemory, so
-// an address mmap'd in one process is unmapped in another (notably the forked
-// wine64 client vs. the wineserver). Cache (processId -> addr) and re-mmap on a
-// process change; a stale global address would fault (performOnMemory panic).
-static U32 g_socketScratch32 = 0;
-static U32 g_socketScratchPid = 0;
+// The scratch must be PER THREAD, not per process: each KProcess has its own
+// 32-bit KMemory (so an address mmap'd in one process is unmapped in another —
+// the forked wine64 client vs. wineserver), AND sibling THREADS of one process
+// share that KMemory but run concurrently. A single per-process scratch is
+// clobbered when two threads do socket calls at once (services.exe spawns a
+// clone3 worker thread that hammers wineserver alongside the main thread) —
+// the result is a malformed request that corrupts wineserver's heap ("unsorted
+// double linked list"). So cache (threadId -> addr) and mmap a fresh region the
+// first time each thread needs one. KThread::id is unique and stable.
+static std::unordered_map<U32, U32> g_socketScratchByThread;
+static BOXEDWINE_MUTEX g_scratchMutex;
 static U32 bounceSockaddrTo32(CPU64* cpu, U64 src64, U32 len, U32* outLenAddr) {
     KThread* thread = cpu->thread;
     if (!thread || !thread->memory || !thread->process) return 0;
     if (len > 256) len = 256; // sockaddr_un is 110 bytes; cap defensively
-    if (!g_socketScratch32 || g_socketScratchPid != thread->process->id) {
-        // One page is plenty for a sockaddr + a socklen_t slot.
-        g_socketScratch32 = thread->memory->mmap(thread, 0, K_PAGE_SIZE,
-            K_PROT_READ | K_PROT_WRITE, K_MAP_ANONYMOUS | K_MAP_PRIVATE, -1, 0);
-        if (!g_socketScratch32) return 0;
-        g_socketScratchPid = thread->process->id;
+    U32 addr;
+    {
+        BOXEDWINE_CRITICAL_SECTION_WITH_MUTEX(g_scratchMutex);
+        auto it = g_socketScratchByThread.find(thread->id);
+        if (it != g_socketScratchByThread.end()) {
+            addr = it->second;
+        } else {
+            // One page is plenty for a sockaddr + a socklen_t slot.
+            addr = thread->memory->mmap(thread, 0, K_PAGE_SIZE,
+                K_PROT_READ | K_PROT_WRITE, K_MAP_ANONYMOUS | K_MAP_PRIVATE, -1, 0);
+            if (!addr) return 0;
+            g_socketScratchByThread[thread->id] = addr;
+        }
     }
-    U32 addr = g_socketScratch32;
     if (src64 && len) {
         U8 tmp[256];
         cpu->memory->memcpyFromGuest(tmp, src64, len);
@@ -1554,17 +1565,19 @@ static U32 bounceSockaddrTo32(CPU64* cpu, U64 src64, U32 len, U32* outLenAddr) {
 #define MSG_SCRATCH_IOV     32
 #define MSG_SCRATCH_CMSG    64
 #define MSG_SCRATCH_DATA    512
-static U32 g_msgScratch32 = 0;
-static U32 g_msgScratchPid = 0;
+// Per-THREAD (see bounceSockaddrTo32's note): a per-process msg scratch is
+// corrupted when sibling threads sendmsg/recvmsg concurrently.
+static std::unordered_map<U32, U32> g_msgScratchByThread;
 static U32 msgScratch(KThread* thread) {
     if (!thread || !thread->memory || !thread->process) return 0;
-    if (!g_msgScratch32 || g_msgScratchPid != thread->process->id) {
-        g_msgScratch32 = thread->memory->mmap(thread, 0, MSG_SCRATCH_BYTES,
-            K_PROT_READ | K_PROT_WRITE, K_MAP_ANONYMOUS | K_MAP_PRIVATE, -1, 0);
-        if (!g_msgScratch32) return 0;
-        g_msgScratchPid = thread->process->id;
-    }
-    return g_msgScratch32;
+    BOXEDWINE_CRITICAL_SECTION_WITH_MUTEX(g_scratchMutex);
+    auto it = g_msgScratchByThread.find(thread->id);
+    if (it != g_msgScratchByThread.end()) return it->second;
+    U32 addr = thread->memory->mmap(thread, 0, MSG_SCRATCH_BYTES,
+        K_PROT_READ | K_PROT_WRITE, K_MAP_ANONYMOUS | K_MAP_PRIVATE, -1, 0);
+    if (!addr) return 0;
+    g_msgScratchByThread[thread->id] = addr;
+    return addr;
 }
 
 // 64-bit struct offsets (x86-64):
@@ -1716,6 +1729,12 @@ static U64 sys_recvmsg64(CPU64* cpu, U64 fd, U64 msg64, U64 flags) {
     U32 ctllen32 = m32->readd(base + MSG_SCRATCH_HDR + 20);
     if (control && ctllen >= 16 && ctllen32 >= 16) {
         U32 nfds = ctllen32 / 16;
+        // NEVER write past the guest's control buffer (ctllen): a 64-bit cmsg
+        // for nfds is 16 (cmsghdr) + nfds*4 bytes. Cap nfds so it fits — an
+        // overflow here scribbles past wine/wineserver's heap-allocated control
+        // buffer and corrupts its malloc arena ("unsorted double linked list").
+        U32 maxFds = (ctllen >= 16) ? (U32)((ctllen - 16) / 4) : 0;
+        if (nfds > maxFds) nfds = maxFds;
         U64 cmsgLen = 16 + (U64)nfds * 4; // 64-bit cmsghdr header is 16 bytes
         cpu->memory->writeq(control + 0, cmsgLen);
         cpu->memory->writed(control + 8, K_SOL_SOCKET);
