@@ -794,6 +794,18 @@ U32 CPU64::step() {
         return opOff + 1;
     }
 
+    // XLAT/XLATB (D7): AL = [RBX + AL] (zero-extended AL as a byte index). In
+    // long mode the base is the full 64-bit RBX; no segment base is applied
+    // (CS/DS/ES/SS are flat). An address-size override would use EBX, but
+    // FreeType's table-driven code uses the default 64-bit form.
+    if (op == 0xD7) {
+        U64 base = p.asize32 ? (U64)reg[X64_RBX].u32 : reg[X64_RBX].u64;
+        U64 addr = base + (U64)reg[X64_RAX].u8;
+        reg[X64_RAX].setU8(memory->readb(addr));
+        rip += opOff + 1;
+        return opOff + 1;
+    }
+
     // PUSH imm8 (6A) / PUSH imm32 sign-ext (68). Always 64-bit push in long mode.
     if (op == 0x6A || op == 0x68) {
         S64 imm = (op == 0x6A)

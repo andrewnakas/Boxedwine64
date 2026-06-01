@@ -383,6 +383,33 @@ int runX64SelfTest() {
         });
     }
 
+    // Test 13b: XLAT/XLATB (D7). AL = [RBX + AL]. FreeType's table-driven code
+    // uses it; it was an unimpl opcode that crashed every winex11-font process.
+    //   lea rbx, [rip+disp]    48 8D 1D <d32>   (7)  -> RBX = &table
+    //   mov al, 3              B0 03            (2)  index 3
+    //   xlat                   D7               (1)  AL = table[3]
+    //   <EXIT_SYSCALL>         ...                   (RAX->R15)
+    //   table: 10 20 30 40 ... (disp points here)
+    // disp = (bytes before table) - end_of_lea(7).
+    {
+        std::vector<U8> code = {
+            0x48, 0x8D, 0x1D, 0x00, 0x00, 0x00, 0x00,            // lea rbx,[rip+disp] (patched)
+            0xB0, 0x03,                                           // mov al, 3
+            0xD7,                                                 // xlat
+        };
+        std::vector<U8> full = withExit(code);
+        U32 disp = (U32)(full.size() - 7);                       // table starts here
+        full[3] = (U8)(disp & 0xff);
+        full[4] = (U8)((disp >> 8) & 0xff);
+        full[5] = (U8)((disp >> 16) & 0xff);
+        full[6] = (U8)((disp >> 24) & 0xff);
+        const U8 table[4] = { 0x10, 0x20, 0x30, 0x40 };          // table[3] = 0x40
+        full.insert(full.end(), table, table + 4);
+        runAndCheck(r, "xlat (AL = [RBX+AL], table[3]=0x40)", full, [](CPU64& c) {
+            return (c.reg[X64_R15].u64 & 0xff) == 0x40;
+        });
+    }
+
     // Test 14: PUSH imm + POP rax round-trip.
     {
         std::vector<U8> code = {
