@@ -49,8 +49,15 @@
 #define X64_SYS_socketpair        53
 #define X64_SYS_shutdown          48
 #define X64_SYS_socket            41
+#define X64_SYS_connect           42
+#define X64_SYS_accept            43
+#define X64_SYS_bind              49
+#define X64_SYS_listen            50
+#define X64_SYS_getsockname       51
+#define X64_SYS_getpeername       52
 #define X64_SYS_unlink            87
 #define X64_SYS_unlinkat          263
+#define X64_SYS_fchdir            81
 #define X64_SYS_setsid            112
 #define X64_SYS_getpid            39
 #define X64_SYS_exit              60
@@ -107,6 +114,7 @@
 #define X64_SYS_clone3            435
 #define X64_SYS_eventfd2          290
 #define X64_SYS_epoll_create1     291
+#define X64_SYS_epoll_create      213
 #define X64_SYS_epoll_ctl         233
 #define X64_SYS_epoll_wait        232
 #define X64_SYS_pwrite64          18
@@ -1327,6 +1335,46 @@ static bool deliverSignalSync(CPU64* cpu, U32 sig) {
     return true;
 }
 
+// --- 64-bit socket address bounce -------------------------------------------
+// The socket object layer (kbind/kconnect/kaccept/kgetsockname and their
+// KSocketObject methods) reads the guest sockaddr through `thread->memory` —
+// the 32-bit KMemory. For a 64-bit process that memory is allocated but unused
+// (the real address space is memory64), so the sockaddr the guest passed lives
+// in memory64, not where the object layer looks. sockaddr_un/_in are pointer-
+// free (identical layout 32/64), so rather than duplicate every object method
+// we BOUNCE: copy the sockaddr bytes out of memory64 into a small scratch page
+// in the 32-bit KMemory, then call the existing 32-bit k* socket helper with
+// that scratch address. This reuses all the bind/connect/accept/handshake logic
+// unchanged. The scratch page is mmap'd once per process (lazily) and reused.
+//
+// Returns the 32-bit scratch address holding `len` bytes copied from `src64`,
+// or 0 on failure. `outLenAddr` (optional) gets a 4-byte slot holding `len`
+// for the helpers that take a pointer-to-socklen_t.
+static U32 g_socketScratch32 = 0;  // process-local enough for the single 64-bit guest we run
+static U32 bounceSockaddrTo32(CPU64* cpu, U64 src64, U32 len, U32* outLenAddr) {
+    KThread* thread = cpu->thread;
+    if (!thread || !thread->memory) return 0;
+    if (len > 256) len = 256; // sockaddr_un is 110 bytes; cap defensively
+    if (!g_socketScratch32) {
+        // One page is plenty for a sockaddr + a socklen_t slot.
+        g_socketScratch32 = thread->memory->mmap(thread, 0, K_PAGE_SIZE,
+            K_PROT_READ | K_PROT_WRITE, K_MAP_ANONYMOUS | K_MAP_PRIVATE, -1, 0);
+        if (!g_socketScratch32) return 0;
+    }
+    U32 addr = g_socketScratch32;
+    if (src64 && len) {
+        U8 tmp[256];
+        cpu->memory->memcpyFromGuest(tmp, src64, len);
+        thread->memory->memcpy(addr, tmp, len);
+    }
+    if (outLenAddr) {
+        U32 lenSlot = addr + 256;
+        thread->memory->writed(lenSlot, len);
+        *outLenAddr = lenSlot;
+    }
+    return addr;
+}
+
 // Map an x86-64 Linux syscall number to a human-readable name. Used only by
 // the unimplemented-syscall log path — when running real glibc binaries, the
 // first thing you want to see is "which syscall is missing", not "#291".
@@ -1789,6 +1837,72 @@ void ksyscall64(CPU64* cpu) {
             ret = (U64)(S64)(S32)sfd;
             break;
         }
+        case X64_SYS_bind: {
+            // bind(sockfd, addr, addrlen) — wineserver binds its listening
+            // AF_UNIX socket (wineserver.sock). Bounce the sockaddr into 32-bit
+            // scratch and reuse kbind + the object layer.
+            if (!cpu->thread) { ret = (U64)-K_ENOSYS; break; }
+            U32 s32 = bounceSockaddrTo32(cpu, a2, (U32)a3, nullptr);
+            if (!s32) { ret = (U64)-K_EFAULT; break; }
+            ret = (U64)(S64)(S32)kbind(cpu->thread, (U32)a1, s32, (U32)a3);
+            break;
+        }
+        case X64_SYS_connect: {
+            // connect(sockfd, addr, addrlen) — wine64 connects to wineserver's
+            // socket. Same bounce.
+            if (!cpu->thread) { ret = (U64)-K_ENOSYS; break; }
+            U32 s32 = bounceSockaddrTo32(cpu, a2, (U32)a3, nullptr);
+            if (!s32) { ret = (U64)-K_EFAULT; break; }
+            ret = (U64)(S64)(S32)kconnect(cpu->thread, (U32)a1, s32, (U32)a3);
+            break;
+        }
+        case X64_SYS_listen:
+            // listen(sockfd, backlog) — no guest memory.
+            if (!cpu->thread) { ret = (U64)-K_ENOSYS; break; }
+            ret = (U64)(S64)(S32)klisten(cpu->thread, (U32)a1, (U32)a2);
+            break;
+        case X64_SYS_accept: {
+            // accept(sockfd, addr, addrlen) — wineserver accepts a wine64 client.
+            // addr/addrlen are optional out-params; pass a scratch slot when set
+            // and copy the result back to memory64.
+            if (!cpu->thread) { ret = (U64)-K_ENOSYS; break; }
+            U32 lenSlot = 0;
+            U32 s32 = a2 ? bounceSockaddrTo32(cpu, 0, 256, &lenSlot) : 0;
+            ret = (U64)(S64)(S32)kaccept(cpu->thread, (U32)a1, s32, lenSlot, 0);
+            // (peer sockaddr writeback omitted — AF_UNIX accept returns an empty
+            // name; wine doesn't rely on it for the server connection.)
+            break;
+        }
+        case X64_SYS_getsockname:
+        case X64_SYS_getpeername: {
+            // get{sock,peer}name(fd, addr, addrlen*). Bounce; copy the resulting
+            // sockaddr + length back into memory64.
+            if (!cpu->thread || !a2 || !a3) { ret = (U64)-K_EFAULT; break; }
+            U32 inLen = cpu->memory->readd(a3);
+            U32 lenSlot = 0;
+            U32 s32 = bounceSockaddrTo32(cpu, 0, inLen, &lenSlot);
+            if (!s32) { ret = (U64)-K_EFAULT; break; }
+            U32 rc = (nr == X64_SYS_getsockname)
+                ? kgetsockname(cpu->thread, (U32)a1, s32, lenSlot)
+                : kgetpeername(cpu->thread, (U32)a1, s32, lenSlot);
+            if ((S32)rc >= 0) {
+                U32 outLen = cpu->thread->memory->readd(lenSlot);
+                if (outLen > 256) outLen = 256;
+                U8 tmp[256];
+                cpu->thread->memory->memcpy(tmp, s32, outLen);
+                cpu->memory->memcpyToGuest(a2, tmp, outLen);
+                cpu->memory->writed(a3, outLen);
+            }
+            ret = (U64)(S64)(S32)rc;
+            break;
+        }
+        case X64_SYS_fchdir:
+            // fchdir(fd) — chdir to a directory held open by descriptor. No
+            // guest memory. wineserver fchdir's into the prefix's server dir;
+            // without it, it mapped ENOSYS to a file error and asserted.
+            if (!cpu->thread || !cpu->thread->process) { ret = (U64)-K_ENOSYS; break; }
+            ret = (U64)(S64)(S32)cpu->thread->process->fchdir((FD)a1);
+            break;
         case X64_SYS_setsid:
             // setsid() — new session; we don't model sessions, return the pid
             // (matches the 32-bit stub). wineserver daemonizes with this.
@@ -1965,20 +2079,48 @@ void ksyscall64(CPU64* cpu) {
             // Real impl needs an FD allocator that can wire poll/read.
             ret = (U64)-K_ENOSYS;
             break;
+        case X64_SYS_epoll_create:
         case X64_SYS_epoll_create1:
-            // Real epoll set needs FD + poll integration. ENOSYS pushes
-            // callers onto their poll/select fallback path.
-            ret = (U64)-K_ENOSYS;
+            // epoll_create(size) / epoll_create1(flags) — allocate an epoll set.
+            // No guest memory. wineserver's main loop is epoll-driven. The
+            // process epoll machinery is reused as-is.
+            if (!cpu->thread || !cpu->thread->process) { ret = (U64)-K_ENOSYS; break; }
+            ret = (U64)(S64)(S32)cpu->thread->process->epollcreate(
+                (nr == X64_SYS_epoll_create) ? (U32)a1 : 0,
+                (nr == X64_SYS_epoll_create1) ? (U32)a1 : 0);
             break;
-        case X64_SYS_epoll_ctl:
-            // Cannot exist meaningfully without epoll_create1 succeeding;
-            // EBADF matches what a closed epoll fd would yield.
-            ret = (U64)-K_EBADF;
+        case X64_SYS_epoll_ctl: {
+            // epoll_ctl(epfd, op, fd, event*). The epoll_event (12 bytes, packed
+            // on x86-64: u32 events; u64 data) is layout-identical 32/64 but the
+            // object reads it via thread->memory — bounce the 12 bytes through
+            // 32-bit scratch. EPOLL_CTL_DEL passes a NULL event. No process
+            // (bare selftest) → -EBADF, matching the kernel + the self-test.
+            if (!cpu->thread || !cpu->thread->process) { ret = (U64)-K_EBADF; break; }
+            U32 ev32 = 0;
+            if (a4) ev32 = bounceSockaddrTo32(cpu, a4, 12, nullptr);
+            ret = (U64)(S64)(S32)cpu->thread->process->epollctl((FD)a1, (U32)a2, (FD)a3, ev32);
             break;
-        case X64_SYS_epoll_wait:
-            // Same story — no valid epoll fd can exist yet.
-            ret = (U64)-K_EBADF;
+        }
+        case X64_SYS_epoll_wait: {
+            // epoll_wait(epfd, events, maxevents, timeout). Bounce: let the
+            // object write the result events into 32-bit scratch, then copy them
+            // back to memory64. Cap maxevents so the scratch page holds them.
+            // No process (bare selftest) → -EBADF.
+            if (!cpu->thread || !cpu->thread->process) { ret = (U64)-K_EBADF; break; }
+            U32 maxevents = (U32)a3;
+            if (maxevents > 64) maxevents = 64;       // 64*12=768 < page
+            U32 ev32 = bounceSockaddrTo32(cpu, 0, maxevents * 12, nullptr);
+            if (!ev32) { ret = (U64)-K_EFAULT; break; }
+            U32 rc = cpu->thread->process->epollwait(cpu->thread, (FD)a1, ev32, maxevents, (U32)a4);
+            if ((S32)rc > 0) {
+                U32 bytes = rc * 12;
+                U8 tmp[64 * 12];
+                cpu->thread->memory->memcpy(tmp, ev32, bytes);
+                cpu->memory->memcpyToGuest(a2, tmp, bytes);
+            }
+            ret = (U64)(S64)(S32)rc;
             break;
+        }
         case X64_SYS_getdents64:
             ret = sys_getdents64_real(cpu, a1, a2, a3);
             break;

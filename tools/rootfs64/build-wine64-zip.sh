@@ -85,6 +85,11 @@ cp -aL /usr/lib/x86_64-linux-gnu/wine/x86_64-unix    "$STAGE/usr/lib/x86_64-linu
 cp -aL /usr/lib/x86_64-linux-gnu/wine/x86_64-windows "$STAGE/usr/lib/x86_64-linux-gnu/wine/"
 # i386-windows is the 32-bit PE side; not needed for a pure wine64 boot.
 
+# Wine data: NLS locale tables (wineserver loads l_intl.nls), fonts, etc.
+# wine resolves these as <bindir>/../../share/wine, i.e. /usr/share/wine.
+mkdir -p "$STAGE/usr/share"
+cp -aL /usr/share/wine "$STAGE/usr/share/"
+
 # Convenience launch symlinks at canonical wine paths.
 mkdir -p "$STAGE/usr/bin"
 ln -sf /usr/lib/wine/wine64      "$STAGE/usr/bin/wine64"
