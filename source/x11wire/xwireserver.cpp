@@ -35,6 +35,13 @@ bool XWireServer::isXDisplayPath(const char* path) {
     return path[pl] >= '0' && path[pl] <= '9';
 }
 
+uint32_t XWireServer::allocClientIdBase() {
+    std::lock_guard<std::mutex> lk(regMutex);
+    uint32_t base = nextClientBase;
+    nextClientBase += 0x00200000;   // step past the 21-bit client id mask
+    return base;
+}
+
 bool XWireServer::acceptConnection(const std::shared_ptr<KUnixSocketObject>& client) {
     if (!client) return false;
 

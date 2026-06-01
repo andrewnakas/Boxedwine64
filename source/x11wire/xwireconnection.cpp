@@ -14,10 +14,17 @@
 
 #include "boxedwine.h"
 #include "xwireconnection.h"
+#include "xwireserver.h"
+#include "xwirepresent.h"
 #include "kunixsocket.h"
 
 #include <cstring>
 #include <string>
+
+// The active presentation sink (platform/sdl sets it during window init). null
+// when headless / -novideo, in which case all PutImage/Map presentation is a
+// no-op and the wire server runs exactly as before.
+XWirePresentSink* g_xwirePresentSink = nullptr;
 
 // ---------------------------------------------------------------------------
 // X11 protocol constants (subset). Little-endian assumed for our replies; we
@@ -174,9 +181,13 @@ void XWireConnection::doHandshake() {
     const uint16_t vendorLen = (uint16_t)(sizeof(vendor) - 1);
     const uint16_t vendorPad = (uint16_t)((4 - (vendorLen & 3)) & 3);
 
-    // Resource-id base/mask handed to the client.
-    clientIdBase = 0x00400000;
+    // Resource-id base/mask handed to the client. Every client gets a DISTINCT
+    // base (from the server) so resource ids are globally unique across
+    // connections. Combined with the server-global window registry, this lets
+    // the connection that PUTIMAGES a window find it even though a different
+    // connection CREATED it (winex11 uses one X connection per thread).
     clientIdMask = 0x001fffff;
+    clientIdBase = XWireServer::instance().allocClientIdBase();
     rootWindow   = 0x00000260;   // arbitrary, in the server-owned id space
     rootVisual   = 0x00000021;
     rootColormap = 0x00000020;
@@ -262,10 +273,15 @@ void XWireConnection::doHandshake() {
     writeToClient(hdr, sizeof(hdr));
     writeToClient(body.data(), (uint32_t)body.size());
 
-    // Register the root window in our model so geometry queries answer.
-    XWindow& rw = windows[rootWindow];
-    rw.isRoot = true; rw.mapped = true;
-    rw.width = screenWidth; rw.height = screenHeight;
+    // Register the root window in the server-global model so geometry queries
+    // answer. rootWindow is the same constant on every connection.
+    {
+        XWireServer& srv = XWireServer::instance();
+        std::lock_guard<std::mutex> lk(srv.regMutex);
+        XWindow& rw = srv.windows[rootWindow];
+        rw.isRoot = true; rw.mapped = true;
+        rw.width = screenWidth; rw.height = screenHeight;
+    }
 
     handshakeDone = true;
     klog_fmt("XWire: handshake complete (vendor=%s root=0x%x visual=0x%x), %d body bytes",
@@ -295,14 +311,24 @@ void XWireConnection::processOneRequest(const uint8_t* req, uint32_t len) {
             w.y = (int16_t)rd16(req + 14);
             w.width = rd16(req + 16);
             w.height = rd16(req + 18);
-            windows[wid] = w;
+            {
+                XWireServer& srv = XWireServer::instance();
+                std::lock_guard<std::mutex> lk(srv.regMutex);
+                srv.windows[wid] = w;
+            }
+            if (getenv("BW64_XWIRE")) {
+                klog_fmt("XWire: CreateWindow wid=0x%x parent=0x%x %dx%d (base=0x%x)",
+                         (int)wid, (int)w.parent, (int)w.width, (int)w.height, (int)clientIdBase);
+            }
             break;
         }
         case X_ChangeWindowAttributes: {
             uint32_t wid = rd32(req + 4);
             uint32_t mask = rd32(req + 8);
-            auto it = windows.find(wid);
-            if (it != windows.end()) {
+            XWireServer& srv = XWireServer::instance();
+            std::lock_guard<std::mutex> lk(srv.regMutex);
+            auto it = srv.windows.find(wid);
+            if (it != srv.windows.end()) {
                 // CWEventMask is bit 11 (0x800). The value list follows the mask
                 // in mask-bit order; event-mask is the value if that bit is set
                 // and it's the only/last bit we track. Find its slot.
@@ -319,25 +345,64 @@ void XWireConnection::processOneRequest(const uint8_t* req, uint32_t len) {
         }
         case X_MapWindow: {
             uint32_t wid = rd32(req + 4);
-            auto it = windows.find(wid);
-            if (it != windows.end()) {
-                it->second.mapped = true;
-                ensureWindow();
-                // A mapped top-level window expects an Expose to draw itself.
-                if (it->second.width && it->second.height) {
-                    sendExpose(wid, 0, 0, it->second.width, it->second.height);
+            uint16_t ew = 0, eh = 0;
+            bool found = false;
+            {
+                XWireServer& srv = XWireServer::instance();
+                std::lock_guard<std::mutex> lk(srv.regMutex);
+                auto it = srv.windows.find(wid);
+                if (it != srv.windows.end()) {
+                    it->second.mapped = true;
+                    ew = it->second.width  ? it->second.width  : screenWidth;
+                    eh = it->second.height ? it->second.height : screenHeight;
+                    found = true;
                 }
+            }
+            if (found) {
+                ensureWindow();
+                // The host window + presentWindow are chosen lazily on the first
+                // PutImage (CreateWindow/Map geometry is unreliable — winex11
+                // sizes via ConfigureWindow). Here we just send the Expose that
+                // prompts the app to paint, which triggers that PutImage; a
+                // generous fallback extent makes the app repaint its whole area.
+                sendExpose(wid, 0, 0, ew, eh);
             }
             break;
         }
         case X_UnmapWindow: {
             uint32_t wid = rd32(req + 4);
-            auto it = windows.find(wid);
-            if (it != windows.end()) it->second.mapped = false;
+            XWireServer& srv = XWireServer::instance();
+            std::lock_guard<std::mutex> lk(srv.regMutex);
+            auto it = srv.windows.find(wid);
+            if (it != srv.windows.end()) it->second.mapped = false;
             break;
         }
         case X_DestroyWindow: {
-            windows.erase(rd32(req + 4));
+            uint32_t wid = rd32(req + 4);
+            XWireServer& srv = XWireServer::instance();
+            std::lock_guard<std::mutex> lk(srv.regMutex);
+            srv.windows.erase(wid);
+            break;
+        }
+        case X_PutImage: {
+            // PutImage(format, drawable, gc, width, height, dst-x, dst-y,
+            //          left-pad, depth, <image data>). For a software-rendered
+            // GDI app, winex11 ZPixmap-blits the whole client area into the
+            // window's backing pixmap/window. We composite into a per-window
+            // ARGB framebuffer and, when it targets the presented window, hand
+            // the latest full image to the host sink.
+            //  req[1]=format (2=ZPixmap), @4 drawable, @8 gc, @12 width,
+            //  @14 height, @16 dst-x, @18 dst-y, @20 left-pad, @21 depth.
+            uint8_t format = req[1];
+            uint32_t drawable = rd32(req + 4);
+            uint16_t w = rd16(req + 12);
+            uint16_t h = rd16(req + 14);
+            int16_t dstX = (int16_t)rd16(req + 16);
+            int16_t dstY = (int16_t)rd16(req + 18);
+            uint8_t depth = req[21];
+            const uint8_t* img = req + 24;
+            uint32_t imgBytes = (len > 24) ? (len - 24) : 0;
+            blitPutImage(drawable, format, depth, dstX, dstY, w, h, img, imgBytes);
             break;
         }
         case X_ConfigureWindow:
@@ -351,7 +416,6 @@ void XWireConnection::processOneRequest(const uint8_t* req, uint32_t len) {
         case X_CreateColormap:
         case X_PolyFillRectangle:
         case X_CopyArea:
-        case X_PutImage:
         case X_ImageText8:
         case X_ImageText16:
         case X_ChangeProperty:
@@ -399,9 +463,13 @@ void XWireConnection::processOneRequest(const uint8_t* req, uint32_t len) {
         case X_GetGeometry: {
             uint32_t drawable = rd32(req + 4);
             XWindow w;
-            auto it = windows.find(drawable);
-            if (it != windows.end()) w = it->second;
-            else { w.width = screenWidth; w.height = screenHeight; }
+            {
+                XWireServer& srv = XWireServer::instance();
+                std::lock_guard<std::mutex> lk(srv.regMutex);
+                auto it = srv.windows.find(drawable);
+                if (it != srv.windows.end()) { w.x = it->second.x; w.y = it->second.y; w.width = it->second.width; w.height = it->second.height; }
+                else { w.width = screenWidth; w.height = screenHeight; }
+            }
             uint8_t r[32] = {0};
             r[0] = 1;                          // reply
             r[1] = 24;                         // depth
@@ -630,15 +698,184 @@ void XWireConnection::onData() {
         processOneRequest(in.data(), reqLen);
         in.erase(in.begin(), in.begin() + reqLen);
     }
+    // Ride any pending host input out on this same wake (wine just talked to us,
+    // so it'll read the socket again right away — events delivered now arrive
+    // promptly without needing a separate writer thread).
+    deliverInputEvents();
     flushReplies();
+}
+
+// Drain host input from the sink and emit X11 input events to the focused
+// (presented) window, honoring its event mask. Called on the guest thread from
+// onData(). Only the connection that OWNS the presented window (its id falls in
+// this connection's resource-id range) delivers input, so events aren't
+// duplicated across the several connections sharing the global registry.
+void XWireConnection::deliverInputEvents() {
+    if (!g_xwirePresentSink) return;
+    XWireServer& srv = XWireServer::instance();
+    uint32_t pw, mask;
+    {
+        std::lock_guard<std::mutex> lk(srv.regMutex);
+        pw = srv.presentWindow;
+        if (!pw) return;
+        // Owner check: the presented window's id base must match ours.
+        if ((pw & ~clientIdMask) != clientIdBase) return;
+        auto it = srv.windows.find(pw);
+        if (it == srv.windows.end()) return;
+        mask = it->second.eventMask;
+    }
+    uint32_t presentWindow = pw;     // local copy for sendInputEvent
+
+    XWireInputEvent ev;
+    while (g_xwirePresentSink->nextInputEvent(ev)) {
+        uint8_t code;
+        uint32_t wantMask;
+        switch (ev.type) {
+            case XWireInputEvent::EvKeyDown:    code = 2;  wantMask = 0x00000001; break; // KeyPressMask
+            case XWireInputEvent::EvKeyUp:      code = 3;  wantMask = 0x00000002; break; // KeyReleaseMask
+            case XWireInputEvent::EvButtonDown: code = 4;  wantMask = 0x00000004; break; // ButtonPressMask
+            case XWireInputEvent::EvButtonUp:   code = 5;  wantMask = 0x00000008; break; // ButtonReleaseMask
+            case XWireInputEvent::EvMotion:     code = 6;  wantMask = 0x00000040; break; // PointerMotionMask
+            default: continue;
+        }
+        // Deliver even if the mask bit isn't set for button/key — wine's windows
+        // usually select these, and dropping them silently would feel dead. But
+        // respect an explicit motion opt-out to avoid event floods.
+        if (ev.type == XWireInputEvent::EvMotion && !(mask & wantMask)) continue;
+        sendInputEvent(code, presentWindow, ev);
+    }
+}
+
+// Emit a 32-byte X11 input event record (KeyPress/Release, Button*, Motion).
+void XWireConnection::sendInputEvent(uint8_t code, uint32_t window, const XWireInputEvent& ev) {
+    uint8_t e[32] = {0};
+    e[0] = code;
+    e[1] = (uint8_t)ev.detail;                 // keycode / button
+    e[2] = (uint8_t)(sequence & 0xff);
+    e[3] = (uint8_t)(sequence >> 8);
+    // time @4 (4) — leave 0 (CurrentTime-ish; wine tolerates monotonic-ish 0)
+    memcpy(e + 8,  &rootWindow, 4);             // root
+    memcpy(e + 12, &window, 4);                 // event window
+    // child @16 = None(0)
+    int16_t rx = (int16_t)ev.x, ry = (int16_t)ev.y;
+    memcpy(e + 20, &rx, 2);                     // root-x
+    memcpy(e + 22, &ry, 2);                     // root-y
+    memcpy(e + 24, &rx, 2);                     // event-x
+    memcpy(e + 26, &ry, 2);                     // event-y
+    uint16_t state = (uint16_t)ev.state;
+    memcpy(e + 28, &state, 2);                  // state
+    e[30] = 1;                                  // same-screen = True
+    writeToClient(e, sizeof(e));
 }
 
 void XWireConnection::ensureWindow() {
     if (windowShown) return;
     windowShown = true;
-    // SDL window creation + present wiring lands in Phase 2c. For now mark it so
-    // the handshake path is exercised headlessly without a window.
-    klog_fmt("XWire: first window mapped (SDL present wiring is Phase 2c)");
+    klog_fmt("XWire: first window mapped (present sink=%s)",
+             g_xwirePresentSink ? "SDL" : "headless");
+}
+
+// Decode an X11 PutImage (ZPixmap, TrueColor 24/32bpp) into the target window's
+// ARGB backing store and, when it's the window we present, hand the full image
+// to the host sink. winex11 sends 32-bit-per-pixel ZPixmap on our visual, so a
+// source row is w*4 bytes in 0x00RRGGBB (== ARGB8888 with X in the high byte)
+// little-endian order — already what SDL_PIXELFORMAT_ARGB8888 expects. Non-32bpp
+// or non-ZPixmap forms are uncommon for GDI blits; we ignore them (the window
+// keeps its prior contents) rather than mis-decode.
+void XWireConnection::blitPutImage(uint32_t drawable, uint8_t format, uint8_t depth,
+                                   int16_t dstX, int16_t dstY, uint16_t w, uint16_t h,
+                                   const uint8_t* data, uint32_t dataBytes) {
+    if (!w || !h) return;
+    if (format != 2 /*ZPixmap*/) return;        // only ZPixmap supported
+    if (depth != 24 && depth != 32) return;     // only TrueColor 24/32
+
+    const uint32_t bpp = 4;
+    const uint32_t srcPitch = (uint32_t)w * bpp;
+    if ((uint64_t)srcPitch * h > dataBytes) {
+        // Truncated payload (shouldn't happen for a single-request blit); bail
+        // rather than read past the buffer.
+        return;
+    }
+
+    XWireServer& srv = XWireServer::instance();
+    std::lock_guard<std::mutex> lk(srv.regMutex);
+
+    if (getenv("BW64_XWIRE")) {
+        klog_fmt("XWire: PutImage drawable=0x%x %dx%d at (%d,%d) presentWindow=0x%x isWin=%d",
+                 (int)drawable, (int)w, (int)h, (int)dstX, (int)dstY,
+                 (int)srv.presentWindow, (int)(srv.windows.count(drawable) ? 1 : 0));
+    }
+    auto it = srv.windows.find(drawable);
+    if (it == srv.windows.end()) {
+        // A pixmap (off-screen drawable) we don't model as a window; ignore for
+        // now — winex11 normally CopyAreas it to the window, which is the path we
+        // present. (CopyArea compositing is a later refinement.)
+        return;
+    }
+    XWindow& win = it->second;
+    if (win.isRoot) return;     // never present the root/desktop background
+
+    // Adopt the first window an app actually draws into as the presented window
+    // (server-global, so it survives the create-vs-draw connection split). The
+    // PutImage target + tiling is the reliable "this is the real client area"
+    // signal; CreateWindow/Map geometry is unreliable (winex11 resizes via
+    // ConfigureWindow which we don't fully model).
+    if (srv.presentWindow == 0 || drawable == srv.presentWindow) {
+        srv.presentWindow = drawable;
+    }
+
+    // Track the window's full extent from the blit reach. winex11 tiles the
+    // client area in horizontal bands, so the max (dstX+w, dstY+h) across blits
+    // is the true client size even when CreateWindow gave us 0x0.
+    uint16_t reachW = (uint16_t)((dstX > 0 ? dstX : 0) + w);
+    uint16_t reachH = (uint16_t)((dstY > 0 ? dstY : 0) + h);
+    if (reachW > win.width)  win.width = reachW;
+    if (reachH > win.height) win.height = reachH;
+
+    uint16_t winW = win.width ? win.width : w;
+    uint16_t winH = win.height ? win.height : h;
+    if (win.fbW != winW || win.fbH != winH) {
+        // Preserve existing content when the framebuffer grows (bands arrive one
+        // at a time): re-layout the old rows into the resized buffer.
+        std::vector<uint8_t> grown((size_t)winW * winH * bpp, 0);
+        if (!win.fb.empty()) {
+            uint16_t copyH = win.fbH < winH ? win.fbH : winH;
+            uint16_t copyW = win.fbW < winW ? win.fbW : winW;
+            for (uint16_t y = 0; y < copyH; y++) {
+                memcpy(grown.data() + (size_t)y * winW * bpp,
+                       win.fb.data() + (size_t)y * win.fbW * bpp,
+                       (size_t)copyW * bpp);
+            }
+        }
+        win.fb.swap(grown);
+        win.fbW = winW;
+        win.fbH = winH;
+    }
+
+    bool isPresented = (drawable == srv.presentWindow);
+    if (g_xwirePresentSink && isPresented) {
+        g_xwirePresentSink->onWindowMapped(drawable, winW, winH);
+    }
+
+    // Copy each source row into the framebuffer at (dstX, dstY), clipping to the
+    // window bounds.
+    for (uint16_t row = 0; row < h; row++) {
+        int dy = dstY + row;
+        if (dy < 0 || dy >= winH) continue;
+        int dx = dstX;
+        uint16_t copyW = w;
+        const uint8_t* src = data + (size_t)row * srcPitch;
+        if (dx < 0) { src += (size_t)(-dx) * bpp; copyW = (uint16_t)(copyW + dx); dx = 0; }
+        if (dx >= winW || copyW == 0) continue;
+        if (dx + copyW > winW) copyW = (uint16_t)(winW - dx);
+        uint8_t* dstRow = win.fb.data() + ((size_t)dy * winW + dx) * bpp;
+        memcpy(dstRow, src, (size_t)copyW * bpp);
+    }
+
+    if (g_xwirePresentSink && isPresented) {
+        g_xwirePresentSink->submitFrame(drawable, winW, winH, win.fb.data(),
+                                        (uint32_t)winW * bpp);
+    }
 }
 
 // ---------------------------------------------------------------------------

@@ -36,6 +36,9 @@
 #include "devsequencer.h"
 #include "devfb.h"
 #include "mainloop.h"
+#ifdef BOXEDWINE_GUEST_X64
+#include "../x11wire/xwirepresent.h"
+#endif
 #include "../io/fsfilenode.h"
 #include "../io/fszip.h"
 #include "loader.h"
@@ -572,6 +575,11 @@ bool StartUpArgs::apply() {
     }
 #endif
     KNativeSystem::initWindow(this->screenCx, this->screenCy, this->screenBpp, this->sdlScaleX, this->sdlScaleY, this->sdlScaleQuality, this->sdlFullScreen, this->vsync);
+#ifdef BOXEDWINE_GUEST_X64
+    // Wire the in-process X11 server's PutImage output to a host SDL window
+    // (Phase 2c). No-op under -novideo.
+    installXWireSink();
+#endif
     KNativeAudio::init();
 #ifdef BOXEDWINE_OPENGL
     PlatformOpenGL::init();

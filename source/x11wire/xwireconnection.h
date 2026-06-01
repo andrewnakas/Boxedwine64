@@ -17,6 +17,7 @@
 
 #include "boxedwine.h"
 #include "kunixsocket.h"
+#include "xwirepresent.h"
 
 #include <memory>
 #include <unordered_map>
@@ -75,16 +76,22 @@ private:
     // Inbound assembly buffer (a request may straddle recvBuffer chunks).
     std::vector<uint8_t> in;
 
-    // ---- resource model (minimal) ----
-    struct XWindow {
-        uint32_t parent = 0;
-        int16_t x = 0, y = 0;
-        uint16_t width = 0, height = 0;
-        uint32_t eventMask = 0;
-        bool mapped = false;
-        bool isRoot = false;
-    };
-    std::unordered_map<uint32_t, XWindow> windows;
+    // ---- resource model ----
+    // The window/drawable registry is SERVER-GLOBAL (XWireServer::windows),
+    // because X resource ids are shared across all client connections and
+    // winex11 creates vs. draws a window on different connections. Atoms stay
+    // local — they're only round-tripped within a connection here.
+
+    // Decode an X PutImage payload into the target window's backing framebuffer
+    // (in the server registry) and, if it's the presented window, push the full
+    // image to the host sink.
+    void blitPutImage(uint32_t drawable, uint8_t format, uint8_t depth,
+                      int16_t dstX, int16_t dstY, uint16_t w, uint16_t h,
+                      const uint8_t* data, uint32_t dataBytes);
+
+    // Host input -> X11 wire events (Phase 2c input path).
+    void deliverInputEvents();
+    void sendInputEvent(uint8_t code, uint32_t window, const XWireInputEvent& ev);
     std::unordered_map<std::string, uint32_t> atoms;   // name -> atom id
     std::unordered_map<uint32_t, std::string> atomNames;
     uint32_t nextAtom = 1;

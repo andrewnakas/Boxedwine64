@@ -34,9 +34,29 @@
 #include <vector>
 #include <string>
 #include <cstdint>
+#include <mutex>
 
 class KUnixSocketObject;
 class XWireConnection;
+
+// A server-global X drawable (window or window-backed pixmap). X resource ids
+// are global across all client connections — winex11 opens a separate X
+// connection per thread, so the connection that CREATES a window is often not
+// the one that PUTIMAGES into it. The window model + backing framebuffer
+// therefore live here, in the server, not in any single XWireConnection.
+struct XWindow {
+    uint32_t parent = 0;
+    int16_t x = 0, y = 0;
+    uint16_t width = 0, height = 0;
+    uint32_t eventMask = 0;
+    bool mapped = false;
+    bool isRoot = false;
+    // ARGB8888 backing store for software-blitted (PutImage) content. Lazily
+    // sized; persists between partial PutImages so a complete client area is
+    // always available to present.
+    std::vector<uint8_t> fb;
+    uint16_t fbW = 0, fbH = 0;
+};
 
 class XWireServer {
 public:
@@ -50,9 +70,22 @@ public:
     // and start a wire connection. Returns false only on hard failure.
     bool acceptConnection(const std::shared_ptr<KUnixSocketObject>& client);
 
+    // ---- server-global resource registry (thread-safe) ----
+    // The registry mutex guards windows + presentWindow. Connections run on
+    // different guest threads, so all access goes through these helpers (or
+    // holds regMutex directly for compound ops).
+    std::mutex regMutex;
+    std::unordered_map<uint32_t, XWindow> windows;
+    uint32_t presentWindow = 0;     // drawable currently shown on the host
+
+    // Allocate the next distinct client resource-id base (so ids never collide
+    // across connections).
+    uint32_t allocClientIdBase();
+
 private:
     XWireServer() {}
     std::vector<std::shared_ptr<XWireConnection>> connections;
+    uint32_t nextClientBase = 0x00400000;
 };
 
 #endif
