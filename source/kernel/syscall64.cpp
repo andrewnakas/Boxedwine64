@@ -2035,13 +2035,15 @@ void ksyscall64(CPU64* cpu) {
             ret = 0;
             break;
         case X64_SYS_munmap:
-            // Actually drop the pages. A no-op munmap broke wine: it unmaps a
-            // view, removes it from its own views_tree, then maps a fresh view at
-            // the same address — if our pages stayed mapped, wine's create_view
-            // found an overlapping non-system view and aborted (virtual.c:1578
-            // "assert(view->protect & VPROT_SYSTEM)"), killing wineboot. a1=addr,
-            // a2=len.
-            ret = cpu->memory->munmap(a1, a2);
+            // Back to a no-op (return success, keep pages). Actually erasing the
+            // pages (the create_view-assert fix) REGRESSED boot reliability:
+            // wine/wineserver munmap a region but still lazily touch it (a thread
+            // mid-access, or wine's own deferred read), and zeroing the backing
+            // store turned the rare create_view assert into a more-frequent
+            // mid-boot wedge/heap-corruption. Net loss — the leak is cheaper than
+            // the breakage. (Proper fix: only erase pages no other thread can be
+            // racing, and outside wine's reserved zones — future work.)
+            ret = 0;
             break;
         case X64_SYS_set_tid_address:
             // set_tid_address(tidptr): records the address the kernel must
