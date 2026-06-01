@@ -197,6 +197,12 @@
 #ifndef K_ESRCH
 #define K_ESRCH 3
 #endif
+#ifndef K_ENODATA
+#define K_ENODATA 61
+#endif
+#ifndef K_ENOTSUP
+#define K_ENOTSUP 95
+#endif
 
 // FUTEX_* op codes from <linux/futex.h>. We handle WAIT/WAKE + their
 // BITSET variants (glibc 2.35+ uses WAKE_BITSET for pthread_cond_signal)
@@ -345,8 +351,15 @@ static U64 sys_mmap64(CPU64* cpu, U64 addr, U64 length, U64 prot, U64 flags, U64
 // process, this ends the process (exitgroup). `group` forces process-wide
 // termination regardless of thread count (exit_group(2)).
 static U64 sys_exit64(CPU64* cpu, U64 status, bool group) {
-    klog_fmt("CPU64: %s syscall, status=%lld",
-             group ? "exit_group" : "exit", (long long)status);
+    if (cpu->thread && cpu->thread->process) {
+        KProcess* p = cpu->thread->process.get();
+        klog_fmt("CPU64: %s syscall, status=%lld  pid=%d exe='%s'",
+                 group ? "exit_group" : "exit", (long long)status,
+                 (int)p->id, p->exe.c_str());
+    } else {
+        klog_fmt("CPU64: %s syscall, status=%lld",
+                 group ? "exit_group" : "exit", (long long)status);
+    }
     // Stop this thread's run loop now, whatever else happens below.
     cpu->yield = true;
     if (cpu->thread && cpu->thread->process) {
@@ -2043,6 +2056,30 @@ void ksyscall64(CPU64* cpu) {
             // a1 = fd (ignored), a2 = struct statfs*
             ret = sys_statfs64_common(cpu, a2);
             break;
+        // Extended attributes: our guest FS has none. get*xattr -> -ENODATA
+        // ("attribute does not exist"), the answer Linux gives for a file with
+        // no xattrs — this is what wine's ntdll probes for and tolerates. The
+        // set*/list*/remove* variants likewise report "unsupported/empty".
+        // Without these, wine64 startup tripped the unimplemented-syscall path
+        // (#191 getxattr) during prefix/service bring-up.
+        case 191: // getxattr
+        case 192: // lgetxattr
+        case 193: // fgetxattr
+            ret = (U64)-K_ENODATA;
+            break;
+        case 194: // listxattr
+        case 195: // llistxattr
+        case 196: // flistxattr
+            ret = 0; // empty attribute list
+            break;
+        case 188: // setxattr
+        case 189: // lsetxattr
+        case 190: // fsetxattr
+        case 197: // removexattr
+        case 198: // lremovexattr
+        case 199: // fremovexattr
+            ret = (U64)-K_ENOTSUP;
+            break;
         case X64_SYS_lseek:
             ret = sys_lseek64(cpu, a1, a2, a3);
             break;
@@ -2222,13 +2259,26 @@ void ksyscall64(CPU64* cpu) {
             if (!s32) { ret = (U64)-K_EFAULT; break; }
             ret = (U64)(S64)(S32)kconnect(cpu->thread, (U32)a1, s32, (U32)a3);
             if (getenv("BW64_SCDUMP")) {
-                // sockaddr_un: family@0 (2), sun_path@2. Log AF_UNIX paths so we
-                // can see wine's X11 socket connect (/tmp/.X11-unix/X0).
+                // sockaddr_un: family@0 (2), sun_path@2. sockaddr_in: family@0,
+                // port@2 (BE u16), addr@4 (BE u32). Decode both so we can tell a
+                // unix X11 connect (/tmp/.X11-unix/X0) from a TCP X connect
+                // (port 6000+display) from plain DNS.
                 U16 fam = cpu->memory->readw(a2);
-                char sun[110] = {0};
-                if (fam == 1 /*AF_UNIX*/) cpu->memory->memcpyFromGuest(sun, a2 + 2, sizeof(sun) - 1);
-                klog_fmt("sys_connect64: fd=%d family=%d path='%s' -> %d",
-                         (int)a1, (int)fam, (fam == 1 ? sun : "(non-unix)"), (int)(S32)ret);
+                char detail[128] = {0};
+                if (fam == 1 /*AF_UNIX*/) {
+                    cpu->memory->memcpyFromGuest(detail, a2 + 2, sizeof(detail) - 1);
+                } else if (fam == 2 /*AF_INET*/) {
+                    U16 portBE = cpu->memory->readw(a2 + 2);
+                    U32 ipBE   = cpu->memory->readd(a2 + 4);
+                    U16 port = (U16)((portBE >> 8) | (portBE << 8));
+                    snprintf(detail, sizeof(detail), "%u.%u.%u.%u:%u",
+                             (ipBE) & 0xff, (ipBE >> 8) & 0xff,
+                             (ipBE >> 16) & 0xff, (ipBE >> 24) & 0xff, port);
+                } else {
+                    snprintf(detail, sizeof(detail), "(family %d)", (int)fam);
+                }
+                klog_fmt("sys_connect64: fd=%d family=%d %s -> %d",
+                         (int)a1, (int)fam, detail, (int)(S32)ret);
             }
             break;
         }
