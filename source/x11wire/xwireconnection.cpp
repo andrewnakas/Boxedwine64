@@ -26,6 +26,63 @@
 // no-op and the wire server runs exactly as before.
 XWirePresentSink* g_xwirePresentSink = nullptr;
 
+// US-layout keysyms for the X keycodes our SDL->X mapping emits (evdev code + 8,
+// see sdlScancodeToX11). GetKeyboardMapping must return REAL keysyms or winex11
+// builds an all-NoSymbol keymap and typed keys produce no characters. Two
+// keysyms per keycode: { unshifted, shifted }. Indexed by keycode (8..); 0 =
+// NoSymbol. Latin-1 letter keysyms == their ASCII codes; X special keys use the
+// 0xFFxx range. Covers the standard typing + editing set.
+struct KeyPair { uint32_t lo, hi; };
+static KeyPair keysymForKeycode(int kc) {
+    switch (kc) {
+        case 9:  return {0xFF1B, 0xFF1B};                 // Escape
+        case 10: return {'1','!'};  case 11: return {'2','@'};
+        case 12: return {'3','#'};  case 13: return {'4','$'};
+        case 14: return {'5','%'};  case 15: return {'6','^'};
+        case 16: return {'7','&'};  case 17: return {'8','*'};
+        case 18: return {'9','('};  case 19: return {'0',')'};
+        case 20: return {'-','_'};  case 21: return {'=','+'};
+        case 22: return {0xFF08, 0xFF08};                 // BackSpace
+        case 23: return {0xFF09, 0xFF09};                 // Tab
+        case 24: return {'q','Q'};  case 25: return {'w','W'};
+        case 26: return {'e','E'};  case 27: return {'r','R'};
+        case 28: return {'t','T'};  case 29: return {'y','Y'};
+        case 30: return {'u','U'};  case 31: return {'i','I'};
+        case 32: return {'o','O'};  case 33: return {'p','P'};
+        case 34: return {'[','{'};  case 35: return {']','}'};
+        case 36: return {0xFF0D, 0xFF0D};                 // Return
+        case 37: return {0xFFE3, 0xFFE3};                 // Control_L
+        case 38: return {'a','A'};  case 39: return {'s','S'};
+        case 40: return {'d','D'};  case 41: return {'f','F'};
+        case 42: return {'g','G'};  case 43: return {'h','H'};
+        case 44: return {'j','J'};  case 45: return {'k','K'};
+        case 46: return {'l','L'};  case 47: return {';',':'};
+        case 48: return {'\'','"'}; case 49: return {'`','~'};
+        case 50: return {0xFFE1, 0xFFE1};                 // Shift_L
+        case 51: return {'\\','|'};
+        case 52: return {'z','Z'};  case 53: return {'x','X'};
+        case 54: return {'c','C'};  case 55: return {'v','V'};
+        case 56: return {'b','B'};  case 57: return {'n','N'};
+        case 58: return {'m','M'};  case 59: return {',','<'};
+        case 60: return {'.','>'};  case 61: return {'/','?'};
+        case 62: return {0xFFE2, 0xFFE2};                 // Shift_R
+        case 64: return {0xFFE9, 0xFFE9};                 // Alt_L
+        case 65: return {' ',' '};                        // space
+        case 105:return {0xFFE4, 0xFFE4};                 // Control_R
+        case 110:return {0xFF50, 0xFF50};                 // Home
+        case 111:return {0xFF52, 0xFF52};                 // Up
+        case 112:return {0xFF55, 0xFF55};                 // Prior (PgUp)
+        case 113:return {0xFF51, 0xFF51};                 // Left
+        case 114:return {0xFF53, 0xFF53};                 // Right
+        case 115:return {0xFF57, 0xFF57};                 // End
+        case 116:return {0xFF54, 0xFF54};                 // Down
+        case 117:return {0xFF56, 0xFF56};                 // Next (PgDn)
+        case 118:return {0xFF63, 0xFF63};                 // Insert
+        case 119:return {0xFFFF, 0xFFFF};                 // Delete
+        default: return {0, 0};
+    }
+}
+
 // ---------------------------------------------------------------------------
 // X11 protocol constants (subset). Little-endian assumed for our replies; we
 // only support a little-endian client (libX11 on x86-64 sends 'l' = 0x6c).
@@ -611,10 +668,9 @@ void XWireConnection::processOneRequest(const uint8_t* req, uint32_t len) {
             // this during init to build its keymap; a real layout isn't needed
             // to bring up a window, so report n=1 and NoSymbol (0) for every
             // requested keycode — enough to satisfy the round-trip.
-            uint8_t first = req[4];   // (unused, but documents the request shape)
-            (void)first;
-            uint8_t count = req[5];
-            const uint8_t n = 1;      // keysyms per keycode
+            uint8_t first = req[4];   // first keycode requested
+            uint8_t count = req[5];   // number of keycodes
+            const uint8_t n = 2;      // keysyms per keycode: {unshifted, shifted}
             uint32_t syms = (uint32_t)count * n;
             // Fixed 32-byte reply header + syms*4 bytes of keysym data.
             std::vector<uint8_t> r(32 + (size_t)syms * 4, 0);
@@ -624,15 +680,22 @@ void XWireConnection::processOneRequest(const uint8_t* req, uint32_t len) {
             r[3] = (uint8_t)(sequence >> 8);
             uint32_t replyLen = syms; // length in 4-byte units = syms*4/4
             memcpy(r.data() + 4, &replyLen, 4);
-            // keysym values left as 0 (NoSymbol).
+            // Fill REAL US-layout keysyms so winex11's keymap maps keys to chars.
+            for (uint32_t i = 0; i < count; i++) {
+                KeyPair kp = keysymForKeycode((int)first + (int)i);
+                uint32_t off = 32 + i * n * 4;
+                memcpy(r.data() + off,     &kp.lo, 4);
+                memcpy(r.data() + off + 4, &kp.hi, 4);
+            }
             writeToClient(r.data(), (uint32_t)r.size());
             break;
         }
         case X_GetModifierMapping: {
             // GetModifierMapping reply: keycodes-per-modifier (n) in r[1], then
-            // 8*n keycodes (8 modifiers). Report n=0 (no modifiers bound) — the
-            // round-trip completes and winex11 proceeds with an empty modmap.
-            const uint8_t n = 0;
+            // 8*n keycodes for the 8 modifiers in order: Shift, Lock, Control,
+            // Mod1(Alt), Mod2..Mod5. Bind real keycodes so winex11 knows which
+            // keys are Shift/Ctrl/Alt — without this, Shift+key gives no capital.
+            const uint8_t n = 2;      // keycodes per modifier
             uint32_t bytes = (uint32_t)8 * n;
             std::vector<uint8_t> r(32 + bytes, 0);
             r[0] = 1;                 // reply
@@ -641,6 +704,11 @@ void XWireConnection::processOneRequest(const uint8_t* req, uint32_t len) {
             r[3] = (uint8_t)(sequence >> 8);
             uint32_t replyLen = (uint32_t)2 * n; // 4-byte units
             memcpy(r.data() + 4, &replyLen, 4);
+            uint8_t* k = r.data() + 32;
+            k[0*n + 0] = 50; k[0*n + 1] = 62;   // Shift: Shift_L, Shift_R
+            // Lock (index 1): none
+            k[2*n + 0] = 37; k[2*n + 1] = 105;  // Control: Control_L, Control_R
+            k[3*n + 0] = 64;                     // Mod1 (Alt): Alt_L
             writeToClient(r.data(), (uint32_t)r.size());
             break;
         }
