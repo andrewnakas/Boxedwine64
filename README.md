@@ -2,20 +2,27 @@
 
 **Boxedwine64** is a fork of [Boxedwine](https://github.com/danoon2/Boxedwine) that adds x86\_64 guest support so it can run 64-bit Wine (`wine64`) and 64-bit Linux ELF binaries. Boxedwine itself is a userland emulator: it implements an x86 CPU and a fake Linux kernel, then runs Wine on top of that so Windows applications execute without a real Linux host.
 
-This fork is a **work in progress**, but a substantial one: real Debian `wine64` and `wineserver64` now run headless, communicating over a working AF\_UNIX/epoll IPC channel. The 32-bit code path remains fully functional and unchanged. The 64-bit code path is gated behind `BOXEDWINE_GUEST_X64` and was built out entirely by running real binaries and implementing each opcode/syscall they touch.
+This fork is a **work in progress**, but a substantial one: real Debian `wine64` now boots a Windows program (`notepad.exe`) all the way to a **visible, rendered GUI window** on macOS arm64, driving real `wineserver64`, `winex11`, FreeType/fontconfig text, and an in-process X11 wire server. The 32-bit code path remains fully functional and unchanged. The 64-bit code path is gated behind `BOXEDWINE_GUEST_X64` and was built out entirely by running real binaries and implementing each opcode/syscall they touch.
 
 > Boxedwine is released under the GNU General Public License v2 (GPL). Original upstream by danoon2 — see [github.com/danoon2/Boxedwine](https://github.com/danoon2/Boxedwine).
 
 ---
 
-## Current state (May 2026)
+## Current state (June 2026)
 
-**Real Debian `wine64` boots headless on macOS arm64, and the full
-`wine64`↔`wineserver` IPC handshake works end to end.** `wine64 wineboot --init`
-now runs **~4000 syscalls across two real processes** (the `wine64` client and a
-forked `wineserver64`) with **zero unimplemented syscalls and no protocol
-errors**, completing the entire Unix-side prefix bring-up and reaching the point
-where it launches the Windows-side `C:\windows\system32\wineboot.exe`.
+**`wine64 notepad.exe` now renders a real, visible GUI window on macOS arm64.**
+The full Windows-PE + X11 path is up: real Debian `wine64` boots the entire
+`wineboot → services.exe → winex11` chain, connects to an in-process X11 wire
+server, and **paints a live notepad window** (hundreds of `PutImage`/GDI
+draw requests per frame, FreeType-rendered text, an animated caret). The
+`wine64`↔`wineserver` IPC handshake, the NT-syscall dispatch, real PE image
+loading, and the X11 wire protocol all work end to end. Keyboard/mouse input
+is the remaining gap (rendering and the full boot are done).
+
+Headless, the same stack runs `wine64 wineboot --init` through **~4000 syscalls
+across the full process tree** (client, `wineserver64`, `services.exe`,
+`winex11`, …) with **zero unimplemented syscalls and no heap corruption**,
+populating a real win64 prefix.
 
 The 64-bit guest path can:
 
@@ -25,12 +32,20 @@ The 64-bit guest path can:
 - **Real `fork()`** (non-thread `clone` → new process with a deep-copied address space) + **64-bit `execve`** + **`wait4`** reaping — the basis for `wine64` spawning `wineserver`
 - A full **AF\_UNIX socket + epoll IPC surface**: `socket`/`socketpair`/`bind`/`connect`/`listen`/`accept`/`shutdown`/`setsockopt`, `epoll_create`/`ctl`/`wait`, `pipe`/`pipe2`, and **`sendmsg`/`recvmsg` with full 64-bit `msghdr`/`iovec`/`cmsghdr` marshaling and `SCM_RIGHTS` fd-passing** (the wineserver request/reply protocol)
 - Dispatch 90+ syscalls total (the above plus write/read/open/openat/close/stat/fstat/newfstatat/mmap/mprotect/munmap/brk/dup/fcntl/chdir/fchdir/mkdir/symlink/unlink/pread64/pwrite64/ftruncate/getdents64/rt\_sig\*/sigaltstack/sched\_get\|setaffinity/exit\_group/arch\_prctl/uname/getrandom/prlimit64/set\_tid\_address/umask/setsid/…)
-- Run the 64-bit self-test harness — **229/229 PASS**
+- Run the 64-bit self-test harness — **234/234 PASS**
 
 ### What works end-to-end
 
+- **`wine64 notepad.exe`** → boots the full `wineboot → services.exe → winex11`
+  chain and **renders a visible notepad window** on macOS: real PE image
+  loading, NT-syscall dispatch, an in-process X11 wire server, FreeType +
+  fontconfig text, and the GDI draw path (`CreateGC`/`PolyFillRectangle`/
+  `CopyArea`/`PutImage`). Run **without** `-novideo` to get the host window.
 - **`wine64 --version`** → `wine-8.0 (Debian 8.0~repack-4)`, exit 0, headless
-- **`wine64 wineboot --init`** → forks `wineserver64`; wineserver binds/listens its socket, accepts the client, loads NLS locales, creates and populates its registry/config files, runs its epoll main loop; the client connects and completes the full request/reply handshake; all processes exit cleanly. Stops only at the (absent) Windows-side `wineboot.exe` — see below.
+- **`wine64 wineboot --init`** → forks `wineserver64`; wineserver binds/listens
+  its socket, accepts the client, loads NLS locales, creates and **populates** a
+  real win64 registry/prefix, runs its epoll main loop; all processes exit
+  cleanly with no heap corruption.
 - **Dynamic glibc programs from a 64-bit rootfs**: `hello_glibc`, busybox `ls -la /` (dynamic `getdents64`), GNU `ls` across 3 versioned DSOs
 - **Threading probes**: `clone`+futex join, a 4-thread atomic/mutex probe (`mt_probe`), `pthread_join` wakeup — all deterministic PASS
 - The static-PIE smoke suite (`tools/x64test/run-static-elf-suite.sh`) — **7/7 PASS** on `zig cc`-built musl binaries (hello, sum, sieve, fib25, qsort, strops, hash)
@@ -38,10 +53,12 @@ The 64-bit guest path can:
 
 ### What does not work yet
 
-- **No Windows program output yet** — the Unix-side `wine64` + `wineserver` stack is fully functional, but the test rootfs ships only Wine's *Unix* libraries, not the *Windows* PE files. `wineboot` reaches `C:\windows\system32\wineboot.exe` and gets ENOENT because system32 is empty. This is a **rootfs-content** matter (populate the prefix with Wine's bundled `x86_64-windows` DLLs/exes), **not** an emulation gap.
-- **No GUI / X server path for 64-bit yet** — headless only (Milestone E)
+- **No keyboard/mouse input yet** — the window renders and the boot completes,
+  but SDL key/mouse events aren't yet delivered as X11 input events to the
+  guest. This is the active frontier (the only thing between here and an
+  interactive notepad).
 - **No 64-bit JIT** — interpreter only (by design; v1 ships interpreter-only)
-- **No WASM `MEMORY64=2` build target yet** — Milestone F
+- **No WASM `MEMORY64=2` build target yet**
 
 ---
 
