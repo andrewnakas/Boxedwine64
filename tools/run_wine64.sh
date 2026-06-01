@@ -31,6 +31,18 @@ fi
 GUEST_PE="${1:-/usr/lib/x86_64-linux-gnu/wine/x86_64-windows/notepad.exe}"
 shift || true
 
+# The guest rootfs is a WRITABLE native overlay, so a crashed/incomplete run
+# leaves wineserver's O_EXCL registry temp files (regf*.tmp) and per-boot
+# server-1-XXX socket dirs behind. On the next launch wineserver's temp-create
+# loops forever on EEXIST and eventually corrupts its own heap ("malloc():
+# unsorted double linked list corrupted"), which kills the GUI bring-up before
+# winex11 loads. Wipe that transient state so every run starts from the clean
+# committed prefix.
+PREFIX="$BASE_ROOT/home/username/.wine"
+rm -f "$PREFIX"/regf*.tmp "$PREFIX/.update-timestamp" 2>/dev/null || true
+find "$BASE_ROOT/run/user/1000/wine" -maxdepth 1 -name 'server-1-*' \
+    ! -name 'server-1-4ee' -exec rm -rf {} + 2>/dev/null || true
+
 echo "using:   $BOX"
 echo "glibc:   $GLIBC_ZIP"
 echo "wine:    $WINE_ZIP"
