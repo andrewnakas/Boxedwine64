@@ -1809,11 +1809,41 @@ void ksyscall64(CPU64* cpu) {
             ret = sys_sigaltstack64(cpu, a1, a2);
             break;
         case X64_SYS_set_robust_list:
-        case X64_SYS_ioctl:
         case X64_SYS_madvise:
             // ld-linux makes these calls before main; safe to no-op.
             ret = 0;
             break;
+        case X64_SYS_ioctl: {
+            // ioctl(fd, request, arg). The old blanket no-op (return 0) made
+            // wine believe a device-type probe on a regular file SUCCEEDED, so
+            // it spun forever re-issuing ioctl(0x82307201) on the PE exe it had
+            // just opened. But routing blindly to kobject->ioctl is also wrong:
+            // the tty/console ioctls (TCGETS, FIONREAD, VT_*, ...) write their
+            // result struct back through thread->memory (the 32-bit KMemory),
+            // so for a 64-bit guest they scribble the wrong address and fault.
+            //
+            // For a 64-bit guest the correct, safe answers here are:
+            //  - FIONBIO (0x5421): set/clear non-blocking — route to the kobject
+            //    via fcntl semantics; the arg is a single int we read ourselves.
+            //  - FIONREAD (0x541B): bytes available — we don't track it; report 0.
+            //  - everything else (TCGETS device probes, the 0x82307201 query,
+            //    KDSKBMUTE, ...): -ENOTTY, which is what a real kernel returns
+            //    for a regular file / non-tty and what wine's fallback expects.
+            if (!cpu->thread || !cpu->thread->process) { ret = (U64)-K_ENOSYS; break; }
+            U32 cmd = (U32)a2;
+            if (cmd == 0x5421) { // FIONBIO: arg = int* (0=blocking, !=0 nonblocking)
+                U32 on = a3 ? cpu->memory->readd(a3) : 0;
+                cpu->thread->process->fcntrl(cpu->thread, (FD)(S32)a1, K_F_SETFL,
+                                             on ? K_O_NONBLOCK : 0);
+                ret = 0;
+            } else if (cmd == 0x541B) { // FIONREAD: report 0 bytes pending
+                if (a3) cpu->memory->writed(a3, 0);
+                ret = 0;
+            } else {
+                ret = (U64)-K_ENOTTY;
+            }
+            break;
+        }
         case X64_SYS_chdir: {
             // chdir(path) — MUST be real: wine chdir's into its WINEPREFIX and
             // then stats "." to validate it. A no-op left cwd at the (missing)
