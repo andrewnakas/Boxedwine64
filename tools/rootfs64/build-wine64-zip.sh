@@ -104,7 +104,13 @@ mkdir -p "$STAGE/root"
 # fails ENOENT (no parent) and wineserver setup aborts. Ship them in the zip so
 # the parent node always exists; the kernel overlays the writable native root
 # on top for the actual file creation.
-mkdir -p "$STAGE/tmp" "$STAGE/run/user/1000" "$STAGE/home" "$STAGE/var/tmp"
+# HOME defaults to /home/username (the writable-prefix path the kernel's
+# getMode() allows); it must exist so wine can create $HOME/.wine and the
+# dosdevices/c: symlink (under /winePrefix those symlinks fail EACCES).
+mkdir -p "$STAGE/tmp" "$STAGE/run/user/1000" "$STAGE/home/username" "$STAGE/var/tmp"
+# /etc/localtime: wine queries it on every time op; ship a UTC symlink so it
+# resolves cleanly instead of spamming ENOENT (wine falls back to UTC anyway).
+ln -sf /usr/share/zoneinfo/UTC "$STAGE/etc/localtime" 2>/dev/null || true
 
 echo "--- staged tree ready ---"
 du -sh "$STAGE"
