@@ -57,6 +57,8 @@ namespace {
         X_CreateColormap        = 78,
         X_QueryColors           = 91,
         X_QueryBestSize         = 97,
+        X_GetKeyboardMapping    = 101,
+        X_GetModifierMapping    = 119,
         X_NoOperation           = 127,
     };
 
@@ -107,7 +109,7 @@ void XWireConnection::writeToClient(const void* data, uint32_t len) {
 
 void XWireConnection::flushReplies() {
     if (out.empty()) return;
-    std::shared_ptr<KUnixSocketObject> peer = serverPeer.lock();
+    const std::shared_ptr<XWireServerSocket>& peer = serverPeer;
     if (peer) {
         // writeNative on the server peer lands the bytes in the *client's*
         // recvBuffer and signals its read/poll condition — exactly the wakeup
@@ -487,6 +489,45 @@ void XWireConnection::processOneRequest(const uint8_t* req, uint32_t len) {
             writeToClient(r, sizeof(r));
             break;
         }
+        case X_GetKeyboardMapping: {
+            // GetKeyboardMapping(first-keycode, count). Reply carries
+            // keysyms-per-keycode (n) and count*n keysym values. winex11 calls
+            // this during init to build its keymap; a real layout isn't needed
+            // to bring up a window, so report n=1 and NoSymbol (0) for every
+            // requested keycode — enough to satisfy the round-trip.
+            uint8_t first = req[4];   // (unused, but documents the request shape)
+            (void)first;
+            uint8_t count = req[5];
+            const uint8_t n = 1;      // keysyms per keycode
+            uint32_t syms = (uint32_t)count * n;
+            // Fixed 32-byte reply header + syms*4 bytes of keysym data.
+            std::vector<uint8_t> r(32 + (size_t)syms * 4, 0);
+            r[0] = 1;                 // reply
+            r[1] = n;                 // keysyms-per-keycode
+            r[2] = (uint8_t)(sequence & 0xff);
+            r[3] = (uint8_t)(sequence >> 8);
+            uint32_t replyLen = syms; // length in 4-byte units = syms*4/4
+            memcpy(r.data() + 4, &replyLen, 4);
+            // keysym values left as 0 (NoSymbol).
+            writeToClient(r.data(), (uint32_t)r.size());
+            break;
+        }
+        case X_GetModifierMapping: {
+            // GetModifierMapping reply: keycodes-per-modifier (n) in r[1], then
+            // 8*n keycodes (8 modifiers). Report n=0 (no modifiers bound) — the
+            // round-trip completes and winex11 proceeds with an empty modmap.
+            const uint8_t n = 0;
+            uint32_t bytes = (uint32_t)8 * n;
+            std::vector<uint8_t> r(32 + bytes, 0);
+            r[0] = 1;                 // reply
+            r[1] = n;                 // keycodes-per-modifier
+            r[2] = (uint8_t)(sequence & 0xff);
+            r[3] = (uint8_t)(sequence >> 8);
+            uint32_t replyLen = (uint32_t)2 * n; // 4-byte units
+            memcpy(r.data() + 4, &replyLen, 4);
+            writeToClient(r.data(), (uint32_t)r.size());
+            break;
+        }
         default:
             // Unknown request. If it expects a reply we'd hang libX11; but most
             // unknown ones here are reply-less. Log so the discovery loop sees
@@ -498,7 +539,7 @@ void XWireConnection::processOneRequest(const uint8_t* req, uint32_t len) {
 }
 
 void XWireConnection::onData() {
-    std::shared_ptr<XWireServerSocket> peer = serverPeer.lock();
+    const std::shared_ptr<XWireServerSocket>& peer = serverPeer;
     if (!peer) return;
 
     // Drain everything currently buffered into our assembly buffer.

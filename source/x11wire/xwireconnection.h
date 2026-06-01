@@ -101,7 +101,15 @@ private:
     uint16_t screenHeight = 768;
 
     std::weak_ptr<KUnixSocketObject> client;
-    std::weak_ptr<XWireServerSocket> serverPeer;
+    // STRONG ref: nothing else keeps the server-side peer alive. The guest's
+    // client socket only holds it through a weak connection ptr, and
+    // serverPeer->owner is weak. If this were weak too, the XWireServerSocket
+    // would be destroyed the instant acceptConnection() returned, leaving the
+    // guest's X socket with an expired peer (not writable, no parser) — winex11
+    // then polls, sees no peer, and shutdown()+close()s the display. The
+    // XWireServer::connections vector keeps the XWireConnection (and thus this
+    // peer) alive for the lifetime of the connection.
+    std::shared_ptr<XWireServerSocket> serverPeer;
 
     uint32_t internAtom(const std::string& name, bool onlyIfExists);
     void processOneRequest(const uint8_t* req, uint32_t len);
