@@ -2,7 +2,7 @@
 
 **Boxedwine64** is a fork of [Boxedwine](https://github.com/danoon2/Boxedwine) that adds x86\_64 guest support so it can run 64-bit Wine (`wine64`) and 64-bit Linux ELF binaries. Boxedwine itself is a userland emulator: it implements an x86 CPU and a fake Linux kernel, then runs Wine on top of that so Windows applications execute without a real Linux host.
 
-This fork is a **work in progress**. The 32-bit code path remains fully functional and unchanged. The 64-bit code path is gated behind `BOXEDWINE_GUEST_X64` and is iteratively being built out via real ELF execution.
+This fork is a **work in progress**, but a substantial one: real Debian `wine64` and `wineserver64` now run headless, communicating over a working AF\_UNIX/epoll IPC channel. The 32-bit code path remains fully functional and unchanged. The 64-bit code path is gated behind `BOXEDWINE_GUEST_X64` and was built out entirely by running real binaries and implementing each opcode/syscall they touch.
 
 > Boxedwine is released under the GNU General Public License v2 (GPL). Original upstream by danoon2 — see [github.com/danoon2/Boxedwine](https://github.com/danoon2/Boxedwine).
 
@@ -10,40 +10,37 @@ This fork is a **work in progress**. The 32-bit code path remains fully function
 
 ## Current state (May 2026)
 
+**Real Debian `wine64` boots headless on macOS arm64, and the full
+`wine64`↔`wineserver` IPC handshake works end to end.** `wine64 wineboot --init`
+now runs **~4000 syscalls across two real processes** (the `wine64` client and a
+forked `wineserver64`) with **zero unimplemented syscalls and no protocol
+errors**, completing the entire Unix-side prefix bring-up and reaching the point
+where it launches the Windows-side `C:\windows\system32\wineboot.exe`.
+
 The 64-bit guest path can:
 
-- Decode and execute a large fraction of x86\_64 user-mode ISA (general-purpose, SSE2 packed + scalar FP, most of x87, CMOV, multi-byte NOP, XGETBV, RDTSCP, BT family, REP string ops, PSHUFB, PALIGNR)
-- Load static-PIE ELFs produced by `zig cc -target x86_64-linux-musl -static` and step them through to `exit_group` end-to-end
-- Apply R\_X86\_64\_JUMP\_SLOT relocations eagerly across a synthesized DT\_NEEDED graph (verified via the in-tree end-to-end PLT self-test)
-- Dispatch 50+ syscalls (write/read/open/openat/close/stat/fstat/mmap/mprotect/munmap/brk/dup/fcntl/sigaltstack/futex(real bookkeeping)/sched\_yield/clock\_getres/clock\_nanosleep/rt\_sigaction/rt\_sigreturn/rt\_sigprocmask/rt\_sigtimedwait/rt\_sigsuspend/rt\_sigpending/pause/wait4/getitimer/statfs/sched\_getaffinity/exit\_group/arch\_prctl/uname/getrandom/prlimit64/set\_tid\_address/…)
-- Surface Wine64 rootfs zips in the UI launcher (label suffix `(Wine64)`) when `x86_64-linux-gnu/`, `x86_64-unix/`, `x86_64-windows/`, or `/lib64/` paths are detected in the central directory
-- Run the 64-bit self-test harness — **210/210 PASS** at last measurement
+- Decode and execute a large fraction of the x86\_64 user-mode ISA (general-purpose, SSE2 packed + scalar FP, most of x87, CMOV, multi-byte NOP, XGETBV, RDTSCP, BT family, REP string ops, PSHUFB, PALIGNR, segment-register MOV, atomic RMW: XCHG/CMPXCHG/XADD/LOCK-prefixed ALU)
+- Load and run **real dynamically-linked glibc 2.36 ELF64 binaries** from a 64-bit rootfs — full PT\_DYNAMIC walk, versioned-symbol (Verneed) resolution across multiple DSOs, lazy PLT/GOT resolution, IFUNC, TLS
+- Run **real x86\_64 threads**: `clone`/`clone3`, real `futex` WAIT/WAKE, per-thread CPU state, `pthread_create`/`pthread_join` — each guest thread on its own host thread, with sharded per-address atomic locks so glibc mutexes are correct under contention
+- **Real `fork()`** (non-thread `clone` → new process with a deep-copied address space) + **64-bit `execve`** + **`wait4`** reaping — the basis for `wine64` spawning `wineserver`
+- A full **AF\_UNIX socket + epoll IPC surface**: `socket`/`socketpair`/`bind`/`connect`/`listen`/`accept`/`shutdown`/`setsockopt`, `epoll_create`/`ctl`/`wait`, `pipe`/`pipe2`, and **`sendmsg`/`recvmsg` with full 64-bit `msghdr`/`iovec`/`cmsghdr` marshaling and `SCM_RIGHTS` fd-passing** (the wineserver request/reply protocol)
+- Dispatch 90+ syscalls total (the above plus write/read/open/openat/close/stat/fstat/newfstatat/mmap/mprotect/munmap/brk/dup/fcntl/chdir/fchdir/mkdir/symlink/unlink/pread64/pwrite64/ftruncate/getdents64/rt\_sig\*/sigaltstack/sched\_get\|setaffinity/exit\_group/arch\_prctl/uname/getrandom/prlimit64/set\_tid\_address/umask/setsid/…)
+- Run the 64-bit self-test harness — **229/229 PASS**
 
 ### What works end-to-end
 
-The in-repo static-PIE smoke suite (`tools/x64test/run-static-elf-suite.sh`) currently runs **7/7 PASS** on `zig cc`-built musl binaries:
-
-- **hello** — `write(1,"hello\n",6); exit(0)`
-- **sum** — `for i in 1..100: s += i; return s` → exit status 5050
-- **sieve** — Sieve of Eratosthenes up to 1000 → exit status 168
-- **fib25** — recursive `fib(25)` → exit status 75025
-- **qsort** — in-place quicksort over 64 ints + verification
-- **strops** — `memcpy / memcmp / strlen` via REP MOVS/CMPS sequences
-- **hash** — open-addressed hash table, 100 inserts + 100 lookups
-
-Additional verified workloads:
-
-- `printf("%d %s %x %o\n", ...)` (integer/string/hex/octal formatting paths)
-- `malloc → strcpy → snprintf → strlen → strcat` chain end-to-end
-- **`fib(30)` recursively** — 832040 result in 29.4M instructions
-- The synthesized end-to-end PLT call test (in `cpu64SelfTest.cpp`) loads a separate shared library, resolves `R_X86_64_JUMP_SLOT` against an exported function, and the main executable correctly calls through the GOT to return 42
+- **`wine64 --version`** → `wine-8.0 (Debian 8.0~repack-4)`, exit 0, headless
+- **`wine64 wineboot --init`** → forks `wineserver64`; wineserver binds/listens its socket, accepts the client, loads NLS locales, creates and populates its registry/config files, runs its epoll main loop; the client connects and completes the full request/reply handshake; all processes exit cleanly. Stops only at the (absent) Windows-side `wineboot.exe` — see below.
+- **Dynamic glibc programs from a 64-bit rootfs**: `hello_glibc`, busybox `ls -la /` (dynamic `getdents64`), GNU `ls` across 3 versioned DSOs
+- **Threading probes**: `clone`+futex join, a 4-thread atomic/mutex probe (`mt_probe`), `pthread_join` wakeup — all deterministic PASS
+- The static-PIE smoke suite (`tools/x64test/run-static-elf-suite.sh`) — **7/7 PASS** on `zig cc`-built musl binaries (hello, sum, sieve, fib25, qsort, strops, hash)
+- The in-tree end-to-end PLT self-test: loads a separate shared library, resolves `R_X86_64_JUMP_SLOT` against an exported function, calls through the GOT to return 42
 
 ### What does not work yet
 
-- **No 64-bit JIT** — interpreter only (per design; v1 ships interpreter-only)
-- **No real wine64 execution** — blocked on Linux-only build artifacts (cross-compiled rootfs, `wine64` build) which cannot be produced on the current macOS arm64 build host without Docker
-- **No `clone(56)` implementation** — single-threaded only for now; needs KThread64 infrastructure
-- **No PT\_DYNAMIC parsing on the file-loading path** — synthesized in-memory DT\_NEEDED works; loading `libc.so.6` from a real rootfs is blocked on (a) above
+- **No Windows program output yet** — the Unix-side `wine64` + `wineserver` stack is fully functional, but the test rootfs ships only Wine's *Unix* libraries, not the *Windows* PE files. `wineboot` reaches `C:\windows\system32\wineboot.exe` and gets ENOENT because system32 is empty. This is a **rootfs-content** matter (populate the prefix with Wine's bundled `x86_64-windows` DLLs/exes), **not** an emulation gap.
+- **No GUI / X server path for 64-bit yet** — headless only (Milestone E)
+- **No 64-bit JIT** — interpreter only (by design; v1 ships interpreter-only)
 - **No WASM `MEMORY64=2` build target yet** — Milestone F
 
 ---
@@ -54,14 +51,17 @@ This project drives the [`docs/PLAN_64BIT.md`](docs/PLAN_64BIT.md) §3.7–§3.1
 
 | Milestone | Goal | Status |
 |---|---|---|
-| **A — Dynamic linking** | PT\_DYNAMIC walk, R\_X86\_64\_\* relocations, DT\_NEEDED recursion, PT\_TLS | In-memory variant ✅ (selftest), file-loading variant ⏳ (blocked on rootfs) |
-| **B — Threading + signals** | `clone(56)`, real futex, real `rt_sigaction`/`rt_sigreturn`, signal frame builder | Signals + futex bookkeeping ✅, `clone(56)` ⏳ (needs KThread64) |
-| **C — Scalar FP + ISA gaps** | SSE2 scalar FP, x87 FPU minimal subset, BT family, XGETBV, RDTSCP, SSSE3 | ✅ Complete (210/210 selftest PASS) |
-| **D — Rootfs + Wine64 build** | `fszip` x86\_64 layout detect, `TinyCore16x64WineBase.zip`, `tools/buildWine/buildWine64.sh`, launcher hook | Detection + UI ✅, rootfs + Wine build ⏳ (Linux-host blocked) |
-| **E — Wine64 GUI + X server** | 64-bit pointer audit in `source/x11/*`, ioctl64 surface, MIT-SHM | ⏳ Not started |
-| **F — WASM memory64 + v1 polish** | Emscripten `MEMORY64=2`, slim wine64 package, lazy DLL fetch, browser tests | ⏳ Not started |
+| **A — Dynamic linking** | PT\_DYNAMIC walk, R\_X86\_64\_\* relocations, DT\_NEEDED recursion, versioned symbols, PT\_TLS | ✅ Complete — real glibc + multi-DSO programs run from a 64-bit rootfs |
+| **B — Threading + signals** | `clone`/`clone3`, real futex, `rt_sigaction`/`rt_sigreturn`, signal frames | ✅ Complete — `pthread_create`/`join`, per-thread CPU, sharded atomics |
+| **C — Scalar FP + ISA gaps** | SSE2 scalar FP, x87 subset, BT family, XGETBV, RDTSCP, SSSE3, atomic RMW | ✅ Complete (229/229 selftest PASS) |
+| **D — Rootfs + Wine64 build** | Build a real `wine64` rootfs (Docker), run it headless | ✅ Complete — `wine64 --version` → `wine-8.0`, headless |
+| **E — fork/exec + wineserver IPC** | real `fork`/`execve`/`wait4`, AF\_UNIX sockets, epoll, `sendmsg`/`recvmsg` + SCM\_RIGHTS | ✅ Complete — `wineboot --init` drives the full wine64↔wineserver handshake |
+| **F — Windows PE + GUI** | populate the prefix with Windows PE files, then the X server / GUI path | ⏳ Next — rootfs content, then Milestone-E-style GUI work |
+| **G — WASM memory64 + v1 polish** | Emscripten `MEMORY64=2`, slim wine64 package, lazy DLL fetch, browser tests | ⏳ Not started |
 
-See [`docs/MILESTONE_D_STATUS.md`](docs/MILESTONE_D_STATUS.md) for the detailed status of the Linux-host-blocked items.
+The commit log (`git log --oneline`) is the canonical, blow-by-blow record of the
+bring-up — each commit names the opcode or syscall and the real binary that
+uncovered it.
 
 ---
 
@@ -81,16 +81,39 @@ Run the self-test:
 ~/Library/Developer/Xcode/DerivedData/Boxedwine-*/Build/Products/Debug/Boxedwine.app/Contents/MacOS/Boxedwine --x64-selftest
 ```
 
-Run a static-PIE x86\_64 ELF (cross-compile with `zig cc -target x86_64-linux-musl -static -O2 hello.c -o hello`):
+Run a dynamically-linked glibc ELF64 from the 64-bit rootfs:
 
 ```sh
-~/Library/Developer/Xcode/DerivedData/Boxedwine-*/Build/Products/Debug/Boxedwine.app/Contents/MacOS/Boxedwine --x64-run-elf /tmp/hello
+BW=~/Library/Developer/Xcode/DerivedData/Boxedwine-*/Build/Products/Debug/Boxedwine.app/Contents/MacOS/Boxedwine
+"$BW" -novideo -root tools/rootfs64/root /bin/hello_glibc
 ```
 
-Run the full static-PIE smoke suite (requires `zig`):
+Run real `wine64` headless (the rootfs zips are built by
+`tools/rootfs64/build-wine64-zip.sh`, which needs Docker for the Debian amd64
+image):
 
 ```sh
-tools/x64test/run-static-elf-suite.sh
+D=tools/rootfs64/dist
+# version check
+"$BW" -novideo -env WINEDLLPATH=/usr/lib/x86_64-linux-gnu/wine \
+      -zip "$D/glibc-rootfs64.zip" -zip "$D/wine64.zip" \
+      /usr/lib/wine/wine64 --version            # -> wine-8.0
+
+# full prefix bring-up + wineserver handshake (set BW64_SYSTRACE=1 to trace syscalls)
+"$BW" -novideo -env HOME=/winePrefix -env WINEPREFIX=/winePrefix/.wine \
+      -env WINESERVER=/usr/lib/wine/wineserver64 \
+      -zip "$D/glibc-rootfs64.zip" -zip "$D/wine64.zip" \
+      /usr/lib/wine/wine64 wineboot --init
+```
+
+(Launch the real `wineserver64` ELF via `WINESERVER` — the guest VFS won't exec
+the `wineserver` wrapper shell-script.)
+
+Run a static-PIE x86\_64 ELF (cross-compile with `zig cc -target x86_64-linux-musl -static -O2 hello.c -o hello`) or the full smoke suite:
+
+```sh
+"$BW" --x64-run-elf /tmp/hello
+tools/x64test/run-static-elf-suite.sh          # requires zig
 ```
 
 For 32-bit builds and the original Wine flow, see the upstream [How-To-Build-Boxedwine.md](docs/How-To-Build-Boxedwine.md).
@@ -126,7 +149,6 @@ For 32-bit builds and the original Wine flow, see the upstream [How-To-Build-Box
 ## Documentation
 
 - [PLAN\_64BIT.md](docs/PLAN_64BIT.md) — the full 64-bit roadmap
-- [MILESTONE\_D\_STATUS.md](docs/MILESTONE_D_STATUS.md) — what's done vs. Linux-blocked
 - [Upcoming Features](docs/Roadmap-Features.md) (upstream)
 - [Troubleshooting Games/Apps](docs/Troubleshooting-Games-Apps.md) (upstream)
 - [Developer Debugging](docs/Developer-Debugging.md) (upstream)
@@ -144,6 +166,6 @@ The fastest way to move Boxedwine64 forward is the **real-binary discovery loop*
 3. When the tracer prints `unimpl opcode at RIP=… bytes=…`, look up the opcode in the Intel SDM and add a handler to `source/emulation/cpu/cpu64.cpp`
 4. When a syscall stub returns `-ENOSYS`, port the 32-bit implementation from `source/kernel/syscall.cpp` into `source/kernel/syscall64.cpp`
 5. Add a self-test entry in `source/emulation/cpu/cpu64SelfTest.cpp`
-6. Build, run selftest (must stay at 210/210), run the binary again, commit with the opcode bytes and the binary that uncovered them in the commit message
+6. Build, run selftest (must stay at 229/229), run the binary again, commit with the opcode bytes and the binary that uncovered them in the commit message
 
 The commit log is the canonical record of what musl/glibc actually touches during startup — every commit there has the form "cpu64: \<opcode\> — \<what discovered it\>".
