@@ -194,6 +194,38 @@ int runX64SelfTest() {
         });
     }
 
+    // IRETQ (48 CF). Wine's PE-side ntdll returns from its user-mode exception
+    // dispatcher with iretq. Build a long-mode interrupt frame on the stack
+    // (pushed high-to-low: SS, RSP, RFLAGS, CS, RIP) and execute iretq; it must
+    // jump to the frame's RIP, reload RSP, and restore RFLAGS. Each frame value
+    // is loaded with `movabs rax, imm64` (10 bytes: 48 B8 + 8) then `push rax`
+    // (1 byte: 50) — 11 bytes per entry, 5 entries = 55 bytes, then `48 CF`
+    // (iretq, 2 bytes). The target `mov rax, 0x42` therefore sits at offset 57.
+    {
+        const U64 newRsp = STACK_TOP - 0x40;
+        const U64 targetOff = 5 * 11 + 2; // after 5 pushes + iretq
+        auto movabsPush = [](std::vector<U8>& v, U64 imm) {
+            v.push_back(0x48); v.push_back(0xB8);
+            for (int i = 0; i < 8; i++) v.push_back((U8)((imm >> (8 * i)) & 0xFF));
+            v.push_back(0x50); // push rax
+        };
+        std::vector<U8> code;
+        movabsPush(code, 0x0000);                 // SS (popped & ignored)
+        movabsPush(code, newRsp);                 // RSP to install
+        movabsPush(code, 0x202);                  // RFLAGS (IF + reserved bit 1)
+        movabsPush(code, 0x0033);                 // CS (popped & ignored)
+        movabsPush(code, CODE_BASE + targetOff);  // RIP target
+        code.push_back(0x48); code.push_back(0xCF); // iretq
+        // target: mov rax, 0x42  (48 C7 C0 42 00 00 00)
+        code.push_back(0x48); code.push_back(0xC7); code.push_back(0xC0);
+        code.push_back(0x42); code.push_back(0x00); code.push_back(0x00); code.push_back(0x00);
+        runAndCheck(r, "iretq restores rip/rflags/rsp", withExit(code), [newRsp](CPU64& c) {
+            // withExit's `mov r15,rax` captures the target's RAX (0x42) and does
+            // not touch RSP, so RSP at exit is the value iretq installed.
+            return c.reg[X64_R15].u64 == 0x42 && c.reg[X64_RSP].u64 == newRsp;
+        });
+    }
+
     // Test 7: LEA RIP-relative.  lea rax, [rip+0]  → RAX = next-RIP.
     {
         std::vector<U8> code = {

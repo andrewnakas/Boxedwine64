@@ -15,6 +15,7 @@
 #include "cpu64.h"
 #include "kmemory64.h"
 #include "ksocket.h"
+#include "kpoll.h"
 
 // x86-64 Linux syscall numbers used here. The canonical table lives in
 // arch/x86/entry/syscalls/syscall_64.tbl in the Linux source; the values
@@ -27,6 +28,7 @@
 #define X64_SYS_fstat             5
 #define X64_SYS_lstat             6
 #define X64_SYS_poll              7
+#define X64_SYS_ppoll             271
 #define X64_SYS_lseek             8
 #define X64_SYS_mmap              9
 #define X64_SYS_mprotect          10
@@ -61,6 +63,9 @@
 #define X64_SYS_recvmsg           47
 #define X64_SYS_unlink            87
 #define X64_SYS_unlinkat          263
+#define X64_SYS_rename            82
+#define X64_SYS_renameat          264
+#define X64_SYS_renameat2         316
 #define X64_SYS_fchdir            81
 #define X64_SYS_ftruncate         77
 #define X64_SYS_umask             95
@@ -99,6 +104,15 @@
 #define X64_SYS_getdents64        217
 #define X64_SYS_tgkill            234
 #define X64_SYS_prlimit64         302
+#define X64_SYS_getrlimit         97
+#define X64_SYS_setrlimit         160
+#define X64_SYS_sched_getscheduler 145
+#define X64_SYS_sched_setscheduler 144
+#define X64_SYS_sched_getparam    143
+#define X64_SYS_mlockall          151
+#define X64_SYS_munlockall        152
+#define X64_SYS_mlock             149
+#define X64_SYS_munlock           150
 #define X64_SYS_getrandom         318
 #define X64_SYS_sched_yield       24
 #define X64_SYS_sched_setaffinity 203
@@ -460,7 +474,14 @@ static U64 sys_openat64(CPU64* cpu, U64 dirfd, U64 pathAddr, U64 flags, U64 /*mo
     U32 rc = process->openFile(process->currentDirectory, BString::copy(path),
                                (U32)flags, result);
     if ((S32)rc < 0) {
-        klog_fmt("sys_openat64: open('%s') -> %d", path, (int)(S32)rc);
+        if (getenv("BW64_SCDUMP")) {
+            BString full = Fs::getFullPath(process->currentDirectory, BString::copy(path));
+            klog_fmt("sys_openat64: open('%s') -> %d  [cwd='%s' full='%s' flags=0x%llx]",
+                     path, (int)(S32)rc, process->currentDirectory.c_str(), full.c_str(),
+                     (unsigned long long)flags);
+        } else {
+            klog_fmt("sys_openat64: open('%s') -> %d", path, (int)(S32)rc);
+        }
         return (U64)(S64)(S32)rc;
     }
     return (U64)result->handle;
@@ -1650,6 +1671,7 @@ static const char* x64SyscallName(U64 nr) {
         case 72: return "fcntl";
         case 79: return "getcwd";
         case 80: return "chdir";
+        case 82: return "rename";
         case 89: return "readlink";
         case 90: return "chmod";
         case 91: return "fchmod";
@@ -1660,6 +1682,8 @@ static const char* x64SyscallName(U64 nr) {
         case 105: return "setuid";
         case 106: return "setgid";
         case 201: return "time";
+        case 264: return "renameat";
+        case 316: return "renameat2";
         case 104: return "getgid";
         case 107: return "geteuid";
         case 108: return "getegid";
@@ -1834,18 +1858,60 @@ void ksyscall64(CPU64* cpu) {
             ret = a1;
             break;
         }
-        case X64_SYS_fcntl:
-            // Minimal F_GETFD/F_SETFD/F_GETFL/F_DUPFD handling for ld-linux.
-            // F_GETFD=1, F_SETFD=2, F_GETFL=3, F_SETFL=4, F_DUPFD=0,
-            // F_DUPFD_CLOEXEC=1030. Returning 0 for the get-ops claims "no
-            // flags set, no CLOEXEC", which matches our reality.
-            if (a2 == 0 || a2 == 1030) { // F_DUPFD / F_DUPFD_CLOEXEC
-                U32 newFd = cpu->thread->process->dup((U32)a1);
-                ret = (S32)newFd < 0 ? (U64)(S64)(S32)newFd : (U64)newFd;
-            } else {
-                ret = 0;
+        case X64_SYS_fcntl: {
+            // fcntl(fd, cmd, arg). Route to the width-agnostic KProcess::fcntrl,
+            // which returns the *real* per-fd state — crucially F_GETFL must
+            // report the fd's actual access mode (O_RDONLY/WRONLY/RDWR). The
+            // old stub returned 0 (== O_RDONLY) for every get, which made
+            // glibc's fdopen(fd, "w") fail with EINVAL when wineserver wrote
+            // its registry temp file (O_WRONLY) — that was the "could not save
+            // registry branch ... Invalid argument" abort.
+            //
+            // The lock commands (F_GETLK/F_SETLK/F_SETLKW) take a `struct flock*`
+            // in `arg`; fcntrl reads/writes it through thread->memory (the 32-bit
+            // KMemory), but for a 64-bit guest the struct lives in cpu->memory
+            // (KMemory64). So for those we bounce the flock through the 32-bit
+            // scratch and use the 64-bit cmd variant (readFileLock(is64=true)
+            // layout: l_type@0 w, l_whence@2 w, l_start@4 q, l_len@12 q,
+            // l_pid@20 d — 24 bytes). wineserver F_SETLKs its registry/lock
+            // files; without this it page-faulted reading the lock arg from the
+            // empty 32-bit memory.
+            if (!cpu->thread || !cpu->thread->process || !cpu->thread->memory) {
+                ret = (U64)-K_ENOSYS; break;
+            }
+            U32 cmd = (U32)a2;
+            bool isLock = (cmd == K_F_GETLK || cmd == K_F_SETLK || cmd == K_F_SETLKW ||
+                           cmd == K_F_GETLK64 || cmd == K_F_SETLK64 || cmd == K_F_SETLKW64);
+            if (!isLock) {
+                ret = (U64)(S64)(S32)cpu->thread->process->fcntrl(
+                    cpu->thread, (FD)(S32)a1, cmd, (U32)a3);
+                break;
+            }
+            // Lock command: marshal the 24-byte 64-bit flock into scratch.
+            const U32 FLOCK64_BYTES = 24;
+            U32 scratch = bounceSockaddrTo32(cpu, 0, 0, nullptr);
+            if (!scratch) { ret = (U64)-K_EFAULT; break; }
+            {
+                U8 tmp[FLOCK64_BYTES];
+                cpu->memory->memcpyFromGuest(tmp, a3, FLOCK64_BYTES);
+                cpu->thread->memory->memcpy(scratch, tmp, FLOCK64_BYTES);
+            }
+            // Use the *64-bit* cmd variant so fcntrl's readFileLock reads the
+            // 64-bit layout from the scratch we just populated.
+            U32 cmd64 = (cmd == K_F_GETLK)  ? K_F_GETLK64
+                      : (cmd == K_F_SETLK)  ? K_F_SETLK64
+                      : (cmd == K_F_SETLKW) ? K_F_SETLKW64
+                      : cmd;
+            ret = (U64)(S64)(S32)cpu->thread->process->fcntrl(
+                cpu->thread, (FD)(S32)a1, cmd64, scratch);
+            // F_GETLK writes the resulting lock back into the struct.
+            if (cmd == K_F_GETLK || cmd == K_F_GETLK64) {
+                U8 tmp[FLOCK64_BYTES];
+                cpu->thread->memory->memcpy(tmp, scratch, FLOCK64_BYTES);
+                cpu->memory->memcpyToGuest(a3, tmp, FLOCK64_BYTES);
             }
             break;
+        }
         case X64_SYS_tgkill: {
             // tgkill(tgid, tid, sig). Single-thread world: any tid that
             // matches our own gets the signal delivered synchronously to
@@ -2007,6 +2073,45 @@ void ksyscall64(CPU64* cpu) {
                 BString::copy(target),
                 BString(Fs::getFullPath(cpu->thread->process->currentDirectory,
                                         BString::copy(linkpath))));
+            break;
+        }
+        case X64_SYS_rename:
+        case X64_SYS_renameat:
+        case X64_SYS_renameat2: {
+            // rename(from, to) / renameat(olddirfd, from, newdirfd, to) /
+            // renameat2(olddirfd, from, newdirfd, to, flags). wineserver saves
+            // each registry branch by writing a temp file and rename()-ing it
+            // into place (system.reg/user.reg/userdef.reg) — without this the
+            // prefix never persists ("could not save registry branch ... :
+            // Invalid argument"). Reuse KProcess::rename/renameat, which route
+            // through the FsNode layer to the native rename in the writable
+            // overlay. renameat2 with a plain (flags==0) rename is identical to
+            // renameat; the NOREPLACE/EXCHANGE/WHITEOUT flag bits aren't
+            // supported, so reject them with EINVAL (glibc/wine fall back to a
+            // plain rename when renameat2 fails).
+            if (!cpu->thread || !cpu->thread->process) { ret = (U64)-K_ENOSYS; break; }
+            char from[1024] = {0};
+            char to[1024] = {0};
+            if (nr == X64_SYS_rename) {
+                cpu->memory->memcpyFromGuest(from, a1, sizeof(from) - 1);
+                cpu->memory->memcpyFromGuest(to,   a2, sizeof(to) - 1);
+                ret = (U64)(S64)(S32)cpu->thread->process->rename(
+                    BString::copy(from), BString::copy(to));
+            } else {
+                if (nr == X64_SYS_renameat2 && (a5 & ~0ULL) != 0) {
+                    // any flag set -> unsupported in this path
+                    ret = (U64)-K_EINVAL; break;
+                }
+                FD olddirfd = (FD)(S32)a1;
+                FD newdirfd = (FD)(S32)a3;
+                cpu->memory->memcpyFromGuest(from, a2, sizeof(from) - 1);
+                cpu->memory->memcpyFromGuest(to,   a4, sizeof(to) - 1);
+                ret = (U64)(S64)(S32)cpu->thread->process->renameat(
+                    olddirfd, BString::copy(from), newdirfd, BString::copy(to));
+            }
+            if (getenv("BW64_SYSTRACE")) {
+                klog_fmt("sys_rename64: '%s' -> '%s' ret=%d", from, to, (int)(S32)ret);
+            }
             break;
         }
         case X64_SYS_socketpair: {
@@ -2217,6 +2322,37 @@ void ksyscall64(CPU64* cpu) {
         case X64_SYS_prlimit64:
             ret = sys_prlimit64_64(cpu, a1, a2, a3, a4);
             break;
+        case X64_SYS_getrlimit:
+            // getrlimit(resource, struct rlimit* {unsigned long cur,max}).
+            // wine's unix ntdll queries RLIMIT_STACK/NOFILE/AS during thread
+            // setup. Pretend "no limit" (RLIM_INFINITY) like prlimit64 does.
+            if (a2) {
+                cpu->memory->writeq(a2, ~0ULL);
+                cpu->memory->writeq(a2 + 8, ~0ULL);
+            }
+            ret = 0;
+            break;
+        case X64_SYS_setrlimit:
+            ret = 0; // accept and ignore — we don't enforce limits
+            break;
+        case X64_SYS_sched_getscheduler:
+            ret = 0; // SCHED_OTHER
+            break;
+        case X64_SYS_sched_setscheduler:
+            ret = 0; // accept; we have one scheduling class
+            break;
+        case X64_SYS_sched_getparam:
+            // sched_param { int sched_priority } — report priority 0.
+            if (a2) cpu->memory->writed(a2, 0);
+            ret = 0;
+            break;
+        case X64_SYS_mlockall:
+        case X64_SYS_munlockall:
+        case X64_SYS_mlock:
+        case X64_SYS_munlock:
+            // We never page guest memory out, so locking is a no-op success.
+            ret = 0;
+            break;
         case X64_SYS_clock_gettime:
             ret = sys_clock_gettime64(cpu, a1, a2);
             break;
@@ -2249,8 +2385,70 @@ void ksyscall64(CPU64* cpu) {
             ret = sys_futex64(cpu, a1, (U32)a2, (U32)a3, a4, (U32)a6);
             break;
         case X64_SYS_poll:
-            ret = 0; // timeout — nothing ready
+        case X64_SYS_ppoll: {
+            // poll(fds, nfds, timeout_ms) / ppoll(fds, nfds, timespec*, sigmask).
+            // wineserver's sock_init runs sock_check_pollhup(): it closes one end
+            // of a socketpair and polls the other, requiring POLLHUP — the old
+            // stub (return 0) failed that check and aborted server startup. Bounce
+            // the pollfd array (8 bytes each: {int fd; short events; short revents}
+            // — layout-identical 32/64) into the process's 32-bit scratch KMemory,
+            // call the width-agnostic kpoll (which drives internal_poll's real
+            // readiness/blocking + POLLHUP detection), then copy the array back so
+            // the updated revents reach the 64-bit guest.
+            if (!cpu->thread || !cpu->thread->process || !cpu->thread->memory) {
+                ret = (U64)-K_ENOSYS; break;
+            }
+            U32 nfds = (U32)a2;
+            // kpoll's timeout convention (see internal_poll): 0 == return
+            // immediately (non-blocking); a value > 0xF0000000 == wait forever;
+            // anything in between is a millisecond deadline. The userspace poll
+            // ABI maps onto this directly — poll(timeout=-1) is 0xFFFFFFFF
+            // (>0xF0000000 == infinite) and poll(timeout=0) is non-blocking — so
+            // the 32-bit path passes the raw arg straight through. We do the same.
+            U32 timeoutMs;
+            if (nr == X64_SYS_ppoll) {
+                // ppoll: a3 is a timespec* (NULL == infinite wait).
+                if (a3 == 0) {
+                    timeoutMs = 0xFFFFFFFFu; // infinite
+                } else {
+                    U64 sec  = cpu->memory->readq(a3);
+                    U64 nsec = cpu->memory->readq(a3 + 8);
+                    U64 ms = sec * 1000 + nsec / 1000000;
+                    // A real zero timespec is a non-blocking poll (kpoll: 0).
+                    timeoutMs = (U32)ms;
+                }
+            } else {
+                // poll: a3 is a signed int ms; pass through (-1 -> 0xFFFFFFFF).
+                timeoutMs = (U32)a3;
+            }
+            if (nfds == 0) {
+                // No fds: kpoll with our scratch still honors the timeout sleep.
+                U32 scratch0 = bounceSockaddrTo32(cpu, 0, 0, nullptr);
+                ret = (U64)(S64)(S32)kpoll(cpu->thread, scratch0, 0, timeoutMs);
+                break;
+            }
+            U32 bytes = nfds * 8;
+            // Reuse the multi-page socket scratch (>= one page); cap nfds so the
+            // array fits comfortably within a single page.
+            if (bytes > K_PAGE_SIZE) { ret = (U64)-K_EINVAL; break; }
+            U32 scratch = bounceSockaddrTo32(cpu, 0, 0, nullptr);
+            if (!scratch) { ret = (U64)-K_EFAULT; break; }
+            // Copy the guest pollfd array into the 32-bit scratch.
+            {
+                U8 tmp[K_PAGE_SIZE];
+                cpu->memory->memcpyFromGuest(tmp, a1, bytes);
+                cpu->thread->memory->memcpy(scratch, tmp, bytes);
+            }
+            S32 rc = (S32)kpoll(cpu->thread, scratch, nfds, timeoutMs);
+            // Copy the (revents-updated) array back to the 64-bit guest.
+            {
+                U8 tmp[K_PAGE_SIZE];
+                cpu->thread->memory->memcpy(tmp, scratch, bytes);
+                cpu->memory->memcpyToGuest(a1, tmp, bytes);
+            }
+            ret = (U64)(S64)rc;
             break;
+        }
         case X64_SYS_sched_yield:
             ret = 0;
             break;
@@ -2498,6 +2696,26 @@ void ksyscall64(CPU64* cpu) {
                      (unsigned long long)a4,
                      (unsigned long long)a5,
                      (unsigned long long)a6);
+            // TEMP DIAGNOSTIC: dump the bytes around the syscall RIP and the
+            // full register set so we can tell a real Linux syscall from a
+            // wine __wine_unix_call / NT thunk landing here. syscallRip points
+            // at the 0F 05 instruction.
+            if (getenv("BW64_SCDUMP")) {
+                U64 r = cpu->syscallRip;
+                U8 b[16];
+                for (int i = 0; i < 16; i++) b[i] = cpu->memory->readb(r - 6 + i);
+                klog_fmt("  SCDUMP bytes@RIP-6: %02x %02x %02x %02x %02x %02x [%02x %02x] %02x %02x %02x %02x %02x %02x %02x %02x",
+                         b[0],b[1],b[2],b[3],b[4],b[5],b[6],b[7],b[8],b[9],b[10],b[11],b[12],b[13],b[14],b[15]);
+                klog_fmt("  SCDUMP RAX=%llx RBX=%llx RCX=%llx RBP=%llx RSP=%llx R12=%llx fsbase=%llx gsbase=%llx",
+                         (unsigned long long)cpu->reg[X64_RAX].u64,
+                         (unsigned long long)cpu->reg[X64_RBX].u64,
+                         (unsigned long long)cpu->reg[X64_RCX].u64,
+                         (unsigned long long)cpu->reg[X64_RBP].u64,
+                         (unsigned long long)cpu->reg[X64_RSP].u64,
+                         (unsigned long long)cpu->reg[X64_R12].u64,
+                         (unsigned long long)cpu->fsbase,
+                         (unsigned long long)cpu->gsbase);
+            }
             ret = (U64)-K_ENOSYS;
             break;
     }

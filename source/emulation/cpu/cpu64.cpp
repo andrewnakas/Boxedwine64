@@ -862,6 +862,44 @@ U32 CPU64::step() {
         return opOff + 1;
     }
 
+    // IRETQ (REX.W CF == 48 CF), and the non-promoted IRET (CF) / IRETD.
+    // Wine's PE-side ntdll uses iretq to return from its user-mode exception
+    // dispatcher (NtContinue / the KiUserExceptionDispatcher tail). In long
+    // mode the interrupt stack frame is, from the top of stack downward:
+    //   RIP, CS, RFLAGS, RSP, SS  (five entries).
+    // Each entry is pushed as a qword for IRETQ (REX.W); for a 32-bit IRETD
+    // (no REX.W) the entries are dwords. We don't model segmentation (CS/SS
+    // are a flat-model approximation — see the CSGSFS handling in syscall64),
+    // so we pop and discard CS/SS. RFLAGS is masked exactly like POPFQ (9D):
+    // only the user-visible arithmetic/direction/IF bits are writable; the
+    // reserved bits keep their fixed values. This is effectively a privileged
+    // return-from-frame, structurally the same as restoreSignalFrame.
+    if (op == 0xCF) {
+        const U32 writable = 0x00254FD5u; // CF PF AF ZF SF TF IF DF OF (matches POPFQ)
+        if (rexW) {
+            U64 newRip   = pop64();
+            (void)         pop64();        // CS (ignored — flat model)
+            U64 newFlags = pop64();
+            U64 newRsp   = pop64();
+            (void)         pop64();        // SS (ignored — flat model)
+            rip = newRip;
+            rflags = (rflags & ~writable) | ((U32)newFlags & writable);
+            reg[X64_RSP].setU64(newRsp);
+        } else {
+            // 32-bit IRETD: dword entries off the (still 64-bit) stack.
+            U64 sp = reg[X64_RSP].u64;
+            U32 newEip   = memory->readd(sp);      sp += 4;
+            (void)         memory->readd(sp);      sp += 4; // CS
+            U32 newFlags = memory->readd(sp);      sp += 4;
+            U32 newEsp   = memory->readd(sp);      sp += 4;
+            (void)         memory->readd(sp);      sp += 4; // SS
+            rip = (U64)newEip;
+            rflags = (rflags & ~writable) | (newFlags & writable);
+            reg[X64_RSP].setU64((U64)newEsp);
+        }
+        return opOff + 1;
+    }
+
     // ---- ALU r/r and r/m forms ----
     //
     // Encodings for ADD/OR/ADC/SBB/AND/SUB/XOR/CMP follow a regular pattern:
