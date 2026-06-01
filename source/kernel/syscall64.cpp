@@ -1993,12 +1993,20 @@ void ksyscall64(CPU64* cpu) {
 
     // Set BW64_SYSTRACE=1 to log every 64-bit syscall — invaluable for wine
     // bring-up (finding where a guest stalls or which syscall is next missing).
-    if (getenv("BW64_SYSTRACE")) {
-        klog_fmt("SYS64 [pid=%d] #%llu %s (a1=0x%llx a2=0x%llx a3=0x%llx)",
-                 (int)(cpu->thread ? cpu->thread->process->id : -1),
-                 (unsigned long long)nr, x64SyscallName(nr),
-                 (unsigned long long)a1, (unsigned long long)a2,
-                 (unsigned long long)a3);
+    // BW64_TRACEPID=N traces ONLY process N (one cheap compare; doesn't slow the
+    // rest of the system, so it can catch a timing-sensitive failure that full
+    // SYSTRACE masks). Useful to see exactly which syscall precedes a process's
+    // exit_group(1).
+    {
+        static const char* tracePidEnv = getenv("BW64_TRACEPID");
+        static int tracePid = tracePidEnv ? atoi(tracePidEnv) : -1;
+        int myPid = (int)(cpu->thread ? cpu->thread->process->id : -1);
+        if (getenv("BW64_SYSTRACE") || (tracePid >= 0 && myPid == tracePid)) {
+            klog_fmt("SYS64 [pid=%d] #%llu %s (a1=0x%llx a2=0x%llx a3=0x%llx)",
+                     myPid, (unsigned long long)nr, x64SyscallName(nr),
+                     (unsigned long long)a1, (unsigned long long)a2,
+                     (unsigned long long)a3);
+        }
     }
 
     switch (nr) {
