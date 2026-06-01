@@ -742,6 +742,10 @@ void XWireConnection::deliverInputEvents() {
         // usually select these, and dropping them silently would feel dead. But
         // respect an explicit motion opt-out to avoid event floods.
         if (ev.type == XWireInputEvent::EvMotion && !(mask & wantMask)) continue;
+        if (getenv("BW64_XWIRE")) {
+            klog_fmt("XWire input: deliver code=%d detail=%d to win=0x%x (mask=0x%x)",
+                     (int)code, (int)ev.detail, (unsigned)presentWindow, (unsigned)mask);
+        }
         sendInputEvent(code, presentWindow, ev);
     }
 }

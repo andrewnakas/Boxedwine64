@@ -64,6 +64,44 @@ bool KSystem::disableHideCursor = false;
 bool KSystem::forceRelativeMouse = false;
 bool KSystem::cacheReads = false;
 BString KSystem::showWindowTimestamp;
+volatile int KSystem::bootProgressPercent = -1;
+BString KSystem::bootProgressLabel;
+
+// Map each PE stage of the wine boot chain to a coarse progress %/label for the
+// GUI loading screen. The chain is roughly fixed: wineboot initializes the
+// prefix, services.exe + its helpers bring up the Win32 service host, winex11
+// loads the graphics driver, then the target app launches. Percentages are
+// hand-tuned to feel monotonic under emulation (each stage is much slower than
+// the last). Unknown PEs nudge the bar forward a little without a new label so
+// it never looks frozen during the long mid-boot stretches.
+void KSystem::noteBootStage(const BString& peName) {
+    BString n = peName;
+    int pct = bootProgressPercent;
+    BString label = bootProgressLabel;
+    if (n.contains(B("wineboot"))) {
+        if (pct < 15) { pct = 15; label = B("Initializing Wine prefix…"); }
+    } else if (n.contains(B("services"))) {
+        if (pct < 35) { pct = 35; label = B("Starting Windows services…"); }
+    } else if (n.contains(B("winedevice"))) {
+        if (pct < 45) { pct = 45; label = B("Loading device drivers…"); }
+    } else if (n.contains(B("plugplay"))) {
+        if (pct < 52) { pct = 52; label = B("Detecting devices…"); }
+    } else if (n.contains(B("rpcss"))) {
+        if (pct < 58) { pct = 58; label = B("Starting RPC service…"); }
+    } else if (n.contains(B("explorer"))) {
+        if (pct < 70) { pct = 70; label = B("Starting desktop…"); }
+    } else if (n.contains(B("rundll32"))) {
+        if (pct < 78) { pct = 78; label = B("Configuring display…"); }
+    } else if (n.contains(B("notepad")) || n.contains(B(".exe"))) {
+        // The target app (anything not matched above). Hold at 88 until the
+        // guest actually paints (the present tick clears the bar on first frame).
+        if (pct < 88) { pct = 88; label = B("Launching application…"); }
+    }
+    if (pct < 5) { pct = 5; if (label.isEmpty()) label = B("Booting Wine…"); }
+    bootProgressLabel = label;
+    bootProgressPercent = pct;
+}
+
 U32 KSystem::pageSize = 4096;
 bool KSystem::canJitUse4KPage = false;
 

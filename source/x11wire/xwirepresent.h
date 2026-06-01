@@ -79,4 +79,12 @@ void installXWireSink();
 // sink is installed. Defined in xwirepresentSDL.cpp.
 void tickXWirePresent();
 
+// Forward one SDL key/mouse event into the XWire input queue. Called from
+// BoxedWine's single platform SDL event pump (platform/sdl/knativeinputSDL)
+// so input isn't split across two competing SDL_PollEvent loops. No-op when no
+// sink is active. Declared with a forward-declared SDL_Event so this header
+// stays SDL-agnostic. Defined in xwirepresentSDL.cpp.
+union SDL_Event;
+void xwireForwardSdlEvent(const SDL_Event& e);
+
 #endif

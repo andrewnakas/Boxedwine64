@@ -24,6 +24,9 @@
 #include "knativeinputSDL.h"
 #include "knativesystem.h"
 #include "kdspaudio.h"
+#ifdef BOXEDWINE_GUEST_X64
+#include "../../source/x11wire/xwirepresent.h"
+#endif
 
 U32 sdlCustomEvent;
 
@@ -559,7 +562,17 @@ bool KNativeInputSDL::handlSdlEvent(SDL_Event* e) {
             return true;
         }
         return false;
-    } else if (e->type == SDL_MOUSEMOTION) {
+    }
+#ifdef BOXEDWINE_GUEST_X64
+    // When the in-process X11 wire server owns the host window (64-bit wine GUI),
+    // route key/mouse input to it. This is the SINGLE SDL pump in the process,
+    // so forwarding here (rather than a competing SDL_PollEvent in the XWire
+    // sink) is what actually delivers input to wine. No-op when no sink is
+    // active. We still fall through to BoxedWine's own handling below — harmless
+    // for the 64-bit path (its 32-bit X server is dead code) and keeps QUIT etc.
+    xwireForwardSdlEvent(*e);
+#endif
+    if (e->type == SDL_MOUSEMOTION) {
         BOXEDWINE_RECORDER_HANDLE_MOUSE_MOVE(e->motion.x, e->motion.y);
         if (!mouseMove(e->motion.x, e->motion.y, false)) {
             onMouseMove(e->motion.x, e->motion.y, false);

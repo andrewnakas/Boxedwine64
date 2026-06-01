@@ -172,6 +172,18 @@ public:
 
     static std::shared_ptr<FsNode> procNode;
     static BString showWindowTimestamp;
+
+    // Boot-progress for the 64-bit wine GUI loading screen. The kernel bumps
+    // these as the wine boot chain execve()s each PE stage (wineboot ->
+    // services -> winex11 -> the target .exe); the XWire present tick renders a
+    // labeled progress bar from them until the guest maps its real window.
+    // 0..100. `bootProgressLabel` is the current stage ("Starting services…").
+    // Plain statics — written from a guest thread, read on the main thread; a
+    // torn read just shows a slightly stale label, which is fine for a spinner.
+    static volatile int bootProgressPercent;   // -1 = inactive / window is up
+    static BString bootProgressLabel;
+    // Called from sys_execve64 with the basename of each PE the boot chain runs.
+    static void noteBootStage(const BString& peName);
 private:
     static void initDisplayModes();
     static void internalEraseProcess(U32 id);

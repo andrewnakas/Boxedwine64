@@ -961,6 +961,14 @@ static U64 sys_execve64(CPU64* cpu, U64 pathAddr, U64 argvAddr, U64 envpAddr) {
         if (strncmp(e.c_str(), "WINELOADER=", 11) == 0)
             klog_fmt("sys_execve64:   env %s", e.c_str());
     }
+    // Drive the GUI loading-screen progress: the wine boot chain re-execs
+    // wine64 with the next PE in argv (e.g. ".../services.exe", "winedevice.exe",
+    // the target "notepad.exe"). Feed each .exe basename to the boot-stage
+    // tracker so the XWire present tick can render a labeled progress bar until
+    // the guest paints its real window.
+    for (auto& a : args) {
+        if (a.contains(".exe")) { KSystem::noteBootStage(a); break; }
+    }
     return (U64)(S64)(S32)cpu->thread->process->execve(cpu->thread, path, args, envs);
 }
 
