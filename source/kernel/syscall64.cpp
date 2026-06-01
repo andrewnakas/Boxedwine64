@@ -61,6 +61,10 @@
 #define X64_SYS_getsockopt        55
 #define X64_SYS_sendmsg           46
 #define X64_SYS_recvmsg           47
+#define X64_SYS_sendmmsg          307
+#define X64_SYS_recvmmsg          299
+#define X64_SYS_sendto            44
+#define X64_SYS_recvfrom          45
 #define X64_SYS_unlink            87
 #define X64_SYS_unlinkat          263
 #define X64_SYS_rename            82
@@ -2069,10 +2073,15 @@ void ksyscall64(CPU64* cpu) {
             cpu->memory->memcpyFromGuest(target, a1, sizeof(target) - 1);
             U64 linkArg = (nr == X64_SYS_symlink) ? a2 : a3;
             cpu->memory->memcpyFromGuest(linkpath, linkArg, sizeof(linkpath) - 1);
+            BString fullLink = Fs::getFullPath(cpu->thread->process->currentDirectory,
+                                               BString::copy(linkpath));
             ret = (U64)(S64)(S32)cpu->thread->process->symlink(
-                BString::copy(target),
-                BString(Fs::getFullPath(cpu->thread->process->currentDirectory,
-                                        BString::copy(linkpath))));
+                BString::copy(target), fullLink);
+            if (getenv("BW64_SCDUMP")) {
+                klog_fmt("sys_symlink64: target='%s' link='%s' (cwd='%s') -> %d",
+                         target, fullLink.c_str(),
+                         cpu->thread->process->currentDirectory.c_str(), (int)(S32)ret);
+            }
             break;
         }
         case X64_SYS_rename:
@@ -2273,6 +2282,79 @@ void ksyscall64(CPU64* cpu) {
             // (carries SCM_RIGHTS fds for shared mappings).
             ret = sys_recvmsg64(cpu, a1, a2, a3);
             break;
+        case X64_SYS_sendto:
+        case X64_SYS_recvfrom: {
+            // sendto(fd, buf, len, flags, dest_addr, addrlen) /
+            // recvfrom(fd, buf, len, flags, src_addr, addrlen). wine's unix ntdll
+            // uses these on the (connected AF_UNIX) wineserver socket, so the
+            // addr argument is unused — pass NULL addr to k*. Bounce the data
+            // buffer through the 32-bit msg scratch (k* read/write thread->memory)
+            // and copy results back to the 64-bit guest buffer via cpu->memory.
+            if (!cpu->thread || !cpu->thread->process || !cpu->thread->memory) {
+                ret = (U64)-K_ENOSYS; break;
+            }
+            U32 scratch = msgScratch(cpu->thread);
+            if (!scratch) { ret = (U64)-K_EFAULT; break; }
+            U32 dataAddr = scratch + MSG_SCRATCH_DATA;
+            U32 cap = MSG_SCRATCH_BYTES - MSG_SCRATCH_DATA;
+            U64 len = a3; if (len > cap) len = cap;
+            if (nr == X64_SYS_sendto) {
+                U8 tmp[4096];
+                U64 off = 0;
+                // copy guest buffer -> 32-bit scratch in chunks
+                while (off < len) {
+                    U32 chunk = (U32)((len - off > sizeof(tmp)) ? sizeof(tmp) : (len - off));
+                    cpu->memory->memcpyFromGuest(tmp, a2 + off, chunk);
+                    cpu->thread->memory->memcpy(dataAddr + (U32)off, tmp, chunk);
+                    off += chunk;
+                }
+                ret = (U64)(S64)(S32)ksendto(cpu->thread, (U32)a1, dataAddr, (U32)len,
+                                             (U32)a4, 0, 0);
+            } else {
+                S32 rc = (S32)krecvfrom(cpu->thread, (U32)a1, dataAddr, (U32)len,
+                                        (U32)a4, 0, 0);
+                if (rc > 0) {
+                    U8 tmp[4096];
+                    U64 off = 0;
+                    while (off < (U64)rc) {
+                        U32 chunk = (U32)(((U64)rc - off > sizeof(tmp)) ? sizeof(tmp) : ((U64)rc - off));
+                        cpu->thread->memory->memcpy(tmp, dataAddr + (U32)off, chunk);
+                        cpu->memory->memcpyToGuest(a2 + off, tmp, chunk);
+                        off += chunk;
+                    }
+                }
+                ret = (U64)(S64)rc;
+            }
+            break;
+        }
+        case X64_SYS_sendmmsg:
+        case X64_SYS_recvmmsg: {
+            // sendmmsg(fd, mmsghdr* msgvec, vlen, flags[, timeout]) /
+            // recvmmsg(...). wine's unix ntdll uses sendmmsg on the wineserver
+            // socket. struct mmsghdr = { struct msghdr msg_hdr; unsigned msg_len }:
+            // the x86-64 msghdr is 56 bytes, msg_len at +56, stride 64 (8-byte
+            // aligned). Loop the existing single-message 64-bit path over each
+            // entry, writing back the per-message byte count, and return the
+            // number of messages processed (Linux semantics). Stop early on the
+            // first error after >=1 success (like the kernel).
+            if (!cpu->thread || !cpu->thread->process) { ret = (U64)-K_ENOSYS; break; }
+            U64 fd = a1, vec = a2; U32 vlen = (U32)a3; U64 flags = a4;
+            const U64 MMSG_STRIDE = 64;   // sizeof(struct mmsghdr) on x86-64
+            const U64 MSGLEN_OFF  = 56;   // offsetof(mmsghdr, msg_len)
+            U32 done = 0;
+            S64 lastErr = 0;
+            for (U32 i = 0; i < vlen; i++) {
+                U64 hdr = vec + i * MMSG_STRIDE;
+                S64 rc = (nr == X64_SYS_sendmmsg)
+                       ? (S64)(S32)sys_sendmsg64(cpu, fd, hdr, flags)
+                       : (S64)(S32)sys_recvmsg64(cpu, fd, hdr, flags);
+                if (rc < 0) { lastErr = rc; break; }
+                cpu->memory->writed(hdr + MSGLEN_OFF, (U32)rc);
+                done++;
+            }
+            ret = done ? (U64)done : (U64)lastErr;
+            break;
+        }
         case X64_SYS_setsid:
             // setsid() — new session; we don't model sessions, return the pid
             // (matches the 32-bit stub). wineserver daemonizes with this.

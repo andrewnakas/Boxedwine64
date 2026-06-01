@@ -814,6 +814,70 @@ U32 CPU64::step() {
         // succeeds — set both before transferring to the kernel layer.
         U64 syscallStartRip = rip;
         U64 nextRip = rip + opOff + 2;
+        // Wine NT-syscall redirect. Wine's PE-side NtXxx stubs choose between a
+        // raw `syscall` (0F 05) and an indirect `call [KUSER_SHARED_DATA+0x1000]`
+        // to __wine_syscall_dispatcher, based on the SystemCall flag at
+        // KUSER_SHARED_DATA+0x308 (0x7ffe0308). On a real host wine sets that
+        // flag when it has wired the raw syscall to its dispatcher (SUD/seccomp);
+        // we don't, so the flag reads 0 and the stub falls into 0F 05 with a
+        // *Windows NT* ordinal in RAX (e.g. NtQueryVirtualMemory) — which is NOT
+        // a Linux syscall and would be mis-dispatched, then trip wine's
+        // __fastfail (UD2). Wine has already published its dispatcher pointer at
+        // [0x7ffe1000] (verified: a unix ntdll.so address). So when a SYSCALL
+        // comes from inside the PE ntdll image and that pointer is set, emulate
+        // exactly what `call [0x7ffe1000]` would have done: push the return
+        // address (the instruction after the 0F 05) and transfer to the
+        // dispatcher. Wine then reads the NT number from RAX and invokes the
+        // correct unix-side implementation entirely in userspace. The dispatcher
+        // itself, and the unix ntdll, still issue genuine Linux syscalls (from
+        // low unix addresses) which fall through to ksyscall64 normally.
+        // Only PE-image syscalls (ntdll.dll ImageBase 0x170000000) are NT
+        // stubs; gate the shared-data read on the cheap RIP range so the hot
+        // Linux-syscall path (glibc/unix ntdll, low addresses) is untouched.
+        //
+        // Wine's NtXxx stub is:
+        //     mov r10, rcx
+        //     mov eax, <ntno>
+        //     test byte ptr [0x7ffe0308], 1     ; KUSER_SHARED_DATA SystemCall
+        //     jne  .indirect                    ; flag set -> call dispatcher
+        //     syscall                           ; flag clear -> raw syscall  (HERE)
+        //     ret
+        //   .indirect:
+        //     call [0x7ffe1000]                 ; -> __wine_syscall_dispatcher
+        //     ret
+        // Wine publishes the dispatcher pointer at [0x7ffe1000] but, on a host
+        // where it didn't wire the raw `syscall` to its dispatcher, leaves the
+        // SystemCall flag at 0 — so PE NT stubs reach the raw `syscall`, whose
+        // RAX holds a *Windows NT* ordinal, not a Linux number. Rather than jump
+        // into the dispatcher with a synthesized frame (its prolog pops the
+        // return off the stack and reads gs:[0x328] — a fragile ABI to fake), we
+        // flip wine's own decision: SET the SystemCall flag so every NtXxx stub
+        // uses its native `call [0x7ffe1000]` path (correct call ABI, correct
+        // return), and steer THIS in-flight stub onto that path by resuming at
+        // the `jne` target. The flag write makes all subsequent stubs branch
+        // there on their own without re-entering this handler.
+        if (syscallStartRip >= 0x170000000ULL && syscallStartRip < 0x170400000ULL) {
+            U64 ntDispatch = memory->readq(0x7ffe1000ULL);
+            if (ntDispatch) {
+                // Persist the choice for all future stubs.
+                memory->writeb(0x7ffe0308ULL, memory->readb(0x7ffe0308ULL) | 1);
+                // Resume on the indirect path. The stub layout is fixed:
+                //   syscall(0F 05) @ R, ret @ R+1, .indirect (jmp/call) @ R+3.
+                // The `jne` (2 bytes before the syscall) targets R+3; jump there
+                // so wine's own `call [0x7ffe1000]` executes with its real ABI.
+                rip = syscallStartRip + 3;
+                if (getenv("BW64_NTDUMP")) {
+                    static int once = 0;
+                    if (once++ < 6)
+                        klog_fmt("NT-redirect RAX=%llx stub=0x%llx -> indirect 0x%llx disp=0x%llx",
+                                 (unsigned long long)reg[X64_RAX].u64,
+                                 (unsigned long long)syscallStartRip,
+                                 (unsigned long long)rip,
+                                 (unsigned long long)ntDispatch);
+                }
+                return opOff + 2;
+            }
+        }
         reg[X64_RCX].setU64(nextRip);
         reg[X64_R11].setU64((U64)rflags);
         rip = nextRip;
