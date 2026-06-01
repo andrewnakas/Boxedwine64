@@ -239,11 +239,40 @@
 // a page-aligned base; advances cpu->mmapNext past it. Keeping a SINGLE
 // pointer is what prevents an anonymous map and a file-backed map from being
 // handed the same address (the bug behind the 2nd-DSO Verneed corruption).
+//
+// The bump pointer alone is NOT sufficient: the guest also issues MAP_FIXED
+// maps (ld.so reserves a DSO span then fixed-maps each segment; wine fixed-maps
+// PE images at their ImageBase). Those fixed maps don't advance mmapNext, so a
+// later mmap(NULL, big) can be handed an address that overlaps an existing
+// fixed map — and mmapAnonymousFixed ZEROES it, wiping live code. (This is
+// exactly what killed services.exe: a 128MB PROT_NONE reservation landed on
+// 0x700000000 and zeroed the already-mapped unix ntdll.so/libwine there.)
+//
+// So scan from mmapNext for the first gap of `pageCount` consecutive UNMAPPED
+// pages, skipping over any region already populated by a fixed map.
 static U64 allocMmapRange(CPU64* cpu, U64 length) {
     if (cpu->mmapNext == 0) cpu->mmapNext = MMAP64_BASE;
-    U64 addr = cpu->mmapNext;
-    cpu->mmapNext += (length + 0xFFF) & ~0xFFFULL;
-    return addr;
+    U64 pageCount = (length + 0xFFF) >> 12;
+    if (pageCount == 0) pageCount = 1;
+
+    KMemory64* mem = cpu->memory;
+    U64 candidate = cpu->mmapNext >> 12; // start page
+    for (;;) {
+        // Is [candidate, candidate+pageCount) entirely free? Scan backward from
+        // the end so a collision near the top skips the whole run at once.
+        U64 firstMapped = 0;
+        bool clash = false;
+        for (U64 p = candidate + pageCount; p-- > candidate; ) {
+            if (mem->isPageMapped(p)) { firstMapped = p; clash = true; break; }
+        }
+        if (!clash) {
+            U64 addr = candidate << 12;
+            cpu->mmapNext = (candidate + pageCount) << 12;
+            return addr;
+        }
+        // Resume the search just past the mapped page we hit.
+        candidate = firstMapped + 1;
+    }
 }
 
 static U64 sys_write64(CPU64* cpu, U64 fd, U64 buf, U64 count) {
@@ -270,6 +299,13 @@ static U64 sys_write64(CPU64* cpu, U64 fd, U64 buf, U64 count) {
         return (U64)-K_EINVAL;
     }
     U32 wrote = fdesc->kobject->writeNative(buffer.data(), (U32)count);
+    if (getenv("BW64_IPCDUMP")) {
+        char hex[64] = {0}; int n = (int)((count < 16) ? count : 16);
+        for (int i = 0; i < n; i++) snprintf(hex + i*3, 4, "%02x ", buffer[i]);
+        klog_fmt("IPC [pid=%d] write(fd=%d,count=%llu) -> %d  [%s]",
+                 (int)cpu->thread->process->id, (int)fd,
+                 (unsigned long long)count, (int)(S32)wrote, hex);
+    }
     return (S32)wrote < 0 ? (U64)(S64)(S32)wrote : (U64)wrote;
 }
 
@@ -342,7 +378,17 @@ static U64 sys_mmap64(CPU64* cpu, U64 addr, U64 length, U64 prot, U64 flags, U64
         // allocator shared with the file-backed path (see allocMmapRange).
         addr = allocMmapRange(cpu, length);
     }
+    if (getenv("BW64_MMAPDUMP") && length >= 0x1000000) {
+        klog_fmt("MMAP [pid=%d] BIG anon enter addr=0x%llx len=0x%llx prot=0x%x",
+                 (int)(cpu->thread ? cpu->thread->process->id : -1),
+                 (unsigned long long)addr, (unsigned long long)length, (unsigned)prot);
+    }
     U64 ret = cpu->memory->mmapAnonymousFixed(addr & ~0xFFFULL, length, (U32)prot);
+    if (getenv("BW64_MMAPDUMP") && length >= 0x1000000) {
+        klog_fmt("MMAP [pid=%d] BIG anon exit  -> 0x%llx",
+                 (int)(cpu->thread ? cpu->thread->process->id : -1),
+                 (unsigned long long)ret);
+    }
     (void)offset;
     return ret;
 }
@@ -453,6 +499,15 @@ static U64 sys_read64(CPU64* cpu, U64 fd, U64 buf, U64 count) {
     }
     if (got > 0) {
         cpu->memory->memcpyToGuest(buf, tmp.data(), got);
+    }
+    if (getenv("BW64_IPCDUMP")) {
+        // First up-to-16 bytes help identify wineserver reply headers vs pipe
+        // wakeup bytes (the wait pipe carries a single status byte).
+        char hex[64] = {0}; int n = (int)((got < 16) ? got : 16);
+        for (int i = 0; i < n; i++) snprintf(hex + i*3, 4, "%02x ", tmp[i]);
+        klog_fmt("IPC [pid=%d] read(fd=%d,count=%llu) -> %d  [%s]",
+                 (int)cpu->thread->process->id, (int)fd,
+                 (unsigned long long)count, (int)got, hex);
     }
     return (U64)got;
 }
@@ -868,6 +923,13 @@ static U64 sys_execve64(CPU64* cpu, U64 pathAddr, U64 argvAddr, U64 envpAddr) {
     readStringArray64(cpu, envpAddr, envs);
     klog_fmt("sys_execve64: path='%s' argv0='%s' argc=%d envc=%d", path.c_str(),
              args.empty() ? "" : args[0].c_str(), (int)args.size(), (int)envs.size());
+    // Full argv dump — invaluable for telling which wine subprocess (wineboot/
+    // services.exe/rpcss/plugplay/explorer) is being launched in the re-exec
+    // chain; the bare argv0 ('/usr/lib/wine/wine64') is identical for all of them.
+    if (getenv("BW64_SYSTRACE") || getenv("BW64_EXECDUMP")) {
+        for (size_t i = 1; i < args.size(); i++)
+            klog_fmt("sys_execve64:   argv[%d]='%s'", (int)i, args[i].c_str());
+    }
     for (auto& e : envs) {
         if (strncmp(e.c_str(), "WINELOADER=", 11) == 0)
             klog_fmt("sys_execve64:   env %s", e.c_str());
@@ -1580,6 +1642,10 @@ static U64 sys_sendmsg64(CPU64* cpu, U64 fd, U64 msg64, U64 flags) {
     m32->writed(base + MSG_SCRATCH_HDR + 24, 0);                 // msg_flags
 
     U32 rc = ksendmsg(thread, (U32)fd, base + MSG_SCRATCH_HDR, (U32)flags);
+    if (getenv("BW64_IPCDUMP")) {
+        klog_fmt("IPC [pid=%d] sendmsg fd=%d datalen=%d ctllen32=%d -> rc=%d",
+                 (int)thread->process->id, (int)fd, (int)total, (int)ctllen32, (int)(S32)rc);
+    }
     return (U64)(S64)(S32)rc;
 }
 
@@ -1622,6 +1688,11 @@ static U64 sys_recvmsg64(CPU64* cpu, U64 fd, U64 msg64, U64 flags) {
     m32->writed(base + MSG_SCRATCH_HDR + 24, 0);
 
     U32 rc = krecvmsg(thread, (U32)fd, base + MSG_SCRATCH_HDR, (U32)flags);
+    if (getenv("BW64_IPCDUMP")) {
+        klog_fmt("IPC [pid=%d] recvmsg fd=%d want=%d flags=0x%x -> rc=%d ctllen32=%d",
+                 (int)thread->process->id, (int)fd, (int)want, (unsigned)flags,
+                 (int)(S32)rc, (int)m32->readd(base + MSG_SCRATCH_HDR + 20));
+    }
     if ((S32)rc < 0) return (U64)(S64)(S32)rc;
 
     // Scatter the received bytes back into the 64-bit iov segments.
@@ -1791,7 +1862,8 @@ void ksyscall64(CPU64* cpu) {
     // Set BW64_SYSTRACE=1 to log every 64-bit syscall — invaluable for wine
     // bring-up (finding where a guest stalls or which syscall is next missing).
     if (getenv("BW64_SYSTRACE")) {
-        klog_fmt("SYS64 #%llu %s (a1=0x%llx a2=0x%llx a3=0x%llx)",
+        klog_fmt("SYS64 [pid=%d] #%llu %s (a1=0x%llx a2=0x%llx a3=0x%llx)",
+                 (int)(cpu->thread ? cpu->thread->process->id : -1),
                  (unsigned long long)nr, x64SyscallName(nr),
                  (unsigned long long)a1, (unsigned long long)a2,
                  (unsigned long long)a3);
@@ -2776,6 +2848,11 @@ void ksyscall64(CPU64* cpu) {
             U32 ev32 = 0;
             if (a4) ev32 = bounceSockaddrTo32(cpu, a4, 12, nullptr);
             ret = (U64)(S64)(S32)cpu->thread->process->epollctl((FD)a1, (U32)a2, (FD)a3, ev32);
+            if (getenv("BW64_IPCDUMP")) {
+                U32 events = a4 ? cpu->thread->memory->readd(ev32 + 0) : 0;
+                klog_fmt("IPC epoll_ctl(epfd=%d, op=%d, fd=%d, events=0x%x) -> %d",
+                         (int)a1, (int)a2, (int)a3, events, (int)(S32)ret);
+            }
             break;
         }
         case X64_SYS_epoll_wait: {
@@ -2794,6 +2871,20 @@ void ksyscall64(CPU64* cpu) {
                 U8 tmp[64 * 12];
                 cpu->thread->memory->memcpy(tmp, ev32, bytes);
                 cpu->memory->memcpyToGuest(a2, tmp, bytes);
+            }
+            if (getenv("BW64_IPCDUMP") && (S32)rc > 0) {
+                // Only log non-timeout waits — a returned event means a fd in the
+                // set (wineserver socket or wait pipe) became readable.
+                char fds[256] = {0}; int off = 0;
+                for (U32 i = 0; i < rc && off < 230; i++) {
+                    U32 ev   = cpu->thread->memory->readd(ev32 + i*12 + 0);
+                    U64 data = cpu->thread->memory->readq(ev32 + i*12 + 4);
+                    off += snprintf(fds + off, sizeof(fds) - off,
+                                    "{ev=0x%x,data=0x%llx} ", ev,
+                                    (unsigned long long)data);
+                }
+                klog_fmt("IPC epoll_wait(epfd=%d,to=%d) -> %d  %s",
+                         (int)a1, (int)(S32)a4, (int)rc, fds);
             }
             ret = (U64)(S64)(S32)rc;
             break;
