@@ -4277,7 +4277,9 @@ U32 CPU64::step() {
 
         // CVTDQ2PD  F3 0F E6 /r — low 2× S32 → 2× f64
         // CVTPD2DQ  F2 0F E6 /r — 2× f64 → low 2× S32 (rounded), hi qword = 0
-        if (op2 == 0xE6 && (p.rep == 0xF3 || p.rep == 0xF2)) {
+        // CVTTPD2DQ 66 0F E6 /r — 2× f64 → low 2× S32 (truncate), hi qword = 0
+        // fontconfig/freetype emit the 66-prefixed truncating form heavily.
+        if (op2 == 0xE6 && (p.rep == 0xF3 || p.rep == 0xF2 || osize66)) {
             ModRM m = decodeModRM(rip + opOff + 2, p, 0);
             U64 sLo, sHi;
             if (m.isReg) { sLo = xmm[m.rmIndex].lo; sHi = xmm[m.rmIndex].hi; }
@@ -4292,11 +4294,18 @@ U32 CPU64::step() {
                 xmm[m.regField].lo = b0;
                 xmm[m.regField].hi = b1;
             } else {
-                // CVTPD2DQ: 2 f64s → 2 S32s in low qword, high qword zeroed.
+                // CVTPD2DQ (F2, round) / CVTTPD2DQ (66, truncate):
+                // 2 f64s → 2 S32s in low qword, high qword zeroed.
                 double d0, d1;
                 std::memcpy(&d0, &sLo, 8); std::memcpy(&d1, &sHi, 8);
-                U32 i0 = (U32)(S32)std::lrint(d0);
-                U32 i1 = (U32)(S32)std::lrint(d1);
+                U32 i0, i1;
+                if (osize66) { // truncate toward zero
+                    i0 = (U32)(S32)d0;
+                    i1 = (U32)(S32)d1;
+                } else {       // round to nearest (current rounding mode)
+                    i0 = (U32)(S32)std::lrint(d0);
+                    i1 = (U32)(S32)std::lrint(d1);
+                }
                 xmm[m.regField].lo = ((U64)i0) | (((U64)i1) << 32);
                 xmm[m.regField].hi = 0;
             }
@@ -4901,6 +4910,19 @@ void CPU64::run() {
     U64 traceTo   = tt ? std::strtoull(tt, nullptr, 0) : 0;
     bool tracing = (tf != nullptr);
 
+    // BW64_WILDJUMP: arm a per-thread RIP-history ring that auto-dumps the
+    // moment execution lands in low memory (a wild computed jump — e.g. the
+    // freetype-load bug RIP=0x10xxx). The dump shows the last 32 (rip, opcode,
+    // key GPRs) tuples so the *source* instruction that produced the bad target
+    // (an indirect call/jmp/ret through a clobbered pointer) is visible. Cheap:
+    // a 32-entry ring updated per step; the threshold check is one compare.
+    static const bool wildJump = std::getenv("BW64_WILDJUMP") != nullptr;
+    const U64 WILD_LO = 0x100000ull;   // anything below 1MB is never real code
+    struct RipHist { U64 rip, rax, rbx, rcx, rdx, rsi, rdi, rsp, rbp; U8 b0,b1,b2,b3; };
+    RipHist ring[32] = {};
+    int ringPos = 0;
+    bool wildFired = false;
+
     while (!yield) {
         if (tracing && instructionCount >= traceFrom && instructionCount <= traceTo) {
             U64 r = rip;
@@ -4915,6 +4937,34 @@ void CPU64::run() {
                      (unsigned long long)reg[X64_RSP].u64, (unsigned long long)reg[X64_RBP].u64,
                      (unsigned long long)xmm[0].hi, (unsigned long long)xmm[0].lo,
                      (unsigned long long)xmm[1].hi, (unsigned long long)xmm[1].lo);
+        }
+        if (wildJump) {
+            RipHist& h = ring[ringPos];
+            h.rip = rip;
+            h.rax = reg[X64_RAX].u64; h.rbx = reg[X64_RBX].u64;
+            h.rcx = reg[X64_RCX].u64; h.rdx = reg[X64_RDX].u64;
+            h.rsi = reg[X64_RSI].u64; h.rdi = reg[X64_RDI].u64;
+            h.rsp = reg[X64_RSP].u64; h.rbp = reg[X64_RBP].u64;
+            h.b0 = fetchByte(rip);   h.b1 = fetchByte(rip+1);
+            h.b2 = fetchByte(rip+2); h.b3 = fetchByte(rip+3);
+            ringPos = (ringPos + 1) & 31;
+            if (!wildFired && rip != 0 && rip < WILD_LO) {
+                wildFired = true;
+                klog_fmt("BW64_WILDJUMP: RIP=0x%llx entered low memory @ insn #%llu "
+                         "— dumping last 32 instructions (oldest first):",
+                         (unsigned long long)rip, (unsigned long long)instructionCount);
+                for (int i = 0; i < 32; i++) {
+                    RipHist& e = ring[(ringPos + i) & 31];
+                    if (e.rip == 0 && e.b0 == 0 && e.rsp == 0) continue;
+                    klog_fmt("  [%2d] RIP=0x%llx %02x %02x %02x %02x  "
+                             "rax=%llx rbx=%llx rcx=%llx rdx=%llx rsi=%llx rdi=%llx rsp=%llx rbp=%llx",
+                             i, (unsigned long long)e.rip, e.b0, e.b1, e.b2, e.b3,
+                             (unsigned long long)e.rax, (unsigned long long)e.rbx,
+                             (unsigned long long)e.rcx, (unsigned long long)e.rdx,
+                             (unsigned long long)e.rsi, (unsigned long long)e.rdi,
+                             (unsigned long long)e.rsp, (unsigned long long)e.rbp);
+                }
+            }
         }
         U32 n = step();
         if (n == 0) break;

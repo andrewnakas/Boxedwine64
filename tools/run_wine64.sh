@@ -58,6 +58,7 @@ if [ ! -d "$PREFIX/drive_c/windows/system32" ]; then
         -env "WINELOADER=/usr/lib/wine/wine64" \
         -env "WINESERVER=/usr/lib/wine/wineserver64" \
         -env "WINEDLLPATH=/usr/lib/x86_64-linux-gnu/wine" \
+        -env "MALLOC_CHECK_=3" -env "GLIBC_TUNABLES=glibc.malloc.check=3" \
         /usr/lib/wine/wine64 wineboot --init >/dev/null 2>&1 || true
     rm -f "$PREFIX"/regf*.tmp "$PREFIX/.update-timestamp" 2>/dev/null || true
     find "$BASE_ROOT/run/user/1000/wine" -maxdepth 1 -name 'server-1-*' \
@@ -86,5 +87,7 @@ echo "guest:   wine64 $GUEST_PE $*"
     -env "WINEDLLPATH=/usr/lib/x86_64-linux-gnu/wine" \
     -env "WINEDEBUG=+x11drv,+win,+message" \
     -env "DISPLAY=:0" \
+    -env "MALLOC_CHECK_=3" \
+    -env "GLIBC_TUNABLES=glibc.malloc.check=3" \
     /usr/lib/wine/wine64 "$GUEST_PE" "$@" 2>&1 \
     | grep -avE "pixel format|redundant|new pixel|failed to choose|software renderer|Number which|Number of"

@@ -48,6 +48,8 @@
 #define X64_SYS_mkdirat           258
 #define X64_SYS_symlink           88
 #define X64_SYS_symlinkat         266
+#define X64_SYS_link              86
+#define X64_SYS_linkat            265
 #define X64_SYS_socketpair        53
 #define X64_SYS_shutdown          48
 #define X64_SYS_socket            41
@@ -95,6 +97,7 @@
 #define X64_SYS_newfstatat        262
 #define X64_SYS_set_robust_list   273
 #define X64_SYS_madvise           28
+#define X64_SYS_fadvise64         221
 #define X64_SYS_mremap            25
 #define X64_SYS_sigaltstack       131
 #define X64_SYS_rt_sigreturn      15
@@ -813,10 +816,51 @@ static U64 sys_mmap64_file(CPU64* cpu, U64 addr, U64 length, U64 prot,
     }
     U64 aligned = addr & ~0xFFFULL;
     U64 mapLen = (length + (addr - aligned) + 0xFFF) & ~0xFFFULL;
+    bool dump = getenv("BW64_FMMAP") != nullptr;
+    if (dump) {
+        klog_fmt("FMMAP [pid=%d] addr=0x%llx aligned=0x%llx len=0x%llx mapLen=0x%llx "
+                 "prot=0x%x flags=0x%x off=0x%llx fixed=%d file='%s'",
+                 (int)(cpu->thread ? cpu->thread->process->id : -1),
+                 (unsigned long long)addr, (unsigned long long)aligned,
+                 (unsigned long long)length, (unsigned long long)mapLen,
+                 (unsigned)prot, (unsigned)flags, (unsigned long long)offset,
+                 (int)((flags & K_MAP_FIXED) != 0),
+                 kfile->openFile->node ? kfile->openFile->node->path.c_str() : "?");
+    }
+    // The page that contains `addr` may already hold valid bytes from a PRIOR
+    // overlapping mapping of the SAME DSO (glibc maps the first PT_LOAD over the
+    // whole span, then MAP_FIXED-remaps later segments whose file offset is not
+    // page-aligned — so [aligned, addr) is the tail of the previous segment).
+    // mmapAnonymousFixed ZEROES whole pages, so a blind zero here wipes that
+    // tail and never refills it (we only read file content into [addr, ...)),
+    // corrupting live code/data. Preserve the leading partial-page bytes across
+    // the (re)map: snapshot [aligned, addr) before, restore after.
+    U64 head = addr - aligned;
+    std::vector<U8> headSave;
+    if (head > 0 && cpu->memory->isPageMapped(aligned >> 12)) {
+        headSave.resize((size_t)head);
+        cpu->memory->memcpyFromGuest(headSave.data(), aligned, head);
+        if (dump) klog_fmt("FMMAP   preserving 0x%llx head bytes at 0x%llx",
+                           (unsigned long long)head, (unsigned long long)aligned);
+    }
+    // Likewise the trailing partial page: file content covers only `length`
+    // bytes from `addr`, but mapLen rounds up to a page boundary. If the tail
+    // page overlapped a prior mapping, save+restore the bytes past the file
+    // content so we don't zero a neighbour segment that already lives there.
+    U64 fileEnd = addr + length;
+    U64 mapEnd  = aligned + mapLen;
+    U64 tail = (mapEnd > fileEnd) ? (mapEnd - fileEnd) : 0;
+    std::vector<U8> tailSave;
+    if (tail > 0 && cpu->memory->isPageMapped((fileEnd) >> 12)) {
+        tailSave.resize((size_t)tail);
+        cpu->memory->memcpyFromGuest(tailSave.data(), fileEnd, tail);
+    }
     U64 mapped = cpu->memory->mmapAnonymousFixed(aligned, mapLen, (U32)prot);
     if ((S64)mapped < 0) {
         return mapped;
     }
+    if (!headSave.empty()) cpu->memory->memcpyToGuest(aligned, headSave.data(), head);
+    if (!tailSave.empty()) cpu->memory->memcpyToGuest(fileEnd, tailSave.data(), tail);
     // Read [offset, offset+length) and copy into [addr, addr+length).
     std::vector<U8> buf((size_t)length);
     S64 saved = kfile->openFile->getFilePointer();
@@ -1843,6 +1887,7 @@ static const char* x64SyscallName(U64 nr) {
         case 24: return "sched_yield";
         case 25: return "mremap";
         case 28: return "madvise";
+        case 221: return "fadvise64";
         case 32: return "dup";
         case 33: return "dup2";
         case 34: return "pause";
@@ -1870,6 +1915,8 @@ static const char* x64SyscallName(U64 nr) {
         case 79: return "getcwd";
         case 80: return "chdir";
         case 82: return "rename";
+        case 86: return "link";
+        case 88: return "symlink";
         case 89: return "readlink";
         case 90: return "chmod";
         case 91: return "fchmod";
@@ -2009,7 +2056,12 @@ void ksyscall64(CPU64* cpu) {
             break;
         case X64_SYS_set_robust_list:
         case X64_SYS_madvise:
+        case X64_SYS_fadvise64:
             // ld-linux makes these calls before main; safe to no-op.
+            // fadvise64(fd, offset, len, advice): a pure readahead hint
+            // (fontconfig POSIX_FADV_WILLNEED/RANDOM on its cache mmaps).
+            // The interpreter has no page cache to advise, so ignoring it is
+            // correct — the data is still read on demand.
             ret = 0;
             break;
         case X64_SYS_ioctl: {
@@ -2334,6 +2386,34 @@ void ksyscall64(CPU64* cpu) {
                 klog_fmt("sys_symlink64: target='%s' link='%s' (cwd='%s') -> %d",
                          target, fullLink.c_str(),
                          cpu->thread->process->currentDirectory.c_str(), (int)(S32)ret);
+            }
+            break;
+        }
+        case X64_SYS_link:
+        case X64_SYS_linkat: {
+            // link(oldpath, newpath) / linkat(olddirfd, oldpath, newdirfd,
+            // newpath, flags). fontconfig builds its on-disk cache atomically by
+            // writing a temp file, link()-ing it to the final cache name, then
+            // unlink()-ing the temp — so a missing link() leaves the cache
+            // perpetually un-built and fontconfig re-scans every font dir on
+            // every process launch (the boot-storm font-scan loop). Route to
+            // KProcess::link, which hard-links (or copies) in the writable
+            // overlay. linkat's dirfds are AT_FDCWD/absolute in this path.
+            if (!cpu->thread || !cpu->thread->process) { ret = (U64)-K_ENOSYS; break; }
+            U64 oldArg = (nr == X64_SYS_link) ? a1 : a2;
+            U64 newArg = (nr == X64_SYS_link) ? a2 : a4;
+            char oldp[1024] = {0};
+            char newp[1024] = {0};
+            cpu->memory->memcpyFromGuest(oldp, oldArg, sizeof(oldp) - 1);
+            cpu->memory->memcpyFromGuest(newp, newArg, sizeof(newp) - 1);
+            BString fullOld = Fs::getFullPath(cpu->thread->process->currentDirectory,
+                                              BString::copy(oldp));
+            BString fullNew = Fs::getFullPath(cpu->thread->process->currentDirectory,
+                                              BString::copy(newp));
+            ret = (U64)(S64)(S32)cpu->thread->process->link(fullOld, fullNew);
+            if (getenv("BW64_SCDUMP")) {
+                klog_fmt("sys_link64: old='%s' new='%s' -> %d",
+                         fullOld.c_str(), fullNew.c_str(), (int)(S32)ret);
             }
             break;
         }

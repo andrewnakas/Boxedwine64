@@ -13,6 +13,7 @@
 #ifdef BOXEDWINE_GUEST_X64
 
 #include <string.h>
+#include <cstdlib>
 
 // K_EINVAL / K_ENOMEM live in the existing kernel headers. We return
 // (U64)-errno from mmap-style calls following the 32-bit convention.
@@ -124,8 +125,33 @@ U64 KMemory64::mprotect(U64 addr, U64 len, U32 prot) {
     return addr;
 }
 
+// BW64_WATCH=0xADDR[,len] — log any guest write that overlaps [ADDR, ADDR+len).
+// Used to find who fills (or fails to fill) a runtime callback slot. The host
+// callstack isn't captured, but the value + the fact that a write happened at
+// all distinguishes "never written" from "written with garbage". Parsed once.
+static U64 g_watchAddr = 0, g_watchLen = 0;
+static bool g_watchInit = false;
+static void initWatch() {
+    g_watchInit = true;
+    const char* e = std::getenv("BW64_WATCH");
+    if (!e) return;
+    g_watchAddr = std::strtoull(e, nullptr, 0);
+    const char* comma = std::strchr(e, ',');
+    g_watchLen = comma ? std::strtoull(comma + 1, nullptr, 0) : 8;
+    if (g_watchLen == 0) g_watchLen = 8;
+}
+
 void KMemory64::memcpyToGuest(U64 dstGuest, const void* src, U64 len) {
     const U8* s = (const U8*)src;
+    if (!g_watchInit) initWatch();
+    if (g_watchAddr && dstGuest < g_watchAddr + g_watchLen && dstGuest + len > g_watchAddr) {
+        U64 v = 0;
+        U64 within = (g_watchAddr >= dstGuest) ? (g_watchAddr - dstGuest) : 0;
+        if (within + 8 <= len) std::memcpy(&v, (const U8*)src + within, 8);
+        klog_fmt("BW64_WATCH: write to 0x%llx (watch 0x%llx) len=%llu first8=0x%llx",
+                 (unsigned long long)dstGuest, (unsigned long long)g_watchAddr,
+                 (unsigned long long)len, (unsigned long long)v);
+    }
     while (len) {
         U64 pageNum = dstGuest >> K64_PAGE_SHIFT;
         U64 offsetInPage = dstGuest & K64_PAGE_MASK;

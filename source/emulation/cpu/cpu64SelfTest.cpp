@@ -3109,6 +3109,28 @@ int runX64SelfTest() {
         });
     }
 
+    // Test 85b — CVTTPD2DQ (66 0F E6): TRUNCATE 2× f64 → 2× S32, hi qword 0.
+    // {3.7, -4.7} truncates toward zero to {3, -4} (rounding would give {4,-5}),
+    // so this distinguishes the truncating form from cvtpd2dq. fontconfig emits
+    // this opcode while building font metrics; it was unimplemented (the
+    // freetype-load "unimpl opcode 66 0f e6" that wedged the GUI boot).
+    {
+        // 3.7 = 0x400D999999999999A? use exact load via movabs of the IEEE bits.
+        // 3.7  bits = 0x400D99999999999A ; -4.7 bits = 0xC012CCCCCCCCCCCD
+        std::vector<U8> code = {
+            0x48, 0xB8, 0x9A,0x99,0x99,0x99,0x99,0x99,0x0D,0x40,           // mov rax, bits(3.7)
+            0x66, 0x48, 0x0F, 0x6E, 0xC0,                                  // movq xmm0, rax (lo=3.7)
+            0x48, 0xB8, 0xCD,0xCC,0xCC,0xCC,0xCC,0xCC,0x12,0xC0,           // mov rax, bits(-4.7)
+            0x66, 0x48, 0x0F, 0x6E, 0xC8,                                  // movq xmm1, rax (lo=-4.7)
+            0x66, 0x0F, 0x14, 0xC1,                                        // unpcklpd xmm0, xmm1 → {3.7, -4.7}
+            0x66, 0x0F, 0xE6, 0xC8,                                        // cvttpd2dq xmm1, xmm0
+            0x66, 0x48, 0x0F, 0x7E, 0xC8,                                  // movq rax, xmm1
+        };
+        runAndCheck(r, "cvttpd2dq {3.7, -4.7} -> {3, -4} (truncate)", withExit(code), [](CPU64& c) {
+            return c.reg[X64_R15].u64 == ((U64)3 | (((U64)(U32)(S32)-4) << 32));
+        });
+    }
+
     // Test 86 — CVTDQ2PS: src.lo = (1)|(2<<32) → result.lo = 1.0f|2.0f<<32
     //   1.0f=0x3F800000, 2.0f=0x40000000 → expected lo = 0x400000003F800000.
     {
