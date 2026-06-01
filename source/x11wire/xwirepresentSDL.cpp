@@ -38,6 +38,7 @@
 #include <SDL.h>
 #include <mutex>
 #include <deque>
+#include <atomic>
 #include <vector>
 
 namespace {
@@ -242,7 +243,12 @@ public:
         if (inputQ.empty()) return false;
         out = inputQ.front();
         inputQ.pop_front();
+        if (inputQ.empty()) inputPending.store(false, std::memory_order_relaxed);
         return true;
+    }
+
+    bool hasInput() const override {
+        return inputPending.load(std::memory_order_relaxed);
     }
 
     void tickMainThread() override {
@@ -368,7 +374,10 @@ private:
     void push(const XWireInputEvent& ie) {
         std::lock_guard<std::mutex> lk(mtx);
         // Cap the queue so a stalled guest can't grow it unbounded.
-        if (inputQ.size() < 1024) inputQ.push_back(ie);
+        if (inputQ.size() < 1024) {
+            inputQ.push_back(ie);
+            inputPending.store(true, std::memory_order_relaxed);
+        }
     }
 
     std::mutex mtx;
@@ -382,6 +391,7 @@ private:
     uint16_t shownW = 0, shownH = 0;     // last size pushed to the host screen
     bool loadingShown = false;           // loading-screen window sized/shown once
     int lastShownPct = -1, creep = 0;    // loading-bar anti-freeze jitter
+    std::atomic<bool> inputPending{false}; // lock-free "queue non-empty" flag
 };
 
 XWirePresentSinkSDL g_sink;
@@ -407,10 +417,14 @@ void xwireForwardSdlEvent(const SDL_Event& e) {
 void tickXWirePresent() {
     if (g_xwirePresentSink) {
         g_xwirePresentSink->tickMainThread();
-        // Flush any host input the SDL pump queued out to the guest, even if the
-        // app is idle (not sending requests). Safe from the main thread: the
+        // Flush queued host input to the guest only when there IS input — a
+        // lock-free check, so during the boot storm (no input) we take zero
+        // mutexes and never contend with the guest threads holding the conn/reg
+        // locks (that contention livelocked the boot). When input is queued the
         // flush lands bytes in the client recvBuffer + signals its condition.
-        XWireServer::instance().pumpInput();
+        if (g_xwirePresentSink->hasInput()) {
+            XWireServer::instance().pumpInput();
+        }
     }
 }
 

@@ -61,6 +61,11 @@ public:
     // socket the next time wine reads it.
     virtual bool nextInputEvent(XWireInputEvent& out) = 0;
 
+    // Cheap lock-free check: is any host input queued? Lets the main-thread
+    // present tick skip pumpInput() entirely (no mutex traffic) when idle, so it
+    // never contends with the guest threads during the boot storm.
+    virtual bool hasInput() const = 0;
+
     // Main-thread (doMainLoop): present the most recent submitted frame and pump
     // the host event queue into the input queue. No-op when nothing changed.
     virtual void tickMainThread() = 0;
