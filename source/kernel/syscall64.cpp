@@ -1373,7 +1373,8 @@ static U64 buildSignalFrame(CPU64* cpu, U64 framePtr) {
     //         next 16 = GS, next 16 = FS, top 16 = ss. Approximate.
     cpu->memory->writeq(gregsPtr + 8 * X64_GREG_CSGSFS,
                         (U64)0x33 | ((U64)0x2B << 48));
-    // ERR/TRAPNO/CR2 = 0 (no fault triggered this delivery)
+    // ERR/TRAPNO/CR2 = 0 (no fault triggered this delivery). A hardware-fault
+    // delivery overwrites these afterwards via the fault-info it has.
     // OLDMASK = caller's sigmask before this delivery (we set it to current)
     cpu->memory->writeq(gregsPtr + 8 * X64_GREG_OLDMASK, cpu->sigMask);
     // fpregs pointer = 0 (we don't snapshot XMM/x87 here yet — the next
@@ -1491,6 +1492,63 @@ static bool deliverSignalSync(CPU64* cpu, U32 sig) {
     cpu->reg[X64_RDX].setU64(uctxPtr);  // arg3: ucontext pointer
     cpu->rip = sa.handler;
 
+    return true;
+}
+
+// Synchronously deliver a hardware-trap-derived signal (SIGFPE on #DE,
+// SIGSEGV on a page fault, ...) at the faulting instruction. Unlike
+// deliverSignalSync (used for raise()/tgkill self), this synthesizes a real
+// siginfo and fills the mcontext TRAPNO/ERR/CR2 so wine's (and glibc's)
+// signal handlers see a genuine fault — wine's setup_raise_exception maps
+// SIGFPE + si_code → EXCEPTION_INT_DIVIDE_BY_ZERO etc, and uses the ucontext
+// RIP as the exception address. cpu->rip must still point at the faulting
+// instruction when this is called (so the captured RIP is the fault site).
+bool CPU64::raiseSyncFault(U32 sig, U32 trapNo, S32 siCode, U64 faultAddr) {
+    if (sig < 1 || sig > 64) return false;
+    SigAction& sa = this->sigActions[sig];
+    if (!sa.installed) return false;
+    if (sa.handler == 0 /*SIG_DFL*/ || sa.handler == 1 /*SIG_IGN*/) return false;
+
+    U64 baseSp;
+    if ((sa.flags & X64_SA_ONSTACK) && this->sigAltStack.ssSp != 0 &&
+        (this->sigAltStack.ssFlags & 2 /*SS_DISABLE*/) == 0) {
+        baseSp = this->sigAltStack.ssSp + this->sigAltStack.ssSize;
+    } else {
+        baseSp = this->reg[X64_RSP].u64 - 128; // red zone
+    }
+    U64 frameBase = (baseSp - X64_SIGFRAME_SIZE) & ~(U64)15;
+
+    U64 uctxPtr = buildSignalFrame(this, frameBase);
+
+    // Fill the fault-specific mcontext slots the generic builder leaves zero.
+    U64 gregsPtr = uctxPtr + X64_MCONTEXT_OFF_IN_UCTX;
+    this->memory->writeq(gregsPtr + 8 * X64_GREG_TRAPNO, (U64)trapNo);
+    this->memory->writeq(gregsPtr + 8 * X64_GREG_ERR, 0);
+    this->memory->writeq(gregsPtr + 8 * X64_GREG_CR2, faultAddr);
+
+    // Synthesize a siginfo_t at the start of the frame (the siginfo region sits
+    // before the ucontext at X64_UCONTEXT_OFF_IN_FRAME). Layout (x86-64):
+    //   int si_signo @0; int si_errno @4; int si_code @8; then the union,
+    //   where the SIGFPE/SIGSEGV variant places void* si_addr @16.
+    U64 siPtr = frameBase;
+    this->memory->writed(siPtr + 0, sig);
+    this->memory->writed(siPtr + 4, 0);
+    this->memory->writed(siPtr + 8, (U32)siCode);
+    this->memory->writeq(siPtr + 16, faultAddr);
+
+    U64 retSlot = uctxPtr - 8;
+    this->memory->writeq(retSlot, sa.restorer);
+
+    if ((sa.flags & 0x40000000) == 0) {
+        this->sigMask |= (1ULL << (sig - 1));
+    }
+    this->sigMask |= sa.mask;
+
+    this->reg[X64_RSP].setU64(retSlot);
+    this->reg[X64_RDI].setU64(sig);        // arg1: signal number
+    this->reg[X64_RSI].setU64(siPtr);      // arg2: siginfo*
+    this->reg[X64_RDX].setU64(uctxPtr);    // arg3: ucontext*
+    this->rip = sa.handler;
     return true;
 }
 

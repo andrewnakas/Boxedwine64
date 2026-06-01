@@ -14,6 +14,7 @@
 #include "cpu64.h"
 #include "kmemory64.h"
 #include "syscall64.h"
+#include "ksignal.h"   // K_SIGFPE
 
 #include <cmath>
 #include <cstring>
@@ -1157,11 +1158,17 @@ U32 CPU64::step() {
     // v1: only /0 TEST imm wired (needed by ld-linux); rest unimpl.
     if (op == 0xF6 || op == 0xF7) {
         U32 size = (op == 0xF6) ? 1 : opSize;
-        ModRM m = decodeModRM(rip + opOff + 1, p,
-            (op == 0xF7 && size != 1) ? (size == 2 ? 2 : 4) : 1);
+        // Decode with NO trailing immediate: only the /0 TEST subform carries
+        // an immediate, and the sub-opcode lives in the ModRM reg field which
+        // we can't know until we decode. trailingImmBytes ONLY shifts the
+        // RIP-relative effective address (disp is relative to end-of-insn), so
+        // a blanket nonzero value mis-addresses the no-immediate subforms (DIV/
+        // IDIV/NOT/NEG/MUL/IMUL) by the immediate width — a real bug that made
+        // a RIP-relative `divq [rip+disp]` read 4 bytes past its operand. We
+        // fix up the TEST operand's RIP-relative address below, once we know it.
+        ModRM m = decodeModRM(rip + opOff + 1, p, 0);
         U8 sub = m.regField & 0x7;
         if (sub == 0) {
-            U64 a = loadRM(m, size, rexPresent);
             U64 imm; U32 immLen;
             U64 immAddr = rip + opOff + 1 + m.length;
             if (size == 1) { imm = fetchByte(immAddr); immLen = 1; }
@@ -1174,6 +1181,11 @@ U32 CPU64::step() {
                 S32 i32 = (S32)fetchDword(immAddr);
                 imm = (U64)(S64)i32; immLen = 4;
             }
+            // RIP-relative TEST: the disp is relative to the address after the
+            // whole instruction, which includes this immediate. decodeModRM
+            // computed effAddr with trailing=0, so add the immediate length.
+            if (m.isRipRel) m.effAddr += immLen;
+            U64 a = loadRM(m, size, rexPresent);
             flagsLogic(rflags, a & imm, size);
             U32 used = opOff + 1 + m.length + immLen;
             rip += used;
@@ -1280,8 +1292,42 @@ U32 CPU64::step() {
             // skip the write and continue; full #DE delivery is a TODO.
             U64 a = loadRM(m, size, rexPresent);
             if (a == 0) {
-                klog_fmt("CPU64: DIV by zero at RIP=0x%llx (TODO: deliver #DE)",
-                         (unsigned long long)rip);
+                // #DE: divide error. Deliver SIGFPE/FPE_INTDIV at this RIP so
+                // the guest's exception handling runs exactly as on real
+                // hardware (wine maps it to EXCEPTION_INT_DIVIDE_BY_ZERO and
+                // its vectored/SEH handlers decide what to do). rip still
+                // points at the DIV, which is what the handler's ucontext and
+                // si_addr must capture.
+                if (getenv("BW64_DIVZERO")) {
+                    U64 ea = m.isReg ? 0 : m.effAddr;
+                    // For the libX11 _XrmInternalStringToQuark rehash divide,
+                    // the divisor global sits at ea; the table mask is ea+0x10
+                    // and the table pointer at ea-0x3240. Dump them to see
+                    // whether the table is live while the divisor reads 0.
+                    U64 mask = (!m.isReg) ? memory->readq(ea + 0x10) : 0;
+                    U64 tptr = (!m.isReg) ? memory->readq(ea - 0x3240) : 0;
+                    klog_fmt("CPU64: #DE divide-by-zero RIP=0x%llx size=%u sub=%u "
+                             "RAX=0x%llx RDX=0x%llx RCX=0x%llx RBX=0x%llx "
+                             "ea=0x%llx [ea]=0x%llx mask@+0x10=0x%llx tptr@-0x3240=0x%llx",
+                             (unsigned long long)rip, size, sub,
+                             (unsigned long long)reg[X64_RAX].u64,
+                             (unsigned long long)reg[X64_RDX].u64,
+                             (unsigned long long)reg[X64_RCX].u64,
+                             (unsigned long long)reg[X64_RBX].u64,
+                             (unsigned long long)ea,
+                             (unsigned long long)(m.isReg ? 0 : memory->readq(ea)),
+                             (unsigned long long)mask, (unsigned long long)tptr);
+                }
+                if (this->raiseSyncFault(K_SIGFPE, /*trapNo #DE*/0,
+                                         K_FPE_INTDIV, rip)) {
+                    return 0; // rip now at the handler
+                }
+                // No SIGFPE handler installed — terminate like the kernel's
+                // default action for an uncaught #DE instead of spinning on a
+                // re-executed faulting DIV.
+                klog_fmt("CPU64: unhandled #DE at RIP=0x%llx (no SIGFPE handler) "
+                         "— terminating thread", (unsigned long long)rip);
+                if (thread) thread->process->signalProcess(K_SIGFPE);
                 yield = true;
                 return 0;
             }

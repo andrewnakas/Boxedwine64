@@ -40,7 +40,13 @@ namespace {
         X_ChangeProperty        = 18,
         X_DeleteProperty        = 19,
         X_GetProperty           = 20,
+        X_GetSelectionOwner     = 23,
         X_GetInputFocus         = 43,
+        X_SetClipRectangles     = 59,
+        X_AllocColor            = 84,
+        X_CreateCursor          = 93,
+        X_FreeCursor            = 95,
+        X_RecolorCursor         = 96,
         X_QueryExtension        = 98,
         X_GetExtension          = 99,
         X_CreatePixmap          = 53,
@@ -344,9 +350,46 @@ void XWireConnection::processOneRequest(const uint8_t* req, uint32_t len) {
         case X_ImageText8:
         case X_ImageText16:
         case X_ChangeProperty:
+        case X_SetClipRectangles:
+        case X_CreateCursor:
+        case X_FreeCursor:
+        case X_RecolorCursor:
         case X_NoOperation:
             // No reply expected (or drawing handled later in Phase 2b/2c).
             break;
+
+        case X_GetSelectionOwner: {
+            // Report "no owner" (None). winex11 queries clipboard selection
+            // owners during init; a None reply is correct for a fresh display.
+            uint8_t r[32] = {0};
+            r[0] = 1;
+            r[2] = (uint8_t)(sequence & 0xff);
+            r[3] = (uint8_t)(sequence >> 8);
+            // owner @8 = 0 (None)
+            writeToClient(r, sizeof(r));
+            break;
+        }
+        case X_AllocColor: {
+            // AllocColor(cmap, red, green, blue) -> echo the requested RGB back
+            // and synthesize a pixel from the high bytes (TrueColor 0xRRGGBB).
+            // Our visual is 24bpp TrueColor so the pixel is just the packed RGB.
+            uint16_t red   = rd16(req + 8);
+            uint16_t green = rd16(req + 10);
+            uint16_t blue  = rd16(req + 12);
+            uint32_t pixel = ((uint32_t)(red   >> 8) << 16) |
+                             ((uint32_t)(green >> 8) << 8)  |
+                              (uint32_t)(blue  >> 8);
+            uint8_t r[32] = {0};
+            r[0] = 1;
+            r[2] = (uint8_t)(sequence & 0xff);
+            r[3] = (uint8_t)(sequence >> 8);
+            memcpy(r + 8, &red, 2);
+            memcpy(r + 10, &green, 2);
+            memcpy(r + 12, &blue, 2);
+            memcpy(r + 16, &pixel, 4);
+            writeToClient(r, sizeof(r));
+            break;
+        }
 
         case X_GetGeometry: {
             uint32_t drawable = rd32(req + 4);

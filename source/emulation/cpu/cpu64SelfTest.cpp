@@ -318,6 +318,58 @@ int runX64SelfTest() {
         });
     }
 
+    // Test 12b: DIV r/m64 with a RIP-RELATIVE memory operand. Regression for
+    // the F6/F7 group passing a bogus trailingImmBytes to decodeModRM: only the
+    // /0 TEST subform has an immediate, but the decoder added the immediate
+    // width to the RIP-relative effective address for *every* subform, so
+    // `divq [rip+disp]` read 4 bytes past its real divisor (it read 0 from the
+    // gap and faulted #DE — exactly what broke libX11's quark-hash rehash).
+    //   mov rax, 84            48 C7 C0 54 00 00 00   (7)
+    //   xor rdx, rdx           48 31 D2               (3)
+    //   divq [rip+0x0C]        48 F7 35 0C 00 00 00   (7)  -> ends at off 17
+    //   <EXIT_SYSCALL>                                (12) -> slot at off 29
+    //   .quad 2                (divisor, off 29)
+    // disp = slot(29) - end_of_divq(17) = 12 = 0x0C. 84 / 2 = 42.
+    {
+        std::vector<U8> code = {
+            0x48, 0xC7, 0xC0, 0x54, 0x00, 0x00, 0x00,             // mov rax, 84
+            0x48, 0x31, 0xD2,                                      // xor rdx, rdx
+            0x48, 0xF7, 0x35, 0x0C, 0x00, 0x00, 0x00,             // divq [rip+0x0C]
+        };
+        std::vector<U8> full = withExit(code);
+        const U8 divisor[8] = { 0x02, 0, 0, 0, 0, 0, 0, 0 };      // 2
+        full.insert(full.end(), divisor, divisor + 8);
+        runAndCheck(r, "divq [rip+disp] (84/2=42, RIP-rel operand)", full, [](CPU64& c) {
+            return c.reg[X64_R15].u64 == 42 && c.reg[X64_RDX].u64 == 0;
+        });
+    }
+
+    // Test 12c: TEST r/m64, imm32 with a RIP-RELATIVE operand still addresses
+    // correctly *after* the trailing-immediate fix (its disp IS relative to the
+    // end of the instruction including the imm32, so the fix re-adds immLen).
+    //   xor rax, rax           48 31 C0                       (3)
+    //   testq [rip+disp], imm  48 F7 05 <d32> 0F 00 00 00    (11) ends at off 14
+    //   sete al                0F 94 C0                       (3)  al=1 if ZF
+    //   movzx rax, al          48 0F B6 C0                    (4)
+    //   <EXIT_SYSCALL>                                        (12) slot at off 33
+    //   .quad 0xF0  (so 0xF0 & 0x0F == 0 -> ZF set -> result 1)
+    // disp = slot(33) - end_of_test(14) = 19 = 0x13.
+    {
+        std::vector<U8> code = {
+            0x48, 0x31, 0xC0,                                     // xor rax, rax
+            0x48, 0xF7, 0x05, 0x13, 0x00, 0x00, 0x00,            // testq [rip+0x13], ...
+            0x0F, 0x00, 0x00, 0x00,                               // imm32 = 0x0F
+            0x0F, 0x94, 0xC0,                                     // sete al
+            0x48, 0x0F, 0xB6, 0xC0,                               // movzx rax, al
+        };
+        std::vector<U8> full = withExit(code);
+        const U8 slot[8] = { 0xF0, 0, 0, 0, 0, 0, 0, 0 };        // 0xF0 & 0x0F == 0
+        full.insert(full.end(), slot, slot + 8);
+        runAndCheck(r, "testq [rip+disp], imm32 (RIP-rel addr w/ imm)", full, [](CPU64& c) {
+            return c.reg[X64_R15].u64 == 1;
+        });
+    }
+
     // Test 13: XCHG rax, rbx round-trips two values.
     {
         std::vector<U8> code = {

@@ -165,6 +165,18 @@ public:
     // only), `futexWaiters`, or scheduling flags (yield/reExecuteSyscall).
     void cloneRegistersFrom(const CPU64* from);
 
+    // Synchronously deliver a hardware-fault signal (e.g. SIGFPE on #DE,
+    // SIGSEGV on a page fault) to this thread, the way the kernel injects a
+    // trap-derived signal at the faulting instruction. Builds a signal frame
+    // capturing the *current* rip (so the handler's ucontext points at the
+    // faulting instruction), synthesizes a minimal siginfo (si_signo/si_code/
+    // si_addr), and sets gregs TRAPNO/ERR/CR2. Returns true if a handler ran
+    // (rip now points at it); false if no handler is installed (SIG_DFL/IGN) —
+    // the caller then falls back to its previous behaviour. Defined alongside
+    // the signal-frame helpers in syscall64.cpp. `siCode` is the si_code (e.g.
+    // FPE_INTDIV=1), `trapNo` the x86 vector (0 = #DE), `faultAddr` -> si_addr.
+    bool raiseSyncFault(U32 sig, U32 trapNo, S32 siCode, U64 faultAddr);
+
     void push64(U64 value);
     U64  pop64();
 
