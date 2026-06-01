@@ -58,6 +58,7 @@
 #define X64_SYS_unlink            87
 #define X64_SYS_unlinkat          263
 #define X64_SYS_fchdir            81
+#define X64_SYS_ftruncate         77
 #define X64_SYS_setsid            112
 #define X64_SYS_getpid            39
 #define X64_SYS_exit              60
@@ -550,6 +551,26 @@ static U64 sys_pread64(CPU64* cpu, U64 fd, U64 buf, U64 count, U64 offset) {
     if ((S32)got < 0) return (U64)(S64)(S32)got;
     if (got > 0) cpu->memory->memcpyToGuest(buf, tmp.data(), got);
     return (U64)got;
+}
+
+// pwrite64(fd, buf, count, offset) — write at an absolute offset without moving
+// the file position. wineserver uses it to populate registry/config files in
+// the prefix (it pwrite's records into the .reg/server files). Emulated as
+// save-pos/seek/write/restore over the KObject layer, mirroring sys_pread64.
+static U64 sys_pwrite64(CPU64* cpu, U64 fd, U64 buf, U64 count, U64 offset) {
+    if (!cpu->thread || !cpu->thread->process) return (U64)-K_ENOSYS;
+    KFileDescriptorPtr fdesc = cpu->thread->process->getFileDescriptor((FD)fd);
+    if (!fdesc) return (U64)-9; // -EBADF
+    if (!fdesc->canWrite()) return (U64)-K_EINVAL;
+    if (count == 0) return 0;
+    if (count > (1ULL << 20)) count = 1ULL << 20;
+    std::vector<U8> tmp((size_t)count);
+    cpu->memory->memcpyFromGuest(tmp.data(), buf, (U32)count);
+    S64 savedPos = fdesc->kobject->getPos();
+    fdesc->kobject->seek((S64)offset);
+    U32 wrote = fdesc->kobject->writeNative(tmp.data(), (U32)count);
+    fdesc->kobject->seek(savedPos);
+    return (U64)(S64)(S32)wrote;
 }
 
 // writeStatBuf64 — write the x86-64 Linux struct stat (144 bytes) into
@@ -1903,6 +1924,12 @@ void ksyscall64(CPU64* cpu) {
             if (!cpu->thread || !cpu->thread->process) { ret = (U64)-K_ENOSYS; break; }
             ret = (U64)(S64)(S32)cpu->thread->process->fchdir((FD)a1);
             break;
+        case X64_SYS_ftruncate:
+            // ftruncate(fd, length) — wineserver sizes its registry/mapping
+            // files. No guest memory.
+            if (!cpu->thread || !cpu->thread->process) { ret = (U64)-K_ENOSYS; break; }
+            ret = (U64)(S64)(S32)cpu->thread->process->ftruncate64((FD)a1, a2);
+            break;
         case X64_SYS_setsid:
             // setsid() — new session; we don't model sessions, return the pid
             // (matches the 32-bit stub). wineserver daemonizes with this.
@@ -2125,10 +2152,10 @@ void ksyscall64(CPU64* cpu) {
             ret = sys_getdents64_real(cpu, a1, a2, a3);
             break;
         case X64_SYS_pwrite64:
-            // pwrite64(fd, buf, count, offset). No real impl; ENOSYS is
-            // safer than silent zero-write.
+            // pwrite64(fd, buf, count, offset) — wineserver populates registry/
+            // config files in the prefix with it.
             if (a2 == 0) { ret = (U64)-K_EFAULT; break; }
-            ret = (U64)-K_ENOSYS;
+            ret = sys_pwrite64(cpu, a1, a2, a3, a4);
             break;
         case X64_SYS_readv:
             // Scatter-gather read. Same shape: needs iovec walker. ENOSYS
