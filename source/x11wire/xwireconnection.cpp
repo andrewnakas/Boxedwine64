@@ -280,6 +280,11 @@ void XWireConnection::processOneRequest(const uint8_t* req, uint32_t len) {
     uint8_t opcode = req[0];
     sequence++;
 
+    if (getenv("BW64_XWIRE")) {
+        klog_fmt("XWire: req opcode=%d detail=%d len=%d seq=%d",
+                 (int)opcode, (int)req[1], (int)len, (int)sequence);
+    }
+
     switch (opcode) {
         case X_CreateWindow: {
             // wid at req[4]; parent at req[8]; x,y,w,h at req[12..]

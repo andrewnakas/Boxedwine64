@@ -20,6 +20,7 @@
 
 #include "kpoll.h"
 #include "kscheduler.h"
+#include "kunixsocket.h"
 
 static void clearPollData(KThread* thread, KPollData* data, U32 count) {
     BOXEDWINE_CRITICAL_SECTION_WITH_MUTEX(thread->process->fdsMutex);
@@ -89,15 +90,39 @@ S32 internal_poll(KThread* thread, KPollData* data, U32 count, U32 timeout) {
                 data++;
             }
         }
-        if (result>0) {	
+        if (result>0) {
             thread->condStartWaitTime = 0;
             clearPollData(thread, firstData, count);
             return result;
         }
+        // Diagnostic: when poll finds NOTHING ready (about to block/timeout),
+        // dump each fd's readiness + buffered bytes. If a unix socket shows
+        // recvUsed>0 yet isReadReady()==0 here, that's the epoll-readiness bug;
+        // if every fd is genuinely empty, the writer/peer never delivered.
+        if (getenv("BW64_POLLDUMP")) {
+            BOXEDWINE_CRITICAL_SECTION_WITH_MUTEX(thread->process->fdsMutex);
+            char buf[512]; int off = 0;
+            KPollData* d = firstData;
+            for (U32 i = 0; i < count && off < 460; i++, d++) {
+                KFileDescriptor* fd = (d->fd >= 0) ? thread->process->getFileDescriptor_nolock(d->fd) : nullptr;
+                long used = -1; int rr = -1; int op = -1;
+                const char* k = "?";
+                if (fd && fd->kobject) {
+                    rr = fd->kobject->isReadReady() ? 1 : 0;
+                    op = fd->kobject->isOpen() ? 1 : 0;
+                    std::shared_ptr<KUnixSocketObject> us = std::dynamic_pointer_cast<KUnixSocketObject>(fd->kobject);
+                    if (us) { k = "us"; used = (long)us->debugRecvUsed(); }
+                }
+                off += snprintf(buf + off, sizeof(buf) - off, "[fd=%d ev=0x%x rr=%d op=%d %s used=%ld]",
+                                (int)d->fd, (unsigned)d->events, rr, op, k, used);
+            }
+            klog_fmt("POLLDUMP pid=%d to=%d cnt=%d %s",
+                     (int)(thread->process ? thread->process->id : -1), (int)timeout, (int)count, buf);
+        }
         if (timeout==0) {
             clearPollData(thread, firstData, count);
             return 0;
-        }	
+        }
         if (interrupted) {
             thread->condStartWaitTime = 0;
             clearPollData(thread, firstData, count);
