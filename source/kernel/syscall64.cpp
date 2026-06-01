@@ -793,6 +793,30 @@ static U64 sys_writev64(CPU64* cpu, U64 fd, U64 iov, U64 iovcnt) {
     return total;
 }
 
+// readv(fd, iov, iovcnt) — scatter read. Mirror sys_writev64: walk the
+// 64-bit iovec array (struct iovec is {void* base; size_t len} = 16 bytes
+// on x86-64) and read into each segment via sys_read64. Stop on the first
+// short read (fewer bytes than the segment asked for) — that's EOF / no
+// more data right now, same as the kernel. Returns total bytes read, or
+// the first segment's error if nothing was read. wine/wineserver read
+// server replies through readv, so a missing impl silently breaks the IPC
+// reply path (was -ENOSYS).
+static U64 sys_readv64(CPU64* cpu, U64 fd, U64 iov, U64 iovcnt) {
+    U64 total = 0;
+    for (U64 i = 0; i < iovcnt; i++) {
+        U64 base = cpu->memory->readq(iov + i * 16 + 0);
+        U64 len  = cpu->memory->readq(iov + i * 16 + 8);
+        if (len == 0) continue;
+        S64 got = (S64)sys_read64(cpu, fd, base, len);
+        if (got < 0) {
+            return total > 0 ? total : (U64)got;
+        }
+        total += (U64)got;
+        if ((U64)got < len) break; // short read: EOF / drained
+    }
+    return total;
+}
+
 // Read a NUL-terminated guest C-string at addr from 64-bit memory. Bounded so a
 // missing terminator can't loop forever; argv/env strings and paths are well
 // under this. Reads in small chunks to avoid a huge fixed stack buffer.
@@ -2784,10 +2808,9 @@ void ksyscall64(CPU64* cpu) {
             ret = sys_pwrite64(cpu, a1, a2, a3, a4);
             break;
         case X64_SYS_readv:
-            // Scatter-gather read. Same shape: needs iovec walker. ENOSYS
-            // until we add it — callers fall back to plain read().
+            // Scatter-gather read — walk the iovec, read into each segment.
             if (a2 == 0) { ret = (U64)-K_EFAULT; break; }
-            ret = (U64)-K_ENOSYS;
+            ret = sys_readv64(cpu, a1, a2, a3);
             break;
         case X64_SYS_select:
             // select(nfds, readfds, writefds, exceptfds, timeout). Without
