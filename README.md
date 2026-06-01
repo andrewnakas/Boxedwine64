@@ -4,6 +4,10 @@
 
 This fork is a **work in progress**, but a substantial one: real Debian `wine64` now boots a Windows program (`notepad.exe`) all the way to a **visible, rendered GUI window** on macOS arm64, driving real `wineserver64`, `winex11`, FreeType/fontconfig text, and an in-process X11 wire server. The 32-bit code path remains fully functional and unchanged. The 64-bit code path is gated behind `BOXEDWINE_GUEST_X64` and was built out entirely by running real binaries and implementing each opcode/syscall they touch.
 
+![wine64 notepad.exe rendering a real GUI window in Boxedwine64 on macOS](docs/images/notepad-gui.png)
+
+*Real `wine64 notepad.exe` running under Boxedwine64 on macOS arm64 — full menu bar, FreeType-rendered text, scrollbar, status bar, and a live caret, painted through the in-process X11 wire server.*
+
 > Boxedwine is released under the GNU General Public License v2 (GPL). Original upstream by danoon2 — see [github.com/danoon2/Boxedwine](https://github.com/danoon2/Boxedwine).
 
 ---
