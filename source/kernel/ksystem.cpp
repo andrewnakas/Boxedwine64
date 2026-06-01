@@ -369,6 +369,81 @@ void KSystem::wakeThreadsWaitingOnProcessStateChanged() {
     BOXEDWINE_CONDITION_SIGNAL_ALL(processesCond);
 }
 
+// Find/block/reap a child for waitpid/wait4. Returns the reaped child's pid (or
+// a negative -errno / 0 for WNOHANG / -K_CONTINUE etc.) and, on a successful
+// reap, the encoded wait status in *statusOut. Arch-neutral — does NOT write
+// guest memory, so 32-bit waitpid and the 64-bit wait4 path can each store the
+// status into their own address space (KMemory vs KMemory64).
+U32 KSystem::reapChild(KThread* thread, S32 pid, U32 options, int* statusOut) {
+    KProcessPtr process;
+    U32 parentId = thread->process->id;
+    U32 parentGroupId = thread->process->groupId;
+
+    BOXEDWINE_CRITICAL_SECTION_WITH_CONDITION(processesCond);
+
+    while (!process) {
+        bool hasChild = false;
+
+        if (pid>0) {
+            process = KSystem::processes[pid];
+            if (!process || process->parentId != parentId) {
+                return -K_ECHILD;
+            }
+            hasChild = true;
+            if (!process->isStopped() && !process->isTerminated()) {
+                process = 0;
+            }
+        } else {
+            for (auto& n : KSystem::processes) {
+                KProcessPtr p = n.value;
+                if (!p || p->parentId != parentId) {
+                    continue;
+                }
+                if (pid == -1 || (pid == 0 && p->groupId == parentGroupId) || (pid < -1 && p->groupId == (U32)(-pid))) {
+                    hasChild = true;
+                    if (p->isStopped() || p->isTerminated()) {
+                        process = p;
+                        break;
+                    }
+                }
+            }
+            if (!hasChild) {
+                return -K_ECHILD;
+            }
+        }
+        if (!process) {
+            if (options & 1) { // WNOHANG
+                return 0;
+            } else {
+                BOXEDWINE_CONDITION_WAIT(processesCond);
+#ifdef BOXEDWINE_MULTI_THREADED
+                if (KThread::currentThread()->terminating) {
+                    return -K_EINTR;
+                }
+                if (KThread::currentThread()->startSignal) {
+                    KThread::currentThread()->startSignal = false;
+                    return -K_CONTINUE;
+                }
+#endif
+            }
+        }
+    }
+    if (statusOut) {
+        int s = 0;
+        if (process->isStopped()) {
+            s |= 0x7f;
+            s |= ((process->signaled & 0xFF) << 8);
+        } else if (process->isTerminated()) {
+            s |= ((process->exitCode & 0xFF) << 8);
+            s |= (process->signaled & 0x7F);
+        }
+        *statusOut = s;
+    }
+    U32 result = process->id;
+    KSystem::internalEraseProcess(result);
+    return result;
+}
+
 U32 KSystem::waitpid(KThread* thread, S32 pid, U32 statusAddress, U32 options) {
     KProcessPtr process;
     U32 result = 0;

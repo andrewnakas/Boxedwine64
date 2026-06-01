@@ -55,10 +55,15 @@
 #define X64_SYS_listen            50
 #define X64_SYS_getsockname       51
 #define X64_SYS_getpeername       52
+#define X64_SYS_setsockopt        54
+#define X64_SYS_getsockopt        55
+#define X64_SYS_sendmsg           46
+#define X64_SYS_recvmsg           47
 #define X64_SYS_unlink            87
 #define X64_SYS_unlinkat          263
 #define X64_SYS_fchdir            81
 #define X64_SYS_ftruncate         77
+#define X64_SYS_umask             95
 #define X64_SYS_setsid            112
 #define X64_SYS_getpid            39
 #define X64_SYS_exit              60
@@ -1371,16 +1376,22 @@ static bool deliverSignalSync(CPU64* cpu, U32 sig) {
 // Returns the 32-bit scratch address holding `len` bytes copied from `src64`,
 // or 0 on failure. `outLenAddr` (optional) gets a 4-byte slot holding `len`
 // for the helpers that take a pointer-to-socklen_t.
-static U32 g_socketScratch32 = 0;  // process-local enough for the single 64-bit guest we run
+// The scratch must be PER PROCESS: each KProcess has its own 32-bit KMemory, so
+// an address mmap'd in one process is unmapped in another (notably the forked
+// wine64 client vs. the wineserver). Cache (processId -> addr) and re-mmap on a
+// process change; a stale global address would fault (performOnMemory panic).
+static U32 g_socketScratch32 = 0;
+static U32 g_socketScratchPid = 0;
 static U32 bounceSockaddrTo32(CPU64* cpu, U64 src64, U32 len, U32* outLenAddr) {
     KThread* thread = cpu->thread;
-    if (!thread || !thread->memory) return 0;
+    if (!thread || !thread->memory || !thread->process) return 0;
     if (len > 256) len = 256; // sockaddr_un is 110 bytes; cap defensively
-    if (!g_socketScratch32) {
+    if (!g_socketScratch32 || g_socketScratchPid != thread->process->id) {
         // One page is plenty for a sockaddr + a socklen_t slot.
         g_socketScratch32 = thread->memory->mmap(thread, 0, K_PAGE_SIZE,
             K_PROT_READ | K_PROT_WRITE, K_MAP_ANONYMOUS | K_MAP_PRIVATE, -1, 0);
         if (!g_socketScratch32) return 0;
+        g_socketScratchPid = thread->process->id;
     }
     U32 addr = g_socketScratch32;
     if (src64 && len) {
@@ -1394,6 +1405,188 @@ static U32 bounceSockaddrTo32(CPU64* cpu, U64 src64, U32 len, U32* outLenAddr) {
         *outLenAddr = lenSlot;
     }
     return addr;
+}
+
+// Ensure a multi-page scratch region in the 64-bit process's (otherwise unused)
+// 32-bit KMemory, big enough for a synthesized 32-bit msghdr + iovec + cmsg +
+// a data buffer. Same per-process caching rationale as bounceSockaddrTo32.
+// Layout within the region:
+//   +0      : 32-bit msghdr (28 bytes: name,namelen,iov,iovlen,control,controllen,flags)
+//   +32     : one 32-bit iovec {base,len}
+//   +64     : cmsg area (up to a few SCM_RIGHTS fds)
+//   +256    : socklen/len scratch
+//   +512 .. : data buffer (region size - 512)
+#define MSG_SCRATCH_BYTES   (64 * 1024)
+#define MSG_SCRATCH_HDR     0
+#define MSG_SCRATCH_IOV     32
+#define MSG_SCRATCH_CMSG    64
+#define MSG_SCRATCH_DATA    512
+static U32 g_msgScratch32 = 0;
+static U32 g_msgScratchPid = 0;
+static U32 msgScratch(KThread* thread) {
+    if (!thread || !thread->memory || !thread->process) return 0;
+    if (!g_msgScratch32 || g_msgScratchPid != thread->process->id) {
+        g_msgScratch32 = thread->memory->mmap(thread, 0, MSG_SCRATCH_BYTES,
+            K_PROT_READ | K_PROT_WRITE, K_MAP_ANONYMOUS | K_MAP_PRIVATE, -1, 0);
+        if (!g_msgScratch32) return 0;
+        g_msgScratchPid = thread->process->id;
+    }
+    return g_msgScratch32;
+}
+
+// 64-bit struct offsets (x86-64):
+//   msghdr {name(0); namelen(8); iov(16); iovlen(24); control(32); controllen(40); flags(48)}  =56
+//   iovec  {base(0); len(8)}                                                                    =16
+//   cmsghdr{len(0,size_t); level(8,int); type(12,int); data(16)}
+// 32-bit (what the socket object expects):
+//   msghdr {name(0); namelen(4); iov(8); iovlen(12); control(16); controllen(20); flags(24)}
+//   iovec  {base(0); len(4)}
+//   cmsghdr{len(0); level(4); type(8); data(12)}  -- 16-byte stride in the object code
+
+// sendmsg(fd, msghdr*, flags) for a 64-bit guest. Gathers the scatter buffers
+// into one scratch blob, translates any SCM_RIGHTS cmsg, builds a 32-bit msghdr
+// in scratch, and calls the 32-bit ksendmsg (reusing all the AF_UNIX queue +
+// fd-passing logic).
+static U64 sys_sendmsg64(CPU64* cpu, U64 fd, U64 msg64, U64 flags) {
+    KThread* thread = cpu->thread;
+    if (!thread || !thread->process) return (U64)-K_ENOSYS;
+    U32 base = msgScratch(thread);
+    if (!base) return (U64)-K_EFAULT;
+    KMemory* m32 = thread->memory;
+
+    U64 iov     = cpu->memory->readq(msg64 + 16);
+    U64 iovlen  = cpu->memory->readq(msg64 + 24);
+    U64 control = cpu->memory->readq(msg64 + 32);
+    U64 ctllen  = cpu->memory->readq(msg64 + 40);
+
+    // Gather all iov segments into the scratch data buffer.
+    U32 dataAddr = base + MSG_SCRATCH_DATA;
+    U32 total = 0;
+    U32 dataCap = MSG_SCRATCH_BYTES - MSG_SCRATCH_DATA;
+    for (U64 i = 0; i < iovlen; i++) {
+        U64 b = cpu->memory->readq(iov + 16 * i);
+        U64 l = cpu->memory->readq(iov + 16 * i + 8);
+        if (l == 0) continue;
+        if (total + l > dataCap) l = dataCap - total;
+        if (l == 0) break;
+        std::vector<U8> tmp((size_t)l);
+        cpu->memory->memcpyFromGuest(tmp.data(), b, (U32)l);
+        m32->memcpy(dataAddr + total, tmp.data(), (U32)l);
+        total += (U32)l;
+    }
+
+    // Build the 32-bit msghdr: a single iovec covering the gathered blob.
+    m32->writed(base + MSG_SCRATCH_IOV + 0, dataAddr);
+    m32->writed(base + MSG_SCRATCH_IOV + 4, total);
+    m32->writed(base + MSG_SCRATCH_HDR + 0, 0);                    // msg_name
+    m32->writed(base + MSG_SCRATCH_HDR + 4, 0);                    // msg_namelen
+    m32->writed(base + MSG_SCRATCH_HDR + 8, base + MSG_SCRATCH_IOV); // msg_iov
+    m32->writed(base + MSG_SCRATCH_HDR + 12, total ? 1 : 0);       // msg_iovlen
+    U32 ctl32 = 0, ctllen32 = 0;
+    if (control && ctllen >= 16) {
+        // Translate SCM_RIGHTS: 64-bit cmsg {len(0),level(8),type(12),fds(16..)}.
+        // The object's recv side reads 16-byte cmsg records with the fd at +12,
+        // i.e. one fd per 16 bytes. Emit that compact form into the cmsg area.
+        U64 clen  = cpu->memory->readq(control + 0);
+        U32 level = cpu->memory->readd(control + 8);
+        U32 type  = cpu->memory->readd(control + 12);
+        if (level == K_SOL_SOCKET && type == K_SCM_RIGHTS) {
+            U32 nfds = (U32)((clen - 16) / 4);
+            U32 cm = base + MSG_SCRATCH_CMSG;
+            for (U32 i = 0; i < nfds; i++) {
+                U32 hostFd = cpu->memory->readd(control + 16 + 4 * i);
+                m32->writed(cm + 16 * i + 0, 16);            // cmsg_len
+                m32->writed(cm + 16 * i + 4, K_SOL_SOCKET);  // cmsg_level
+                m32->writed(cm + 16 * i + 8, K_SCM_RIGHTS);  // cmsg_type
+                m32->writed(cm + 16 * i + 12, hostFd);       // fd
+            }
+            ctl32 = cm;
+            ctllen32 = nfds * 16;
+        }
+    }
+    m32->writed(base + MSG_SCRATCH_HDR + 16, ctl32);              // msg_control
+    m32->writed(base + MSG_SCRATCH_HDR + 20, ctllen32);          // msg_controllen
+    m32->writed(base + MSG_SCRATCH_HDR + 24, 0);                 // msg_flags
+
+    U32 rc = ksendmsg(thread, (U32)fd, base + MSG_SCRATCH_HDR, (U32)flags);
+    return (U64)(S64)(S32)rc;
+}
+
+// recvmsg(fd, msghdr*, flags) for a 64-bit guest. Builds a 32-bit msghdr over a
+// scratch data buffer + cmsg area, calls krecvmsg, then scatters the received
+// bytes back into the 64-bit iov segments and translates any received
+// SCM_RIGHTS fds into the 64-bit cmsg.
+static U64 sys_recvmsg64(CPU64* cpu, U64 fd, U64 msg64, U64 flags) {
+    KThread* thread = cpu->thread;
+    if (!thread || !thread->process) return (U64)-K_ENOSYS;
+    U32 base = msgScratch(thread);
+    if (!base) return (U64)-K_EFAULT;
+    KMemory* m32 = thread->memory;
+
+    U64 iov     = cpu->memory->readq(msg64 + 16);
+    U64 iovlen  = cpu->memory->readq(msg64 + 24);
+    U64 control = cpu->memory->readq(msg64 + 32);
+    U64 ctllen  = cpu->memory->readq(msg64 + 40);
+
+    // Total receive capacity across all iov segments, capped to the scratch buf.
+    U32 dataAddr = base + MSG_SCRATCH_DATA;
+    U32 dataCap = MSG_SCRATCH_BYTES - MSG_SCRATCH_DATA;
+    U32 want = 0;
+    for (U64 i = 0; i < iovlen; i++) {
+        U64 l = cpu->memory->readq(iov + 16 * i + 8);
+        want += (U32)l;
+    }
+    if (want > dataCap) want = dataCap;
+
+    U32 cmArea = base + MSG_SCRATCH_CMSG;
+    U32 cmCap = MSG_SCRATCH_DATA - MSG_SCRATCH_CMSG; // room for cmsg records
+    m32->writed(base + MSG_SCRATCH_IOV + 0, dataAddr);
+    m32->writed(base + MSG_SCRATCH_IOV + 4, want);
+    m32->writed(base + MSG_SCRATCH_HDR + 0, 0);
+    m32->writed(base + MSG_SCRATCH_HDR + 4, 0);
+    m32->writed(base + MSG_SCRATCH_HDR + 8, base + MSG_SCRATCH_IOV);
+    m32->writed(base + MSG_SCRATCH_HDR + 12, 1);
+    m32->writed(base + MSG_SCRATCH_HDR + 16, (control && ctllen) ? cmArea : 0);
+    m32->writed(base + MSG_SCRATCH_HDR + 20, (control && ctllen) ? cmCap : 0);
+    m32->writed(base + MSG_SCRATCH_HDR + 24, 0);
+
+    U32 rc = krecvmsg(thread, (U32)fd, base + MSG_SCRATCH_HDR, (U32)flags);
+    if ((S32)rc < 0) return (U64)(S64)(S32)rc;
+
+    // Scatter the received bytes back into the 64-bit iov segments.
+    U32 remaining = (U32)rc;
+    U32 off = 0;
+    for (U64 i = 0; i < iovlen && remaining; i++) {
+        U64 b = cpu->memory->readq(iov + 16 * i);
+        U64 l = cpu->memory->readq(iov + 16 * i + 8);
+        U32 chunk = (U32)((l < remaining) ? l : remaining);
+        if (chunk) {
+            std::vector<U8> tmp(chunk);
+            m32->memcpy(tmp.data(), dataAddr + off, chunk);
+            cpu->memory->memcpyToGuest(b, tmp.data(), chunk);
+            off += chunk;
+            remaining -= chunk;
+        }
+    }
+
+    // Translate any received SCM_RIGHTS fds (32-bit object wrote 16-byte cmsg
+    // records, fd at +12) into the 64-bit cmsg the guest provided.
+    U32 ctllen32 = m32->readd(base + MSG_SCRATCH_HDR + 20);
+    if (control && ctllen >= 16 && ctllen32 >= 16) {
+        U32 nfds = ctllen32 / 16;
+        U64 cmsgLen = 16 + (U64)nfds * 4; // 64-bit cmsghdr header is 16 bytes
+        cpu->memory->writeq(control + 0, cmsgLen);
+        cpu->memory->writed(control + 8, K_SOL_SOCKET);
+        cpu->memory->writed(control + 12, K_SCM_RIGHTS);
+        for (U32 i = 0; i < nfds; i++) {
+            U32 fdv = m32->readd(cmArea + 16 * i + 12);
+            cpu->memory->writed(control + 16 + 4 * i, fdv);
+        }
+        cpu->memory->writeq(msg64 + 40, cmsgLen); // msg_controllen
+    } else {
+        cpu->memory->writeq(msg64 + 40, 0);
+    }
+    return (U64)(S64)(S32)rc;
 }
 
 // Map an x86-64 Linux syscall number to a human-readable name. Used only by
@@ -1930,6 +2123,51 @@ void ksyscall64(CPU64* cpu) {
             if (!cpu->thread || !cpu->thread->process) { ret = (U64)-K_ENOSYS; break; }
             ret = (U64)(S64)(S32)cpu->thread->process->ftruncate64((FD)a1, a2);
             break;
+        case X64_SYS_umask:
+            // umask(mask) — returns the previous mask. wine sets it during init.
+            if (!cpu->thread || !cpu->thread->process) { ret = (U64)-K_ENOSYS; break; }
+            ret = (U64)cpu->thread->process->umask((U32)a1);
+            break;
+        case X64_SYS_setsockopt: {
+            // setsockopt(fd, level, name, optval, optlen). wineserver sets
+            // socket options (SO_PASSCRED etc.) on its connection. optval is a
+            // small pointer-free buffer — bounce it into 32-bit scratch.
+            if (!cpu->thread) { ret = (U64)-K_ENOSYS; break; }
+            U32 optlen = (U32)a5;
+            U32 v32 = (a4 && optlen) ? bounceSockaddrTo32(cpu, a4, optlen, nullptr) : 0;
+            ret = (U64)(S64)(S32)ksetsockopt(cpu->thread, (U32)a1, (U32)a2, (U32)a3, v32, optlen);
+            break;
+        }
+        case X64_SYS_getsockopt: {
+            // getsockopt(fd, level, name, optval, optlen*). optlen is a pointer
+            // to socklen_t (in/out). Bounce optval + the length slot, run the
+            // helper, copy the result + new length back to memory64.
+            if (!cpu->thread || !a5) { ret = (U64)-K_EFAULT; break; }
+            U32 inLen = cpu->memory->readd(a5);
+            U32 lenSlot = 0;
+            U32 v32 = bounceSockaddrTo32(cpu, a4, inLen, &lenSlot);
+            if (!v32) { ret = (U64)-K_EFAULT; break; }
+            U32 rc = kgetsockopt(cpu->thread, (U32)a1, (U32)a2, (U32)a3, v32, lenSlot);
+            if ((S32)rc >= 0) {
+                U32 outLen = cpu->thread->memory->readd(lenSlot);
+                if (outLen > 256) outLen = 256;
+                U8 tmp[256];
+                cpu->thread->memory->memcpy(tmp, v32, outLen);
+                cpu->memory->memcpyToGuest(a4, tmp, outLen);
+                cpu->memory->writed(a5, outLen);
+            }
+            ret = (U64)(S64)(S32)rc;
+            break;
+        }
+        case X64_SYS_sendmsg:
+            // sendmsg(fd, msghdr*, flags) — the wineserver request channel.
+            ret = sys_sendmsg64(cpu, a1, a2, a3);
+            break;
+        case X64_SYS_recvmsg:
+            // recvmsg(fd, msghdr*, flags) — the wineserver reply channel
+            // (carries SCM_RIGHTS fds for shared mappings).
+            ret = sys_recvmsg64(cpu, a1, a2, a3);
+            break;
         case X64_SYS_setsid:
             // setsid() — new session; we don't model sessions, return the pid
             // (matches the 32-bit stub). wineserver daemonizes with this.
@@ -2064,10 +2302,20 @@ void ksyscall64(CPU64* cpu) {
             // glibc-compatible answer is -EINTR (caller's loop retries).
             ret = (U64)-K_EINTR;
             break;
-        case X64_SYS_wait4:
-            // No children to reap (single-process world).
-            ret = (U64)-K_ECHILD;
+        case X64_SYS_wait4: {
+            // wait4(pid, status*, options, rusage*) — reap a forked child (e.g.
+            // wineboot waiting on the wineserver it fork+exec'd). Reuse the
+            // arch-neutral reaper and write the status into memory64. rusage
+            // (a4) is ignored.
+            if (!cpu->thread || !cpu->thread->process) { ret = (U64)-K_ECHILD; break; }
+            int status = 0;
+            U32 rc = KSystem::reapChild(cpu->thread, (S32)a1, (U32)a3, a2 ? &status : nullptr);
+            if ((S32)rc > 0 && a2) {
+                cpu->memory->writed(a2, (U32)status);
+            }
+            ret = (U64)(S64)(S32)rc;
             break;
+        }
         case X64_SYS_clone:
             // x86-64 clone arg order: (flags=rdi, stack=rsi, parent_tid=rdx,
             // child_tid=r10, tls=r8). Create a real thread sharing this
