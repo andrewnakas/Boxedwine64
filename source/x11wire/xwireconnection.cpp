@@ -504,8 +504,14 @@ void XWireConnection::onData() {
     // Drain everything currently buffered into our assembly buffer.
     uint8_t chunk[4096];
     U32 got;
+    U32 drained = 0;
     while ((got = peer->readNativeNonBlocking(chunk, sizeof(chunk))) > 0) {
         in.insert(in.end(), chunk, chunk + got);
+        drained += got;
+    }
+    if (getenv("BW64_XWIRE")) {
+        klog_fmt("XWire: onData drained=%u inBuf=%zu handshakeDone=%d",
+                 drained, in.size(), (int)handshakeDone);
     }
 
     if (!handshakeDone) {

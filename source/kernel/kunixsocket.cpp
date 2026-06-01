@@ -23,6 +23,7 @@
 #include "kstat.h"
 #include "ksignal.h"
 #include "../x11wire/xwireserver.h"
+#include "../x11wire/xwireconnection.h"
 
 KUnixSocketObject::KUnixSocketObject(U32 domain, U32 type, U32 protocol) : KSocketObject(KTYPE_UNIX_SOCKET, domain, type, protocol), 
     lockCond(std::make_shared<BoxedWineCondition>(B("KUnixSocketObject::lockCond"))), recvBuffer(128)
@@ -895,6 +896,10 @@ U32 KUnixSocketObject::sendmsg(KThread* thread, const KFileDescriptorPtr& fd, U3
     con->msgs.push(msg);
     BOXEDWINE_CONDITION_SIGNAL_ALL(con->lockCond);
 
+    if (getenv("BW64_XWIRE")) {
+        klog_fmt("KUnixSocket::sendmsg datalen=%d to peer (isXWire=%d) via msgs queue",
+                 (int)result, (int)(std::dynamic_pointer_cast<XWireServerSocket>(con) != nullptr));
+    }
     return result;
 }
 
