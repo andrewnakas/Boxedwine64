@@ -31,6 +31,9 @@
 #include "../x11/x11.h"
 
 #include <time.h>
+#ifdef __APPLE__
+#include <mach/mach.h>
+#endif
 
 bool KSystem::modesInitialized = false;
 U32 KSystem::skipFrameFPS = 0;
@@ -1079,6 +1082,18 @@ U64 KSystem::getSystemTimeAsMicroSeconds() {
     U64 diff = currentTime - KSystem::startTimeSystemTime;
     U64 adjustedDiff = diff * KSystem::adjustClockFactor / 100;
     return KSystem::startTimeSystemTime + adjustedDiff;
+}
+
+U64 KSystem::getHostResidentBytes() {
+#ifdef __APPLE__
+    mach_task_basic_info_data_t info;
+    mach_msg_type_number_t count = MACH_TASK_BASIC_INFO_COUNT;
+    if (task_info(mach_task_self(), MACH_TASK_BASIC_INFO,
+                  (task_info_t)&info, &count) == KERN_SUCCESS) {
+        return (U64)info.resident_size;
+    }
+#endif
+    return 0;
 }
 
 U64 KSystem::getMicroCounter() {

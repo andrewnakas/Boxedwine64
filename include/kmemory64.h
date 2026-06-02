@@ -134,6 +134,10 @@ public:
 
     // Diagnostics
     U64 mappedPageCount() const { return (U64)pages.size(); }
+    // Pages that hold a committed backing buffer. Until lazy commit (Phase 2)
+    // every mapped page is committed, so this equals mappedPageCount(); afterward
+    // it tracks only pages whose K64Page::data is non-null (i.e. actually touched).
+    U64 committedPageCount() const;
 
 private:
     KProcess* process;

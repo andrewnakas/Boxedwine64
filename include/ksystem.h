@@ -156,6 +156,10 @@ public:
     
     static U32 getMilliesSinceStart();
     static U64 getSystemTimeAsMicroSeconds();
+    // Host resident-set size of this emulator process, in bytes. Used by the
+    // BW64_MEMSTATS diagnostic to watch for the guest-memory leak across a boot.
+    // macOS: task_info(MACH_TASK_BASIC_INFO). Other platforms: 0 (not wired).
+    static U64 getHostResidentBytes();
     static U64 getMicroCounter();
     static void startMicroCounter();
     static U32 emulatedMilliesToHost(U32 millies);

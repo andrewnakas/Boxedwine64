@@ -2011,6 +2011,32 @@ void ksyscall64(CPU64* cpu) {
         }
     }
 
+    // BW64_MEMSTATS=1 — periodically log the guest-memory footprint + host RSS so
+    // we can SEE the leak (mapped pages climb monotonically while munmap is a
+    // no-op) and the boot slowdown (per-syscall cost rises with the page map).
+    // Throttled to once per ~2s wall so it never perturbs the timing-sensitive
+    // race. Env read once (static cache); near-zero cost when off.
+    {
+        static const bool memStats = getenv("BW64_MEMSTATS") != nullptr;
+        if (memStats && cpu->memory && cpu->thread && cpu->thread->process) {
+            static std::atomic<U64> lastUs{0};
+            U64 nowUs = KSystem::getSystemTimeAsMicroSeconds();
+            U64 prev = lastUs.load(std::memory_order_relaxed);
+            if (nowUs - prev >= 2000000ULL &&
+                lastUs.compare_exchange_strong(prev, nowUs, std::memory_order_relaxed)) {
+                KMemory64* mem = cpu->memory;
+                U64 mapped = mem->mappedPageCount();
+                U64 committed = mem->committedPageCount();
+                U64 rss = KSystem::getHostResidentBytes();
+                klog_fmt("MEMSTATS pid=%d pages=%llu committedKB=%llu rssKB=%llu",
+                         (int)cpu->thread->process->id,
+                         (unsigned long long)mapped,
+                         (unsigned long long)(committed * 4),
+                         (unsigned long long)(rss / 1024));
+            }
+        }
+    }
+
     switch (nr) {
         case X64_SYS_write:
             ret = sys_write64(cpu, a1, a2, a3);

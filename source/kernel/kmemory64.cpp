@@ -70,6 +70,14 @@ K64Page* KMemory64::getOrAllocPage(U64 pageNum, U32 flagsIfNew) {
     return raw;
 }
 
+U64 KMemory64::committedPageCount() const {
+    // Phase 0/1: every mapped page is eagerly committed, so the committed count
+    // equals the mapped count. Phase 2 (lazy commit) replaces this body with a
+    // count of pages whose data buffer is non-null.
+    BOXEDWINE_CRITICAL_SECTION_WITH_MUTEX(pagesMutex);
+    return (U64)pages.size();
+}
+
 bool KMemory64::isPageMapped(U64 pageNum) const {
     K64Page* p = getPage(pageNum);
     return p && (p->flags & K64_PAGE_MAPPED);
