@@ -88,6 +88,11 @@ U32 KMemory64::getPageFlags(U64 pageNum) const {
     return p ? p->flags : 0;
 }
 
+// Process-wide mmap base — must match MMAP64_BASE in syscall64.cpp. Anonymous
+// and file-backed mmap(NULL,...) both draw from here so they can't collide.
+#define K64_MMAP_BASE 0x700000000ULL
+#define K64_MMAP_BASE_PAGE (K64_MMAP_BASE >> K64_PAGE_SHIFT)
+
 U64 KMemory64::mmapAnonymousFixed(U64 addr, U64 len, U32 prot) {
     if (len == 0) return (U64)-K_EINVAL;
     if (addr & K64_PAGE_MASK) return (U64)-K_EINVAL;
@@ -107,12 +112,55 @@ U64 KMemory64::mmapAnonymousFixed(U64 addr, U64 len, U32 prot) {
         page->flags = flags;
         ::memset(page->data, 0, K64_PAGE_SIZE);
     }
+    // Keep the reservation map authoritative for the mmap region. A MAP_FIXED
+    // landing here (wine remapping inside an earlier reservation, or the
+    // allocator's own commit) updates `ranges` so later gap searches see the
+    // real occupancy. rangeInsertLocked ignores addresses below the base and
+    // splits any range this one overwrites. mmapMutex is recursive, so this is
+    // safe whether or not the caller (mmapReserveAndMap) already holds it.
+    if (pageStart >= K64_MMAP_BASE_PAGE) {
+        BOXEDWINE_CRITICAL_SECTION_WITH_MUTEX(mmapMutex);
+        rangeInsertLocked(pageStart, pageCount, prot,
+                          prot ? (U8)MMAP_ANON : (U8)MMAP_RESERVED);
+    }
     return addr;
 }
 
-// Process-wide mmap base — must match MMAP64_BASE in syscall64.cpp. Anonymous
-// and file-backed mmap(NULL,...) both draw from here so they can't collide.
-#define K64_MMAP_BASE 0x700000000ULL
+// Record a reservation in the ordered `ranges` map. Caller holds mmapMutex.
+// Splits/clamps any pre-existing ranges that the new one overwrites so the map
+// stays a non-overlapping cover of the live mmap-region reservations (wine
+// MAP_FIXED-remaps inside an earlier reservation constantly). Only the mmap
+// region (>= K64_MMAP_BASE) is tracked; the loader's fixed low maps don't need
+// allocation bookkeeping because the gap search never looks below the base.
+void KMemory64::rangeInsertLocked(U64 startPage, U64 pageCount, U32 prot, U8 kind) {
+    if (pageCount == 0 || startPage < K64_MMAP_BASE_PAGE) return;
+    rangeRemoveLocked(startPage, pageCount); // clear any overlap first
+    ranges[startPage] = MMapRange{ startPage, pageCount, prot, kind };
+}
+
+// Remove/trim ranges overlapping [startPage, startPage+pageCount). Caller holds
+// mmapMutex. A range straddling either edge is split into the surviving
+// non-overlapping remnant(s). This is the address-space free that makes the
+// region reusable; it does NOT touch page backing store (that is Phase 2).
+void KMemory64::rangeRemoveLocked(U64 startPage, U64 pageCount) {
+    if (pageCount == 0) return;
+    U64 hole0 = startPage;
+    U64 hole1 = startPage + pageCount; // exclusive
+    // Start from the last range that could overlap: the one beginning at or
+    // before hole0. std::map is ordered so we can walk forward from there.
+    auto it = ranges.upper_bound(hole0);
+    if (it != ranges.begin()) --it;
+    while (it != ranges.end() && it->second.startPage < hole1) {
+        U64 r0 = it->second.startPage;
+        U64 r1 = r0 + it->second.pageCount; // exclusive
+        if (r1 <= hole0) { ++it; continue; } // entirely before the hole
+        // Overlaps. Drop it, then re-insert any surviving head/tail remnants.
+        U32 prot = it->second.prot; U8 kind = it->second.kind;
+        it = ranges.erase(it);
+        if (r0 < hole0) ranges[r0] = MMapRange{ r0, hole0 - r0, prot, kind };
+        if (r1 > hole1) ranges[hole1] = MMapRange{ hole1, r1 - hole1, prot, kind };
+    }
+}
 
 U64 KMemory64::mmapReserveAndMap(U64 length, U32 prot) {
     U64 pageCount = (length + K64_PAGE_MASK) >> K64_PAGE_SHIFT;
@@ -120,25 +168,36 @@ U64 KMemory64::mmapReserveAndMap(U64 length, U32 prot) {
 
     BOXEDWINE_CRITICAL_SECTION_WITH_MUTEX(mmapMutex);
     if (mmapNext == 0) mmapNext = K64_MMAP_BASE;
-    U64 candidate = mmapNext >> K64_PAGE_SHIFT;
-    for (;;) {
-        // Is [candidate, candidate+pageCount) entirely free? Scan from the top
-        // so a collision near the end skips the whole run at once.
-        U64 firstMapped = 0;
-        bool clash = false;
-        for (U64 p = candidate + pageCount; p-- > candidate; ) {
-            if (isPageMapped(p)) { firstMapped = p; clash = true; break; }
-        }
-        if (!clash) {
-            U64 addr = candidate << K64_PAGE_SHIFT;
-            // Map the range NOW, under mmapMutex, so a concurrent sibling's scan
-            // sees these pages taken and can't pick the same gap.
-            mmapAnonymousFixed(addr, pageCount << K64_PAGE_SHIFT, prot);
-            mmapNext = (candidate + pageCount) << K64_PAGE_SHIFT;
-            return addr;
-        }
-        candidate = firstMapped + 1;
+    U64 cursor = mmapNext >> K64_PAGE_SHIFT;
+    if (cursor < K64_MMAP_BASE_PAGE) cursor = K64_MMAP_BASE_PAGE;
+
+    // Gap search over the ordered reservation map: O(log n + ranges scanned),
+    // not O(pages). Walk ranges from `cursor`; the first hole of `pageCount`
+    // pages between consecutive reservations (or after the last one) wins.
+    U64 candidate = cursor;
+    auto it = ranges.lower_bound(candidate);
+    // A range starting before `candidate` may still cover it — back up one and
+    // push `candidate` past its end if so.
+    if (it != ranges.begin()) {
+        auto prev = std::prev(it);
+        U64 prevEnd = prev->second.startPage + prev->second.pageCount;
+        if (prevEnd > candidate) candidate = prevEnd;
     }
+    for (; it != ranges.end(); ++it) {
+        U64 gapEnd = it->second.startPage; // exclusive
+        if (gapEnd >= candidate + pageCount) break; // fits before this range
+        U64 rangeEnd = it->second.startPage + it->second.pageCount;
+        if (rangeEnd > candidate) candidate = rangeEnd; // jump past it
+    }
+    // `candidate` now points at a hole large enough (either before `it` or past
+    // the last range — address space above is effectively unbounded for us).
+    U64 addr = candidate << K64_PAGE_SHIFT;
+    // Map the pages NOW, under mmapMutex (recursive), so a concurrent sibling's
+    // allocation sees them taken. mmapAnonymousFixed registers the reservation
+    // in `ranges` itself, so the gap is claimed before we drop the lock.
+    mmapAnonymousFixed(addr, pageCount << K64_PAGE_SHIFT, prot);
+    mmapNext = (candidate + pageCount) << K64_PAGE_SHIFT;
+    return addr;
 }
 
 U64 KMemory64::mprotect(U64 addr, U64 len, U32 prot) {
@@ -169,10 +228,15 @@ U64 KMemory64::munmap(U64 addr, U64 len) {
     if (len == 0) return 0;
     U64 pageStart = addr >> K64_PAGE_SHIFT;
     U64 pageCount = (len + K64_PAGE_SIZE - 1) >> K64_PAGE_SHIFT;
-    BOXEDWINE_CRITICAL_SECTION_WITH_MUTEX(pagesMutex);
-    for (U64 i = 0; i < pageCount; i++) {
-        pages.erase(pageStart + i);
-    }
+
+    // Phase 1: free the ADDRESS SPACE only — drop/trim the reservation record so
+    // the range is reusable and the gap search stays fast. Deliberately do NOT
+    // erase page slots or backing buffers here: a prior real-munmap that
+    // pages.erase()'d slots regressed boot (wine lazily touches munmap'd regions,
+    // and in MT mode erasing a slot another thread holds a K64Page* to is UB).
+    // Phase 2 adds a SAFE buffer free (data->null, keep slot, futex-pinned).
+    BOXEDWINE_CRITICAL_SECTION_WITH_MUTEX(mmapMutex);
+    rangeRemoveLocked(pageStart, pageCount);
     return 0;
 }
 

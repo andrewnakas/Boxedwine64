@@ -14,6 +14,7 @@
 
 #include <memory>
 #include <unordered_map>
+#include <map>
 
 class KProcess;
 class KThread;
@@ -160,6 +161,22 @@ private:
     // every thread of the process advances the same pointer). 0 = uninitialised.
     BOXEDWINE_MUTEX mmapMutex;
     U64 mmapNext = 0;
+
+    // Reserved address-space ranges drawn from the mmap region (>= K64_MMAP_BASE).
+    // Keyed by start PAGE number, ordered, so a gap search is O(log n + ranges
+    // scanned) instead of the old O(pages) per-page isPageMapped() scan that
+    // degraded badly as the page map grew (the boot slowdown). munmap removes /
+    // trims entries here so the address space is genuinely reusable. Guarded by
+    // mmapMutex (same lock as the gap scan it feeds). `start`/`pages` are page
+    // units. kind distinguishes wine's PROT_NONE reservations from our committed
+    // anon/file maps (used by Phase 2/3 to free backing store safely).
+    enum MMapKind : U8 { MMAP_ANON = 0, MMAP_FILE = 1, MMAP_RESERVED = 2 };
+    struct MMapRange { U64 startPage; U64 pageCount; U32 prot; U8 kind; };
+    std::map<U64, MMapRange> ranges;
+
+    // Add/trim/remove range bookkeeping. Callers must hold mmapMutex.
+    void rangeInsertLocked(U64 startPage, U64 pageCount, U32 prot, U8 kind);
+    void rangeRemoveLocked(U64 startPage, U64 pageCount);
 
     K64Page* getOrAllocPage(U64 pageNum, U32 flagsIfNew);
     K64Page* getPage(U64 pageNum) const;
