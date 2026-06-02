@@ -22,6 +22,8 @@
 #include <memory>
 #include <unordered_map>
 #include <vector>
+#include <string>
+#include <utility>
 
 class XWireConnection;
 
@@ -107,6 +109,15 @@ private:
     void blitPutImage(uint32_t drawable, uint8_t format, uint8_t depth,
                       int16_t dstX, int16_t dstY, uint16_t w, uint16_t h,
                       const uint8_t* data, uint32_t dataBytes);
+
+    // Render X core text (PolyText/ImageText) into a window's text-overlay buffer
+    // using the GC's foreground (and background, for ImageText). y is the X text
+    // BASELINE. blitTextItems draws a whole PolyText item list with one lock +
+    // one present. Both no-op for an unknown/pixmap drawable.
+    void blitText(uint32_t drawable, uint32_t gc, int16_t x, int16_t y,
+                  const std::string& chars, bool imageText);
+    void blitTextItems(uint32_t drawable, uint32_t gc, int16_t y,
+                       const std::vector<std::pair<int16_t, std::string>>& items);
 
     // Host input -> X11 wire events (Phase 2c input path).
     void deliverInputEvents();

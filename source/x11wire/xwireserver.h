@@ -44,7 +44,14 @@ class XWireConnection;
 // connection per thread, so the connection that CREATES a window is often not
 // the one that PUTIMAGES into it. The window model + backing framebuffer
 // therefore live here, in the server, not in any single XWireConnection.
-struct XWindow {
+//
+// NOTE: named XWireWindow (not XWindow) deliberately — the 32-bit X server has a
+// global `class XWindow` in source/x11/xwindow.h, and a second global type of the
+// same name is an ODR violation: the linker merges their destructor symbols, so
+// destroying one can run the other's destructor over the wrong memory (a real
+// stack/heap-corruption crash, caught by ASan). Likewise XWireGC below avoids the
+// global `typedef XID GContext` in source/x11/x11.h.
+struct XWireWindow {
     uint32_t parent = 0;
     int16_t x = 0, y = 0;
     uint16_t width = 0, height = 0;
@@ -65,6 +72,21 @@ struct XWindow {
     // always available to present.
     std::vector<uint8_t> fb;
     uint16_t fbW = 0, fbH = 0;
+    // ARGB8888 text overlay, same dimensions as fb. X core-text (PolyText/
+    // ImageText) is drawn here, NOT into fb, so a later PutImage band that
+    // rewrites fb can't erase the glyphs; composeAndPresent blits it on top of
+    // fb (pixel != 0 = opaque). Cleared per-region by a PutImage that repaints
+    // that region. Empty until the window first draws text.
+    std::vector<uint8_t> textFb;
+};
+
+// An X graphics context. We model only the bits the core-text path needs:
+// foreground/background pixel colors and the (informational) font id. Stored as
+// opaque ARGB (0xff000000 | pixel) so blits don't have to special-case alpha.
+struct XWireGC {
+    uint32_t foreground = 0xff000000;   // opaque black
+    uint32_t background = 0xffffffff;   // opaque white
+    uint32_t font = 0;
 };
 
 class XWireServer {
@@ -84,10 +106,16 @@ public:
     // different guest threads, so all access goes through these helpers (or
     // holds regMutex directly for compound ops).
     std::mutex regMutex;
-    std::unordered_map<uint32_t, XWindow> windows;
+    std::unordered_map<uint32_t, XWireWindow> windows;
     uint32_t presentWindow = 0;     // base window composited under any overlays
 
-    // Monotonic counter handed to XWindow.mapSerial on each MapWindow, so the
+    // GC id -> graphics context (foreground/background/font for core-text). Font
+    // id -> name (all map to the single builtin 5x7 font for now). Both guarded
+    // by regMutex like the window registry.
+    std::unordered_map<uint32_t, XWireGC> gcs;
+    std::unordered_map<uint32_t, std::string> fonts;
+
+    // Monotonic counter handed to XWireWindow.mapSerial on each MapWindow, so the
     // compositor can stack overlays in map order (newest on top).
     uint64_t mapSerialCounter = 0;
 

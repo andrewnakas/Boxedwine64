@@ -83,7 +83,9 @@ void XWireServer::composeAndPresent() {
     uint32_t baseId = 0;
     uint16_t hostW = 0, hostH = 0;
     std::vector<uint8_t> canvas;          // host-sized ARGB, == base window fb
-    struct Overlay { int x, y; uint16_t w, h; std::vector<uint8_t> fb; uint64_t serial; };
+    std::vector<uint8_t> baseText;        // base window text overlay (may be empty)
+    struct Overlay { int x, y; uint16_t w, h; std::vector<uint8_t> fb;
+                     std::vector<uint8_t> textFb; uint64_t serial; };
     std::vector<Overlay> overlays;
     {
         std::lock_guard<std::mutex> lk(regMutex);
@@ -91,9 +93,10 @@ void XWireServer::composeAndPresent() {
         if (!baseId) return;
         auto bit = windows.find(baseId);
         if (bit == windows.end() || bit->second.fb.empty()) return;
-        XWindow& base = bit->second;
+        XWireWindow& base = bit->second;
         hostW = base.fbW; hostH = base.fbH;
         canvas = base.fb;                 // copy the background
+        baseText = base.textFb;           // copy the text overlay
         // The base client is at this root origin (e.g. (4,23)); we present its fb
         // at host (0,0), so an overlay at root (ox,oy) lands at host (ox-baseX,
         // oy-baseY).
@@ -102,30 +105,45 @@ void XWireServer::composeAndPresent() {
         // Gather mapped overlay windows (anything mapped + drawn that isn't the
         // base or the root), oldest-mapped first so newer menus land on top.
         for (auto& kv : windows) {
-            XWindow& w = kv.second;
+            XWireWindow& w = kv.second;
             if (kv.first == baseId || w.isRoot) continue;
             if (!w.mapped || w.fb.empty() || !w.fbW || !w.fbH) continue;
             overlays.push_back({ (int)w.x - baseX, (int)w.y - baseY,
-                                 w.fbW, w.fbH, w.fb, w.mapSerial });
+                                 w.fbW, w.fbH, w.fb, w.textFb, w.mapSerial });
         }
     }
     if (canvas.empty() || !hostW || !hostH) return;
 
     const uint32_t bpp = 4;
+    // Blit the base window's text overlay onto the canvas (opaque where != 0).
+    if (baseText.size() == canvas.size()) {
+        const uint32_t* t = reinterpret_cast<const uint32_t*>(baseText.data());
+        uint32_t* c = reinterpret_cast<uint32_t*>(canvas.data());
+        size_t n = (size_t)hostW * hostH;
+        for (size_t i = 0; i < n; i++) if (t[i]) c[i] = t[i];
+    }
     if (!overlays.empty()) {
         std::sort(overlays.begin(), overlays.end(),
                   [](const Overlay& a, const Overlay& b) { return a.serial < b.serial; });
         for (const Overlay& ov : overlays) {
+            bool haveText = (ov.textFb.size() == (size_t)ov.w * ov.h * bpp);
             for (uint16_t row = 0; row < ov.h; row++) {
                 int dy = ov.y + row;
                 if (dy < 0 || dy >= hostH) continue;
                 int dx = ov.x;
                 uint16_t copyW = ov.w;
-                const uint8_t* src = ov.fb.data() + (size_t)row * ov.w * bpp;
-                if (dx < 0) { src += (size_t)(-dx) * bpp; copyW = (uint16_t)(copyW + dx); dx = 0; }
+                uint32_t srcOff = (uint32_t)row * ov.w;     // in pixels
+                const uint8_t* src = ov.fb.data() + (size_t)srcOff * bpp;
+                if (dx < 0) { srcOff += (uint32_t)(-dx); src += (size_t)(-dx) * bpp; copyW = (uint16_t)(copyW + dx); dx = 0; }
                 if (dx >= hostW || copyW == 0) continue;
                 if (dx + copyW > hostW) copyW = (uint16_t)(hostW - dx);
                 memcpy(canvas.data() + ((size_t)dy * hostW + dx) * bpp, src, (size_t)copyW * bpp);
+                // Overlay this window's own text on top of its just-blitted fb.
+                if (haveText) {
+                    const uint32_t* t = reinterpret_cast<const uint32_t*>(ov.textFb.data()) + srcOff;
+                    uint32_t* c = reinterpret_cast<uint32_t*>(canvas.data()) + (size_t)dy * hostW + dx;
+                    for (uint16_t i = 0; i < copyW; i++) if (t[i]) c[i] = t[i];
+                }
             }
         }
     }

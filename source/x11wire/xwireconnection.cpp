@@ -16,12 +16,15 @@
 #include "xwireconnection.h"
 #include "xwireserver.h"
 #include "xwirepresent.h"
+#include "xwirefont.h"
 #include "kunixsocket.h"
 #include "knativesystem.h"
 #include "knativescreen.h"
 
 #include <cstring>
 #include <string>
+#include <vector>
+#include <utility>
 
 // The active presentation sink (platform/sdl sets it during window init). null
 // when headless / -novideo, in which case all PutImage/Map presentation is a
@@ -141,6 +144,15 @@ namespace {
         X_CopyArea              = 62,
         X_PolyFillRectangle     = 70,
         X_PutImage              = 72,
+        X_OpenFont              = 45,
+        X_CloseFont             = 46,
+        X_QueryFont             = 47,
+        X_QueryTextExtents      = 48,
+        X_ListFonts             = 49,
+        X_ListFontsWithInfo     = 50,
+        X_GetFontPath           = 52,
+        X_PolyText8             = 74,
+        X_PolyText16            = 75,
         X_ImageText8            = 76,
         X_ImageText16           = 77,
         X_CreateColormap        = 78,
@@ -174,7 +186,7 @@ namespace {
 
     // Walk a CW value list (in mask-bit order) and pull out the few fields we
     // model: event mask, override-redirect (marks menus/popups), and cursor.
-    void applyWindowValues(XWindow& w, uint32_t mask, const uint8_t* vals) {
+    void applyWindowValues(XWireWindow& w, uint32_t mask, const uint8_t* vals) {
         uint32_t slot = 0;
         for (int bit = 0; bit <= CWCursor; bit++) {
             if (!(mask & (1u << bit))) continue;
@@ -183,6 +195,35 @@ namespace {
                 case CWOverrideRedirect: w.overrideRedirect = (v != 0); break;
                 case CWEventMask:        w.eventMask = v; break;
                 case CWCursor:           w.cursor = v; break;
+                default: break;
+            }
+            slot++;
+        }
+    }
+
+    // GC value-mask bits (value list is in this order, 4 bytes per present
+    // value). We only model the ones core-text needs.
+    enum {
+        GCFunction=0, GCPlaneMask=1, GCForeground=2, GCBackground=3,
+        GCLineWidth=4, GCLineStyle=5, GCCapStyle=6, GCJoinStyle=7,
+        GCFillStyle=8, GCFillRule=9, GCTile=10, GCStipple=11,
+        GCTileStipXOrigin=12, GCTileStipYOrigin=13, GCFont=14,
+        GCSubwindowMode=15, GCGraphicsExposures=16, GCClipXOrigin=17,
+        GCClipYOrigin=18, GCClipMask=19, GCDashOffset=20, GCDashList=21,
+        GCArcMode=22,
+    };
+
+    // Apply a GC value list to a XWireGC. The pixel value for our TrueColor
+    // 24/32 visual is 0x00RRGGBB; store it as opaque ARGB.
+    void applyGCValues(XWireGC& gc, uint32_t mask, const uint8_t* vals) {
+        uint32_t slot = 0;
+        for (int bit = 0; bit <= GCArcMode; bit++) {
+            if (!(mask & (1u << bit))) continue;
+            uint32_t v = rd32(vals + slot * 4);
+            switch (bit) {
+                case GCForeground: gc.foreground = 0xff000000u | (v & 0x00ffffffu); break;
+                case GCBackground: gc.background = 0xff000000u | (v & 0x00ffffffu); break;
+                case GCFont:       gc.font = v; break;
                 default: break;
             }
             slot++;
@@ -379,7 +420,7 @@ void XWireConnection::doHandshake() {
     {
         XWireServer& srv = XWireServer::instance();
         std::lock_guard<std::mutex> lk(srv.regMutex);
-        XWindow& rw = srv.windows[rootWindow];
+        XWireWindow& rw = srv.windows[rootWindow];
         rw.isRoot = true; rw.mapped = true;
         rw.width = screenWidth; rw.height = screenHeight;
     }
@@ -407,7 +448,7 @@ void XWireConnection::processOneRequest(const uint8_t* req, uint32_t len) {
             // wid at req[4]; parent at req[8]; x,y,w,h at req[12..]; the CW value
             // mask is at req[28], value list at req[32].
             uint32_t wid = rd32(req + 4);
-            XWindow w;
+            XWireWindow w;
             w.parent = rd32(req + 8);
             w.x = (int16_t)rd16(req + 12);
             w.y = (int16_t)rd16(req + 14);
@@ -564,30 +605,77 @@ void XWireConnection::processOneRequest(const uint8_t* req, uint32_t len) {
             }
             break;
         }
+        case X_CreateGC: {
+            // cid@4, drawable@8, value-mask@12, value list@16.
+            uint32_t cid  = rd32(req + 4);
+            uint32_t mask = rd32(req + 12);
+            XWireGC gc;
+            applyGCValues(gc, mask, req + 16);
+            XWireServer& srv = XWireServer::instance();
+            std::lock_guard<std::mutex> lk(srv.regMutex);
+            srv.gcs[cid] = gc;
+            break;
+        }
+        case X_ChangeGC: {
+            // gc@4, value-mask@8, value list@12. Default-creates the GC if unseen.
+            uint32_t cid  = rd32(req + 4);
+            uint32_t mask = rd32(req + 8);
+            XWireServer& srv = XWireServer::instance();
+            std::lock_guard<std::mutex> lk(srv.regMutex);
+            applyGCValues(srv.gcs[cid], mask, req + 12);
+            break;
+        }
+        case X_FreeGC: {
+            uint32_t cid = rd32(req + 4);
+            XWireServer& srv = XWireServer::instance();
+            std::lock_guard<std::mutex> lk(srv.regMutex);
+            srv.gcs.erase(cid);
+            break;
+        }
+        case X_OpenFont: {
+            // fid@4, length-of-name@8 (u16), name@12. All map to the one builtin
+            // font; we just record the id so CloseFont can drop it. Reply-less.
+            uint32_t fid = rd32(req + 4);
+            uint16_t nlen = rd16(req + 8);
+            std::string name;
+            if (len >= 12u + nlen) name.assign((const char*)(req + 12), nlen);
+            XWireServer& srv = XWireServer::instance();
+            std::lock_guard<std::mutex> lk(srv.regMutex);
+            srv.fonts[fid] = name;
+            break;
+        }
+        case X_CloseFont: {
+            uint32_t fid = rd32(req + 4);
+            XWireServer& srv = XWireServer::instance();
+            std::lock_guard<std::mutex> lk(srv.regMutex);
+            srv.fonts.erase(fid);
+            break;
+        }
         case X_ClearArea:
-        case X_FreeGC:
         case X_FreePixmap:
         case X_DeleteProperty:
-        case X_ChangeGC:
-        case X_CreateGC:
         case X_CreatePixmap:
         case X_CreateColormap:
         case X_PolyFillRectangle:
         case X_CopyArea:
-        case X_ImageText8:
-        case X_ImageText16:
         case X_ChangeProperty:
         case X_SetClipRectangles:
         case X_CreateGlyphCursor: {
-            // CreateGlyphCursor(cid, source-font, mask-font, source-char,
-            // mask-char, fg/bg rgb). The source-char IS the XC_* cursor shape
-            // glyph (cursor font), e.g. 152=xterm/I-beam, 68=left_ptr. Record
-            // cid -> shape so a window's CWCursor can drive the host cursor.
-            uint32_t cid = rd32(req + 4);
-            uint16_t sourceChar = rd16(req + 16);
-            XWireServer& srv = XWireServer::instance();
-            std::lock_guard<std::mutex> lk(srv.regMutex);
-            srv.cursorShapes[cid] = sourceChar;
+            // This block is a catch-all for reply-less drawing/property ops we
+            // don't model; only CreateGlyphCursor needs to inspect its payload.
+            // Guard the field reads by opcode + length so a shorter request
+            // (e.g. a 16-byte CopyArea) never reads past the assembled request.
+            if (opcode == X_CreateGlyphCursor && len >= 18) {
+                // CreateGlyphCursor(cid, source-font, mask-font, source-char,
+                // mask-char, fg/bg rgb). The source-char IS the XC_* cursor shape
+                // glyph (cursor font), e.g. 152=xterm/I-beam, 68=left_ptr. Record
+                // cid -> shape so a window's CWCursor can drive the host cursor.
+                uint32_t cid = rd32(req + 4);
+                uint16_t sourceChar = rd16(req + 16);
+                XWireServer& srv = XWireServer::instance();
+                std::lock_guard<std::mutex> lk(srv.regMutex);
+                srv.cursorShapes[cid] = sourceChar;
+            }
             break;
         }
         case X_CreateCursor:
@@ -654,7 +742,7 @@ void XWireConnection::processOneRequest(const uint8_t* req, uint32_t len) {
 
         case X_GetGeometry: {
             uint32_t drawable = rd32(req + 4);
-            XWindow w;
+            XWireWindow w;
             {
                 XWireServer& srv = XWireServer::instance();
                 std::lock_guard<std::mutex> lk(srv.regMutex);
@@ -977,6 +1065,164 @@ void XWireConnection::processOneRequest(const uint8_t* req, uint32_t len) {
             writeToClient(r.data(), (uint32_t)r.size());
             break;
         }
+
+        // ---- Core fonts: reply with our single builtin 5x7 monospace font's
+        // metrics so libX11 builds a usable XFontStruct and never blocks. These
+        // are REPLY-expecting; falling into default: would hang the client.
+        case X_QueryFont: {
+            // 60-byte fixed reply, 0 properties, 0 per-char infos. all-chars-exist
+            // + populated min/max bounds => libX11 needs no per-char data.
+            uint8_t r[60] = {0};
+            r[0] = 1;
+            r[2] = (uint8_t)(sequence & 0xff);
+            r[3] = (uint8_t)(sequence >> 8);
+            uint32_t replyLen = 7;              // 7 + 2*nProps(0) + 3*nChars(0)
+            memcpy(r + 4, &replyLen, 4);
+            auto putCharInfo = [](uint8_t* p, int16_t cw, int16_t asc, int16_t desc) {
+                int16_t lsb = 0, rsb = cw;
+                memcpy(p + 0, &lsb, 2); memcpy(p + 2, &rsb, 2);
+                memcpy(p + 4, &cw, 2);  memcpy(p + 6, &asc, 2);
+                memcpy(p + 8, &desc, 2);        // attributes @10 = 0
+            };
+            putCharInfo(r + 8,  xwirefont::CELL_W, 6, 1);   // min-bounds
+            putCharInfo(r + 24, xwirefont::CELL_W, 6, 1);   // max-bounds
+            uint16_t minCh = 32, maxCh = 126, defCh = 32, nProps = 0;
+            memcpy(r + 40, &minCh, 2);
+            memcpy(r + 42, &maxCh, 2);
+            memcpy(r + 44, &defCh, 2);
+            memcpy(r + 46, &nProps, 2);
+            r[48] = 0;                          // draw-direction LeftToRight
+            r[51] = 1;                          // all-chars-exist
+            int16_t fa = 6, fd = 1;
+            memcpy(r + 52, &fa, 2);
+            memcpy(r + 54, &fd, 2);
+            // nCharInfos @56 = 0
+            writeToClient(r, sizeof(r));
+            break;
+        }
+        case X_QueryTextExtents: {
+            // req[1] bit0 = odd-length flag; CHAR2B string from @8 to padded end.
+            uint32_t bodyBytes = (len > 8) ? (len - 8) : 0;
+            uint32_t nChars = bodyBytes / 2;
+            if ((req[1] & 1) && nChars) nChars--;   // odd-length padded one CHAR2B
+            uint8_t r[32] = {0};
+            r[0] = 1;
+            r[1] = 0;                          // draw-direction LeftToRight
+            r[2] = (uint8_t)(sequence & 0xff);
+            r[3] = (uint8_t)(sequence >> 8);
+            int16_t fa = 6, fd = 1;
+            memcpy(r + 8,  &fa, 2);            // font-ascent
+            memcpy(r + 10, &fd, 2);            // font-descent
+            memcpy(r + 12, &fa, 2);            // overall-ascent
+            memcpy(r + 14, &fd, 2);            // overall-descent
+            int32_t width = (int32_t)(nChars * xwirefont::CELL_W);
+            memcpy(r + 16, &width, 4);         // overall-width
+            int32_t left = 0, right = width;
+            memcpy(r + 20, &left, 4);
+            memcpy(r + 24, &right, 4);
+            writeToClient(r, sizeof(r));
+            break;
+        }
+        case X_ListFonts: {
+            // Return one name ("fixed"), length-prefixed + padded to 4.
+            static const char kName[] = "fixed";
+            uint8_t nameLen = (uint8_t)(sizeof(kName) - 1);
+            uint32_t bodyLen = 1u + nameLen;
+            uint32_t pad = (4 - (bodyLen & 3)) & 3;
+            uint8_t r[32] = {0};
+            r[0] = 1;
+            r[2] = (uint8_t)(sequence & 0xff);
+            r[3] = (uint8_t)(sequence >> 8);
+            uint32_t replyLen = (bodyLen + pad) / 4;
+            memcpy(r + 4, &replyLen, 4);
+            uint16_t nNames = 1;
+            memcpy(r + 8, &nNames, 2);
+            writeToClient(r, sizeof(r));
+            writeToClient(&nameLen, 1);
+            writeToClient(kName, nameLen);
+            for (uint32_t i = 0; i < pad; i++) { uint8_t z = 0; writeToClient(&z, 1); }
+            break;
+        }
+        case X_ListFontsWithInfo: {
+            // Series-of-replies request; emit only the terminating reply
+            // (length-of-name byte = 0 => end of list) so libX11 sees an empty
+            // list and returns instead of blocking.
+            uint8_t r[60] = {0};
+            r[0] = 1;
+            r[1] = 0;                          // length-of-name 0 = last reply
+            r[2] = (uint8_t)(sequence & 0xff);
+            r[3] = (uint8_t)(sequence >> 8);
+            uint32_t replyLen = 7;
+            memcpy(r + 4, &replyLen, 4);
+            writeToClient(r, sizeof(r));
+            break;
+        }
+        case X_GetFontPath: {
+            // Empty font path (reply-length 0, number-of-STRs 0).
+            uint8_t r[32] = {0};
+            r[0] = 1;
+            r[2] = (uint8_t)(sequence & 0xff);
+            r[3] = (uint8_t)(sequence >> 8);
+            writeToClient(r, sizeof(r));
+            break;
+        }
+
+        // ---- Core text drawing (reply-less). Draw into the window's text
+        // overlay so a later PutImage band can't erase the glyphs.
+        case X_ImageText8:
+        case X_ImageText16: {
+            bool wide = (opcode == X_ImageText16);
+            uint8_t n = req[1];
+            uint32_t need = 16u + (wide ? 2u * n : n);
+            if (len < need) break;             // truncated; bail safely
+            uint32_t drawable = rd32(req + 4);
+            uint32_t gc       = rd32(req + 8);
+            int16_t  x = (int16_t)rd16(req + 12);
+            int16_t  y = (int16_t)rd16(req + 14);
+            std::string s; s.reserve(n);
+            for (uint32_t i = 0; i < n; i++) {
+                if (!wide) s.push_back((char)req[16 + i]);
+                else {
+                    uint8_t hi = req[16 + 2*i], lo = req[16 + 2*i + 1];
+                    s.push_back(hi ? '.' : (char)lo);
+                }
+            }
+            blitText(drawable, gc, x, y, s, /*imageText=*/true);
+            break;
+        }
+        case X_PolyText8:
+        case X_PolyText16: {
+            bool wide = (opcode == X_PolyText16);
+            uint32_t drawable = rd32(req + 4);
+            uint32_t gc       = rd32(req + 8);
+            int16_t  penX = (int16_t)rd16(req + 12);
+            int16_t  penY = (int16_t)rd16(req + 14);
+            // Walk the text-item list at @16. Each item: [len][delta][len bytes],
+            // or a font-shift item (len==255 + 4 font-id bytes), or pad (len==0).
+            std::vector<std::pair<int16_t, std::string>> items;  // (drawX, text)
+            uint32_t p = 16;
+            while (p + 1 < len) {
+                uint8_t lenByte = req[p];
+                if (lenByte == 0) break;                  // pad / end of items
+                if (lenByte == 255) { p += 1 + 4; continue; }  // font shift: skip
+                if (p + 2 > len) break;
+                int8_t delta = (int8_t)req[p + 1];
+                uint32_t strBytes = wide ? (uint32_t)lenByte * 2 : lenByte;
+                if (p + 2 + strBytes > len) break;        // truncated; bail
+                const uint8_t* sp = req + p + 2;
+                std::string s; s.reserve(lenByte);
+                for (uint32_t i = 0; i < lenByte; i++) {
+                    if (!wide) s.push_back((char)sp[i]);
+                    else { uint8_t hi = sp[2*i], lo = sp[2*i+1]; s.push_back(hi ? '.' : (char)lo); }
+                }
+                penX = (int16_t)(penX + delta);
+                items.emplace_back(penX, s);
+                penX = (int16_t)(penX + (int)lenByte * xwirefont::CELL_W);
+                p += 2 + strBytes;
+            }
+            blitTextItems(drawable, gc, penY, items);
+            break;
+        }
         default:
             // Unknown request. If it expects a reply we'd hang libX11; but most
             // unknown ones here are reply-less. Log so the discovery loop sees
@@ -1106,7 +1352,7 @@ void XWireConnection::deliverInputEvents() {
             std::lock_guard<std::mutex> lk(srv.regMutex);
             uint64_t bestSerial = 0;
             for (auto& kv : srv.windows) {
-                XWindow& w = kv.second;
+                XWireWindow& w = kv.second;
                 if (kv.first == presentWindow || w.isRoot) continue;
                 if (!w.mapped || !w.fbW || !w.fbH) continue;
                 int hx0 = (int)w.x - baseX, hy0 = (int)w.y - baseY;   // host rect
@@ -1243,7 +1489,7 @@ void XWireConnection::blitPutImage(uint32_t drawable, uint8_t format, uint8_t de
         // present. (CopyArea compositing is a later refinement.)
         return;
     }
-    XWindow& win = it->second;
+    XWireWindow& win = it->second;
     if (win.isRoot) return;     // never present the root/desktop background
 
     // Track the window's full extent from the blit reach. winex11 tiles the
@@ -1284,12 +1530,31 @@ void XWireConnection::blitPutImage(uint32_t drawable, uint8_t format, uint8_t de
             }
         }
         win.fb.swap(grown);
+        // Keep the text overlay aligned with fb so composeAndPresent can blit it
+        // 1:1. Grow-and-preserve identically (only if it was already allocated).
+        if (!win.textFb.empty()) {
+            std::vector<uint8_t> tgrown((size_t)winW * winH * bpp, 0);
+            uint16_t copyH = win.fbH < winH ? win.fbH : winH;
+            uint16_t copyW = win.fbW < winW ? win.fbW : winW;
+            for (uint16_t y = 0; y < copyH; y++) {
+                memcpy(tgrown.data() + (size_t)y * winW * bpp,
+                       win.textFb.data() + (size_t)y * win.fbW * bpp,
+                       (size_t)copyW * bpp);
+            }
+            win.textFb.swap(tgrown);
+        }
         win.fbW = winW;
         win.fbH = winH;
     }
 
+    // The text overlay, when present, is always sized to exactly fbW*fbH*bpp (see
+    // the grow block above and drawTextOverlay). Guard the clear below by its real
+    // size so a stale/empty overlay can never be written out of bounds.
+    const size_t textBytes = win.textFb.size();
+
     // Copy each source row into the framebuffer at (dstX, dstY), clipping to the
-    // window bounds.
+    // window bounds. A repaint of a region supersedes any stale core-text there,
+    // so clear the overlapping rows of the text overlay too.
     for (uint16_t row = 0; row < h; row++) {
         int dy = dstY + row;
         if (dy < 0 || dy >= winH) continue;
@@ -1301,6 +1566,9 @@ void XWireConnection::blitPutImage(uint32_t drawable, uint8_t format, uint8_t de
         if (dx + copyW > winW) copyW = (uint16_t)(winW - dx);
         uint8_t* dstRow = win.fb.data() + ((size_t)dy * winW + dx) * bpp;
         memcpy(dstRow, src, (size_t)copyW * bpp);
+        size_t off = ((size_t)dy * winW + dx) * bpp;
+        if (textBytes && off + (size_t)copyW * bpp <= textBytes)
+            memset(win.textFb.data() + off, 0, (size_t)copyW * bpp);
     }
 
     // Done mutating the registry — drop the lock before composing (it re-locks).
@@ -1308,6 +1576,90 @@ void XWireConnection::blitPutImage(uint32_t drawable, uint8_t format, uint8_t de
     // Recompose base + overlays whenever any window draws, so a menu/popup that
     // PutImages into its own (non-base) window still appears on the host.
     srv.composeAndPresent();
+}
+
+// ---------------------------------------------------------------------------
+// X core text. Glyphs go into the window's text-overlay buffer (NOT fb), so a
+// later PutImage band can't erase them; composeAndPresent blits the overlay on
+// top of fb. Caller must hold srv.regMutex. `win` is a live registry entry; the
+// overlay is grown to match fb and the string is drawn at baseline `y`.
+// ---------------------------------------------------------------------------
+namespace {
+    // Draw one string into win.textFb at (x, baselineY). fg/bg are opaque ARGB.
+    // imageText fills the text box with bg first; PolyText (imageText=false)
+    // draws foreground glyphs only (transparent elsewhere = overlay pixel 0).
+    void drawTextOverlay(XWireWindow& win, int16_t x, int16_t baselineY,
+                         const std::string& s, uint32_t fg, uint32_t bg,
+                         bool imageText) {
+        if (s.empty() || !win.fbW || !win.fbH) return;
+        const uint32_t bpp = 4;
+        // Size the overlay to EXACTLY match fb's allocation, so the (W*H) index
+        // space below and the 1:1 blit in composeAndPresent can never run past
+        // either buffer even if win.width/height got ahead of the fb extent.
+        size_t want = (size_t)win.fbW * win.fbH * bpp;
+        if (win.fb.size() < want) return;        // fb not yet grown to fbW*fbH
+        if (win.textFb.size() != want)
+            win.textFb.assign(want, 0);
+        uint32_t* tfb = reinterpret_cast<uint32_t*>(win.textFb.data());
+        int W = win.fbW, H = win.fbH;
+        int top = baselineY - 6;                 // ascent: glyph top from baseline
+        int textW = (int)s.size() * xwirefont::CELL_W;
+
+        if (imageText) {
+            for (int row = 0; row < xwirefont::GLYPH_H; row++) {
+                int py = top + row;
+                if (py < 0 || py >= H) continue;
+                for (int col = 0; col < textW; col++) {
+                    int px = x + col;
+                    if (px >= 0 && px < W) tfb[py*W + px] = bg;
+                }
+            }
+        }
+        int penX = x;
+        for (char c : s) {
+            uint8_t gcol[5];
+            xwirefont::glyphInto(c, gcol);
+            for (int col = 0; col < 5; col++)
+                for (int row = 0; row < 7; row++)
+                    if (gcol[col] & (1 << row)) {
+                        int px = penX + col, py = top + row;
+                        if (px >= 0 && px < W && py >= 0 && py < H)
+                            tfb[py*W + px] = fg;
+                    }
+            penX += xwirefont::CELL_W;
+        }
+    }
+}
+
+void XWireConnection::blitText(uint32_t drawable, uint32_t gcId, int16_t x, int16_t y,
+                               const std::string& chars, bool imageText) {
+    if (chars.empty()) return;
+    XWireServer& srv = XWireServer::instance();
+    std::unique_lock<std::mutex> lk(srv.regMutex);
+    uint32_t fg = 0xff000000, bg = 0xffffffff;
+    auto git = srv.gcs.find(gcId);
+    if (git != srv.gcs.end()) { fg = git->second.foreground; bg = git->second.background; }
+    auto it = srv.windows.find(drawable);
+    if (it == srv.windows.end() || it->second.isRoot) return;  // pixmap/root -> skip
+    drawTextOverlay(it->second, x, y, chars, fg, bg, imageText);
+    lk.unlock();
+    srv.composeAndPresent();
+}
+
+void XWireConnection::blitTextItems(uint32_t drawable, uint32_t gcId, int16_t y,
+                                    const std::vector<std::pair<int16_t, std::string>>& items) {
+    if (items.empty()) return;
+    XWireServer& srv = XWireServer::instance();
+    std::unique_lock<std::mutex> lk(srv.regMutex);
+    uint32_t fg = 0xff000000, bg = 0xffffffff;
+    auto git = srv.gcs.find(gcId);
+    if (git != srv.gcs.end()) { fg = git->second.foreground; bg = git->second.background; }
+    auto it = srv.windows.find(drawable);
+    if (it == srv.windows.end() || it->second.isRoot) return;  // pixmap/root -> skip
+    for (const auto& item : items)
+        drawTextOverlay(it->second, item.first, y, item.second, fg, bg, /*imageText=*/false);
+    lk.unlock();
+    srv.composeAndPresent();   // one present for the whole item list
 }
 
 // ---------------------------------------------------------------------------
