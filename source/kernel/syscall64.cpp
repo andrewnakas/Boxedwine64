@@ -2019,6 +2019,17 @@ void ksyscall64(CPU64* cpu) {
     {
         static const bool memStats = getenv("BW64_MEMSTATS") != nullptr;
         if (memStats && cpu->memory && cpu->thread && cpu->thread->process) {
+            // Per-pid syscall accounting for the livelock (Mode 2) diagnosis: a
+            // busy-poll storm shows one pid spinning the SAME syscall thousands of
+            // times between ticks while no real progress is logged. pids stay
+            // small during boot; cap the table and fold the rest into slot 0.
+            static std::atomic<U32> sysCount[256];
+            static std::atomic<U32> lastNr[256];
+            int mypid = (int)cpu->thread->process->id;
+            U32 slot = (mypid >= 0 && mypid < 256) ? (U32)mypid : 0;
+            sysCount[slot].fetch_add(1, std::memory_order_relaxed);
+            lastNr[slot].store((U32)nr, std::memory_order_relaxed);
+
             static std::atomic<U64> lastUs{0};
             U64 nowUs = KSystem::getSystemTimeAsMicroSeconds();
             U64 prev = lastUs.load(std::memory_order_relaxed);
@@ -2028,11 +2039,20 @@ void ksyscall64(CPU64* cpu) {
                 U64 mapped = mem->mappedPageCount();
                 U64 committed = mem->committedPageCount();
                 U64 rss = KSystem::getHostResidentBytes();
-                klog_fmt("MEMSTATS pid=%d pages=%llu committedKB=%llu rssKB=%llu",
+                // Find the busiest pid this interval (the livelock suspect) and
+                // reset all counters for the next window.
+                U32 topPid = 0, topCount = 0, topNr = 0;
+                for (U32 i = 0; i < 256; i++) {
+                    U32 c = sysCount[i].exchange(0, std::memory_order_relaxed);
+                    if (c > topCount) { topCount = c; topPid = i; topNr = lastNr[i].load(std::memory_order_relaxed); }
+                }
+                klog_fmt("MEMSTATS pid=%d pages=%llu committedKB=%llu rssKB=%llu "
+                         "busiest=pid%u/%usc/last=%s",
                          (int)cpu->thread->process->id,
                          (unsigned long long)mapped,
                          (unsigned long long)(committed * 4),
-                         (unsigned long long)(rss / 1024));
+                         (unsigned long long)(rss / 1024),
+                         topPid, topCount, x64SyscallName(topNr));
             }
         }
     }
