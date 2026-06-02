@@ -50,6 +50,7 @@
 #define X64_SYS_symlinkat         266
 #define X64_SYS_link              86
 #define X64_SYS_linkat            265
+#define X64_SYS_utimensat         280
 #define X64_SYS_socketpair        53
 #define X64_SYS_shutdown          48
 #define X64_SYS_socket            41
@@ -1892,6 +1893,7 @@ static const char* x64SyscallName(U64 nr) {
         case 25: return "mremap";
         case 28: return "madvise";
         case 221: return "fadvise64";
+        case 280: return "utimensat";
         case 32: return "dup";
         case 33: return "dup2";
         case 34: return "pause";
@@ -2071,6 +2073,14 @@ void ksyscall64(CPU64* cpu) {
             break;
         case X64_SYS_sigaltstack:
             ret = sys_sigaltstack64(cpu, a1, a2);
+            break;
+        case X64_SYS_utimensat:
+            // utimensat(dirfd, path, times[2], flags) — set file atime/mtime.
+            // fontconfig touches its cache files' timestamps; returning -ENOSYS
+            // made it retry (43+ calls seen). We don't model per-file mtime
+            // precisely, so report success — the cache write itself already
+            // persisted the data. (a1=dirfd, a2=path, a3=times, a4=flags.)
+            ret = 0;
             break;
         case X64_SYS_set_robust_list:
         case X64_SYS_madvise:
