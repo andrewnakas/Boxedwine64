@@ -105,7 +105,7 @@ This project drives the [`docs/PLAN_64BIT.md`](docs/PLAN_64BIT.md) §3.7–§3.1
 | **E — fork/exec + wineserver IPC** | real `fork`/`execve`/`wait4`, AF\_UNIX sockets, epoll, `sendmsg`/`recvmsg` + SCM\_RIGHTS | ✅ Complete — `wineboot --init` drives the full wine64↔wineserver handshake |
 | **F — Windows PE + GUI** | populate the prefix with Windows PE files, then the X server / GUI path; interactive input + a working common dialog | ✅ Complete — notepad paints, takes keyboard+mouse, and Save As writes a file to the host |
 | **G — App breadth + X completeness** | get a spread of bundled apps (winecfg, regedit, clock, write, …) usable, fill the remaining X core opcodes they need | ⏳ Next |
-| **H — Interpreter throughput** | close the gap to interactive speed: block/trace caching, faster hot-path decode, fewer per-op map lookups | ⏳ Not started |
+| **H — Interpreter throughput** | close the gap to interactive speed: faster hot-path decode, fewer per-op map lookups, block/trace caching | 🟡 In progress — instruction-fetch page cache + profiled hot-opcode dispatch hoist landed (`BW64_OPPROF`); full decoded-block cache still open |
 | **I — WASM memory64 + v1 polish** | Emscripten `MEMORY64=2`, slim wine64 package, lazy DLL fetch, browser tests | ⏳ Not started |
 
 The commit log (`git log --oneline`) is the canonical, blow-by-blow record of the
@@ -116,23 +116,27 @@ uncovered it.
 
 The most useful work, in rough priority order:
 
-1. **App breadth (Milestone G).** Run each program in `tools/run_wine64_gui.sh`
-   and fix the first thing each one needs. `winecfg`, `regedit`, and `clock` are
-   the highest-value targets (tabbed dialogs, tree controls, timers). Expect
-   missing X **core-font/text opcodes** — the dialog text path uses
-   `OpenFont`(45)/`QueryFont`(47)/`PolyText8`(65)/`ImageText8`(76); they
-   currently fall through `default:` in `source/x11wire/xwireconnection.cpp`
-   (use `BW64_XWIREDUMP=1` to hex-dump unhandled requests). Implement a builtin
-   fixed font + glyph blit into the window pixmap so dialog labels render.
+1. **X core text — now the top gate (Milestone G).** Text-heavy apps (WordPad,
+   and notepad once it reaches its text-draw) boot fully but then sit IDLE
+   (~9% CPU, not spinning) at a flood of unhandled **`PolyText8`(65)/
+   `PolyText16`(66)** requests — the window maps but never paints its text and
+   the app blocks. This, not interpreter speed, is what currently stops those
+   apps from being usable. Implement the X core-text path: `OpenFont`(45)/
+   `QueryFont`(47, reply)/`PolyText8`(65)/`PolyText16`(66)/`ImageText8`(76) with
+   a builtin fixed font + glyph blit into the window pixmap. Use
+   `BW64_XWIREDUMP=1` to hex-dump the exact request layout. Then sweep the apps
+   in `tools/run_wine64_gui.sh` (or `--wine-gui`) — `winecfg`, `regedit`,
+   `clock` are the next highest-value targets.
 2. **A real Save/Open into the Mac home.** Point the guest's
    `Documents`/`Desktop` `.link` files at a host-visible folder (or add a
    `-drive` mapping) so files land somewhere natural instead of inside the repo
    rootfs. Today everything under `C:` lives in `tools/rootfs64/root/`.
-3. **Interpreter throughput (Milestone H).** The fetch cache helped, but the
-   `step()` decoder still re-decodes every instruction. A per-page decoded-block
-   cache (keyed by guest RIP, invalidated on unmap/exec) would speed up the hot
-   loops that dominate wineserver and GDI; this is the single biggest lever on
-   "feels native."
+3. **Interpreter throughput (Milestone H, partly done).** The instruction-fetch
+   page cache and the profiled hot-opcode dispatch hoist (`BW64_OPPROF`) landed;
+   `step()` still re-decodes every instruction though. The remaining big lever is
+   a per-RIP **decoded-block cache** (memoize prefix length + opcode class +
+   instruction length, keyed by guest RIP, invalidated on unmap/exec) so the hot
+   wineserver/GDI loops skip re-decode entirely — the path to "feels native."
 4. **Reliability: kill the residual boot wedge.** Boots are fast now but still
    occasionally stall in wineserver's O(n) name-table scan. Either a wineserver-
    side fast path for the UTF-16 case-fold compare (disasm at `wineserver64`
