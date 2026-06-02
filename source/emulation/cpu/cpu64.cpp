@@ -529,6 +529,39 @@ static U64 doShift(U32& rflags, U8 sub, U64 v, U8 count, U32 width) {
 // Minimal x86-64 decode-and-execute. Grows opcode by opcode. Anything not
 // handled logs the leading bytes and yields so we surface gaps quickly
 // instead of looping.
+// BW64_OPPROF: opcode-frequency profiler (env-gated, zero cost when off). Counts
+// each executed (op, op2) pair so we can see which opcodes dominate a real
+// wineserver/notepad boot and order the step() dispatch by measured frequency.
+// op2 is the second byte for the 0F two-byte map, else 0. Dumped at process exit.
+static bool g_opProf = false;
+static bool g_opProfInit = false;
+static U64 g_opProfCount[256][256] = {};   // [op][op2]
+static U64 g_opProf1[256] = {};            // single-byte totals
+
+void cpu64DumpOpProfile() {
+    if (!g_opProf) return;
+    // Top single-byte opcodes.
+    struct E { U32 op, op2; U64 n; };
+    std::vector<E> v;
+    for (U32 a = 0; a < 256; a++) {
+        if (g_opProf1[a]) v.push_back({a, 0, g_opProf1[a]});
+        for (U32 b = 0; b < 256; b++)
+            if (g_opProfCount[a][b]) v.push_back({a, b, g_opProfCount[a][b]});
+    }
+    std::sort(v.begin(), v.end(), [](const E& x, const E& y){ return x.n > y.n; });
+    klog("BW64_OPPROF: top opcodes by execution count (op[/op2] = count):");
+    U64 total = 0; for (auto& e : v) total += e.n;
+    for (size_t i = 0; i < v.size() && i < 40; i++) {
+        if (v[i].op == 0x0F)
+            klog_fmt("  0F %02x = %llu (%.1f%%)", v[i].op2,
+                     (unsigned long long)v[i].n, total ? 100.0*v[i].n/total : 0.0);
+        else
+            klog_fmt("  %02x    = %llu (%.1f%%)", v[i].op,
+                     (unsigned long long)v[i].n, total ? 100.0*v[i].n/total : 0.0);
+    }
+    klog_fmt("BW64_OPPROF: %llu instructions profiled", (unsigned long long)total);
+}
+
 U32 CPU64::step() {
     U64 ipStart = rip;
 
@@ -541,6 +574,16 @@ U32 CPU64::step() {
     U32 opSize = rexW ? 8u : (p.osize16 ? 2u : 4u);
 
     U8 op = fetchByte(rip + opOff);
+
+    if (!g_opProfInit) {
+        g_opProfInit = true;
+        g_opProf = std::getenv("BW64_OPPROF") != nullptr;
+        if (g_opProf) std::atexit(cpu64DumpOpProfile);
+    }
+    if (g_opProf) {
+        if (op == 0x0F) g_opProfCount[0x0F][fetchByte(rip + opOff + 1)]++;
+        else g_opProf1[op]++;
+    }
 
     // ---- Single-byte opcodes ----
 
@@ -619,6 +662,122 @@ U32 CPU64::step() {
             case 4: reg[m.regField].setU32((U32)val); break;
             case 8: reg[m.regField].setU64(val); break;
         }
+        U32 used = opOff + 1 + m.length;
+        rip += used;
+        return used;
+    }
+
+    // ---- Hot-opcode fast dispatch (Milestone H) ----
+    // These blocks were profiled (BW64_OPPROF) as the most-executed opcodes in a
+    // real wine64 boot — the ALU r/r-and-r/m group, the 80/81/83 imm-ALU group,
+    // and 84/85 TEST together are ~30% of all instructions, on top of the 89/8B
+    // MOVs above (~27%). They were physically below ~30 other single-byte checks;
+    // hoisting them here (they are disjoint from every check above — verified: no
+    // earlier branch matches 00-3D / 80 / 81 / 83 / 84 / 85) cuts the average
+    // dispatch scan from ~30 to ~5 for >55% of executions. Bodies are unchanged.
+
+    // ALU r/r and r/m forms. 00/01/02/03 + 04/05 imm-acc, repeated per 8 bytes
+    // for ADD/OR/ADC/SBB/AND/SUB/XOR/CMP. /6 and /7 rows are legacy long-mode-
+    // invalid opcodes (filtered), and 0F is the two-byte escape.
+    if (op <= 0x3D && ((op & 0x06) != 0x06)) {
+        U8 aluOp = (op >> 3) & 0x7;
+        U8 form  = op & 0x7;
+        if (form <= 3) {
+            U32 size = (form & 1) ? opSize : 1;
+            bool destIsRM = (form < 2);  // forms 0,1: dest is r/m; forms 2,3: dest is reg
+            ModRM m = decodeModRM(rip + opOff + 1, p, 0);
+            // `lock add`/`lock or`/`lock and`/... on a memory dest must be an
+            // atomic RMW across host threads (glibc futex/lock words use these).
+            std::unique_lock<std::recursive_mutex> atomicLock(cpu64AtomicLockFor(m.effAddr), std::defer_lock);
+            if (p.lock && destIsRM && !m.isReg) atomicLock.lock();
+            U64 a, b;
+            if (destIsRM) {
+                a = loadRM(m, size, rexPresent);
+                b = (size == 1) ? readReg8(m.regField, rexPresent)
+                  : (size == 2) ? (U64)reg[m.regField].u16
+                  : (size == 4) ? (U64)reg[m.regField].u32
+                                : reg[m.regField].u64;
+            } else {
+                a = (size == 1) ? readReg8(m.regField, rexPresent)
+                  : (size == 2) ? (U64)reg[m.regField].u16
+                  : (size == 4) ? (U64)reg[m.regField].u32
+                                : reg[m.regField].u64;
+                b = loadRM(m, size, rexPresent);
+            }
+            runAlu(aluOp, size, destIsRM, a, b, m, rexPresent);
+            U32 used = opOff + 1 + m.length;
+            rip += used;
+            return used;
+        }
+        if (form == 4 || form == 5) {
+            U32 size = (form == 4) ? 1 : opSize;
+            U64 imm = 0;
+            U32 immLen = 0;
+            if (size == 1) {
+                imm = fetchByte(rip + opOff + 1); immLen = 1;
+            } else if (size == 2) {
+                imm = (U16)(fetchByte(rip + opOff + 1) |
+                            ((U16)fetchByte(rip + opOff + 2) << 8)); immLen = 2;
+            } else if (size == 4) {
+                imm = fetchDword(rip + opOff + 1); immLen = 4;
+            } else {
+                S32 i32 = (S32)fetchDword(rip + opOff + 1);
+                imm = (U64)(S64)i32; immLen = 4;
+            }
+            U64 a = (size == 1) ? reg[X64_RAX].u8
+                  : (size == 2) ? reg[X64_RAX].u16
+                  : (size == 4) ? reg[X64_RAX].u32 : reg[X64_RAX].u64;
+            ModRM fake;
+            fake.isReg = true; fake.rmIndex = X64_RAX; fake.regField = 0;
+            runAlu(aluOp, size, true, a, imm, fake, rexPresent);
+            U32 used = opOff + 1 + immLen;
+            rip += used;
+            return used;
+        }
+    }
+
+    // 80/81/83 immediate-group ALU. /digit selects the alu op.
+    if (op == 0x80 || op == 0x81 || op == 0x83) {
+        U32 size = (op == 0x80) ? 1 : opSize;
+        ModRM m = decodeModRM(rip + opOff + 1, p,
+            (op == 0x81) ? (size == 2 ? 2 : 4) : 1);
+        U8 aluOp = m.regField & 0x7;
+        U64 imm = 0; U32 immLen = 0;
+        U64 immAddr = rip + opOff + 1 + m.length;
+        if (op == 0x80 || op == 0x83) {
+            S8 i8 = (S8)fetchByte(immAddr);
+            imm = (U64)(S64)i8; immLen = 1;
+            if (size == 2) imm &= 0xFFFF;
+            else if (size == 4) imm &= 0xFFFFFFFFULL;
+        } else { // 0x81
+            if (size == 2) {
+                imm = (U16)(fetchByte(immAddr) | ((U16)fetchByte(immAddr + 1) << 8));
+                immLen = 2;
+            } else if (size == 4) {
+                imm = fetchDword(immAddr); immLen = 4;
+            } else {
+                S32 i32 = (S32)fetchDword(immAddr);
+                imm = (U64)(S64)i32; immLen = 4;
+            }
+        }
+        std::unique_lock<std::recursive_mutex> atomicLock(cpu64AtomicLockFor(m.effAddr), std::defer_lock);
+        if (p.lock && !m.isReg) atomicLock.lock();
+        U64 a = loadRM(m, size, rexPresent);
+        runAlu(aluOp, size, true, a, imm, m, rexPresent);
+        U32 used = opOff + 1 + m.length + immLen;
+        rip += used;
+        return used;
+    }
+
+    // TEST r/m, r (84/85). Computes AND, sets flags, discards result.
+    if (op == 0x84 || op == 0x85) {
+        U32 size = (op == 0x84) ? 1 : opSize;
+        ModRM m = decodeModRM(rip + opOff + 1, p, 0);
+        U64 a = loadRM(m, size, rexPresent);
+        U64 b = (size == 1) ? readReg8(m.regField, rexPresent)
+              : (size == 2) ? reg[m.regField].u16
+              : (size == 4) ? reg[m.regField].u32 : reg[m.regField].u64;
+        flagsLogic(rflags, a & b, size);
         U32 used = opOff + 1 + m.length;
         rip += used;
         return used;
@@ -996,128 +1155,10 @@ U32 CPU64::step() {
         return opOff + 1;
     }
 
-    // ---- ALU r/r and r/m forms ----
-    //
-    // Encodings for ADD/OR/ADC/SBB/AND/SUB/XOR/CMP follow a regular pattern:
-    //   00 r/m8,  r8        01 r/m, r        02 r8, r/m8        03 r, r/m
-    //   04 AL, ib           05 (E|R)AX, iz
-    // and the same six-form block repeats every 8 bytes:
-    //   ADD=00 OR=08 ADC=10 SBB=18 AND=20 SUB=28 XOR=30 CMP=38.
-    // Bytes ending in /6 or /7 within each row are legacy segment/BCD
-    // opcodes (PUSH ES/POP ES/DAA/AAS/etc) — all invalid in long mode,
-    // and 0x0F is the two-byte escape, so we filter those out.
-    // 00/01/08/09/...3B — regular 6-row block (8 alu ops × 4 encodings).
-    // Bits: top 3 = alu op (op>>3 & 7), low 3: 0=r/m8 r8, 1=r/m r, 2=r8 r/m8, 3=r r/m.
-    if (op <= 0x3D && ((op & 0x06) != 0x06)) {
-        // Exclude segment-prefix bytes (already handled) and the imm-acc forms below.
-        U8 aluOp = (op >> 3) & 0x7;
-        U8 form  = op & 0x7;
-        if (form <= 3) {
-            U32 size = (form & 1) ? opSize : 1;
-            bool destIsRM = (form < 2);  // forms 0,1: dest is r/m; forms 2,3: dest is reg
-            ModRM m = decodeModRM(rip + opOff + 1, p, 0);
-            // `lock add`/`lock or`/`lock and`/... on a memory dest must be an
-            // atomic RMW across host threads (glibc futex/lock words use these).
-            std::unique_lock<std::recursive_mutex> atomicLock(cpu64AtomicLockFor(m.effAddr), std::defer_lock);
-            if (p.lock && destIsRM && !m.isReg) atomicLock.lock();
-            U64 a, b;
-            if (destIsRM) {
-                a = loadRM(m, size, rexPresent);
-                b = (size == 1) ? readReg8(m.regField, rexPresent)
-                  : (size == 2) ? (U64)reg[m.regField].u16
-                  : (size == 4) ? (U64)reg[m.regField].u32
-                                : reg[m.regField].u64;
-            } else {
-                a = (size == 1) ? readReg8(m.regField, rexPresent)
-                  : (size == 2) ? (U64)reg[m.regField].u16
-                  : (size == 4) ? (U64)reg[m.regField].u32
-                                : reg[m.regField].u64;
-                b = loadRM(m, size, rexPresent);
-            }
-            runAlu(aluOp, size, destIsRM, a, b, m, rexPresent);
-            U32 used = opOff + 1 + m.length;
-            rip += used;
-            return used;
-        }
-        if (form == 4 || form == 5) {
-            // 04 ib / 05 iz — ALU AL/AX/EAX/RAX, imm. AL form is 1 byte, EAX/RAX
-            // form takes imm32 (sign-extended for 64-bit).
-            U32 size = (form == 4) ? 1 : opSize;
-            U64 imm = 0;
-            U32 immLen = 0;
-            if (size == 1) {
-                imm = fetchByte(rip + opOff + 1); immLen = 1;
-            } else if (size == 2) {
-                imm = (U16)(fetchByte(rip + opOff + 1) |
-                            ((U16)fetchByte(rip + opOff + 2) << 8)); immLen = 2;
-            } else if (size == 4) {
-                imm = fetchDword(rip + opOff + 1); immLen = 4;
-            } else {
-                S32 i32 = (S32)fetchDword(rip + opOff + 1);
-                imm = (U64)(S64)i32; immLen = 4;
-            }
-            U64 a = (size == 1) ? reg[X64_RAX].u8
-                  : (size == 2) ? reg[X64_RAX].u16
-                  : (size == 4) ? reg[X64_RAX].u32 : reg[X64_RAX].u64;
-            ModRM fake;
-            fake.isReg = true; fake.rmIndex = X64_RAX; fake.regField = 0;
-            // Reuse runAlu by faking dest=RM=RAX.
-            runAlu(aluOp, size, true, a, imm, fake, rexPresent);
-            U32 used = opOff + 1 + immLen;
-            rip += used;
-            return used;
-        }
-    }
-
-    // 80/81/83 immediate-group ALU. /digit selects the alu op.
-    // 80: r/m8, imm8.  81: r/m, imm(opSize, imm32 sign-ext for 64).
-    // 83: r/m, imm8 sign-extended to opSize.
-    if (op == 0x80 || op == 0x81 || op == 0x83) {
-        U32 size = (op == 0x80) ? 1 : opSize;
-        ModRM m = decodeModRM(rip + opOff + 1, p,
-            (op == 0x81) ? (size == 2 ? 2 : 4) : 1);
-        U8 aluOp = m.regField & 0x7;
-        U64 imm = 0; U32 immLen = 0;
-        U64 immAddr = rip + opOff + 1 + m.length;
-        if (op == 0x80 || op == 0x83) {
-            S8 i8 = (S8)fetchByte(immAddr);
-            imm = (U64)(S64)i8; immLen = 1;
-            if (size == 2) imm &= 0xFFFF;
-            else if (size == 4) imm &= 0xFFFFFFFFULL;
-        } else { // 0x81
-            if (size == 2) {
-                imm = (U16)(fetchByte(immAddr) | ((U16)fetchByte(immAddr + 1) << 8));
-                immLen = 2;
-            } else if (size == 4) {
-                imm = fetchDword(immAddr); immLen = 4;
-            } else {
-                S32 i32 = (S32)fetchDword(immAddr);
-                imm = (U64)(S64)i32; immLen = 4;
-            }
-        }
-        // `lock orl/andl/addl $imm, [mem]` — atomic RMW across host threads.
-        std::unique_lock<std::recursive_mutex> atomicLock(cpu64AtomicLockFor(m.effAddr), std::defer_lock);
-        if (p.lock && !m.isReg) atomicLock.lock();
-        U64 a = loadRM(m, size, rexPresent);
-        runAlu(aluOp, size, true, a, imm, m, rexPresent);
-        U32 used = opOff + 1 + m.length + immLen;
-        rip += used;
-        return used;
-    }
-
-    // TEST r/m, r (84/85). Computes AND, sets flags, discards result.
-    if (op == 0x84 || op == 0x85) {
-        U32 size = (op == 0x84) ? 1 : opSize;
-        ModRM m = decodeModRM(rip + opOff + 1, p, 0);
-        U64 a = loadRM(m, size, rexPresent);
-        U64 b = (size == 1) ? readReg8(m.regField, rexPresent)
-              : (size == 2) ? reg[m.regField].u16
-              : (size == 4) ? reg[m.regField].u32 : reg[m.regField].u64;
-        flagsLogic(rflags, a & b, size);
-        U32 used = opOff + 1 + m.length;
-        rip += used;
-        return used;
-    }
+    // ---- ALU r/r-and-r/m (00-3D), 80/81/83 imm-ALU, and 84/85 TEST were
+    // hoisted to the hot-opcode fast dispatch right after the 89/8B MOVs
+    // (Milestone H) — they were profiled as ~30% of executions and no longer
+    // pay the ~30-deep single-byte scan to reach here. See that block above.
 
     // TEST AL/AX/EAX/RAX, imm  (A8 ib / A9 iz).
     // A0/A1/A2/A3 — MOV AL/AX/EAX/RAX ↔ moffs (64-bit absolute address).
