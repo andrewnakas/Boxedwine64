@@ -15,6 +15,7 @@
 #include "cpu64.h"
 #include "kmemory64.h"
 #include "ksocket.h"
+#include "kunixsocket.h"
 #include "kpoll.h"
 
 // x86-64 Linux syscall numbers used here. The canonical table lives in
@@ -3152,6 +3153,40 @@ void ksyscall64(CPU64* cpu) {
                 }
                 klog_fmt("IPC epoll_wait(epfd=%d,to=%d) -> %d  %s",
                          (int)a1, (int)(S32)a4, (int)rc, fds);
+            }
+            // BW64_EPSPIN: identify a perpetually-ready fd (the Mode 2 spinner).
+            // For each returned event, the epoll `data` is the guest fd number;
+            // log that fd's kobject type so we can see WHAT keeps firing EPOLLIN.
+            if (getenv("BW64_EPSPIN") && (S32)rc > 0) {
+                for (U32 i = 0; i < rc; i++) {
+                    U32 ev   = cpu->thread->memory->readd(ev32 + i*12 + 0);
+                    U64 data = cpu->thread->memory->readq(ev32 + i*12 + 4);
+                    KFileDescriptorPtr rfd = cpu->thread->process->getFileDescriptor((FD)data);
+                    const char* kind = "none";
+                    long recvUsed = -1, msgsN = -1; int inClosed = -1;
+                    long pendTot = -1, pendLive = -1;
+                    if (rfd && rfd->kobject) {
+                        switch (rfd->kobject->type) {
+                            case KTYPE_FILE: kind="file"; break;
+                            case KTYPE_UNIX_SOCKET: {
+                                kind="unixsock";
+                                std::shared_ptr<KUnixSocketObject> us =
+                                    std::dynamic_pointer_cast<KUnixSocketObject>(rfd->kobject);
+                                if (us) { recvUsed=(long)us->debugRecvUsed(); msgsN=(long)us->debugMsgsSize(); inClosed=us->debugInClosed()?1:0; pendTot=(long)us->debugPendingTotal(); pendLive=(long)us->debugPendingLive(); }
+                                break;
+                            }
+                            case KTYPE_NATIVE_SOCKET: kind="natsock"; break;
+                            case KTYPE_EPOLL: kind="epoll"; break;
+                            case KTYPE_EVENT: kind="event"; break;
+                            case KTYPE_TIMER: kind="timer"; break;
+                            case KTYPE_SIGNAL: kind="signal"; break;
+                            default: kind="other"; break;
+                        }
+                    }
+                    klog_fmt("EPSPIN pid=%d epfd=%d to=%d readyfd=%llu ev=0x%x kind=%s recvUsed=%ld msgs=%ld inClosed=%d pendTot=%ld pendLive=%ld",
+                             (int)cpu->thread->process->id, (int)a1, (int)(S32)a4,
+                             (unsigned long long)data, ev, kind, recvUsed, msgsN, inClosed, pendTot, pendLive);
+                }
             }
             ret = (U64)(S64)(S32)rc;
             break;

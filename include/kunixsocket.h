@@ -87,6 +87,13 @@ public:
     // Debug-only: bytes currently sitting in the recv buffer (for epoll spin
     // diagnostics — BW64_EPDUMP).
     size_t debugRecvUsed() { return recvBuffer.size_used(); }
+    size_t debugMsgsSize() { return msgs.size(); }
+    bool debugInClosed() { return inClosed; }
+    // pendingConnections total vs the subset whose weak_ptr is still live. If
+    // total>0 but live==0, the listen socket is spuriously read-ready forever
+    // (expired entries never get accept()'d away) — the epoll busy-spin.
+    size_t debugPendingTotal() { return pendingConnections.size(); }
+    size_t debugPendingLive() { size_t n=0; for (auto& w : pendingConnections) if (!w.expired()) n++; return n; }
 
 protected:
     std::list< std::weak_ptr<KUnixSocketObject> > pendingConnections; // weak, if object is destroyed it should remove itself from this list
