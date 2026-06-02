@@ -109,6 +109,7 @@ public:
 
     void setCursor(const std::shared_ptr<XCursor>& cursor) override;
     void buildCursor(KThread* thread, const std::shared_ptr<XCursor>& cursor, U32 pixelsAddress, U32 width, U32 height, S32 xHot, S32 yHot) override;
+    void setCursorByX11Shape(int shape) override;
 
     KNativeInputSDLPtr input;
     

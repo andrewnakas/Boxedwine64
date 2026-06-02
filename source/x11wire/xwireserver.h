@@ -51,6 +51,15 @@ struct XWindow {
     uint32_t eventMask = 0;
     bool mapped = false;
     bool isRoot = false;
+    // Override-redirect (menus/tooltips/combo dropdowns set this so the WM leaves
+    // them alone). Used by the compositor to recognize overlay popups.
+    bool overrideRedirect = false;
+    // Monotonic map order so the compositor stacks later-mapped windows on top
+    // (a freshly-opened menu draws over everything below it).
+    uint64_t mapSerial = 0;
+    // X cursor associated with this window via CWCursor (0 = none/inherit). The
+    // host shows this shape while the pointer is over the window.
+    uint32_t cursor = 0;
     // ARGB8888 backing store for software-blitted (PutImage) content. Lazily
     // sized; persists between partial PutImages so a complete client area is
     // always available to present.
@@ -76,7 +85,28 @@ public:
     // holds regMutex directly for compound ops).
     std::mutex regMutex;
     std::unordered_map<uint32_t, XWindow> windows;
-    uint32_t presentWindow = 0;     // drawable currently shown on the host
+    uint32_t presentWindow = 0;     // base window composited under any overlays
+
+    // Monotonic counter handed to XWindow.mapSerial on each MapWindow, so the
+    // compositor can stack overlays in map order (newest on top).
+    uint64_t mapSerialCounter = 0;
+
+    // cursorId -> X core cursor shape (the XC_* glyph number, e.g. 152=xterm).
+    // Populated from X_CreateGlyphCursor; read when a window's CWCursor points at
+    // the id so the host shows the matching shape. Guarded by regMutex.
+    std::unordered_map<uint32_t, uint32_t> cursorShapes;
+
+    // Composite the base window + any mapped overlay windows (menus/popups) into
+    // one host-sized image and hand it to the present sink. Call with regMutex
+    // NOT held (it locks internally). Cheap no-op when nothing is dirty.
+    void composeAndPresent();
+
+    // Selection (clipboard) ownership: selection-atom -> owner window. wine's
+    // clipboard manager does SetSelectionOwner then polls GetSelectionOwner to
+    // confirm it owns CLIPBOARD/PRIMARY; if we never record the owner the poll
+    // never sees itself win and spins forever (the boot wedge). Guarded by
+    // regMutex like the other registries.
+    std::unordered_map<uint32_t, uint32_t> selectionOwners;
 
     // Allocate the next distinct client resource-id base (so ids never collide
     // across connections).

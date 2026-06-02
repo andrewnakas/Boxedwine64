@@ -679,6 +679,51 @@ void KNativeScreenSDL::setCursor(const std::shared_ptr<XCursor>& cursor) {
     DISPATCH_MAIN_THREAD_BLOCK_END
 }
 
+// Map an X core cursor-font glyph (XC_* shape number) to an SDL system cursor.
+// Shared shape table with setCursor() above.
+static SDL_SystemCursor x11ShapeToSdlSystemCursor(int shape) {
+    switch (shape) {
+        case 52:  return SDL_SYSTEM_CURSOR_SIZEALL;    // XC_fleur
+        case 60:  return SDL_SYSTEM_CURSOR_HAND;       // XC_hand2
+        case 68:  return SDL_SYSTEM_CURSOR_ARROW;      // XC_left_ptr
+        case 88:  return SDL_SYSTEM_CURSOR_NO;         // XC_pirate
+        case 108: return SDL_SYSTEM_CURSOR_SIZEWE;     // XC_sb_h_double_arrow
+        case 116: return SDL_SYSTEM_CURSOR_SIZENS;     // XC_sb_v_double_arrow
+        case 130: return SDL_SYSTEM_CURSOR_CROSSHAIR;  // XC_tcross
+        case 132: return SDL_SYSTEM_CURSOR_ARROW;      // XC_top_left_arrow
+        case 134:                                      // XC_top_left_corner
+        case 136: return SDL_SYSTEM_CURSOR_SIZEALL;    // XC_top_right_corner
+        case 150: return SDL_SYSTEM_CURSOR_WAITARROW;  // XC_watch
+        case 152: return SDL_SYSTEM_CURSOR_IBEAM;      // XC_xterm (text)
+        default:  return SDL_SYSTEM_CURSOR_ARROW;
+    }
+}
+
+void KNativeScreenSDL::setCursorByX11Shape(int shape) {
+    if (KSystem::videoOption == VIDEO_NO_WINDOW) {
+        return;
+    }
+    SDL_SystemCursor sc = x11ShapeToSdlSystemCursor(shape);
+    // Cache one SDL cursor per system-cursor enum (keyed by 0x40000000|sc so it
+    // never collides with the XCursor-id keyed entries in `cursors`).
+    U32 key = 0x40000000u | (U32)sc;
+    SDL_Cursor* sdlCursor;
+    {
+        BOXEDWINE_CRITICAL_SECTION_WITH_MUTEX(cursorsMutex);
+        sdlCursor = cursors.get(key);
+        if (!sdlCursor) {
+            sdlCursor = SDL_CreateSystemCursor(sc);
+            cursors.set(key, sdlCursor);
+        }
+    }
+    DISPATCH_MAIN_THREAD_BLOCK_BEGIN
+        if (sdlCursor) {
+            SDL_ShowCursor(1);
+            SDL_SetCursor(sdlCursor);
+        }
+    DISPATCH_MAIN_THREAD_BLOCK_END
+}
+
 void KNativeScreenSDL::destroyTextureCache() {
     BOXEDWINE_CRITICAL_SECTION_WITH_MUTEX(wndCacheMutex);
     wndCache.clear();

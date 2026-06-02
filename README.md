@@ -20,8 +20,10 @@ The full Windows-PE + X11 path is up: real Debian `wine64` boots the entire
 server, and **paints a live notepad window** (hundreds of `PutImage`/GDI
 draw requests per frame, FreeType-rendered text, an animated caret). The
 `wine64`↔`wineserver` IPC handshake, the NT-syscall dispatch, real PE image
-loading, and the X11 wire protocol all work end to end. Keyboard/mouse input
-is the remaining gap (rendering and the full boot are done).
+loading, and the X11 wire protocol all work end to end. **Keyboard and mouse
+input now work too**: you can type into notepad, click to place the caret, open
+the menus (composited as separate top-level windows), and the host shows wine's
+own cursor (I-beam over text, arrow elsewhere) aligned to the pointer.
 
 Headless, the same stack runs `wine64 wineboot --init` through **~4000 syscalls
 across the full process tree** (client, `wineserver64`, `services.exe`,
@@ -54,13 +56,14 @@ The 64-bit guest path can:
 - **Threading probes**: `clone`+futex join, a 4-thread atomic/mutex probe (`mt_probe`), `pthread_join` wakeup — all deterministic PASS
 - The static-PIE smoke suite (`tools/x64test/run-static-elf-suite.sh`) — **7/7 PASS** on `zig cc`-built musl binaries (hello, sum, sieve, fib25, qsort, strops, hash)
 - The in-tree end-to-end PLT self-test: loads a separate shared library, resolves `R_X86_64_JUMP_SLOT` against an exported function, calls through the GOT to return 42
+- **Interactive GUI input**: type into notepad, click to place/move the caret,
+  open and track the menus, and see wine's own cursor aligned to the pointer —
+  SDL key/mouse events are translated to X11 input events, pointer/focus/grab
+  requests are answered, popup menus are composited as overlay windows, and
+  click coordinates are translated through the window's root origin
 
 ### What does not work yet
 
-- **No keyboard/mouse input yet** — the window renders and the boot completes,
-  but SDL key/mouse events aren't yet delivered as X11 input events to the
-  guest. This is the active frontier (the only thing between here and an
-  interactive notepad).
 - **No 64-bit JIT** — interpreter only (by design; v1 ships interpreter-only)
 - **No WASM `MEMORY64=2` build target yet**
 

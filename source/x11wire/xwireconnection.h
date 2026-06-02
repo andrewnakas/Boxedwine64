@@ -60,6 +60,19 @@ public:
     // pump). Honors the per-window event mask.
     void sendExpose(uint32_t window, uint16_t x, uint16_t y, uint16_t w, uint16_t h);
 
+    // Tell the client its window holds the keyboard focus (FocusIn, code 9).
+    // Without it wine's window never activates its input queue, so KeyPress
+    // events we deliver are ignored even though they arrive. Sent when a window
+    // maps; GetInputFocus is also answered with the present window (not root).
+    void sendFocusIn(uint32_t window);
+
+    // Emit an EnterNotify/LeaveNotify crossing event (code 7/8). winex11 selects
+    // for EnterWindowMask and uses the crossing to associate the pointer with
+    // the window; without it clicks are mishandled (they defocus the edit and
+    // menus never track). Sent the first time the pointer is over the presented
+    // window. Mirrors the 32-bit XWindow::crossingNotify.
+    void sendCrossing(uint32_t window, bool enter, int16_t x, int16_t y);
+
     // Drain any queued host input to the client and flush, even with no incoming
     // request. Called by XWireServer::pumpInput from the main-thread present tick
     // so an idle app still receives keystrokes/clicks. flushReplies' writeNative
@@ -97,7 +110,8 @@ private:
 
     // Host input -> X11 wire events (Phase 2c input path).
     void deliverInputEvents();
-    void sendInputEvent(uint8_t code, uint32_t window, const XWireInputEvent& ev);
+    void sendInputEvent(uint8_t code, uint32_t window, const XWireInputEvent& ev,
+                        int16_t winX, int16_t winY);
     std::unordered_map<std::string, uint32_t> atoms;   // name -> atom id
     std::unordered_map<uint32_t, std::string> atomNames;
     uint32_t nextAtom = 1;
@@ -107,6 +121,20 @@ private:
     uint32_t rootColormap = 0;
     uint32_t clientIdBase = 0;
     uint32_t clientIdMask = 0;
+
+    // Pointer-button mask (Button1Mask=1<<8 ...) tracked across input events so
+    // motion during a drag and the press/release sequence report the correct
+    // logical button state, like the 32-bit XServer path.
+    uint32_t buttonState = 0;
+
+    // The window the pointer has "entered" (we sent EnterNotify for). 0 = none.
+    // We send a crossing the first time input lands so winex11 associates the
+    // pointer with the window before any click.
+    uint32_t enteredWindow = 0;
+
+    // The window we last sent FocusIn for (via X_SetInputFocus). Tracked so a
+    // click that re-focuses the same window doesn't thrash FocusIn every time.
+    uint32_t lastFocus = 0;
 
     // The macOS window has been created/shown for this connection.
     bool windowShown = false;

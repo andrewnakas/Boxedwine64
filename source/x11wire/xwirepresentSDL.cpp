@@ -251,6 +251,12 @@ public:
         return inputPending.load(std::memory_order_relaxed);
     }
 
+    void lastPointer(int& x, int& y, uint32_t& state) const override {
+        std::lock_guard<std::mutex> lk(mtx);
+        x = lastX; y = lastY;
+        state = sdlModState();
+    }
+
     void tickMainThread() override {
         // Present + input pump (main thread only). We render through BoxedWine's
         // OWN screen (KNativeSystem::getScreen()), not a private SDL window: the
@@ -380,7 +386,7 @@ private:
         }
     }
 
-    std::mutex mtx;
+    mutable std::mutex mtx;
     std::vector<uint8_t> pending;
     uint16_t pendingW = 0, pendingH = 0;
     bool haveFrame = false, frameDirty = false;

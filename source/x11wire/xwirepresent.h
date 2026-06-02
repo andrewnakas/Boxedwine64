@@ -66,6 +66,11 @@ public:
     // never contends with the guest threads during the boot storm.
     virtual bool hasInput() const = 0;
 
+    // Guest-thread: the last known pointer position (window coords) and current
+    // modifier/button mask, as tracked by the SDL pump. The wire connection uses
+    // this to answer X_QueryPointer so wine's click handler doesn't block.
+    virtual void lastPointer(int& x, int& y, uint32_t& state) const = 0;
+
     // Main-thread (doMainLoop): present the most recent submitted frame and pump
     // the host event queue into the input queue. No-op when nothing changed.
     virtual void tickMainThread() = 0;

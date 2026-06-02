@@ -62,6 +62,12 @@ public:
 	virtual void setCursor(const std::shared_ptr<XCursor>& cursor) = 0;
 	virtual void buildCursor(KThread* thread, const std::shared_ptr<XCursor>& cursor, U32 pixelsAddress, U32 width, U32 height, S32 xHot, S32 yHot) = 0;
 
+	// Show a host cursor matching an X core cursor-font glyph shape (XC_* number,
+	// e.g. 152=xterm/I-beam, 68=left_ptr). Used by the X11 wire server (64-bit
+	// wine GUI) so the on-screen pointer is the Windows cursor at the true pointer
+	// position. Default no-op for backends that don't support it.
+	virtual void setCursorByX11Shape(int shape) {}
+
 	virtual void warpMouse(int x, int y) = 0;
 	virtual bool isVisible() = 0;
 

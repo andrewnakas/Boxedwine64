@@ -15,10 +15,13 @@
 #include "boxedwine.h"
 #include "xwireserver.h"
 #include "xwireconnection.h"
+#include "xwirepresent.h"
 #include "kunixsocket.h"
 #include "ksocket.h"
 
+#include <algorithm>
 #include <cstring>
+#include <vector>
 
 XWireServer& XWireServer::instance() {
     static XWireServer s;
@@ -66,6 +69,69 @@ bool XWireServer::acceptConnection(const std::shared_ptr<KUnixSocketObject>& cli
     klog_fmt("XWireServer: accepted X11 client connection (now %d open)",
              (int)nconn);
     return true;
+}
+
+// Composite the base (main) window with any mapped overlay windows (menus,
+// dropdowns, tooltips, dialogs) — each its own top-level X window that wine
+// draws once — into a single host-sized image, then submit it to the present
+// sink. Without this only `presentWindow` is shown and menus render to an
+// invisible backing store (they ARE open in wine, just never blitted).
+void XWireServer::composeAndPresent() {
+    if (!g_xwirePresentSink) return;
+
+    // Snapshot what we need under the lock, then blit outside it.
+    uint32_t baseId = 0;
+    uint16_t hostW = 0, hostH = 0;
+    std::vector<uint8_t> canvas;          // host-sized ARGB, == base window fb
+    struct Overlay { int x, y; uint16_t w, h; std::vector<uint8_t> fb; uint64_t serial; };
+    std::vector<Overlay> overlays;
+    {
+        std::lock_guard<std::mutex> lk(regMutex);
+        baseId = presentWindow;
+        if (!baseId) return;
+        auto bit = windows.find(baseId);
+        if (bit == windows.end() || bit->second.fb.empty()) return;
+        XWindow& base = bit->second;
+        hostW = base.fbW; hostH = base.fbH;
+        canvas = base.fb;                 // copy the background
+        // The base client is at this root origin (e.g. (4,23)); we present its fb
+        // at host (0,0), so an overlay at root (ox,oy) lands at host (ox-baseX,
+        // oy-baseY).
+        int baseX = base.x, baseY = base.y;
+
+        // Gather mapped overlay windows (anything mapped + drawn that isn't the
+        // base or the root), oldest-mapped first so newer menus land on top.
+        for (auto& kv : windows) {
+            XWindow& w = kv.second;
+            if (kv.first == baseId || w.isRoot) continue;
+            if (!w.mapped || w.fb.empty() || !w.fbW || !w.fbH) continue;
+            overlays.push_back({ (int)w.x - baseX, (int)w.y - baseY,
+                                 w.fbW, w.fbH, w.fb, w.mapSerial });
+        }
+    }
+    if (canvas.empty() || !hostW || !hostH) return;
+
+    const uint32_t bpp = 4;
+    if (!overlays.empty()) {
+        std::sort(overlays.begin(), overlays.end(),
+                  [](const Overlay& a, const Overlay& b) { return a.serial < b.serial; });
+        for (const Overlay& ov : overlays) {
+            for (uint16_t row = 0; row < ov.h; row++) {
+                int dy = ov.y + row;
+                if (dy < 0 || dy >= hostH) continue;
+                int dx = ov.x;
+                uint16_t copyW = ov.w;
+                const uint8_t* src = ov.fb.data() + (size_t)row * ov.w * bpp;
+                if (dx < 0) { src += (size_t)(-dx) * bpp; copyW = (uint16_t)(copyW + dx); dx = 0; }
+                if (dx >= hostW || copyW == 0) continue;
+                if (dx + copyW > hostW) copyW = (uint16_t)(hostW - dx);
+                memcpy(canvas.data() + ((size_t)dy * hostW + dx) * bpp, src, (size_t)copyW * bpp);
+            }
+        }
+    }
+
+    g_xwirePresentSink->onWindowMapped(baseId, hostW, hostH);
+    g_xwirePresentSink->submitFrame(baseId, hostW, hostH, canvas.data(), (uint32_t)hostW * bpp);
 }
 
 // Flush queued host input to every connection from the main thread's present
