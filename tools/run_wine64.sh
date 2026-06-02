@@ -86,7 +86,5 @@ echo "guest:   wine64 $GUEST_PE $*"
     -env "WINEDLLPATH=/usr/lib/x86_64-linux-gnu/wine" \
     -env "WINEDEBUG=+x11drv,+win,+message" \
     -env "DISPLAY=:0" \
-    -env "MALLOC_CHECK_=3" \
-    -env "GLIBC_TUNABLES=glibc.malloc.check=3" \
     /usr/lib/wine/wine64 "$GUEST_PE" "$@" 2>&1 \
     | grep -avE "pixel format|redundant|new pixel|failed to choose|software renderer|Number which|Number of"
