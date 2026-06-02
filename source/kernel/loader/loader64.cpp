@@ -14,6 +14,7 @@
 #ifdef BOXEDWINE_GUEST_X64
 #include "kmemory64.h"
 #include "cpu64.h"
+#include "ripSampler.h"
 #endif
 
 // ELF p_type values reused from loader.cpp. Kept local here to avoid a
@@ -241,7 +242,7 @@ bool ElfLoader64::mapSegmentsFromBuffer(KMemory64* mem,
 // executable and (recursively) PT_INTERP.
 static bool mapSegments(KMemory64* mem, FsOpenNode* openNode,
                         const Elf64ParseResult& r, U64 reloc,
-                        const char* tag) {
+                        const char* tag, int pid, const char* modPath) {
     for (const Elf64LoadSegment& seg : r.segments) {
         U64 vaddr = seg.vaddr + reloc;
         U64 alignedAddr = vaddr & ~K64_PAGE_MASK;
@@ -253,6 +254,11 @@ static bool mapSegments(KMemory64* mem, FsOpenNode* openNode,
             klog_fmt("loadProgram64[%s]: mmap failed for segment at 0x%llx (got 0x%llx)",
                      tag, (unsigned long long)alignedAddr, (unsigned long long)mapped);
             return false;
+        }
+        // BW64_RIPSAMPLE: the initial wine64/ld.so/glibc images are mapped here
+        // (not through sys_mmap64_file), so record them too for RIP resolution.
+        if (ripSamplerEnabled() && modPath) {
+            ripSamplerNoteModule(pid, alignedAddr, mapLen, modPath);
         }
         if (seg.filesz > 0) {
             std::vector<U8> buf((size_t)seg.filesz);
@@ -860,7 +866,8 @@ bool ElfLoader64::loadProgram(KThread* thread, FsOpenNode* openNode, U64* rip) {
 
     U64 reloc = r.isPie ? X64_PIE_BASE : 0;
 
-    if (!mapSegments(mem, openNode, r, reloc, "exe")) {
+    if (!mapSegments(mem, openNode, r, reloc, "exe", (int)process->id,
+                     process->name.length() ? process->name.c_str() : "exe")) {
         return false;
     }
 
@@ -924,7 +931,8 @@ bool ElfLoader64::loadProgram(KThread* thread, FsOpenNode* openNode, U64* rip) {
         // Pick a base well away from the exe and stack. ld-linux is ET_DYN
         // and small (~200 KiB), so any free high address is fine.
         interpBase = 0x7FFFF7FCE000ULL & ~K64_PAGE_MASK;
-        if (!mapSegments(mem, interpNode, interpR, interpBase, "interp")) {
+        if (!mapSegments(mem, interpNode, interpR, interpBase, "interp",
+                         (int)process->id, r.interpreter.c_str())) {
             interpNode->close();
             delete interpNode;
             return false;

@@ -17,6 +17,7 @@
 #include "ksocket.h"
 #include "kunixsocket.h"
 #include "kpoll.h"
+#include "ripSampler.h"
 
 // x86-64 Linux syscall numbers used here. The canonical table lives in
 // arch/x86/entry/syscalls/syscall_64.tbl in the Linux source; the values
@@ -869,6 +870,14 @@ static U64 sys_mmap64_file(CPU64* cpu, U64 addr, U64 length, U64 prot,
         cpu->memory->memcpyToGuest(addr, buf.data(), got);
     }
     (void)flags;
+    // BW64_RIPSAMPLE: record this DSO/PE segment so a sampled spinning RIP can be
+    // resolved to file+offset. This is where wine's x86_64-unix .so halves (where
+    // the C code that busy-loops lives) become known. Use the same aligned/mapLen
+    // span the BW64_FMMAP trace prints above.
+    if (ripSamplerEnabled() && kfile->openFile->node) {
+        ripSamplerNoteModule((int)cpu->thread->process->id, aligned, mapLen,
+                             kfile->openFile->node->path.c_str());
+    }
     return addr;
 }
 
@@ -959,6 +968,10 @@ static U64 sys_execve64(CPU64* cpu, U64 pathAddr, U64 argvAddr, U64 envpAddr) {
     if (!cpu->thread || !cpu->thread->process) return (U64)-K_ENOSYS;
     if (!pathAddr) return (U64)-K_EFAULT;
     BString path = readGuestString64(cpu, pathAddr);
+    // BW64_RIPSAMPLE: a re-exec replaces this pid's address space, so its old
+    // module ranges would mis-attribute the next image's RIPs. Drop them; the
+    // new image's segment maps re-populate the table.
+    ripSamplerClearPid((int)cpu->thread->process->id);
     std::vector<BString> args;
     std::vector<BString> envs;
     readStringArray64(cpu, argvAddr, args);

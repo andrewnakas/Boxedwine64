@@ -18,6 +18,7 @@
 
 #include "boxedwine.h"
 #include "knativesystem.h"
+#include "ripSampler.h"
 #ifdef BOXEDWINE_GUEST_X64
 #include "cpu64.h"
 #endif
@@ -49,6 +50,12 @@ static void platformThread(CPU* cpu) {
         // threads (clone64) get a distinct CPU64 sharing memory64. Driving the
         // shared process->cpu64 from every host thread would race two threads
         // through one register file and corrupt guest state.
+        //
+        // BW64_RIPSAMPLE: claim a sampler registry slot for this host thread so
+        // the background sampler can find a guest thread spinning in guest code
+        // (a wine busy-loop that makes no syscalls). Returns -1 when disabled, in
+        // which case publish/release below are no-ops.
+        int ripSlot = ripSamplerAcquireSlot((int)cpu->thread->process->id, (int)cpu->thread->id);
         while (true) {
             // Re-fetch the CPU64 each iteration: execve() tears down the old
             // per-thread CPU64 and loadProgram64 installs a fresh one (new RIP /
@@ -59,6 +66,11 @@ static void platformThread(CPU* cpu) {
             // live per-thread pointer (main thread: == process->cpu64).
             CPU64* cpu64 = cpu->thread->cpu64 ? cpu->thread->cpu64
                                               : cpu->thread->process->cpu64;
+            // Republish the live CPU64 every iteration: execve frees the old one
+            // and installs a fresh thread->cpu64, so the slot must track the
+            // pointer we're about to run (overwriting the freed pre-execve one
+            // before run() touches it). No-op when disabled (ripSlot==-1).
+            ripSamplerPublish(ripSlot, cpu64);
             cpu64->yield = false;
             try {
                 cpu64->run();
@@ -79,6 +91,7 @@ static void platformThread(CPU* cpu) {
                 break;
             }
         }
+        ripSamplerReleaseSlot(ripSlot);
         cpu->thread->cleanup();
         platformThreadCount--;
         process->deleteThread(cpu->thread);
