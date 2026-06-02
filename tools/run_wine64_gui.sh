@@ -148,20 +148,116 @@ fi
 
 echo "using:   $BOX"
 echo "guest:   wine64 $GUEST_PE $*"
-echo "video:   ENABLED (interactive window) — retry past the Mode-2 boot wedge if it stalls"
+echo "video:   ENABLED (interactive window) — supervised: waits out a slow boot, restarts a dead one"
 
-# NOTE: no -novideo here, so a real SDL window opens and the in-process X11 wire
-# server drives keyboard/mouse/menus into winex11 (Milestone F Phase 2).
-"$BOX" \
-    -root "$BASE_ROOT" \
-    -zip "$GLIBC_ZIP" \
-    -zip "$WINE_ZIP" \
-    -env "HOME=/home/username" \
-    -env "USER=username" \
-    -env "WINEPREFIX=/home/username/.wine" \
-    -env "WINELOADER=/usr/lib/wine/wine64" \
-    -env "WINESERVER=/usr/lib/wine/wineserver64" \
-    -env "WINEDLLPATH=/usr/lib/x86_64-linux-gnu/wine" \
-    -env "DISPLAY=:0" \
-    /usr/lib/wine/wine64 "$GUEST_PE" "$@" 2>&1 \
-    | grep -avE "pixel format|redundant|new pixel|failed to choose|software renderer|Number which|Number of"
+# ---------------------------------------------------------------------------
+# Supervised launch (so the GUI ALWAYS reaches a window, not a ~50/50 lottery).
+#
+# Diagnosis (RIP-sampler, 2026-06-02): the boot never deadlocks and never misses
+# a wakeup — wineserver (pid 14) is the single bottleneck and grinds through its
+# startup CONTINUOUSLY at interpreter speed while every other process correctly
+# blocks on it; the window maps once it finishes. The perceived "wedge" was just
+# a slow-but-progressing boot being killed too early (the activity log stops
+# growing during wineserver's internal grind even though it IS progressing).
+#
+# So the reliable strategy is: be patient, and only RESTART if the box actually
+# dies (crash/exit) before mapping a window. We watch the box's stdout for the
+# "first window mapped" marker. If the box exits before that, we relaunch (fresh
+# attempt; each is independent). Once the window maps we stop supervising and
+# stream output through for the rest of the session.
+# ---------------------------------------------------------------------------
+
+# Tunables (override via env): how many fresh attempts, and how long to wait for
+# a window before giving up on a SILENT box (one that is alive but printed no new
+# output at all for this long — a true hang, not slow progress).
+MAX_ATTEMPTS="${BW64_GUI_MAX_ATTEMPTS:-6}"
+# A progressing boot dribbles output the whole way (slowest observed map ~300s).
+# Only treat the box as hung if it emits NOTHING new for this long.
+SILENT_GIVEUP_SECS="${BW64_GUI_SILENT_SECS:-240}"   # no NEW output for this long = restart
+
+run_box() {
+    # NOTE: no -novideo here, so a real SDL window opens and the in-process X11
+    # wire server drives keyboard/mouse/menus into winex11 (Milestone F Phase 2).
+    "$BOX" \
+        -root "$BASE_ROOT" \
+        -zip "$GLIBC_ZIP" \
+        -zip "$WINE_ZIP" \
+        -env "HOME=/home/username" \
+        -env "USER=username" \
+        -env "WINEPREFIX=/home/username/.wine" \
+        -env "WINELOADER=/usr/lib/wine/wine64" \
+        -env "WINESERVER=/usr/lib/wine/wineserver64" \
+        -env "WINEDLLPATH=/usr/lib/x86_64-linux-gnu/wine" \
+        -env "DISPLAY=:0" \
+        /usr/lib/wine/wine64 "$GUEST_PE" "$@" 2>&1 \
+        | grep -avE "pixel format|redundant|new pixel|failed to choose|software renderer|Number which|Number of"
+}
+
+cleanup_transients() {
+    rm -f "$PREFIX"/regf*.tmp "$PREFIX/.update-timestamp" 2>/dev/null || true
+    find "$BASE_ROOT/run/user/1000/wine" -maxdepth 1 -name 'server-1-*' \
+        ! -name 'server-1-4ee' -exec rm -rf {} + 2>/dev/null || true
+}
+
+attempt=1
+while [ "$attempt" -le "$MAX_ATTEMPTS" ]; do
+    [ "$attempt" -gt 1 ] && echo ">>> boot attempt $attempt/$MAX_ATTEMPTS (previous attempt died before mapping a window)"
+    LOG="$(mktemp -t bw64gui.XXXXXX)"
+
+    # Run the box in the background, tee-ing its (filtered) output to both the
+    # terminal and a log we watch for the window-mapped marker + liveness.
+    run_box | tee "$LOG" &
+    PIPE_PID=$!
+    # The box itself is the grandchild; find it so we can detect its exit and,
+    # on a restart, kill it cleanly.
+    sleep 1
+    BOX_PID="$(pgrep -n -f "$BOX .* $GUEST_PE" 2>/dev/null || true)"
+
+    mapped=0
+    last_size=0
+    silent_for=0
+    while kill -0 "$PIPE_PID" 2>/dev/null; do
+        if grep -qiE 'first window mapped|host screen sized' "$LOG" 2>/dev/null; then
+            mapped=1
+            break
+        fi
+        sz=$(wc -c < "$LOG" 2>/dev/null || echo 0)
+        if [ "$sz" = "$last_size" ]; then
+            silent_for=$((silent_for+3))
+        else
+            silent_for=0; last_size=$sz
+        fi
+        # A box that is ALIVE but has emitted no new output for SILENT_GIVEUP_SECS
+        # is a genuine hang (not slow progress — progress always dribbles output);
+        # kill it and start a fresh attempt.
+        if [ "$silent_for" -ge "$SILENT_GIVEUP_SECS" ]; then
+            # Re-check the marker once more before pulling the plug — the window
+            # may have mapped in the same tick the silence timer expired.
+            if grep -qiE 'first window mapped|host screen sized' "$LOG" 2>/dev/null; then
+                mapped=1; break
+            fi
+            echo ">>> no progress for ${SILENT_GIVEUP_SECS}s — restarting"
+            [ -n "${BOX_PID:-}" ] && kill -9 "$BOX_PID" 2>/dev/null || true
+            pkill -9 -f "$BOX " 2>/dev/null || true
+            break
+        fi
+        sleep 3
+    done
+
+    if [ "$mapped" = 1 ]; then
+        echo ">>> window mapped — handing over (Ctrl-C to quit)"
+        rm -f "$LOG" 2>/dev/null || true
+        wait "$PIPE_PID" 2>/dev/null || true   # stay attached for the session
+        exit 0
+    fi
+
+    # Reap whatever's left and clean transients before the next attempt.
+    wait "$PIPE_PID" 2>/dev/null || true
+    rm -f "$LOG" 2>/dev/null || true
+    cleanup_transients
+    attempt=$((attempt+1))
+done
+
+echo "error: could not boot a window after $MAX_ATTEMPTS attempts." >&2
+echo "       raise BW64_GUI_MAX_ATTEMPTS / BW64_GUI_SILENT_SECS, or the host may be too loaded." >&2
+exit 1
