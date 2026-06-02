@@ -123,6 +123,16 @@ public:
     bool isPageMapped(U64 pageNum) const;
     U32  getPageFlags(U64 pageNum) const;
 
+    // Return the committed backing buffer for `pageNum`, or nullptr if the page
+    // is absent/uncommitted. Used by the CPU64 instruction-fetch cache to grab a
+    // stable per-page pointer once (under the lock) and then read bytes from it
+    // directly. The returned pointer stays valid until the page is decommitted
+    // (which munmap does NOT do) or the process tears down. Does NOT commit a
+    // fresh page — an uncommitted page reads as zero, and code never executes
+    // from a never-written page, so returning nullptr (caller falls back to
+    // readb) is correct.
+    U8* getCommittedPagePtr(U64 pageNum);
+
     // Bulk copy host -> guest and guest -> host. Allocates target pages
     // if not yet present (zero-fills). Caller is responsible for permission
     // checks at the kernel layer if it cares.

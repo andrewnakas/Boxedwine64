@@ -88,7 +88,26 @@ void CPU64::cloneRegistersFrom(const CPU64* from) {
 }
 
 U8 CPU64::fetchByte(U64 addr) {
-    return memory ? memory->readb(addr) : 0;
+    if (!memory) return 0;
+    // Fast path: same code page as the last fetch -> read straight from the
+    // cached backing buffer, no lock, no map lookup. Code locality makes this
+    // hit on essentially every byte within an instruction and across a loop
+    // body, eliminating the per-byte pagesMutex + unordered_map cost that
+    // dominated interpreter throughput.
+    U64 pageNum = addr >> K64_PAGE_SHIFT;
+    if (pageNum == fetchCachePage) {
+        return fetchCacheData[addr & K64_PAGE_MASK];
+    }
+    // Miss: resolve the page once under the lock and cache its buffer. An
+    // uncommitted/absent page returns nullptr -> fall back to readb (which
+    // zero-fills) and leave the cache empty so we don't memoize a hole.
+    U8* data = memory->getCommittedPagePtr(pageNum);
+    if (data) {
+        fetchCachePage = pageNum;
+        fetchCacheData = data;
+        return data[addr & K64_PAGE_MASK];
+    }
+    return memory->readb(addr);
 }
 
 U32 CPU64::fetchDword(U64 addr) {

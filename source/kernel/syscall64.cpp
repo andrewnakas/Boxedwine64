@@ -36,6 +36,10 @@
 #define X64_SYS_mprotect          10
 #define X64_SYS_munmap            11
 #define X64_SYS_brk               12
+#define X64_SYS_shmget            29
+#define X64_SYS_shmat             30
+#define X64_SYS_shmctl            31
+#define X64_SYS_shmdt             67
 #define X64_SYS_rt_sigaction      13
 #define X64_SYS_rt_sigprocmask    14
 #define X64_SYS_ioctl             16
@@ -353,15 +357,48 @@ static U64 sys_mmap64(CPU64* cpu, U64 addr, U64 length, U64 prot, U64 flags, U64
                  (unsigned long long)addr, (unsigned long long)length, (unsigned)prot);
     }
     U64 ret;
-    if (addr == 0) {
-        // Anonymous mmap without MAP_FIXED: atomically reserve+map a free range.
-        // mmapReserveAndMap holds the process mmap lock across the gap scan AND
-        // the map, so two sibling threads can't be handed the same address (the
-        // old allocMmapRange-then-map split was a TOCTOU race → guest-heap
-        // corruption in wineserver during the MT boot storm).
-        ret = cpu->memory->mmapReserveAndMap(length, (U32)prot);
-    } else {
+    bool fixed = (flags & K_MAP_FIXED) != 0;
+    if (addr != 0 && fixed) {
+        // MAP_FIXED: caller demands this exact address and expects any existing
+        // mapping there to be replaced. Honor it verbatim.
         ret = cpu->memory->mmapAnonymousFixed(addr & ~0xFFFULL, length, (U32)prot);
+    } else if (addr != 0) {
+        // addr is a HINT (no MAP_FIXED). Linux may place elsewhere if the hint
+        // is already occupied — and it MUST, because force-mapping over an
+        // existing region silently destroys whatever lived there. Wine's view
+        // manager then later MAP_FIXED-maps its own view at an address it still
+        // believes is free, finds our stray anonymous mapping, and aborts in
+        // create_view (`assert(view->protect & VPROT_SYSTEM)`, virtual.c:1578).
+        // So: take the hint only if the whole range is free; otherwise let the
+        // allocator pick a free range (kernel's prerogative for a hint).
+        //
+        // "Free" here means no ACCESSIBLE mapping — a page with any of R/W/X.
+        // Crucially it does NOT mean "no K64_PAGE_MAPPED": wine reserves huge
+        // PROT_NONE arenas (MAPPED but prot 0) and then mmaps committed pages at
+        // HINT addresses *inside* its own reservation. Treating those reserved
+        // pages as occupied would bounce the allocation to an unrelated address
+        // and desync wine's view tree (hang/abort). Only a real R/W/X mapping is
+        // a genuine conflict that forces relocation.
+        U64 alignedAddr = addr & ~0xFFFULL;
+        U64 pageStart = alignedAddr >> 12;
+        U64 pageCount = (length + 0xFFFULL) >> 12;
+        const U32 accessible = K64_PAGE_READ | K64_PAGE_WRITE | K64_PAGE_EXEC;
+        bool rangeFree = true;
+        for (U64 i = 0; i < pageCount; i++) {
+            if (cpu->memory->getPageFlags(pageStart + i) & accessible) { rangeFree = false; break; }
+        }
+        if (rangeFree) {
+            ret = cpu->memory->mmapAnonymousFixed(alignedAddr, length, (U32)prot);
+        } else {
+            ret = cpu->memory->mmapReserveAndMap(length, (U32)prot);
+        }
+    } else {
+        // addr == 0: atomically reserve+map a free range. mmapReserveAndMap holds
+        // the process mmap lock across the gap scan AND the map, so two sibling
+        // threads can't be handed the same address (the old allocMmapRange-then-
+        // map split was a TOCTOU race → guest-heap corruption in wineserver
+        // during the MT boot storm).
+        ret = cpu->memory->mmapReserveAndMap(length, (U32)prot);
     }
     if (getenv("BW64_MMAPDUMP") && length >= 0x1000000) {
         klog_fmt("MMAP [pid=%d] BIG anon exit  -> 0x%llx",
@@ -370,6 +407,92 @@ static U64 sys_mmap64(CPU64* cpu, U64 addr, U64 length, U64 prot, U64 flags, U64
     }
     (void)offset;
     return ret;
+}
+
+// ---- SysV shared memory (IPC_PRIVATE only) for the 64-bit guest ----
+// Wine's unix-side ntdll uses anonymous shm segments to back memory views; the
+// Save/Save As common dialog is the first GUI path that hits this. We service
+// shmget/shmat/shmdt/shmctl out of the per-process shm64 table (see kprocess.h
+// for why per-process is correct). shmat backs the segment with real anonymous
+// pages via the normal mmap allocator, so wine sees a properly-mapped view and
+// no longer trips create_view. Non-IPC_PRIVATE keys are rejected (-ENOSYS-free
+// fallback isn't what wine wants here; it asks for IPC_PRIVATE).
+#define K_IPC_PRIVATE   0
+#define K_IPC_RMID      0
+#define K_IPC_STAT      2
+#define K_IPC_64        0x0100
+#define K_SHM_RDONLY    010000
+
+static U64 sys_shmget64(CPU64* cpu, U64 key, U64 size, U64 /*shmflg*/) {
+    if (!cpu->thread || !cpu->thread->process) return (U64)-K_EINVAL;
+    // Only anonymous segments are supported (what wine requests). A named key
+    // would need a system-wide table; wine's view-backing path never uses one.
+    if (key != K_IPC_PRIVATE) return (U64)-K_EINVAL;
+    KProcess* process = cpu->thread->process.get();
+    S32 id = process->nextShm64Id++;
+    KProcess::ShmSeg64 seg;
+    seg.size = size;
+    process->shm64[id] = seg;
+    return (U64)(S64)id;
+}
+
+static U64 sys_shmat64(CPU64* cpu, U64 shmid, U64 shmaddr, U64 shmflg) {
+    if (!cpu->thread || !cpu->thread->process) return (U64)-K_EINVAL;
+    KProcess* process = cpu->thread->process.get();
+    auto it = process->shm64.find((S32)shmid);
+    if (it == process->shm64.end()) return (U64)-K_EINVAL;
+    KProcess::ShmSeg64& seg = it->second;
+    U32 prot = (shmflg & K_SHM_RDONLY) ? K_PROT_READ : (K_PROT_READ | K_PROT_WRITE);
+    U64 addr;
+    if (shmaddr == 0) {
+        addr = cpu->memory->mmapReserveAndMap(seg.size, prot);
+    } else {
+        addr = cpu->memory->mmapAnonymousFixed(shmaddr & ~0xFFFULL, seg.size, prot);
+    }
+    if ((S64)addr < 0) return addr;          // propagate -errno
+    seg.address = addr;
+    return addr;
+}
+
+static U64 sys_shmdt64(CPU64* cpu, U64 shmaddr) {
+    if (!cpu->thread || !cpu->thread->process) return (U64)-K_EINVAL;
+    KProcess* process = cpu->thread->process.get();
+    for (auto it = process->shm64.begin(); it != process->shm64.end(); ++it) {
+        KProcess::ShmSeg64& seg = it->second;
+        if (seg.address && seg.address == shmaddr) {
+            cpu->memory->munmap(seg.address, seg.size);
+            seg.address = 0;
+            // A segment detached after IPC_RMID is destroyed (Linux semantics).
+            if (seg.markedForDelete) process->shm64.erase(it);
+            return 0;
+        }
+    }
+    return (U64)-K_EINVAL;
+}
+
+static U64 sys_shmctl64(CPU64* cpu, U64 shmid, U64 cmd, U64 buf) {
+    if (!cpu->thread || !cpu->thread->process) return (U64)-K_EINVAL;
+    KProcess* process = cpu->thread->process.get();
+    cmd &= ~K_IPC_64;
+    auto it = process->shm64.find((S32)shmid);
+    if (it == process->shm64.end()) return (U64)-K_EINVAL;
+    KProcess::ShmSeg64& seg = it->second;
+    if (cmd == K_IPC_RMID) {
+        // Mark for delete; reap now if nothing is attached (matches Linux: RMID
+        // on an unattached segment frees it immediately).
+        seg.markedForDelete = true;
+        if (seg.address == 0) process->shm64.erase(it);
+        return 0;
+    }
+    if (cmd == K_IPC_STAT) {
+        if (!buf) return (U64)-K_EFAULT;
+        // Minimal struct shmid64_ds: zero it, then fill shm_segsz. Wine's view
+        // backing doesn't inspect the rest; zeroing keys/perms is safe.
+        cpu->memory->memsetGuest(buf, 0, 112);
+        cpu->memory->writeq(buf + 40, seg.size);   // shm_segsz
+        return 0;
+    }
+    return (U64)-K_EINVAL;
 }
 
 // exit(2) — terminate the calling thread. If it's the last thread in the
@@ -1965,6 +2088,10 @@ static const char* x64SyscallName(U64 nr) {
         case 129: return "rt_sigqueueinfo";
         case 130: return "rt_sigsuspend";
         case 131: return "sigaltstack";
+        case 29:  return "shmget";
+        case 30:  return "shmat";
+        case 31:  return "shmctl";
+        case 67:  return "shmdt";
         case 137: return "statfs";
         case 138: return "fstatfs";
         case 157: return "prctl";
@@ -2124,6 +2251,18 @@ void ksyscall64(CPU64* cpu) {
             // zero-filled reads trip asserts), so the backing store is kept; the
             // memory is already bounded by lazy commit on the mmap side.
             ret = cpu->memory->munmap(a1, a2);
+            break;
+        case X64_SYS_shmget:
+            ret = sys_shmget64(cpu, a1, a2, a3);
+            break;
+        case X64_SYS_shmat:
+            ret = sys_shmat64(cpu, a1, a2, a3);
+            break;
+        case X64_SYS_shmctl:
+            ret = sys_shmctl64(cpu, a1, a2, a3);
+            break;
+        case X64_SYS_shmdt:
+            ret = sys_shmdt64(cpu, a1);
             break;
         case X64_SYS_set_tid_address:
             // set_tid_address(tidptr): records the address the kernel must

@@ -980,9 +980,22 @@ void XWireConnection::processOneRequest(const uint8_t* req, uint32_t len) {
         default:
             // Unknown request. If it expects a reply we'd hang libX11; but most
             // unknown ones here are reply-less. Log so the discovery loop sees
-            // exactly which opcode notepad needs next.
-            klog_fmt("XWire: unhandled request opcode=%d len=%d (seq=%d)",
-                     (int)opcode, (int)len, (int)sequence);
+            // exactly which opcode notepad needs next. BW64_XWIREDUMP adds a hex
+            // dump of the request header + data1/data2 fields so an unknown
+            // fixed-length request can be decoded (e.g. distinguishing a real
+            // PolyText8 from something else riding opcode 65).
+            if (getenv("BW64_XWIREDUMP")) {
+                uint32_t n = (len < 32) ? len : 32;
+                char hex[3*32 + 1]; int o = 0;
+                for (uint32_t i = 0; i < n && o + 3 < (int)sizeof(hex); i++)
+                    o += snprintf(hex + o, sizeof(hex) - o, "%02x ", req[i]);
+                klog_fmt("XWire: unhandled opcode=%d len=%d seq=%d data1=0x%x data2=0x%x bytes[%s]",
+                         (int)opcode, (int)len, (int)sequence,
+                         (unsigned)rd32(req + 4), (unsigned)rd32(req + 8), hex);
+            } else {
+                klog_fmt("XWire: unhandled request opcode=%d len=%d (seq=%d)",
+                         (int)opcode, (int)len, (int)sequence);
+            }
             break;
     }
 }
@@ -1046,25 +1059,23 @@ void XWireConnection::onData() {
 void XWireConnection::deliverInputEvents() {
     if (!g_xwirePresentSink) return;
     XWireServer& srv = XWireServer::instance();
-    uint32_t pw, mask;
-    int16_t winX = 0, winY = 0;
+    uint32_t pw;
+    int16_t baseX = 0, baseY = 0;
     {
         std::lock_guard<std::mutex> lk(srv.regMutex);
         pw = srv.presentWindow;
         if (!pw) return;
-        // Owner check: the presented window's id base must match ours.
+        // Owner check: the presented (base) window's id base must match ours, so
+        // only one connection drains the shared host input queue.
         if ((pw & ~clientIdMask) != clientIdBase) return;
         auto it = srv.windows.find(pw);
         if (it == srv.windows.end()) return;
-        mask = it->second.eventMask;
-        // The presented client is positioned at this root origin (winex11
-        // ConfigureWindows it below where a WM caption would be, e.g. (4,23)).
-        // We present the client at host (0,0), so host coords ARE window-relative
-        // (event-x/y), but ROOT-x/y must add the origin back — wine positions
-        // menus and tracks the pointer in root coords.
-        winX = it->second.x; winY = it->second.y;
+        // Base window root origin. Host coords are relative to the base content
+        // (presented at host 0,0), so root coords = host + base origin, and an
+        // overlay at root (ox,oy) occupies host [ox-baseX, oy-baseY).
+        baseX = it->second.x; baseY = it->second.y;
     }
-    uint32_t presentWindow = pw;     // local copy for sendInputEvent
+    uint32_t presentWindow = pw;
 
     XWireInputEvent ev;
     while (g_xwirePresentSink->nextInputEvent(ev)) {
@@ -1078,23 +1089,64 @@ void XWireConnection::deliverInputEvents() {
             case XWireInputEvent::EvMotion:     code = 6;  wantMask = 0x00000040; break; // PointerMotionMask
             default: continue;
         }
-        // Deliver even if the mask bit isn't set for button/key — wine's windows
-        // usually select these, and dropping them silently would feel dead. But
-        // respect an explicit motion opt-out to avoid event floods.
+
+        // Hit-test: route the event to the TOPMOST mapped window under the
+        // cursor, not the global presentWindow. The old code always delivered to
+        // presentWindow (chosen by largest area = the main window), so when a
+        // modal dialog (Save As) opened as a separate, smaller top-level window,
+        // clicks kept going to the main window behind it — the dialog's buttons
+        // never saw the press (keyboard still worked because the dialog grabs
+        // input focus, which is what carries keystrokes). Now an overlay window
+        // whose host rect contains the pointer wins, and the event is translated
+        // into that window's coordinates.
+        uint32_t target = presentWindow;
+        int16_t tgtX = baseX, tgtY = baseY;   // target window root origin
+        uint32_t mask = 0;
+        {
+            std::lock_guard<std::mutex> lk(srv.regMutex);
+            uint64_t bestSerial = 0;
+            for (auto& kv : srv.windows) {
+                XWindow& w = kv.second;
+                if (kv.first == presentWindow || w.isRoot) continue;
+                if (!w.mapped || !w.fbW || !w.fbH) continue;
+                int hx0 = (int)w.x - baseX, hy0 = (int)w.y - baseY;   // host rect
+                if (ev.x >= hx0 && ev.x < hx0 + (int)w.fbW &&
+                    ev.y >= hy0 && ev.y < hy0 + (int)w.fbH &&
+                    w.mapSerial >= bestSerial) {
+                    bestSerial = w.mapSerial;
+                    target = kv.first;
+                    tgtX = w.x; tgtY = w.y;
+                }
+            }
+            auto it = srv.windows.find(target);
+            if (it != srv.windows.end()) mask = it->second.eventMask;
+        }
+        // Only this connection's own windows can be delivered to from here (each
+        // connection writes events to its own client socket). If the topmost hit
+        // belongs to another connection, that connection's own pump will service
+        // it; skip here to avoid writing a foreign window id down our socket.
+        if ((target & ~clientIdMask) != clientIdBase) continue;
+
+        // event-x/y are relative to the TARGET window: host coord minus the
+        // target's host origin (target root origin minus base origin).
+        XWireInputEvent local = ev;
+        local.x = ev.x - ((int)tgtX - (int)baseX);
+        local.y = ev.y - ((int)tgtY - (int)baseY);
+
         if (ev.type == XWireInputEvent::EvMotion && !(mask & wantMask)) continue;
-        // Before the first event on this window, announce the pointer ENTERED it
-        // (EnterNotify). winex11 tracks the pointer's window via crossing events;
-        // without it a click defocuses the edit control and menus never track.
-        if (enteredWindow != presentWindow) {
-            sendCrossing(presentWindow, true, (int16_t)ev.x, (int16_t)ev.y);
-            enteredWindow = presentWindow;
+        // Announce EnterNotify when the pointer crosses into a new target window;
+        // winex11 tracks the pointer window via crossing events (a click without
+        // it defocuses the control / menus don't track).
+        if (enteredWindow != target) {
+            sendCrossing(target, true, (int16_t)local.x, (int16_t)local.y);
+            enteredWindow = target;
         }
         if (getenv("BW64_XWIRE")) {
-            klog_fmt("XWire input: deliver code=%d detail=%d at (%d,%d) to win=0x%x (mask=0x%x)",
+            klog_fmt("XWire input: deliver code=%d detail=%d host(%d,%d)->win(%d,%d) to win=0x%x (mask=0x%x)",
                      (int)code, (int)ev.detail, (int)ev.x, (int)ev.y,
-                     (unsigned)presentWindow, (unsigned)mask);
+                     (int)local.x, (int)local.y, (unsigned)target, (unsigned)mask);
         }
-        sendInputEvent(code, presentWindow, ev, winX, winY);
+        sendInputEvent(code, target, local, tgtX, tgtY);
     }
 }
 

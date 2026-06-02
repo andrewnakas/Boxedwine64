@@ -25,6 +25,7 @@
 #define ADDRESS_PROCESS_FRAME_BUFFER_ADDRESS 0xF8000000
 
 #include "../source/util/bheap.h"
+#include <map>
 
 class MappedFileCache;
 
@@ -319,6 +320,24 @@ public:
     // name. startProcess populates these before calling loadProgram.
     std::vector<BString> startupArgs64;
     std::vector<BString> startupEnv64;
+
+    // SysV shared memory for the 64-bit guest. Wine's unix-side ntdll allocates
+    // anonymous (IPC_PRIVATE) shm segments to back some memory views — e.g. when
+    // notepad opens the Save/Save As common dialog. Without shmget/shmat the
+    // syscall returns -ENOSYS, wine's fallback mis-creates a view, and ntdll
+    // aborts on `create_view: assert(view->protect & VPROT_SYSTEM)` (virtual.c).
+    // The 32-bit KSystem::shm* impls are KMemory(U32)-bound and can't serve the
+    // KMemory64 path, so this is a parallel, process-local table: every segment
+    // here is IPC_PRIVATE scratch for THIS process (no cross-process attach is
+    // needed for what wine does), so keeping it per-KProcess is both simpler and
+    // correct. shmat maps via memory64->mmapReserveAndMap; shmdt munmaps.
+    struct ShmSeg64 {
+        U64 size = 0;        // requested byte length (pre-page-rounding)
+        U64 address = 0;     // mapped guest address once attached (0 = detached)
+        bool markedForDelete = false;
+    };
+    std::map<S32, ShmSeg64> shm64;   // shmid -> segment
+    S32 nextShm64Id = 1;
 #endif
 
     BHashTable<U32, U32> glStrings;

@@ -92,6 +92,11 @@ bool KMemory64::isPageMapped(U64 pageNum) const {
     return p && (p->flags & K64_PAGE_MAPPED);
 }
 
+U8* KMemory64::getCommittedPagePtr(U64 pageNum) {
+    K64Page* p = getPage(pageNum);
+    return (p && p->committed()) ? p->data : nullptr;
+}
+
 U32 KMemory64::getPageFlags(U64 pageNum) const {
     K64Page* p = getPage(pageNum);
     return p ? p->flags : 0;

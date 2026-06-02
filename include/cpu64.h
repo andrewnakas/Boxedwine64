@@ -116,6 +116,23 @@ public:
     KThread*   thread = nullptr;
     KMemory64* memory = nullptr;
 
+    // Instruction-fetch page cache. fetchByte() is the single hottest call in
+    // the interpreter: every instruction byte went through memory->readb(),
+    // which takes pagesMutex and does an unordered_map lookup PER BYTE. On a
+    // tight guest loop (e.g. wineserver's O(n) UTF-16 case-fold name compare —
+    // ~15 instrs, ~45 byte fetches per iteration, millions of iterations) that
+    // lock+hash dominates and starves the whole emulator. Code has near-total
+    // page locality, so caching the current code page's backing pointer turns
+    // the common case into a bounds-compare + array index with no lock. The
+    // cached K64Page buffer stays valid because munmap is address-space-only
+    // (never frees buffers) and K64Page payloads never move on rehash; the only
+    // events that replace the page map are fork (a fresh CPU64 with its own
+    // cache) and exit. Invalidated explicitly via invalidateFetchCache() if the
+    // backing store is ever decommitted under us. -1 page = empty.
+    U64 fetchCachePage = (U64)-1;
+    U8* fetchCacheData = nullptr;
+    void invalidateFetchCache() { fetchCachePage = (U64)-1; fetchCacheData = nullptr; }
+
     // Standalone-runner heap pointer. The full kernel tracks the program
     // break on KProcess::brkEnd64; the --x64-run-elf path has no KProcess,
     // so sys_brk64 falls back to this when thread/process is null. Set by

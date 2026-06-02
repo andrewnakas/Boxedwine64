@@ -828,6 +828,10 @@ U32 KProcess::execve(KThread* thread, BString path, std::vector<BString>& args, 
         this->memory64 = freshMem;
         if (this->cpu64) {
             this->cpu64->memory = freshMem;
+            // The old memory64 (and its page buffers) was just freed; drop the
+            // instruction-fetch page cache so it can't read through a dangling
+            // pointer into the deleted image.
+            this->cpu64->invalidateFetchCache();
             // Reset the image-specific CPU64 state for the new program. GPRs are
             // re-seeded (RIP/RSP/RDX/fsbase) by loadProgram64; clear the rest so
             // no stale mapping cursor, futex waiters, or signal handlers leak
