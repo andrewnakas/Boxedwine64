@@ -2064,22 +2064,32 @@ void ksyscall64(CPU64* cpu) {
             ret = sys_mmap64(cpu, a1, a2, a3, a4, a5, a6);
             break;
         case X64_SYS_mprotect:
-            // v1: no-op success. KMemory64 doesn't track per-page prot
-            // changes after mmap yet; for ld-linux's typical "make
-            // .text RX, .data RW" calls this is benign because we
-            // currently treat every page as RWX.
-            ret = 0;
+            // Flags-only: record the new protection on the page flags (real impl
+            // in KMemory64::mprotect). The interpreter does NOT enforce
+            // protection (it reads/writes unconditionally, and RELRO/JIT rely on
+            // that lenience), so this is pure bookkeeping — it lets munmap and the
+            // gap search reason about wine's PROT_NONE reservations vs committed
+            // anon pages. We do NOT free buffers on PROT_NONE: that is the same
+            // lazy-re-read hazard that makes decommit-on-munmap unsafe.
+            //
+            // KMemory64::mprotect returns the addr (mmap-style) on success; the
+            // mprotect SYSCALL must return 0. Translate: pass through a negative
+            // errno, otherwise report success. (Returning addr made ld.so read it
+            // as -errno -> "cannot apply additional memory protection after
+            // relocation" -> exit 127.)
+            {
+                U64 r = cpu->memory->mprotect(a1, a2, a3);
+                ret = ((S64)r < 0) ? r : 0;
+            }
             break;
         case X64_SYS_munmap:
-            // Back to a no-op (return success, keep pages). Actually erasing the
-            // pages (the create_view-assert fix) REGRESSED boot reliability:
-            // wine/wineserver munmap a region but still lazily touch it (a thread
-            // mid-access, or wine's own deferred read), and zeroing the backing
-            // store turned the rare create_view assert into a more-frequent
-            // mid-boot wedge/heap-corruption. Net loss — the leak is cheaper than
-            // the breakage. (Proper fix: only erase pages no other thread can be
-            // racing, and outside wine's reserved zones — future work.)
-            ret = 0;
+            // Address-space-only free: KMemory64::munmap trims the ranges
+            // reservation record so the region is reusable and the gap search
+            // stays fast, WITHOUT freeing page backing buffers. Freeing buffers
+            // regresses boot (wine/wineserver lazily re-read munmap'd regions —
+            // zero-filled reads trip asserts), so the backing store is kept; the
+            // memory is already bounded by lazy commit on the mmap side.
+            ret = cpu->memory->munmap(a1, a2);
             break;
         case X64_SYS_set_tid_address:
             // set_tid_address(tidptr): records the address the kernel must
