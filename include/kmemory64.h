@@ -15,6 +15,7 @@
 #include <memory>
 #include <unordered_map>
 #include <map>
+#include <cstring>
 
 class KProcess;
 class KThread;
@@ -44,10 +45,34 @@ class KThread;
 #define K64_PAGE_EXEC    0x04
 #define K64_PAGE_SHARED  0x08
 #define K64_PAGE_MAPPED  0x20
+// Set when getRamPtr handed out this page's host pointer (futex table / atomic
+// RMW hold it across a blocking wait). munmap/mprotect must not decommit a
+// pinned page's buffer, or the held pointer would dangle. Outside the kmemory.h
+// numbering — a 64-bit-only internal bit.
+#define K64_PAGE_PINNED  0x40
 
+// A guest page slot. `data` is allocated lazily: a freshly reserved page (mmap
+// of an address wine may never touch — its huge PROT_NONE reservations) carries
+// no backing buffer (data==nullptr) and reads as zero, so host RAM tracks pages
+// actually TOUCHED, not address space RESERVED. The buffer, once allocated, is
+// never reallocated while live, so a host pointer handed out by getRamPtr (the
+// 64-bit futex table keys on it) stays stable until the page is decommitted.
 struct K64Page {
-    U8 data[K64_PAGE_SIZE];
+    U8* data = nullptr;
     U32 flags = 0;
+    ~K64Page() { delete[] data; }
+    // Allocate + zero the backing buffer on first write/commit. Idempotent.
+    U8* commit() {
+        if (!data) {
+            data = new U8[K64_PAGE_SIZE];
+            ::memset(data, 0, K64_PAGE_SIZE);
+        }
+        return data;
+    }
+    // Drop the backing buffer (munmap / PROT_NONE). The slot survives; a later
+    // read returns zero, a later write re-commits a fresh zero page.
+    void decommit() { delete[] data; data = nullptr; }
+    bool committed() const { return data != nullptr; }
 };
 
 class KMemory64 {

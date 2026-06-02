@@ -42,8 +42,12 @@ void KMemory64::cloneFrom(const KMemory64* from) {
     pages.reserve(from->pages.size());
     for (const auto& kv : from->pages) {
         auto copy = std::make_unique<K64Page>();
-        ::memcpy(copy->data, kv.second->data, K64_PAGE_SIZE);
         copy->flags = kv.second->flags;
+        // Only copy backing store for committed pages; an uncommitted page in
+        // the parent (reserved but never touched) stays uncommitted in the child.
+        if (kv.second->committed()) {
+            ::memcpy(copy->commit(), kv.second->data, K64_PAGE_SIZE);
+        }
         pages.emplace(kv.first, std::move(copy));
     }
 }
@@ -71,11 +75,16 @@ K64Page* KMemory64::getOrAllocPage(U64 pageNum, U32 flagsIfNew) {
 }
 
 U64 KMemory64::committedPageCount() const {
-    // Phase 0/1: every mapped page is eagerly committed, so the committed count
-    // equals the mapped count. Phase 2 (lazy commit) replaces this body with a
-    // count of pages whose data buffer is non-null.
+    // Pages that actually hold a backing buffer (touched), as opposed to merely
+    // reserved address space (data==nullptr). The gap between this and
+    // mappedPageCount() is the memory lazy commit saves on wine's huge
+    // PROT_NONE reservations.
     BOXEDWINE_CRITICAL_SECTION_WITH_MUTEX(pagesMutex);
-    return (U64)pages.size();
+    U64 n = 0;
+    for (const auto& kv : pages) {
+        if (kv.second->committed()) n++;
+    }
+    return n;
 }
 
 bool KMemory64::isPageMapped(U64 pageNum) const {
@@ -107,10 +116,16 @@ U64 KMemory64::mmapAnonymousFixed(U64 addr, U64 len, U32 prot) {
 
     for (U64 i = 0; i < pageCount; i++) {
         K64Page* page = getOrAllocPage(pageStart + i, flags);
-        // If the page already existed (e.g. overlap), update its flags and
-        // zero its contents per MAP_ANONYMOUS semantics.
         page->flags = flags;
-        ::memset(page->data, 0, K64_PAGE_SIZE);
+        // Lazy commit: a FRESH reservation gets NO backing buffer — it reads as
+        // zero (memcpyFromGuest zero-fills an uncommitted page) and only commits
+        // on first write. This is the leak fix: wine's huge PROT_NONE spans no
+        // longer cost a 4 KB buffer per page. An ALREADY-COMMITTED page being
+        // re-mapped (overlap) is zeroed in place to preserve MAP_ANONYMOUS
+        // semantics and keep the file-mmap head/tail preservation logic valid.
+        if (page->committed()) {
+            ::memset(page->data, 0, K64_PAGE_SIZE);
+        }
     }
     // Keep the reservation map authoritative for the mmap region. A MAP_FIXED
     // landing here (wine remapping inside an earlier reservation, or the
@@ -217,7 +232,7 @@ U64 KMemory64::mprotect(U64 addr, U64 len, U32 prot) {
         // wholesale. Holes (no page) are skipped — see header comment.
         auto it = pages.find(pageStart + i);
         if (it == pages.end()) continue;
-        U32 preserved = it->second->flags & K64_PAGE_SHARED;
+        U32 preserved = it->second->flags & (K64_PAGE_SHARED | K64_PAGE_PINNED);
         it->second->flags = newFlags | preserved;
     }
     return addr;
@@ -229,12 +244,20 @@ U64 KMemory64::munmap(U64 addr, U64 len) {
     U64 pageStart = addr >> K64_PAGE_SHIFT;
     U64 pageCount = (len + K64_PAGE_SIZE - 1) >> K64_PAGE_SHIFT;
 
-    // Phase 1: free the ADDRESS SPACE only — drop/trim the reservation record so
-    // the range is reusable and the gap search stays fast. Deliberately do NOT
-    // erase page slots or backing buffers here: a prior real-munmap that
-    // pages.erase()'d slots regressed boot (wine lazily touches munmap'd regions,
-    // and in MT mode erasing a slot another thread holds a K64Page* to is UB).
-    // Phase 2 adds a SAFE buffer free (data->null, keep slot, futex-pinned).
+    // Free the ADDRESS SPACE only — drop/trim the reservation record so the
+    // range is reusable and the gap search stays fast.
+    //
+    // We deliberately do NOT decommit (free) the page buffers here, even though
+    // that would reclaim more memory. Decommitting was measured to REGRESS boot:
+    // wine/wineserver munmap a region and then lazily re-read it; with the
+    // buffer freed those reads return ZERO instead of the stale-but-present
+    // bytes, which tripped `wineserver: release_object: Assertion obj->refcount`
+    // deterministically (refcount read back as 0). This is the same lazy-touch
+    // hazard that sank the earlier pages.erase() real-munmap (commit 3ae9ca3a,
+    // reverted). The big leak win comes from LAZY COMMIT on the mmap side (fresh
+    // reservations carry no buffer at all — wine's 1.9 GB PROT_NONE spans now
+    // cost ~60 MB), not from freeing on munmap, so address-space-only munmap
+    // keeps essentially all the benefit with none of the breakage.
     BOXEDWINE_CRITICAL_SECTION_WITH_MUTEX(mmapMutex);
     rangeRemoveLocked(pageStart, pageCount);
     return 0;
@@ -273,7 +296,7 @@ void KMemory64::memcpyToGuest(U64 dstGuest, const void* src, U64 len) {
         U64 chunk = K64_PAGE_SIZE - offsetInPage;
         if (chunk > len) chunk = len;
         K64Page* page = getOrAllocPage(pageNum, K64_PAGE_MAPPED | K64_PAGE_READ | K64_PAGE_WRITE);
-        ::memcpy(page->data + offsetInPage, s, (size_t)chunk);
+        ::memcpy(page->commit() + offsetInPage, s, (size_t)chunk); // commit-on-write
         dstGuest += chunk;
         s += chunk;
         len -= chunk;
@@ -288,9 +311,10 @@ void KMemory64::memcpyFromGuest(void* dst, U64 srcGuest, U64 len) {
         U64 chunk = K64_PAGE_SIZE - offsetInPage;
         if (chunk > len) chunk = len;
         K64Page* page = getPage(pageNum);
-        if (page) {
+        if (page && page->committed()) {
             ::memcpy(d, page->data + offsetInPage, (size_t)chunk);
         } else {
+            // Absent slot OR reserved-but-uncommitted page → reads as zero.
             ::memset(d, 0, (size_t)chunk);
         }
         srcGuest += chunk;
@@ -306,7 +330,7 @@ void KMemory64::memsetGuest(U64 dstGuest, U8 value, U64 len) {
         U64 chunk = K64_PAGE_SIZE - offsetInPage;
         if (chunk > len) chunk = len;
         K64Page* page = getOrAllocPage(pageNum, K64_PAGE_MAPPED | K64_PAGE_READ | K64_PAGE_WRITE);
-        ::memset(page->data + offsetInPage, value, (size_t)chunk);
+        ::memset(page->commit() + offsetInPage, value, (size_t)chunk); // commit-on-write
         dstGuest += chunk;
         len -= chunk;
     }
@@ -314,7 +338,7 @@ void KMemory64::memsetGuest(U64 dstGuest, U8 value, U64 len) {
 
 U8 KMemory64::readb(U64 addr) {
     K64Page* p = getPage(addr >> K64_PAGE_SHIFT);
-    return p ? p->data[addr & K64_PAGE_MASK] : 0;
+    return (p && p->committed()) ? p->data[addr & K64_PAGE_MASK] : 0;
 }
 
 U16 KMemory64::readw(U64 addr) {
@@ -331,7 +355,7 @@ U64 KMemory64::readq(U64 addr) {
 
 void KMemory64::writeb(U64 addr, U8 value) {
     K64Page* p = getOrAllocPage(addr >> K64_PAGE_SHIFT, K64_PAGE_MAPPED | K64_PAGE_READ | K64_PAGE_WRITE);
-    p->data[addr & K64_PAGE_MASK] = value;
+    p->commit()[addr & K64_PAGE_MASK] = value; // commit-on-write
 }
 
 U8* KMemory64::getRamPtr(U64 addr, U32 len) {
@@ -342,7 +366,14 @@ U8* KMemory64::getRamPtr(U64 addr, U32 len) {
     }
     K64Page* page = getOrAllocPage(addr >> K64_PAGE_SHIFT,
                                    K64_PAGE_MAPPED | K64_PAGE_READ | K64_PAGE_WRITE);
-    return page->data + offsetInPage;
+    // Commit + PIN. Callers (the 64-bit futex table, atomic RMW in common_lock)
+    // keep this raw host pointer across a blocking wait. If a concurrent munmap
+    // decommitted the buffer, a re-commit would move it and the futex wake would
+    // target a stale address. The pin flag tells munmap/mprotect to free the
+    // address space but LEAVE this page's buffer in place. Once allocated, the
+    // buffer is never reallocated, so the returned pointer stays valid.
+    page->flags |= K64_PAGE_PINNED;
+    return page->commit() + offsetInPage;
 }
 
 void KMemory64::writew(U64 addr, U16 value) { memcpyToGuest(addr, &value, 2); }
