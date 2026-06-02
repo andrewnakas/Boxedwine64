@@ -14,16 +14,30 @@ This fork is a **work in progress**, but a substantial one: real Debian `wine64`
 
 ## Current state (June 2026)
 
-**`wine64 notepad.exe` now renders a real, visible GUI window on macOS arm64.**
-The full Windows-PE + X11 path is up: real Debian `wine64` boots the entire
-`wineboot → services.exe → winex11` chain, connects to an in-process X11 wire
-server, and **paints a live notepad window** (hundreds of `PutImage`/GDI
-draw requests per frame, FreeType-rendered text, an animated caret). The
-`wine64`↔`wineserver` IPC handshake, the NT-syscall dispatch, real PE image
-loading, and the X11 wire protocol all work end to end. **Keyboard and mouse
-input now work too**: you can type into notepad, click to place the caret, open
-the menus (composited as separate top-level windows), and the host shows wine's
-own cursor (I-beam over text, arrow elsewhere) aligned to the pointer.
+**`wine64 notepad.exe` now runs as a real, interactive GUI app on macOS arm64 —
+including File ▸ Save As all the way to a file on disk.** The full Windows-PE +
+X11 path is up: real Debian `wine64` boots the entire `wineboot → services.exe →
+winex11` chain, connects to an in-process X11 wire server, and **paints a live
+notepad window** (hundreds of `PutImage`/GDI draw requests per frame,
+FreeType-rendered text, an animated caret). The `wine64`↔`wineserver` IPC
+handshake, the NT-syscall dispatch, real PE image loading, and the X11 wire
+protocol all work end to end. **Keyboard and mouse input work**: you can type
+into notepad, click to place the caret, open the menus (composited as separate
+top-level windows), and the host shows wine's own cursor (I-beam over text,
+arrow elsewhere) aligned to the pointer.
+
+**The common-dialog round trip works**: opening Save As pops the modal dialog as
+its own top-level window, you can type a filename, **click its buttons** (pointer
+events hit-test to the topmost window under the cursor, so clicks land on the
+dialog and not the window behind it), and the file is written through wine's
+`C:` drive to the host filesystem (`tools/rootfs64/root/home/username/`).
+
+Boots now reach a painted window in **~25 s** rather than appearing to hang for
+minutes: a per-CPU instruction-fetch page cache removed a per-byte
+mutex+hashmap lookup that was pinning a core inside wineserver's name-table
+scans. Pick any bundled Windows program to launch with the
+**`tools/run_wine64_gui.sh`** picker (notepad, winecfg, regedit, taskmgr, clock,
+write, …) — the 64-bit equivalent of the 32-bit "run a program" UI.
 
 Headless, the same stack runs `wine64 wineboot --init` through **~4000 syscalls
 across the full process tree** (client, `wineserver64`, `services.exe`,
@@ -61,6 +75,15 @@ The 64-bit guest path can:
   SDL key/mouse events are translated to X11 input events, pointer/focus/grab
   requests are answered, popup menus are composited as overlay windows, and
   click coordinates are translated through the window's root origin
+- **Common-dialog Save As**: type a filename, click the dialog's buttons, and
+  write the file out to the host. Backed by SysV shared memory
+  (`shmget`/`shmat`/`shmctl`/`shmdt` for wine's view-backing), MAP_FIXED-correct
+  anonymous `mmap` placement (a bare hint relocates instead of stomping a wine
+  view → no more `create_view` abort), and multi-window pointer hit-testing so a
+  modal dialog over the main window still receives its clicks
+- **`tools/run_wine64_gui.sh`** picker: launch any bundled GUI program (notepad,
+  winecfg, regedit, taskmgr, clock, write, explorer, …) in a real window, by
+  menu or by name — the 64-bit analogue of the 32-bit "run a program" UI
 
 ### What does not work yet
 
@@ -80,12 +103,44 @@ This project drives the [`docs/PLAN_64BIT.md`](docs/PLAN_64BIT.md) §3.7–§3.1
 | **C — Scalar FP + ISA gaps** | SSE2 scalar FP, x87 subset, BT family, XGETBV, RDTSCP, SSSE3, atomic RMW | ✅ Complete (229/229 selftest PASS) |
 | **D — Rootfs + Wine64 build** | Build a real `wine64` rootfs (Docker), run it headless | ✅ Complete — `wine64 --version` → `wine-8.0`, headless |
 | **E — fork/exec + wineserver IPC** | real `fork`/`execve`/`wait4`, AF\_UNIX sockets, epoll, `sendmsg`/`recvmsg` + SCM\_RIGHTS | ✅ Complete — `wineboot --init` drives the full wine64↔wineserver handshake |
-| **F — Windows PE + GUI** | populate the prefix with Windows PE files, then the X server / GUI path | ⏳ Next — rootfs content, then Milestone-E-style GUI work |
-| **G — WASM memory64 + v1 polish** | Emscripten `MEMORY64=2`, slim wine64 package, lazy DLL fetch, browser tests | ⏳ Not started |
+| **F — Windows PE + GUI** | populate the prefix with Windows PE files, then the X server / GUI path; interactive input + a working common dialog | ✅ Complete — notepad paints, takes keyboard+mouse, and Save As writes a file to the host |
+| **G — App breadth + X completeness** | get a spread of bundled apps (winecfg, regedit, clock, write, …) usable, fill the remaining X core opcodes they need | ⏳ Next |
+| **H — Interpreter throughput** | close the gap to interactive speed: block/trace caching, faster hot-path decode, fewer per-op map lookups | ⏳ Not started |
+| **I — WASM memory64 + v1 polish** | Emscripten `MEMORY64=2`, slim wine64 package, lazy DLL fetch, browser tests | ⏳ Not started |
 
 The commit log (`git log --oneline`) is the canonical, blow-by-blow record of the
 bring-up — each commit names the opcode or syscall and the real binary that
 uncovered it.
+
+### Concrete next steps
+
+The most useful work, in rough priority order:
+
+1. **App breadth (Milestone G).** Run each program in `tools/run_wine64_gui.sh`
+   and fix the first thing each one needs. `winecfg`, `regedit`, and `clock` are
+   the highest-value targets (tabbed dialogs, tree controls, timers). Expect
+   missing X **core-font/text opcodes** — the dialog text path uses
+   `OpenFont`(45)/`QueryFont`(47)/`PolyText8`(65)/`ImageText8`(76); they
+   currently fall through `default:` in `source/x11wire/xwireconnection.cpp`
+   (use `BW64_XWIREDUMP=1` to hex-dump unhandled requests). Implement a builtin
+   fixed font + glyph blit into the window pixmap so dialog labels render.
+2. **A real Save/Open into the Mac home.** Point the guest's
+   `Documents`/`Desktop` `.link` files at a host-visible folder (or add a
+   `-drive` mapping) so files land somewhere natural instead of inside the repo
+   rootfs. Today everything under `C:` lives in `tools/rootfs64/root/`.
+3. **Interpreter throughput (Milestone H).** The fetch cache helped, but the
+   `step()` decoder still re-decodes every instruction. A per-page decoded-block
+   cache (keyed by guest RIP, invalidated on unmap/exec) would speed up the hot
+   loops that dominate wineserver and GDI; this is the single biggest lever on
+   "feels native."
+4. **Reliability: kill the residual boot wedge.** Boots are fast now but still
+   occasionally stall in wineserver's O(n) name-table scan. Either a wineserver-
+   side fast path for the UTF-16 case-fold compare (disasm at `wineserver64`
+   file-offset `0x663e0`/`0x302a0`) or the block cache above should clear it.
+   Use `BW64_RIPSAMPLE=1` to confirm the spinner.
+5. **Regression coverage.** Add a headless smoke test that boots `wineboot
+   --init` + a non-interactive PE to a known exit, so the memory/mmap changes
+   here can't silently regress. Keep `--x64-selftest` at 234/234.
 
 ---
 
