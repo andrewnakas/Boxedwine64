@@ -43,12 +43,22 @@ KUnixSocketObject::~KUnixSocketObject() {
         BOXEDWINE_CRITICAL_SECTION_WITH_CONDITION(con->lockCond);
         con = this->connection.lock();
         if (con) {
+            // BW64_WSREAD witness: when a client socket is destroyed we tell the
+            // peer (wineserver) EOF. Log whether the peer STILL had unread request
+            // bytes/records buffered at that moment — an EOF-before-drain means
+            // wineserver tears down the client without processing requests it
+            // already sent (the suspected disconnect-cascade double-release).
+            if (getenv("BW64_WSREAD")) {
+                klog_fmt("WSDISC: peer EOF set — pid=%u recvUsed=%u msgs=%u (this pid=%u)",
+                         (unsigned)con->pid, (unsigned)con->recvBuffer.size_used(),
+                         (unsigned)con->msgs.size(), (unsigned)this->pid);
+            }
             con->connection.reset();
             con->inClosed = true;
             con->outClosed = true;
             BOXEDWINE_CONDITION_SIGNAL_ALL(con->lockCond);
         }
-    }        
+    }
     
     std::shared_ptr<KUnixSocketObject> c = this->connecting.lock();
     if (c) {

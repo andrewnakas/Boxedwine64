@@ -35,6 +35,7 @@ public:
     XWireServerSocket(U32 domain, U32 type, U32 protocol)
         : KUnixSocketObject(domain, type, protocol) {}
     void onPeerWrote() override;
+    bool isXWire() override { return true; }
 
     // Non-blocking drain of this server peer's own recvBuffer (the bytes wine
     // wrote). Returns 0 when empty. Unlike readNative it never blocks — onData()

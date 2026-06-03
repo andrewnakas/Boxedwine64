@@ -265,28 +265,52 @@
 // Assertion 'obj->refcount' failed"), we dump the ring so the request sequence
 // that led to the crash is visible WITHOUT the multi-GB BW64_IPCDUMP firehose.
 // Zero cost when the env var is unset.
-struct CrashRingEntry { U32 pid; U32 fd; U32 len; U8 hdr[16]; };
+// kind: 'W'=write, 'R'=read, 'M'=recvmsg, 'F'=scm_rights fd delivered.
+// extra0/extra1 carry per-kind context (see crashRingRecordRead callers).
+struct CrashRingEntry { char kind; U32 pid; U32 fd; U32 len; U32 extra0; U32 extra1; U8 hdr[16]; };
 static CrashRingEntry g_crashRing[64];
 static std::atomic<U32> g_crashRingPos{0};
 static bool g_crashRingOn = false;
 static bool g_crashRingChecked = false;
+// BW64_WSREAD: also record the READ side (read/recvmsg/scm) of wineserver
+// sockets into the same ring, so the dump shows the request/reply/fd-pass
+// sequence — needed to catch a duplicated or mis-framed request that drives
+// wineserver's release_object double-free. Independent gate, zero cost when off.
+static bool g_wsReadOn = false;
+static bool g_wsReadChecked = false;
+static bool wsReadEnabled() {
+    if (!g_wsReadChecked) { g_wsReadOn = getenv("BW64_WSREAD") != nullptr; g_wsReadChecked = true; }
+    return g_wsReadOn;
+}
+static void crashRingPut(char kind, U32 pid, U32 fd, const U8* data, U32 count, U32 extra0, U32 extra1) {
+    U32 i = g_crashRingPos.fetch_add(1) % 64;
+    g_crashRing[i].kind = kind;
+    g_crashRing[i].pid = pid; g_crashRing[i].fd = fd; g_crashRing[i].len = count;
+    g_crashRing[i].extra0 = extra0; g_crashRing[i].extra1 = extra1;
+    U32 n = count < 16 ? count : 16;
+    for (U32 j = 0; j < 16; j++) g_crashRing[i].hdr[j] = (data && j < n) ? data[j] : 0;
+}
 static void crashRingRecord(U32 pid, U32 fd, const U8* data, U32 count) {
     if (!g_crashRingChecked) { g_crashRingOn = getenv("BW64_CRASHRING") != nullptr; g_crashRingChecked = true; }
     if (!g_crashRingOn) return;
-    U32 i = g_crashRingPos.fetch_add(1) % 64;
-    g_crashRing[i].pid = pid; g_crashRing[i].fd = fd; g_crashRing[i].len = count;
-    U32 n = count < 16 ? count : 16;
-    for (U32 j = 0; j < 16; j++) g_crashRing[i].hdr[j] = (j < n) ? data[j] : 0;
+    crashRingPut('W', pid, fd, data, count, 0, 0);
+}
+// Read-side recorder (used by sys_read64 / sys_recvmsg64 / the scm witness).
+// Gated by BW64_WSREAD AND the same ring being on so the dump path fires.
+static void crashRingRecordRead(char kind, U32 pid, U32 fd, const U8* data, U32 count, U32 extra0, U32 extra1) {
+    if (!g_crashRingChecked) { g_crashRingOn = getenv("BW64_CRASHRING") != nullptr; g_crashRingChecked = true; }
+    if (!g_crashRingOn || !wsReadEnabled()) return;
+    crashRingPut(kind, pid, fd, data, count, extra0, extra1);
 }
 static void crashRingDump(const char* why) {
     if (!g_crashRingOn) return;
-    klog_fmt("CRASHRING dump (%s) — last 64 socket writes, oldest first:", why);
+    klog_fmt("CRASHRING dump (%s) — last 64 socket events, oldest first:", why);
     U32 start = g_crashRingPos.load();
     for (U32 k = 0; k < 64; k++) {
         CrashRingEntry& e = g_crashRing[(start + k) % 64];
-        if (e.len == 0 && e.pid == 0) continue;
-        klog_fmt("  CR[%u] pid=%u fd=%u len=%u  [%02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x]",
-                 k, e.pid, e.fd, e.len,
+        if (e.kind == 0) continue;
+        klog_fmt("  CR[%u] %c pid=%u fd=%u len=%u e0=%u e1=%u  [%02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x]",
+                 k, e.kind, e.pid, e.fd, e.len, e.extra0, e.extra1,
                  e.hdr[0],e.hdr[1],e.hdr[2],e.hdr[3],e.hdr[4],e.hdr[5],e.hdr[6],e.hdr[7],
                  e.hdr[8],e.hdr[9],e.hdr[10],e.hdr[11],e.hdr[12],e.hdr[13],e.hdr[14],e.hdr[15]);
     }
@@ -643,12 +667,27 @@ static U64 sys_read64(CPU64* cpu, U64 fd, U64 buf, U64 count) {
     // Cap to a reasonable per-call size — ld-linux reads in 4KB-64KB chunks.
     if (count > (1ULL << 20)) count = 1ULL << 20;
     std::vector<U8> tmp((size_t)count);
+    // BW64_WSREAD witness: for a wineserver (record-oriented, non-XWire) unix
+    // socket, capture the recv-buffer fill before/after the read so the dump can
+    // reveal a read that returns N>0 without the cursor advancing by N (a
+    // re-read of the same request bytes — the suspected double-free driver).
+    KUnixSocketObject* wsSock = nullptr;
+    size_t recvBefore = 0;
+    if (wsReadEnabled() && cpu->thread && cpu->thread->process) {
+        KUnixSocketObject* us = dynamic_cast<KUnixSocketObject*>(fdesc->kobject.get());
+        if (us && !us->isXWire()) { wsSock = us; recvBefore = us->debugRecvUsed(); }
+    }
     U32 got = fdesc->kobject->readNative(tmp.data(), (U32)count);
     if ((S32)got < 0) {
         return (U64)(S64)(S32)got; // sign-extend kernel errno
     }
     if (got > 0) {
         cpu->memory->memcpyToGuest(buf, tmp.data(), got);
+    }
+    if (wsSock) {
+        size_t recvAfter = wsSock->debugRecvUsed();
+        crashRingRecordRead('R', cpu->thread->process->id, (U32)fd, tmp.data(), got,
+                            (U32)recvBefore, (U32)recvAfter);
     }
     if (getenv("BW64_IPCDUMP")) {
         // First bytes help identify wineserver reply headers vs pipe wakeup
@@ -2000,6 +2039,16 @@ static U64 sys_recvmsg64(CPU64* cpu, U64 fd, U64 msg64, U64 flags) {
                  (int)thread->process->id, (int)fd, (int)want, (unsigned)flags,
                  (int)(S32)rc, (int)m32->readd(base + MSG_SCRATCH_HDR + 20));
     }
+    if (wsReadEnabled() && (S32)rc >= 0) {
+        // 'M' record: the wineserver request-reply / fd-pass channel (the select
+        // + get_apc_result loop the crash trace runs). hdr = first 16 bytes of
+        // the received data; e0 = want, e1 = ctllen32 (bytes of SCM_RIGHTS).
+        U8 head[16] = {0};
+        U32 n = (rc < 16) ? (U32)rc : 16;
+        if (n) m32->memcpy(head, dataAddr, n);
+        crashRingRecordRead('M', (U32)thread->process->id, (U32)fd, head, (U32)rc,
+                            want, (U32)m32->readd(base + MSG_SCRATCH_HDR + 20));
+    }
     if ((S32)rc < 0) return (U64)(S64)(S32)rc;
 
     // Scatter the received bytes back into the 64-bit iov segments.
@@ -2036,6 +2085,12 @@ static U64 sys_recvmsg64(CPU64* cpu, U64 fd, U64 msg64, U64 flags) {
         for (U32 i = 0; i < nfds; i++) {
             U32 fdv = m32->readd(cmArea + 16 * i + 12);
             cpu->memory->writed(control + 16 + 4 * i, fdv);
+            if (wsReadEnabled()) {
+                // 'F' witness: which fd was just handed to the guest via
+                // SCM_RIGHTS. The same delivered fd value reappearing (e1) flags
+                // a double-delivered wineserver object handle.
+                crashRingRecordRead('F', (U32)thread->process->id, (U32)fd, nullptr, 0, nfds, fdv);
+            }
         }
         cpu->memory->writeq(msg64 + 40, cmsgLen); // msg_controllen
     } else {

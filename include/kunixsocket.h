@@ -84,6 +84,10 @@ public:
     // the writer's thread and write replies/events straight back to the client.
     virtual void onPeerWrote() {}
 
+    // True only for the in-process X11 wire server peer. Used to keep the
+    // wineserver-stream read diagnostics (BW64_WSREAD) off the X11 byte-stream.
+    virtual bool isXWire() { return false; }
+
     // Debug-only: bytes currently sitting in the recv buffer (for epoll spin
     // diagnostics — BW64_EPDUMP).
     size_t debugRecvUsed() { return recvBuffer.size_used(); }
