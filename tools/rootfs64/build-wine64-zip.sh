@@ -132,6 +132,23 @@ echo "--- staged tree ready ---"
 du -sh "$STAGE"
 '
 
+# Stage our custom guest libGL.so.1 (the 64-bit OpenGL shim wine dlopens; it
+# traps gl*/glX* to the Boxedwine64 host — see source/opengl/gl64bridge*). It's a
+# freestanding prebuilt artifact (tools/rootfs64/build-libgl64.sh) copied in on
+# the host AFTER the container stages glibc, so wine's loader finds libGL.so.1 on
+# the standard path and 3D apps don't hit "GLX is missing, disabling OpenGL".
+LIBGL_PREBUILT="$HERE/libgl64/libGL.so.1"
+if [ -f "$LIBGL_PREBUILT" ]; then
+    echo "--- staging custom guest libGL.so.1 ---"
+    mkdir -p "$STAGEHOST/lib/x86_64-linux-gnu" "$STAGEHOST/usr/lib/x86_64-linux-gnu"
+    cp "$LIBGL_PREBUILT" "$STAGEHOST/lib/x86_64-linux-gnu/libGL.so.1"
+    # also drop a copy on the usr path some wine builds search first
+    cp "$LIBGL_PREBUILT" "$STAGEHOST/usr/lib/x86_64-linux-gnu/libGL.so.1"
+else
+    echo "WARNING: $LIBGL_PREBUILT missing — run tools/rootfs64/build-libgl64.sh first;" \
+         "wine64 will run but with OpenGL disabled." >&2
+fi
+
 echo "=== zipping on host (macOS zip preserves the symlinks) ==="
 rm -f "$DIST/glibc-rootfs64.zip" "$DIST/wine64.zip"
 # Base: glibc + deps. Overlay: wine trees + launchers. -y keeps symlinks as links.

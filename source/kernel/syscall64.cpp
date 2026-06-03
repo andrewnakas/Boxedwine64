@@ -18,6 +18,10 @@
 #include "kunixsocket.h"
 #include "kpoll.h"
 #include "ripSampler.h"
+#ifdef BOXEDWINE_OPENGL
+#include "../opengl/gl64bridge.h"
+#include "../opengl/gl64bridge_abi.h"
+#endif
 
 // x86-64 Linux syscall numbers used here. The canonical table lives in
 // arch/x86/entry/syscalls/syscall_64.tbl in the Linux source; the values
@@ -31,6 +35,7 @@
 #define X64_SYS_lstat             6
 #define X64_SYS_poll              7
 #define X64_SYS_ppoll             271
+#define X64_SYS_pselect6          270
 #define X64_SYS_lseek             8
 #define X64_SYS_mmap              9
 #define X64_SYS_mprotect          10
@@ -2001,6 +2006,9 @@ static U64 sys_recvmsg64(CPU64* cpu, U64 fd, U64 msg64, U64 flags) {
 // gaps that are most likely to surface during early Wine/glibc bring-up.
 // Returns "?" for unknown numbers; the caller still logs the raw #N.
 static const char* x64SyscallName(U64 nr) {
+#ifdef BOXEDWINE_OPENGL
+    if (nr == GL64_SYSCALL_NR) return "gl64_trap";
+#endif
     switch (nr) {
         case 0: return "read";
         case 1: return "write";
@@ -2111,6 +2119,7 @@ static const char* x64SyscallName(U64 nr) {
         case 234: return "tgkill";
         case 257: return "openat";
         case 262: return "newfstatat";
+        case 270: return "pselect6";
         case 273: return "set_robust_list";
         case 290: return "eventfd2";
         case 291: return "epoll_create1";
@@ -2199,6 +2208,13 @@ void ksyscall64(CPU64* cpu) {
     }
 
     switch (nr) {
+#ifdef BOXEDWINE_OPENGL
+        case GL64_SYSCALL_NR:
+            // Private guest->host OpenGL trap (see source/opengl/gl64bridge*).
+            // RDI=fn id, RSI=guest VA of GL64Args. Result goes back in RAX.
+            ret = gl64Bridge(cpu, a1, a2);
+            break;
+#endif
         case X64_SYS_write:
             ret = sys_write64(cpu, a1, a2, a3);
             break;
@@ -3143,6 +3159,92 @@ void ksyscall64(CPU64* cpu) {
                 cpu->memory->memcpyToGuest(a1, tmp, bytes);
             }
             ret = (U64)(S64)rc;
+            break;
+        }
+        case X64_SYS_pselect6: {
+            // pselect6(nfds, readfds*, writefds*, exceptfds*, timespec*, sigmask).
+            // We have no native select, but kpoll() is the real readiness/blocking
+            // engine. Translate the fd_set bitmaps into a pollfd array, run kpoll,
+            // then translate the revents back into the fd_sets. Without this, wine
+            // (winex11/msg-loop) spins on pselect6=ENOSYS and never reaches GL.
+            if (!cpu->thread || !cpu->thread->process || !cpu->thread->memory) {
+                ret = (U64)-K_ENOSYS; break;
+            }
+            U32 nfds = (U32)a1;          // highest fd + 1
+            U64 rfdsAddr = a2, wfdsAddr = a3, efdsAddr = a4, tsAddr = a5;
+            if (nfds > 1024) { ret = (U64)-K_EINVAL; break; }
+
+            // Timeout: a5 is a timespec* (NULL == infinite). Match kpoll's
+            // convention (0 == non-blocking, >0xF0000000 == infinite).
+            U32 timeoutMs;
+            if (tsAddr == 0) {
+                timeoutMs = 0xFFFFFFFFu;
+            } else {
+                U64 sec  = cpu->memory->readq(tsAddr);
+                U64 nsec = cpu->memory->readq(tsAddr + 8);
+                timeoutMs = (U32)(sec * 1000 + nsec / 1000000);
+            }
+
+            // Read the three fd_set bitmaps (each (nfds+7)/8 bytes, capped to the
+            // 128-byte/1024-fd standard). 0 addr == that set not requested.
+            U32 setBytes = (nfds + 7) / 8;
+            if (setBytes > 128) setBytes = 128;
+            U8 rset[128] = {0}, wset[128] = {0}, eset[128] = {0};
+            if (rfdsAddr) cpu->memory->memcpyFromGuest(rset, rfdsAddr, setBytes);
+            if (wfdsAddr) cpu->memory->memcpyFromGuest(wset, wfdsAddr, setBytes);
+            if (efdsAddr) cpu->memory->memcpyFromGuest(eset, efdsAddr, setBytes);
+
+            auto isSet = [](const U8* s, U32 fd) { return (s[fd >> 3] >> (fd & 7)) & 1; };
+
+            // Build a pollfd array (8 bytes each: {int fd; short events; short revents})
+            // — one entry per fd that appears in any set. POLLIN=1, POLLOUT=4,
+            // POLLPRI=2 (the select events) per Linux poll.h.
+            struct PFD { S32 fd; U16 ev; U16 rev; };
+            PFD pfds[1024];
+            U32 npoll = 0;
+            for (U32 fd = 0; fd < nfds && npoll < 1024; fd++) {
+                U16 ev = 0;
+                if (rfdsAddr && isSet(rset, fd)) ev |= 0x0001; // POLLIN
+                if (wfdsAddr && isSet(wset, fd)) ev |= 0x0004; // POLLOUT
+                if (efdsAddr && isSet(eset, fd)) ev |= 0x0002; // POLLPRI
+                if (ev) { pfds[npoll].fd = (S32)fd; pfds[npoll].ev = ev; pfds[npoll].rev = 0; npoll++; }
+            }
+
+            // Run kpoll via the 32-bit scratch (same path the poll/ppoll case uses).
+            S32 rc;
+            U32 scratch = bounceSockaddrTo32(cpu, 0, 0, nullptr);
+            if (!scratch) { ret = (U64)-K_EFAULT; break; }
+            if (npoll == 0) {
+                rc = (S32)kpoll(cpu->thread, scratch, 0, timeoutMs);
+            } else {
+                U8 tmp[K_PAGE_SIZE] = {0};
+                for (U32 i = 0; i < npoll; i++) {
+                    U8* e = tmp + i * 8;
+                    *(U32*)e = (U32)pfds[i].fd;
+                    *(U16*)(e + 4) = pfds[i].ev;
+                    *(U16*)(e + 6) = 0;
+                }
+                cpu->thread->memory->memcpy(scratch, tmp, npoll * 8);
+                rc = (S32)kpoll(cpu->thread, scratch, npoll, timeoutMs);
+                cpu->thread->memory->memcpy(tmp, scratch, npoll * 8);
+                for (U32 i = 0; i < npoll; i++) pfds[i].rev = *(U16*)(tmp + i * 8 + 6);
+            }
+            if (rc < 0) { ret = (U64)(S64)rc; break; }
+
+            // Translate revents back into freshly-zeroed fd_sets and count ready fds
+            // (select returns the total number of ready bits across all sets).
+            U8 outR[128] = {0}, outW[128] = {0}, outE[128] = {0};
+            U32 readyCount = 0;
+            for (U32 i = 0; i < npoll; i++) {
+                U32 fd = (U32)pfds[i].fd; U16 rev = pfds[i].rev;
+                if (rfdsAddr && (rev & (0x0001 | 0x0010 /*POLLHUP*/ ))) { outR[fd>>3] |= (1<<(fd&7)); readyCount++; }
+                if (wfdsAddr && (rev & 0x0004)) { outW[fd>>3] |= (1<<(fd&7)); readyCount++; }
+                if (efdsAddr && (rev & (0x0002 | 0x0008 /*POLLERR*/))) { outE[fd>>3] |= (1<<(fd&7)); readyCount++; }
+            }
+            if (rfdsAddr) cpu->memory->memcpyToGuest(rfdsAddr, outR, setBytes);
+            if (wfdsAddr) cpu->memory->memcpyToGuest(wfdsAddr, outW, setBytes);
+            if (efdsAddr) cpu->memory->memcpyToGuest(efdsAddr, outE, setBytes);
+            ret = (U64)readyCount;
             break;
         }
         case X64_SYS_sched_yield:

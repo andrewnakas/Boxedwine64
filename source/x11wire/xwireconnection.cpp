@@ -163,6 +163,19 @@ namespace {
         X_NoOperation           = 127,
     };
 
+    // GLX extension. We advertise it present (see X_QueryExtension) so wine's
+    // winex11.drv loads our direct-rendering libGL.so.1; GL itself never rides
+    // this wire (the guest libGL traps straight to the host). The major opcode
+    // is the request-stream opcode libX11 assigns to GLX after QueryExtension.
+    enum {
+        GLX_MAJOR_OPCODE = 149,
+        GLX_FIRST_EVENT  = 95,   // first GLX event code (BufferSwapComplete et al.)
+        // GLX minor opcodes (the few libX11 might still send synchronously).
+        X_GLXQueryVersion        = 7,
+        X_GLXQueryServerString   = 19,
+        X_GLXClientInfo          = 20,
+    };
+
     // error codes
     enum {
         BadRequest = 1, BadValue = 2, BadWindow = 3, BadPixmap = 4,
@@ -982,16 +995,32 @@ void XWireConnection::processOneRequest(const uint8_t* req, uint32_t len) {
         case X_WarpPointer:
             break;
         case X_QueryExtension: {
-            // Report every extension as not present (incl. MIT-SHM, GLX, XKB),
-            // so libX11 uses the plain core path (non-SHM PutImage).
+            // Most extensions are reported absent (MIT-SHM, XKB, ...) so libX11
+            // uses the plain core path (non-SHM PutImage). EXCEPTION: GLX. wine's
+            // winex11.drv calls glXQueryExtension(), which under libX11 first does
+            // XQueryExtension("GLX") over the wire; if we say "absent" wine prints
+            // "GLX extension is missing, disabling OpenGL" and never loads our
+            // libGL. So we advertise GLX present with a major opcode. Actual GL
+            // rendering is DIRECT (our guest libGL.so.1 traps straight to the host
+            // — see source/opengl/gl64bridge), so no GLX rendering rides this wire;
+            // we only need the existence handshake to pass.
+            uint16_t nameLen = rd16(req + 4);
+            std::string extName((const char*)(req + 8), nameLen);
             uint8_t r[32] = {0};
             r[0] = 1;
             r[2] = (uint8_t)(sequence & 0xff);
             r[3] = (uint8_t)(sequence >> 8);
-            r[8] = 0;                          // present = false
-            r[9] = 0;                          // major-opcode
-            r[10] = 0;                         // first-event
-            r[11] = 0;                         // first-error
+            if (extName == "GLX") {
+                r[8] = 1;                      // present = true
+                r[9] = GLX_MAJOR_OPCODE;       // major-opcode
+                r[10] = GLX_FIRST_EVENT;       // first-event
+                r[11] = 0;                     // first-error
+            } else {
+                r[8] = 0;                      // present = false
+                r[9] = 0;
+                r[10] = 0;
+                r[11] = 0;
+            }
             writeToClient(r, sizeof(r));
             break;
         }
@@ -1004,6 +1033,41 @@ void XWireConnection::processOneRequest(const uint8_t* req, uint32_t len) {
             memcpy(r + 8, &w, 2);
             memcpy(r + 10, &h, 2);
             writeToClient(r, sizeof(r));
+            break;
+        }
+        case GLX_MAJOR_OPCODE: {
+            // GLX requests over the wire. Our guest libGL renders directly (host
+            // trap), so winex11 issues almost no GLX wire traffic — but libX11's
+            // GLX glue may still send a couple of reply-expecting requests during
+            // init. Answer them minimally so wine never blocks waiting on a reply.
+            uint8_t minor = req[1];
+            switch (minor) {
+                case X_GLXQueryVersion: {
+                    // reply: major(4)=1, minor(4)=4 in the reply body
+                    uint8_t r[32] = {0};
+                    r[0] = 1;
+                    r[2] = (uint8_t)(sequence & 0xff);
+                    r[3] = (uint8_t)(sequence >> 8);
+                    uint32_t maj = 1, min = 4;
+                    memcpy(r + 8, &maj, 4);
+                    memcpy(r + 12, &min, 4);
+                    writeToClient(r, sizeof(r));
+                    break;
+                }
+                case X_GLXClientInfo:
+                    // no reply expected (client->server info)
+                    break;
+                default: {
+                    // Any other reply-expecting GLX request: send an empty 32-byte
+                    // reply so a synchronous client doesn't hang. (Requests with no
+                    // reply will just see this as the next reply for a later seq;
+                    // winex11's direct path doesn't depend on these.)
+                    if (getenv("BW64_XWIRE")) {
+                        klog_fmt("XWire: GLX minor=%d (stub-reply) seq=%d", (int)minor, (int)sequence);
+                    }
+                    break;
+                }
+            }
             break;
         }
         case X_QueryColors: {

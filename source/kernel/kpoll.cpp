@@ -76,12 +76,29 @@ S32 internal_poll(KThread* thread, KPollData* data, U32 count, U32 timeout) {
                     }
                     if ((data->events & K_POLLPRI) && fd->kobject->isPriorityReadReady()) {
                         data->revents |= K_POLLPRI;
-                    } 
+                    }
                     if ((data->events & K_POLLIN) != 0 && fd->kobject->isReadReady()) {
                         data->revents |= K_POLLIN;
                     }
                     if ((data->events & K_POLLOUT) != 0 && fd->kobject->isWriteReady()) {
                         data->revents |= K_POLLOUT;
+                    }
+                    // BW64_POLLREADY: when we DECIDE a unix socket is POLLIN-ready,
+                    // log its true buffered state AT DECISION TIME (under the fds
+                    // lock). The epoll busy-loop shows a fd that's perpetually
+                    // POLLIN-ready but empty; this pins down which field of
+                    // isReadReady() is non-zero here vs. zero by the time the
+                    // syscall returns (the spurious-ready producer).
+                    if ((data->revents & K_POLLIN) && getenv("BW64_POLLREADY") &&
+                        fd->kobject->type == KTYPE_UNIX_SOCKET) {
+                        std::shared_ptr<KUnixSocketObject> us =
+                            std::dynamic_pointer_cast<KUnixSocketObject>(fd->kobject);
+                        if (us) {
+                            klog_fmt("POLLREADY fd=%d POLLIN: recvUsed=%ld msgs=%ld inClosed=%d pendTot=%ld pendLive=%ld",
+                                     (int)data->fd, (long)us->debugRecvUsed(),
+                                     (long)us->debugMsgsSize(), us->debugInClosed()?1:0,
+                                     (long)us->debugPendingTotal(), (long)us->debugPendingLive());
+                        }
                     }
                     if (data->revents != 0) {
                         result++;
