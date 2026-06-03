@@ -15,6 +15,7 @@
 #include "cpu64.h"
 #include "kmemory64.h"
 #include "ksocket.h"
+#include <thread>   // std::this_thread::yield() for sched_yield
 #include "kunixsocket.h"
 #include "kpoll.h"
 #include "ripSampler.h"
@@ -258,6 +259,39 @@
 // corruption ("malloc(): corrupted double linked list") in wineserver during
 // the boot storm. The shared bump cursor moved to KMemory64::mmapNext.
 
+// BW64_CRASHRING: a tiny lock-light ring of the last few socket writes (pid +
+// fd + first 16 bytes = the wineserver request header / opcode). When a guest
+// process prints an abort to stderr (e.g. wineserver's "release_object:
+// Assertion 'obj->refcount' failed"), we dump the ring so the request sequence
+// that led to the crash is visible WITHOUT the multi-GB BW64_IPCDUMP firehose.
+// Zero cost when the env var is unset.
+struct CrashRingEntry { U32 pid; U32 fd; U32 len; U8 hdr[16]; };
+static CrashRingEntry g_crashRing[64];
+static std::atomic<U32> g_crashRingPos{0};
+static bool g_crashRingOn = false;
+static bool g_crashRingChecked = false;
+static void crashRingRecord(U32 pid, U32 fd, const U8* data, U32 count) {
+    if (!g_crashRingChecked) { g_crashRingOn = getenv("BW64_CRASHRING") != nullptr; g_crashRingChecked = true; }
+    if (!g_crashRingOn) return;
+    U32 i = g_crashRingPos.fetch_add(1) % 64;
+    g_crashRing[i].pid = pid; g_crashRing[i].fd = fd; g_crashRing[i].len = count;
+    U32 n = count < 16 ? count : 16;
+    for (U32 j = 0; j < 16; j++) g_crashRing[i].hdr[j] = (j < n) ? data[j] : 0;
+}
+static void crashRingDump(const char* why) {
+    if (!g_crashRingOn) return;
+    klog_fmt("CRASHRING dump (%s) — last 64 socket writes, oldest first:", why);
+    U32 start = g_crashRingPos.load();
+    for (U32 k = 0; k < 64; k++) {
+        CrashRingEntry& e = g_crashRing[(start + k) % 64];
+        if (e.len == 0 && e.pid == 0) continue;
+        klog_fmt("  CR[%u] pid=%u fd=%u len=%u  [%02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x]",
+                 k, e.pid, e.fd, e.len,
+                 e.hdr[0],e.hdr[1],e.hdr[2],e.hdr[3],e.hdr[4],e.hdr[5],e.hdr[6],e.hdr[7],
+                 e.hdr[8],e.hdr[9],e.hdr[10],e.hdr[11],e.hdr[12],e.hdr[13],e.hdr[14],e.hdr[15]);
+    }
+}
+
 static U64 sys_write64(CPU64* cpu, U64 fd, U64 buf, U64 count) {
     if (count == 0) return 0;
     if (count > (1ULL << 20)) count = 1ULL << 20;
@@ -269,6 +303,15 @@ static U64 sys_write64(CPU64* cpu, U64 fd, U64 buf, U64 count) {
         // surface immediately. Also forward to the kobject so anything
         // tailing the host FS still sees it.
         klog_fmt("[guest fd=%llu] %s", (unsigned long long)fd, (const char*)buffer.data());
+        // On a guest abort, dump the request ring so we can see the wineserver
+        // request sequence that triggered the double-release.
+        if (fd == 2 && (strstr((const char*)buffer.data(), "release_object") ||
+                        strstr((const char*)buffer.data(), "Assertion") ||
+                        strstr((const char*)buffer.data(), "corrupted"))) {
+            crashRingDump((const char*)buffer.data());
+        }
+    } else if (cpu->thread && cpu->thread->process) {
+        crashRingRecord(cpu->thread->process->id, (U32)fd, buffer.data(), (U32)count);
     }
     if (!cpu->thread || !cpu->thread->process) {
         return count;
@@ -608,9 +651,11 @@ static U64 sys_read64(CPU64* cpu, U64 fd, U64 buf, U64 count) {
         cpu->memory->memcpyToGuest(buf, tmp.data(), got);
     }
     if (getenv("BW64_IPCDUMP")) {
-        // First up-to-16 bytes help identify wineserver reply headers vs pipe
-        // wakeup bytes (the wait pipe carries a single status byte).
-        char hex[64] = {0}; int n = (int)((got < 16) ? got : 16);
+        // First bytes help identify wineserver reply headers vs pipe wakeup
+        // bytes. BW64_IPCWIDE dumps up to 48 bytes so a select_reply's apc_call
+        // body (past the 8-byte reply_header) is visible, not just the header.
+        int cap = getenv("BW64_IPCWIDE") ? 48 : 16;
+        char hex[160] = {0}; int n = (int)((got < (U32)cap) ? got : (U32)cap);
         for (int i = 0; i < n; i++) snprintf(hex + i*3, 4, "%02x ", tmp[i]);
         klog_fmt("IPC [pid=%d] read(fd=%d,count=%llu) -> %d  [%s]",
                  (int)cpu->thread->process->id, (int)fd,
@@ -3248,6 +3293,19 @@ void ksyscall64(CPU64* cpu) {
             break;
         }
         case X64_SYS_sched_yield:
+            // Actually yield the host thread, mirroring the 32-bit path
+            // (syscall.cpp syscall_sched_yield). It was a pure no-op here, which
+            // breaks wine's spin-then-yield waits: when a thread spin-loops on
+            // sched_yield (e.g. RtlpWaitForCriticalSection / a server_select
+            // retry loop), a no-op yield never relinquishes the core, so on a
+            // contended host the PEER thread/process that must run to signal the
+            // awaited event is starved and the waiter spins forever. Observed as
+            // gltri's main thread (pid 10) pinned in a write(6)/read(7) select +
+            // recvmsg + sched_yield loop after `first window mapped`, never
+            // reaching GL, while its signaler sat unscheduled. cpu->yield also
+            // nudges our cooperative scheduler to pick another guest thread.
+            cpu->yield = true;
+            std::this_thread::yield();
             ret = 0;
             break;
         case X64_SYS_sched_getaffinity:
