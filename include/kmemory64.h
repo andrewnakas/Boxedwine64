@@ -60,7 +60,13 @@ class KThread;
 struct K64Page {
     U8* data = nullptr;
     U32 flags = 0;
-    ~K64Page() { delete[] data; }
+    // When set, `data` is BORROWED from a process-shared file mapping (wine's
+    // server shared-memory section: MAP_SHARED writable file). The buffer is
+    // owned by g_sharedFileRegistry and aliased by every process that maps the
+    // same file page, so wineserver's writes are visible to clients and vice
+    // versa. We must NOT delete[] or reallocate a borrowed buffer.
+    bool dataShared = false;
+    ~K64Page() { if (!dataShared) delete[] data; }
     // Allocate + zero the backing buffer on first write/commit. Idempotent.
     U8* commit() {
         if (!data) {
@@ -69,9 +75,20 @@ struct K64Page {
         }
         return data;
     }
+    // Point this page at a process-shared backing buffer (not owned here).
+    void adoptShared(U8* shared) {
+        if (data && !dataShared) delete[] data;
+        data = shared;
+        dataShared = true;
+    }
     // Drop the backing buffer (munmap / PROT_NONE). The slot survives; a later
-    // read returns zero, a later write re-commits a fresh zero page.
-    void decommit() { delete[] data; data = nullptr; }
+    // read returns zero, a later write re-commits a fresh zero page. A borrowed
+    // shared buffer is detached (not freed — the registry owns it).
+    void decommit() {
+        if (!dataShared) delete[] data;
+        data = nullptr;
+        dataShared = false;
+    }
     bool committed() const { return data != nullptr; }
 };
 
@@ -84,6 +101,16 @@ public:
     // address, or (U64)-errno on failure. addr MUST be page-aligned and
     // non-zero (no address-picking in v1).
     U64 mmapAnonymousFixed(U64 addr, U64 len, U32 prot);
+
+    // Map a MAP_SHARED file region so it is genuinely SHARED across every process
+    // that maps the same file (keyed by path). Each guest page in [addr,addr+len)
+    // adopts a process-global backing buffer from g_sharedFileRegistry, seeded
+    // once from the file contents at [fileOffset,...). wine's server shared-memory
+    // section (server-1-*/tmpmap-*) relies on this: wineserver writes object/
+    // sequence state that clients read directly. Without real sharing the section
+    // desyncs → wineserver release_object refcount underflow. addr is page-aligned.
+    U64 mmapSharedFile(U64 addr, U64 len, U32 prot, const char* path, U64 fileOffset,
+                       const U8* fileBytes, U64 fileBytesLen);
 
     // Atomically pick a free address range AND map it, so two guest threads of
     // the same process (sharing this KMemory64) can never be handed overlapping
@@ -174,6 +201,11 @@ public:
     // every mapped page is committed, so this equals mappedPageCount(); afterward
     // it tracks only pages whose K64Page::data is non-null (i.e. actually touched).
     U64 committedPageCount() const;
+
+    // BW64_STRAYWRITE tripwire (see kmemory64.cpp): logs a guest write whose
+    // target page was never mapped/reserved — a stray write candidate for the
+    // guest-heap corruption ASan can't see. No-op unless the env var is set.
+    void strayWriteCheck(U64 dstGuest, U64 len);
 
 private:
     KProcess* process;

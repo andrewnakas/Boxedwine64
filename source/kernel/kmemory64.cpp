@@ -14,6 +14,49 @@
 
 #include <string.h>
 #include <cstdlib>
+#include <string>
+#include <unordered_map>
+#include <memory>
+#include <mutex>
+
+// ---------------------------------------------------------------------------
+// Process-shared file mappings (MAP_SHARED). A single host buffer per
+// (file path, page-aligned file offset) is aliased by every process that maps
+// that file page MAP_SHARED — so a write by one process (e.g. wineserver
+// updating its shared object/sequence section) is seen by all others, exactly
+// like a real shared mmap. Without this, the 64-bit file-mmap path handed each
+// process a private copy and wine's server shared-memory section desynced,
+// crashing wineserver with release_object refcount underflow. Mirrors the
+// 32-bit KMemory::MappedFileCache (keyed by node->path). Pages live for the
+// life of the process (server section is tiny + long-lived); we never evict.
+// ---------------------------------------------------------------------------
+namespace {
+struct SharedFilePage {
+    U8 data[K64_PAGE_SIZE];
+};
+std::mutex g_sharedFileMutex;
+// key: path + "\0" + decimal page-aligned file offset -> one shared page buffer.
+std::unordered_map<std::string, std::shared_ptr<SharedFilePage>> g_sharedFileRegistry;
+
+std::shared_ptr<SharedFilePage> getSharedFilePage(const std::string& path, U64 offsetPage,
+                                                  const U8* seed, U64 seedLen, bool& created) {
+    std::string key = path;
+    key.push_back('\0');
+    key += std::to_string(offsetPage);
+    std::lock_guard<std::mutex> lk(g_sharedFileMutex);
+    auto it = g_sharedFileRegistry.find(key);
+    if (it != g_sharedFileRegistry.end()) { created = false; return it->second; }
+    auto page = std::make_shared<SharedFilePage>();
+    ::memset(page->data, 0, K64_PAGE_SIZE);
+    if (seed && seedLen) {
+        U64 n = seedLen < K64_PAGE_SIZE ? seedLen : K64_PAGE_SIZE;
+        ::memcpy(page->data, seed, (size_t)n);
+    }
+    g_sharedFileRegistry[key] = page;
+    created = true;
+    return page;
+}
+} // namespace
 
 // K_EINVAL / K_ENOMEM live in the existing kernel headers. We return
 // (U64)-errno from mmap-style calls following the 32-bit convention.
@@ -26,6 +69,33 @@
 
 KMemory64::KMemory64(KProcess* process) : process(process) {}
 KMemory64::~KMemory64() = default;
+
+// BW64_STRAYWRITE tripwire: ASan cannot see writes that land inside the
+// emulated guest address space (one big host allocation), so a syscall handler
+// that computes a wrong guest destination and scribbles into e.g. wineserver's
+// malloc arena is invisible to ASan yet shows up later as glibc "unaligned
+// tcache"/"corrupted double-linked list". This logs a guest WRITE whose target
+// page had no prior map entry at all — i.e. the process never reserved/mmap'd
+// it, so writing there is a stray write (legit lazy-commit always targets a
+// page that mmapAnonymousFixed already entered with K64_PAGE_MAPPED). Cheap:
+// one map lookup, only when the env var is set.
+static bool g_strayInit = false, g_strayOn = false;
+void KMemory64::strayWriteCheck(U64 dstGuest, U64 len) {
+    if (!g_strayInit) { g_strayOn = std::getenv("BW64_STRAYWRITE") != nullptr; g_strayInit = true; }
+    if (!g_strayOn) return;
+    U64 firstPage = dstGuest >> K64_PAGE_SHIFT;
+    U64 lastPage  = (dstGuest + (len ? len - 1 : 0)) >> K64_PAGE_SHIFT;
+    for (U64 pn = firstPage; pn <= lastPage; pn++) {
+        K64Page* p = getPage(pn);
+        if (!p || !(p->flags & K64_PAGE_MAPPED)) {
+            klog_fmt("STRAYWRITE: pid=%u write to UNMAPPED guest page 0x%llx (addr=0x%llx len=%llu) — corruption candidate",
+                     (unsigned)(process ? process->id : 0),
+                     (unsigned long long)(pn << K64_PAGE_SHIFT),
+                     (unsigned long long)dstGuest, (unsigned long long)len);
+            return; // one report per write is enough
+        }
+    }
+}
 
 void KMemory64::cloneFrom(const KMemory64* from) {
     // Lock both sides: `from` may be a live address space (the forking parent),
@@ -142,6 +212,55 @@ U64 KMemory64::mmapAnonymousFixed(U64 addr, U64 len, U32 prot) {
         BOXEDWINE_CRITICAL_SECTION_WITH_MUTEX(mmapMutex);
         rangeInsertLocked(pageStart, pageCount, prot,
                           prot ? (U8)MMAP_ANON : (U8)MMAP_RESERVED);
+    }
+    return addr;
+}
+
+U64 KMemory64::mmapSharedFile(U64 addr, U64 len, U32 prot, const char* path,
+                              U64 fileOffset, const U8* fileBytes, U64 fileBytesLen) {
+    if (len == 0) return (U64)-K_EINVAL;
+    if (addr & K64_PAGE_MASK) return (U64)-K_EINVAL;
+    if (!path) return (U64)-K_EINVAL;
+
+    U64 pageStart = addr >> K64_PAGE_SHIFT;
+    U64 pageCount = (len + K64_PAGE_SIZE - 1) >> K64_PAGE_SHIFT;
+
+    U32 flags = K64_PAGE_MAPPED | K64_PAGE_SHARED;
+    if (prot & 0x1) flags |= K64_PAGE_READ;
+    if (prot & 0x2) flags |= K64_PAGE_WRITE | K64_PAGE_READ;
+    if (prot & 0x4) flags |= K64_PAGE_EXEC;
+
+    std::string p(path);
+    for (U64 i = 0; i < pageCount; i++) {
+        K64Page* page = getOrAllocPage(pageStart + i, flags);
+        page->flags = flags;
+        // Each guest page adopts the one shared buffer for this file page. The
+        // FIRST process to map a given file page seeds it from the file bytes we
+        // were handed; later processes (and later maps) alias the same buffer and
+        // must NOT re-seed (that would clobber writes already made through it,
+        // e.g. wineserver's live server section). So only the registry-created
+        // buffer takes the seed.
+        U64 fpage = (fileOffset >> K64_PAGE_SHIFT) + i;
+        const U8* seed = nullptr; U64 seedLen = 0;
+        U64 thisPageFileStart = (U64)i * K64_PAGE_SIZE;
+        if (fileBytes && fileBytesLen > thisPageFileStart) {
+            seed = fileBytes + thisPageFileStart;
+            seedLen = fileBytesLen - thisPageFileStart;
+            if (seedLen > K64_PAGE_SIZE) seedLen = K64_PAGE_SIZE;
+        }
+        bool created = false;
+        std::shared_ptr<SharedFilePage> shared = getSharedFilePage(p, fpage, seed, seedLen, created);
+        page->adoptShared(shared->data);
+        if (std::getenv("BW64_SHAREMAP")) {
+            klog_fmt("SHAREMAP: pid=%u %s fpage=%llu guest=0x%llx path='%s'",
+                     (unsigned)(process ? process->id : 0), created ? "CREATE" : "ALIAS ",
+                     (unsigned long long)fpage,
+                     (unsigned long long)((pageStart + i) << K64_PAGE_SHIFT), p.c_str());
+        }
+    }
+    if (pageStart >= K64_MMAP_BASE_PAGE) {
+        BOXEDWINE_CRITICAL_SECTION_WITH_MUTEX(mmapMutex);
+        rangeInsertLocked(pageStart, pageCount, prot, (U8)MMAP_ANON);
     }
     return addr;
 }
@@ -286,6 +405,7 @@ static void initWatch() {
 
 void KMemory64::memcpyToGuest(U64 dstGuest, const void* src, U64 len) {
     const U8* s = (const U8*)src;
+    strayWriteCheck(dstGuest, len);
     if (!g_watchInit) initWatch();
     if (g_watchAddr && dstGuest < g_watchAddr + g_watchLen && dstGuest + len > g_watchAddr) {
         U64 v = 0;
@@ -329,6 +449,7 @@ void KMemory64::memcpyFromGuest(void* dst, U64 srcGuest, U64 len) {
 }
 
 void KMemory64::memsetGuest(U64 dstGuest, U8 value, U64 len) {
+    strayWriteCheck(dstGuest, len);
     while (len) {
         U64 pageNum = dstGuest >> K64_PAGE_SHIFT;
         U64 offsetInPage = dstGuest & K64_PAGE_MASK;
@@ -359,6 +480,7 @@ U64 KMemory64::readq(U64 addr) {
 }
 
 void KMemory64::writeb(U64 addr, U8 value) {
+    strayWriteCheck(addr, 1);
     K64Page* p = getOrAllocPage(addr >> K64_PAGE_SHIFT, K64_PAGE_MAPPED | K64_PAGE_READ | K64_PAGE_WRITE);
     p->commit()[addr & K64_PAGE_MASK] = value; // commit-on-write
 }

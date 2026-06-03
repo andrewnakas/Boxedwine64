@@ -16,6 +16,7 @@
 #include "kmemory64.h"
 #include "ksocket.h"
 #include <thread>   // std::this_thread::yield() for sched_yield
+#include <mutex>    // std::recursive_mutex for BW64_SERIAL_TEARDOWN
 #include "kunixsocket.h"
 #include "kpoll.h"
 #include "ripSampler.h"
@@ -612,7 +613,24 @@ static U64 sys_shmctl64(CPU64* cpu, U64 shmid, U64 cmd, U64 buf) {
 // exit(2) — terminate the calling thread. If it's the last thread in the
 // process, this ends the process (exitgroup). `group` forces process-wide
 // termination regardless of thread count (exit_group(2)).
+// BW64_SERIAL_TEARDOWN experiment: a global lock serializing the EXECUTION of
+// 64-bit process/thread teardown. On real Linux wineserver observes every client
+// disconnect + final request through ONE epoll, fully serial. Here the boot
+// helpers run on separate HOST threads and exit truly concurrently, so their
+// terminate_thread/close requests + socket EOFs interleave at instruction
+// granularity — the suspected trigger for wineserver's release_object refcount
+// underflow / heap corruption during the post-boot teardown storm. Holding this
+// across the whole cleanup (which closes the wineserver socket -> EOF) forces
+// wineserver to see one client's full disconnect before the next begins.
+// Recursive so an exitgroup that internally drives sibling teardown can't
+// self-deadlock. Env-gated so it's a clean A/B with no cost when off.
+static std::recursive_mutex g_serialTeardownMutex;
+static bool g_serialTeardownInit = false, g_serialTeardownOn = false;
 static U64 sys_exit64(CPU64* cpu, U64 status, bool group) {
+    if (!g_serialTeardownInit) {
+        g_serialTeardownOn = std::getenv("BW64_SERIAL_TEARDOWN") != nullptr;
+        g_serialTeardownInit = true;
+    }
     if (cpu->thread && cpu->thread->process) {
         KProcess* p = cpu->thread->process.get();
         klog_fmt("CPU64: %s syscall, status=%lld  pid=%d exe='%s'",
@@ -626,6 +644,10 @@ static U64 sys_exit64(CPU64* cpu, U64 status, bool group) {
     cpu->yield = true;
     if (cpu->thread && cpu->thread->process) {
         KProcess* process = cpu->thread->process.get();
+        std::unique_lock<std::recursive_mutex> serialLk;
+        if (g_serialTeardownOn) {
+            serialLk = std::unique_lock<std::recursive_mutex>(g_serialTeardownMutex);
+        }
         if (group) {
             process->exitgroup(cpu->thread, (U32)status);
         } else {
@@ -1072,6 +1094,33 @@ static U64 sys_mmap64_file(CPU64* cpu, U64 addr, U64 length, U64 prot,
                  (unsigned)prot, (unsigned)flags, (unsigned long long)offset,
                  (int)((flags & K_MAP_FIXED) != 0),
                  kfile->openFile->node ? kfile->openFile->node->path.c_str() : "?");
+    }
+    // MAP_SHARED file mapping: this must be GENUINELY shared across every process
+    // that maps the same file (wine's server shared-memory section
+    // server-1-*/tmpmap-* — wineserver maps it WRITABLE and writes object/sequence
+    // state; the CLIENTS map the SAME file READ-ONLY (e.g. KUSER_SHARED_DATA at
+    // 0x7ffe0000) and read those writes directly). The private read-copy path
+    // below would give every process its own stale snapshot, desyncing the
+    // section and crashing wineserver with release_object refcount underflow. So
+    // BOTH readers and writers must alias the one shared buffer — divert any
+    // MAP_SHARED file map, not just the writable one.
+    if ((flags & K_MAP_SHARED) && kfile->openFile->node && !reserved) {
+        // Seed bytes for any page of this file not yet in the registry.
+        std::vector<U8> seedBuf((size_t)mapLen, 0);
+        U64 fileBase = offset & ~0xFFFULL;
+        S64 savedFp = kfile->openFile->getFilePointer();
+        kfile->openFile->seek((S64)fileBase);
+        kfile->openFile->readNative(seedBuf.data(), (U32)mapLen);
+        kfile->openFile->seek(savedFp);
+        U64 r = cpu->memory->mmapSharedFile(aligned, mapLen, (U32)prot,
+                                            kfile->openFile->node->path.c_str(),
+                                            fileBase, seedBuf.data(), (U64)seedBuf.size());
+        if ((S64)r < 0) return r;
+        if (ripSamplerEnabled() && kfile->openFile->node) {
+            ripSamplerNoteModule((int)cpu->thread->process->id, aligned, mapLen,
+                                 kfile->openFile->node->path.c_str());
+        }
+        return addr;
     }
     // The page that contains `addr` may already hold valid bytes from a PRIOR
     // overlapping mapping of the SAME DSO (glibc maps the first PT_LOAD over the
