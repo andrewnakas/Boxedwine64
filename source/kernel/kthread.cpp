@@ -297,6 +297,91 @@ public:
 
 struct futex system_futex[MAX_FUTEXES];
 
+// ---------------------------------------------------------------------------
+// Pending-wake records for the no-word-change ("pure signal") futex.
+//
+// wine's NtWaitForAlertByThreadId / NtAlertThreadByThreadId is implemented over
+// a futex whose WORD NEVER CHANGES (word=0 on both the WAIT and the WAKE side —
+// it is an edge-triggered signal, not a lock). For a normal lock futex the
+// waiter's userspace word compare catches a wake-before-wait race (the word
+// moved), but here the word is identical, so a WAKE that lands before the
+// waiter parks is lost and the thread hangs forever. This is the residual boot
+// wedge traced in UPDATE 6: `tidA WAKE addr=X woke=0` immediately followed by
+// `tidB WAIT addr=X`.
+//
+// Fix: when a WAKE wakes NOBODY, remember a single pending wake for that
+// address; the next fresh WAIT on that address consumes it and returns a
+// (permitted) spurious EWOULDBLOCK instead of parking, so the caller re-checks
+// its alert state and makes progress. Spurious futex wakeups are always legal
+// (the caller rechecks the userspace word), so an over-eager pending consumed
+// by an unrelated lock waiter only costs that waiter one extra re-check loop —
+// never a hang — and the record self-heals (it is consumed exactly once).
+//
+// LOCK DISCIPLINE: gPendingWakeMutex is taken ONLY on the two COLD paths — a
+// woke-nobody WAKE, and a fresh WAIT that already passed the word compare and is
+// about to allocate a slot and park. It is NEVER taken on the hot paths (a WAKE
+// that woke a real waiter, or a WAIT whose word mismatched / single-threaded
+// early-out), so it does not serialize the common unlock or would-block. This
+// is the lock-light form of the pending-wake ring that UPDATE 6 prototyped but
+// rejected for putting a global mutex on the hot path.
+#define MAX_PENDING_WAKES 256
+struct pendingWake {
+    U64 address = 0; // host ram pointer key (0 == empty slot)
+    U32 process = 0; // owning process id (private-futex scoping, parity w/ WAKE)
+    U32 count = 0;   // outstanding woke-nobody wakes for (process,address)
+};
+static struct pendingWake gPendingWakes[MAX_PENDING_WAKES];
+static std::mutex gPendingWakeMutex;
+
+// Record one wake that found no parked waiter. Caller holds gPendingWakeMutex.
+static void recordPendingWakeLocked(U32 process, U64 address) {
+    int free = -1;
+    for (int i = 0; i < MAX_PENDING_WAKES; i++) {
+        if (gPendingWakes[i].address == address && gPendingWakes[i].process == process) {
+            // Cap accumulation: one pending is enough to bridge wake-before-wait;
+            // capping keeps a chronically-unconsumed address from spinning a
+            // future waiter through many spurious returns.
+            if (gPendingWakes[i].count < 2) gPendingWakes[i].count++;
+            return;
+        }
+        if (free < 0 && gPendingWakes[i].address == 0) free = i;
+    }
+    if (free < 0) {
+        // Table full: evict a victim slot round-robin rather than dropping the
+        // CURRENT wake — the wake we are recording now is the one most likely
+        // racing a waiter this instant, while an old occupied entry has had its
+        // chance to be consumed. Losing the victim's pending only risks the
+        // pre-fix hang for that stale address, no worse than today. (256
+        // distinct in-flight pendings is not reached in normal boots; this is
+        // pure belt-and-suspenders so exhaustion can't drop a live alert.)
+        static U32 victim = 0;
+        free = victim;
+        victim = (victim + 1) % MAX_PENDING_WAKES;
+    }
+    gPendingWakes[free].address = address;
+    gPendingWakes[free].process = process;
+    gPendingWakes[free].count = 1;
+}
+
+// Consume a pending wake for (process,address) if one exists. Caller holds
+// gPendingWakeMutex. Returns true if consumed (caller should not park).
+static bool consumePendingWakeLocked(U32 process, U64 address) {
+    for (int i = 0; i < MAX_PENDING_WAKES; i++) {
+        if (gPendingWakes[i].address == address && gPendingWakes[i].process == process) {
+            if (gPendingWakes[i].count > 0) {
+                gPendingWakes[i].count--;
+                if (gPendingWakes[i].count == 0) {
+                    gPendingWakes[i].address = 0;
+                    gPendingWakes[i].process = 0;
+                }
+                return true;
+            }
+            return false;
+        }
+    }
+    return false;
+}
+
 struct futex* getFutex(KThread* thread, U64 address) {
     int i=0;
 
@@ -565,7 +650,25 @@ S64 KThread::futex64(U64 addr, U32 op, U32 value, U64 timeoutAddr, U32 val3) {
                 expireTime = (U32)(seconds * 1000 + nano / 1000000);
                 expireTime += KSystem::getMilliesSinceStart();
             }
-            f = allocFutex(this, ramAddress, expireTime);
+            // Wake-before-wait bridge for the no-word-change alert futex, made
+            // atomic against a racing WAKE. gPendingWakeMutex is the bucket lock
+            // spanning "consume-pending OR register-slot" here and "flag-slot OR
+            // record-pending" on the WAKE side, so for any interleaving the
+            // waiter either (a) consumes a pending the WAKE already recorded, or
+            // (b) registers its slot before the WAKE scans — the WAKE then finds
+            // and flags it. The lost ordering (waiter consumes false, THEN WAKE
+            // records after the slot scan missed it) can no longer happen
+            // because both sides are serialized by this lock. Cold path only —
+            // reached after the word compare and thread-count checks above.
+            {
+                std::lock_guard<std::mutex> lk(gPendingWakeMutex);
+                if (consumePendingWakeLocked(process->id, ramAddress)) {
+                    return -K_EWOULDBLOCK;
+                }
+                // Register the slot while still holding the bucket lock so a WAKE
+                // scanning after this point is guaranteed to see it.
+                f = allocFutex(this, ramAddress, expireTime);
+            }
             if (cmd == FUTEX_WAIT_BITSET) {
                 f->mask = val3;
             }
@@ -646,6 +749,14 @@ S64 KThread::futex64(U64 addr, U32 op, U32 value, U64 timeoutAddr, U32 val3) {
         }
     } else if (cmd == FUTEX_WAKE || cmd == FUTEX_WAKE_BITSET) {
         U32 count = 0;
+        // Hold the pending-wake bucket lock across the WHOLE scan and the
+        // woke-nobody record so it is atomic against a racing fresh WAIT (which
+        // holds the same lock across its consume-pending + slot registration).
+        // Lock order is gPendingWakeMutex -> per-slot cond, matching the WAIT
+        // side (allocFutex under the same lock), so no deadlock. This is the
+        // serialization the real kernel's hash-bucket lock provides between
+        // WAKE and the enqueue half of WAIT.
+        std::lock_guard<std::mutex> pendingLk(gPendingWakeMutex);
         for (int i = 0; i < MAX_FUTEXES && count < value; i++) {
             if (!system_futex[i].thread) {
                 continue;
@@ -676,6 +787,17 @@ S64 KThread::futex64(U64 addr, U32 op, U32 value, U64 timeoutAddr, U32 val3) {
                 BOXEDWINE_CONDITION_SIGNAL(system_futex[i].cond);
                 count++;
             }
+        }
+        // Woke nobody: if this was a no-word-change alert WAKE racing ahead of
+        // its waiter, the signal would be lost. Remember it so the imminent WAIT
+        // consumes it (see consumePendingWakeLocked / pendingWake above). Only a
+        // plain FUTEX_WAKE qualifies — BITSET wakes carry a mask the simple
+        // pending record can't represent, and uncontended unlocks that record a
+        // stray pending only cost a future waiter one harmless re-check. Still
+        // under pendingLk, so this record cannot slip past a concurrent WAIT's
+        // consume+register.
+        if (count == 0 && cmd == FUTEX_WAKE) {
+            recordPendingWakeLocked(this->process->id, ramAddress);
         }
         return count;
     } else if (cmd == 3 /*REQUEUE*/ || cmd == 4 /*CMP_REQUEUE*/ || cmd == 5 /*WAKE_OP*/) {
