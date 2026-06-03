@@ -646,9 +646,16 @@ S64 KThread::futex64(U64 addr, U32 op, U32 value, U64 timeoutAddr, U32 val3) {
             bool addressCheck = system_futex[i].address == ramAddress;
             bool maskCheck = ((cmd != FUTEX_WAKE_BITSET) || (system_futex[i].mask & val3));
             if (processCheck && addressCheck && !system_futex[i].wake && maskCheck) {
-                if (!system_futex[i].waiting) {
-                    continue;
-                }
+                // LOST-WAKEUP FIX: a registered slot is a live waiter even when
+                // `waiting` is still false — that flag is only set AFTER the WAIT
+                // path drops allocFutex's cond and re-takes it (kthread.cpp ~567
+                // -> ~585). A FUTEX_WAKE landing in that window used to `continue`
+                // here (skip without flagging), so the waiter then parked forever
+                // (the boot-storm wedge: glibc/ld.so locks at fixed addrs whose
+                // unlock-wake raced the lock-wait). Mark wake unconditionally; the
+                // WAIT path re-checks `wake` under this same cond before blocking,
+                // so flagging a not-yet-parked waiter is correct and the SIGNAL is
+                // a harmless no-op if nobody is on the condition yet.
                 system_futex[i].wake = true;
                 BOXEDWINE_CONDITION_SIGNAL(system_futex[i].cond);
                 count++;
