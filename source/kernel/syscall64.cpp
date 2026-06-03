@@ -266,7 +266,8 @@
 // Assertion 'obj->refcount' failed"), we dump the ring so the request sequence
 // that led to the crash is visible WITHOUT the multi-GB BW64_IPCDUMP firehose.
 // Zero cost when the env var is unset.
-// kind: 'W'=write, 'R'=read, 'M'=recvmsg, 'F'=scm_rights fd delivered.
+// kind: 'W'=write, 'R'=read, 'M'=recvmsg, 'F'=scm_rights fd delivered (recv),
+//       'S'=sendmsg scm_rights fd sent (e0=#fds, e1=first guest fd).
 // extra0/extra1 carry per-kind context (see crashRingRecordRead callers).
 struct CrashRingEntry { char kind; U32 pid; U32 fd; U32 len; U32 extra0; U32 extra1; U8 hdr[16]; };
 static CrashRingEntry g_crashRing[64];
@@ -2079,6 +2080,16 @@ static U64 sys_sendmsg64(CPU64* cpu, U64 fd, U64 msg64, U64 flags) {
     m32->writed(base + MSG_SCRATCH_HDR + 24, 0);                 // msg_flags
 
     U32 rc = ksendmsg(thread, (U32)fd, base + MSG_SCRATCH_HDR, (U32)flags);
+    // Record the SEND side of fd-passing in the crashring ('S'). get_handle_fd
+    // (wineserver -> client) is the request that precedes the deterministic
+    // teardown crash; seeing whether/which fd wineserver actually sent (and
+    // whether ksendmsg succeeded) is the missing half — recvmsg's 'M'/'F' only
+    // capture the receive side. e0 = #fds sent, e1 = the first guest fd value.
+    if (wsReadEnabled() && ctllen32) {
+        U32 firstFd = (control && ctllen >= 16) ? cpu->memory->readd(control + 16) : 0;
+        crashRingRecordRead('S', (U32)thread->process->id, (U32)fd,
+                            nullptr, 0, ctllen32 / 16, firstFd);
+    }
     if (getenv("BW64_IPCDUMP")) {
         klog_fmt("IPC [pid=%d] sendmsg fd=%d datalen=%d ctllen32=%d -> rc=%d",
                  (int)thread->process->id, (int)fd, (int)total, (int)ctllen32, (int)(S32)rc);
