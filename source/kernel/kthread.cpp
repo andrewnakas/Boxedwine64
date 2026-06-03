@@ -524,6 +524,7 @@ S64 KThread::futex64(U64 addr, U32 op, U32 value, U64 timeoutAddr, U32 val3) {
 
     if (cmd == FUTEX_WAIT || cmd == FUTEX_WAIT_BITSET) {
         struct futex* f = getFutex(this, ramAddress);
+        bool freshWait = false;
 
         // Re-entry after being woken (single-threaded re-execution) or after a
         // host-thread wakeup: the slot exists and was flagged. Consume it.
@@ -568,6 +569,7 @@ S64 KThread::futex64(U64 addr, U32 op, U32 value, U64 timeoutAddr, U32 val3) {
             if (cmd == FUTEX_WAIT_BITSET) {
                 f->mask = val3;
             }
+            freshWait = true;
         }
 
         // Park. In multi-threaded builds the WAIT loop blocks the host thread
@@ -581,6 +583,20 @@ S64 KThread::futex64(U64 addr, U32 op, U32 value, U64 timeoutAddr, U32 val3) {
             if (f->wake) {
                 freeFutex(f);
                 return 0;
+            }
+            // Re-read the futex WORD now that the slot is registered and its cond
+            // is held. There is a race between the initial word compare (before
+            // allocFutex) and slot registration: another thread can change the
+            // word and FUTEX_WAKE in that gap; the WAKE finds no slot yet and is
+            // lost, and we would then park forever on a word that already moved.
+            // The real kernel rechecks the word under the hash-bucket lock for
+            // exactly this reason — if it no longer matches, the condition we
+            // meant to wait for is gone, so return EWOULDBLOCK and let the caller
+            // re-evaluate instead of blocking on a stale value. (Fresh WAIT only:
+            // a re-entry `f` already owns its slot and may be legitimately armed.)
+            if (freshWait && mem->readd(addr) != value) {
+                freeFutex(f);
+                return -K_EWOULDBLOCK;
             }
             f->waiting = true;
 #ifdef BOXEDWINE_MULTI_THREADED
