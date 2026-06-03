@@ -326,13 +326,55 @@ static U64 sys_write64(CPU64* cpu, U64 fd, U64 buf, U64 count) {
         // Tee stdout/stderr to host console so ld-linux + glibc diagnostics
         // surface immediately. Also forward to the kobject so anything
         // tailing the host FS still sees it.
-        klog_fmt("[guest fd=%llu] %s", (unsigned long long)fd, (const char*)buffer.data());
+        U32 wpid = (cpu->thread && cpu->thread->process) ? cpu->thread->process->id : 0;
+        const char* wexe = (cpu->thread && cpu->thread->process) ? cpu->thread->process->name.c_str() : "?";
+        klog_fmt("[guest fd=%llu pid=%u %s] %s", (unsigned long long)fd, (unsigned)wpid, wexe, (const char*)buffer.data());
         // On a guest abort, dump the request ring so we can see the wineserver
         // request sequence that triggered the double-release.
         if (fd == 2 && (strstr((const char*)buffer.data(), "release_object") ||
                         strstr((const char*)buffer.data(), "Assertion") ||
+                        strstr((const char*)buffer.data(), "tcache") ||
+                        strstr((const char*)buffer.data(), "unaligned") ||
+                        strstr((const char*)buffer.data(), "unimplemented function") ||
                         strstr((const char*)buffer.data(), "corrupted"))) {
             crashRingDump((const char*)buffer.data());
+        }
+        // BW64_STUBDUMP: when wine reports a call to an unimplemented function,
+        // dump the live register/stack state so we can identify the stub and the
+        // ABI register the dll/func name strings actually landed in. The abort
+        // message itself loses the names (they print as ".garbage").
+        if (fd == 2 && getenv("BW64_STUBDUMP") &&
+            strstr((const char*)buffer.data(), "unimplemented function")) {
+            auto rdStr = [&](U64 a) -> std::string {
+                std::string s;
+                if (!a) return "<null>";
+                for (int i = 0; i < 64; i++) {
+                    U8 c = cpu->memory->readb(a + i);
+                    if (!c) break;
+                    if (c < 32 || c > 126) { s += '?'; } else s += (char)c;
+                }
+                return s.empty() ? "<empty>" : s;
+            };
+            klog_fmt("STUBDUMP pid=%u RIP=%llx RSP=%llx RAX=%llx RCX=%llx RDX=%llx R8=%llx R9=%llx RDI=%llx RSI=%llx",
+                     (unsigned)wpid, (unsigned long long)cpu->rip,
+                     (unsigned long long)cpu->reg[X64_RSP].u64, (unsigned long long)cpu->reg[X64_RAX].u64,
+                     (unsigned long long)cpu->reg[X64_RCX].u64, (unsigned long long)cpu->reg[X64_RDX].u64,
+                     (unsigned long long)cpu->reg[X64_R8].u64, (unsigned long long)cpu->reg[X64_R9].u64,
+                     (unsigned long long)cpu->reg[X64_RDI].u64, (unsigned long long)cpu->reg[X64_RSI].u64);
+            klog_fmt("STUBDUMP  RCX->\"%s\" RDX->\"%s\" R8->\"%s\" RDI->\"%s\" RSI->\"%s\"",
+                     rdStr(cpu->reg[X64_RCX].u64).c_str(), rdStr(cpu->reg[X64_RDX].u64).c_str(),
+                     rdStr(cpu->reg[X64_R8].u64).c_str(), rdStr(cpu->reg[X64_RDI].u64).c_str(),
+                     rdStr(cpu->reg[X64_RSI].u64).c_str());
+            auto rdq = [&](U64 a) -> U64 {
+                U64 v = 0;
+                for (int b = 0; b < 8; b++) v |= ((U64)cpu->memory->readb(a + b)) << (b * 8);
+                return v;
+            };
+            U64 sp = cpu->reg[X64_RSP].u64;
+            for (int i = 0; i < 12; i++) {
+                U64 v = rdq(sp + (U64)i * 8);
+                klog_fmt("STUBDUMP  [rsp+%02x]=%llx  ->\"%s\"", i * 8, (unsigned long long)v, rdStr(v).c_str());
+            }
         }
     } else if (cpu->thread && cpu->thread->process) {
         crashRingRecord(cpu->thread->process->id, (U32)fd, buffer.data(), (U32)count);

@@ -98,6 +98,18 @@ private:
     // Inbound assembly buffer (a request may straddle recvBuffer chunks).
     std::vector<uint8_t> in;
 
+    // Per-request zero-padded dispatch scratch (see onData). Reused across
+    // requests to avoid per-request allocation. REQ_SCRATCH_FLOOR is >= the
+    // largest fixed request-header offset any handler reads (X11 core requests
+    // are at most 32 header bytes; 64 leaves margin), so an undersized request
+    // never reads past the assembled bytes into uninitialized memory.
+    static constexpr uint32_t REQ_SCRATCH_FLOOR = 64;
+    // Extra zero bytes appended after the request so a handler whose over-read is
+    // driven by an in-request sub-length byte (max 255 entries * 2 bytes wide)
+    // cannot run past the allocation even on a malformed request.
+    static constexpr uint32_t REQ_SCRATCH_GUARD = 1024;
+    std::vector<uint8_t> reqScratch;
+
     // ---- resource model ----
     // The window/drawable registry is SERVER-GLOBAL (XWireServer::windows),
     // because X resource ids are shared across all client connections and

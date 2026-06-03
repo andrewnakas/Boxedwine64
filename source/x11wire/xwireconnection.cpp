@@ -1351,7 +1351,22 @@ void XWireConnection::onData() {
         if (units == 0) units = 1;            // defensive
         uint32_t reqLen = units * 4;
         if (in.size() < reqLen) break;        // incomplete; wait for more
-        processOneRequest(in.data(), reqLen);
+        // Dispatch from a zero-padded copy, not directly out of `in`. Several
+        // request handlers read fixed fields (e.g. rd32(req+4), req[16+i]) whose
+        // offsets can exceed this particular request's declared reqLen — a short
+        // request would otherwise read past the assembled bytes into the vector's
+        // reserved-but-uninitialized tail (ASan "container-overflow") and act on
+        // stale/garbage data, which cascaded into wineserver heap corruption
+        // (release_object / unaligned-tcache) and GUI-client aborts. Padding to a
+        // safe header floor makes every such over-read return a deterministic 0.
+        reqScratch.assign(in.begin(), in.begin() + reqLen);
+        // Pad with a zero guard region so any handler over-read — a fixed field
+        // past a short request, or a sub-length-driven variable read on a
+        // malformed request — lands on deterministic zeros inside this buffer
+        // rather than past the allocation. Floor keeps tiny requests covered.
+        uint32_t scratchLen = (reqLen > REQ_SCRATCH_FLOOR ? reqLen : REQ_SCRATCH_FLOOR) + REQ_SCRATCH_GUARD;
+        reqScratch.resize(scratchLen, 0);
+        processOneRequest(reqScratch.data(), reqLen);
         in.erase(in.begin(), in.begin() + reqLen);
     }
     // Ride any pending host input out on this same wake (wine just talked to us,
