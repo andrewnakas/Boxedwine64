@@ -404,6 +404,51 @@ static U64 sys_write64(CPU64* cpu, U64 fd, U64 buf, U64 count) {
                     }
                 }
             }
+            // BW64_MALLOCDUMP: for the glibc malloc-METADATA faces ("unaligned
+            // tcache chunk" / "corrupted double-linked list" / "corrupted
+            // unsorted chunks") — the dominant faces of bug #2 — REFWATCH can't
+            // fire (no release_object). glibc's malloc_printerr(msg) is reached
+            // from the freelist-walk that detected the bad chunk, and the bad
+            // chunk pointer is usually still live in a callee-saved register
+            // (rbx/rbp/r12-r15, preserved across __libc_message) or a nearby
+            // stack slot. Dump them + flag stack words that point into the
+            // wineserver heap range so we can correlate the corrupted address
+            // against recent writes (BW64_MEMRING). Cheap: abort path only.
+            if (getenv("BW64_MALLOCDUMP") &&
+                (strstr((const char*)buffer.data(), "tcache") ||
+                 strstr((const char*)buffer.data(), "corrupted") ||
+                 strstr((const char*)buffer.data(), "unaligned"))) {
+                auto rdq = [&](U64 a) -> U64 {
+                    U64 v = 0;
+                    for (int b = 0; b < 8; b++) v |= ((U64)cpu->memory->readb(a + b)) << (b * 8);
+                    return v;
+                };
+                klog_fmt("MALLOCDUMP pid=%u %s RIP=%llx RSP=%llx RBP=%llx RBX=%llx R12=%llx R13=%llx R14=%llx R15=%llx RDI=%llx RSI=%llx",
+                         (unsigned)wpid, wexe, (unsigned long long)cpu->rip,
+                         (unsigned long long)cpu->reg[X64_RSP].u64, (unsigned long long)cpu->reg[X64_RBP].u64,
+                         (unsigned long long)cpu->reg[X64_RBX].u64, (unsigned long long)cpu->reg[X64_R12].u64,
+                         (unsigned long long)cpu->reg[X64_R13].u64, (unsigned long long)cpu->reg[X64_R14].u64,
+                         (unsigned long long)cpu->reg[X64_R15].u64, (unsigned long long)cpu->reg[X64_RDI].u64,
+                         (unsigned long long)cpu->reg[X64_RSI].u64);
+                // Heap candidates: glibc's main arena heap lives well above the
+                // PE/text mappings and below the stack. Print stack words that
+                // look like heap data pointers (not text <0x500000000, not near
+                // rsp), and dump 16 bytes around each — a corrupted chunk shows a
+                // mis-aligned or wild fd/bk.
+                U64 sp = cpu->reg[X64_RSP].u64;
+                for (int i = 0; i < 64; i++) {
+                    U64 v = rdq(sp + (U64)i * 8);
+                    if (v > 0x500000000ULL && v < 0x800000000000ULL &&
+                        (v < sp - 0x200000 || v > sp + 0x200000)) {
+                        klog_fmt("MALLOCDUMP   [rsp+%03x]=0x%llx  chunk?[-8..+16]= %016llx | %016llx %016llx %016llx",
+                                 i * 8, (unsigned long long)v,
+                                 (unsigned long long)rdq(v - 8), (unsigned long long)rdq(v),
+                                 (unsigned long long)rdq(v + 8), (unsigned long long)rdq(v + 16));
+                    }
+                }
+                // Correlate against the wineserver write ring (BW64_MEMRING).
+                kmemory64DumpMemRing(0);
+            }
         }
         // BW64_STUBDUMP: when wine reports a call to an unimplemented function,
         // dump the live register/stack state so we can identify the stub and the

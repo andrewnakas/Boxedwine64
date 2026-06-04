@@ -9,6 +9,7 @@
 
 #include "boxedwine.h"
 #include "kmemory64.h"
+#include "cpu64.h"   // CPU64 full def — BW64_MEMRING reads the running thread's rip
 
 #ifdef BOXEDWINE_GUEST_X64
 
@@ -424,9 +425,59 @@ static void initWatch() {
     if (g_watchLen == 0) g_watchLen = 8;
 }
 
+// BW64_MEMRING: a ring of the most recent guest writes made BY THE WINESERVER
+// process, each tagged with the guest RIP that issued it (recovered from the
+// running thread's CPU64). Bug #2's dominant faces are glibc malloc-metadata
+// corruption ("unaligned tcache chunk" / "corrupted ... double linked list") —
+// a stray/overshooting write landed in a heap chunk's metadata word. At the
+// abort, BW64_MALLOCDUMP prints candidate corrupted-chunk addresses; dumping
+// this ring lets us find the WRITE (and its RIP) that hit that address. Gated;
+// when off, recordMemWrite is a couple of cheap checks. Only wineserver writes
+// are recorded to keep the ring signal-dense (the bug is in its own heap).
+struct MemRingRec { U64 rip; U64 addr; U32 len; U64 value; };
+static MemRingRec g_memRing[256];
+static U32        g_memRingNext = 0;
+static std::mutex g_memRingMutex;
+static bool       g_memRingInit = false, g_memRingOn = false;
+
+void KMemory64::recordMemWrite(U64 addr, U64 len, U64 value) {
+    if (!g_memRingInit) { g_memRingOn = std::getenv("BW64_MEMRING") != nullptr; g_memRingInit = true; }
+    if (!g_memRingOn) return;
+    if (!process || !process->exe.contains("wineserver")) return;
+    U64 rip = 0;
+    KThread* t = KThread::currentThread();
+    if (t && t->cpu64) rip = t->cpu64->rip;
+    std::lock_guard<std::mutex> lk(g_memRingMutex);
+    g_memRing[g_memRingNext % 256] = { rip, addr, (U32)len, value };
+    g_memRingNext++;
+}
+
+// Dump the ring newest-first, flagging any entry whose target is at/near `near`
+// (0 = no correlation filter). Called from the abort path in syscall64.cpp.
+void kmemory64DumpMemRing(U64 nearAddr) {
+    if (!g_memRingOn) return;
+    std::lock_guard<std::mutex> lk(g_memRingMutex);
+    klog_fmt("MEMRING: last %u wineserver guest writes (newest first)%s:",
+             (g_memRingNext < 256 ? g_memRingNext : 256),
+             nearAddr ? " [* = within 64B of a malloc-dump candidate]" : "");
+    U32 n = (g_memRingNext < 256) ? g_memRingNext : 256;
+    for (U32 k = 0; k < n; k++) {
+        U32 idx = (g_memRingNext + 256 - 1 - k) % 256;
+        const MemRingRec& r = g_memRing[idx];
+        bool hot = nearAddr && (r.addr <= nearAddr + 64 && r.addr + r.len + 64 > nearAddr);
+        klog_fmt("MEMRING:  %s rip=0x%llx -> [0x%llx] len=%u val=0x%llx",
+                 hot ? "*" : " ", (unsigned long long)r.rip,
+                 (unsigned long long)r.addr, r.len, (unsigned long long)r.value);
+    }
+}
+
 void KMemory64::memcpyToGuest(U64 dstGuest, const void* src, U64 len) {
     const U8* s = (const U8*)src;
     strayWriteCheck(dstGuest, len);
+    {
+        U64 v = 0; if (len >= 8) std::memcpy(&v, src, 8); else std::memcpy(&v, src, (size_t)len);
+        recordMemWrite(dstGuest, len, v);
+    }
     if (!g_watchInit) initWatch();
     if (g_watchAddr && dstGuest < g_watchAddr + g_watchLen && dstGuest + len > g_watchAddr) {
         U64 v = 0;
@@ -503,6 +554,7 @@ U64 KMemory64::readq(U64 addr) {
 
 void KMemory64::writeb(U64 addr, U8 value) {
     strayWriteCheck(addr, 1);
+    recordMemWrite(addr, 1, value);
     U8* data = commitPageLocked(addr >> K64_PAGE_SHIFT, K64_PAGE_MAPPED | K64_PAGE_READ | K64_PAGE_WRITE);
     data[addr & K64_PAGE_MASK] = value; // commit-on-write (MT-safe)
 }

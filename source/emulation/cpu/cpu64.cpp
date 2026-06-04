@@ -562,8 +562,123 @@ void cpu64DumpOpProfile() {
     klog_fmt("BW64_OPPROF: %llu instructions profiled", (unsigned long long)total);
 }
 
+// ---------------------------------------------------------------------------
+// BW64_REFWATCH: refcount double-release canary for bug #2 (wineserver teardown
+// heap corruption). The assert that aborts wineserver is
+//     server/object.c:443  assert( obj->refcount );   // release_object()
+// i.e. release_object() is called on a struct object whose refcount is ALREADY
+// 0 — a double-release / use-after-free. (refcount is the first member, a 4-byte
+// unsigned int at offset 0; ops* is at +8. Verified from the stripped wineserver64
+// disassembly: release_object @ file-vaddr 0x30170 begins
+//   53               push %rbx                ; function entry (we trap HERE)
+//   8b 07            mov  (%rdi),%eax        ; eax = obj->refcount
+//   85 c0            test %eax,%eax
+//   74 xx            je   <assert_fail path>  ; refcount==0 -> abort.)
+//
+// WSBT (stack scan at the abort WRITE) couldn't name the culprit because the
+// binary is stripped + frame-pointer-omitted. This catches the bug ONE
+// instruction EARLIER — at release_object's entry, while %rdi still holds the
+// dying object and [%rsp] still holds the CALLER's return address — which is the
+// exact wineserver call site that released a dead object (the fix lead).
+//
+// Self-validating: rather than trust a load base, we confirm the 4 prologue
+// bytes (8b 07 85 c0) at the probed address; default address is the fixed PIE
+// base (0x400000000) + 0x30170, overridable via BW64_REFWATCH=0xADDR. Gated;
+// one rip compare per instruction only when the env is set.
+static bool g_refWatchInit = false;
+static U64  g_refObjAddr = 0;          // absolute guest vaddr of release_object
+static bool g_refValidated = false;    // prologue bytes confirmed at g_refObjAddr
+// Small ring of recent release_object calls so that, at the fatal double-release,
+// we can also show the object's PRIOR (legitimate, final) release + its caller.
+struct RefRelRec { U64 obj; U64 caller; U32 refBefore; U32 pid; };
+static RefRelRec g_refRing[64];
+static U32       g_refRingNext = 0;
+static std::mutex g_refRingMutex;
+
+static void refWatchInit() {
+    g_refWatchInit = true;
+    const char* e = std::getenv("BW64_REFWATCH");
+    if (!e) return;
+    if (e[0] == '0' && (e[1] == 'x' || e[1] == 'X'))
+        g_refObjAddr = std::strtoull(e, nullptr, 0);
+    else
+        g_refObjAddr = 0x400000000ULL + 0x30170ULL; // PIE base + release_object
+}
+
 U32 CPU64::step() {
     U64 ipStart = rip;
+
+    // BW64_REFWATCH probe: catch wineserver's double-release at release_object
+    // entry, one instruction before the assert. See the big comment above.
+    if (!g_refWatchInit) refWatchInit();
+    if (g_refObjAddr && rip == g_refObjAddr) {
+        // Confirm we're really at release_object (prologue 8b 07 85 c0). Done
+        // once; if the bytes don't match, the base guess is wrong — disarm so we
+        // don't spam on a coincidental rip match.
+        if (!g_refValidated) {
+            // release_object entry: 53 (push %rbx) 8b 07 (mov (%rdi),%eax)
+            // 85 c0 (test %eax,%eax). We trap the very first byte (entry), where
+            // %rdi still holds the object and [%rsp] is the caller's return addr.
+            U8 b0 = fetchByte(rip), b1 = fetchByte(rip + 1),
+               b2 = fetchByte(rip + 2), b3 = fetchByte(rip + 3);
+            if (b0 == 0x53 && b1 == 0x8b && b2 == 0x07 && b3 == 0x85) {
+                g_refValidated = true;
+                klog_fmt("REFWATCH: armed — release_object confirmed at 0x%llx (pid=%u %s)",
+                         (unsigned long long)rip,
+                         (unsigned)(thread && thread->process ? thread->process->id : 0),
+                         (thread && thread->process) ? thread->process->name.c_str() : "?");
+            } else {
+                klog_fmt("REFWATCH: prologue mismatch at 0x%llx (got %02x %02x %02x %02x) — disarming; set BW64_REFWATCH=0x<release_object addr>",
+                         (unsigned long long)rip, b0, b1, b2, b3);
+                g_refObjAddr = 0;
+            }
+        }
+        if (g_refObjAddr) {
+            U64 obj    = reg[X64_RDI].u64;
+            U32 refNow = memory ? memory->readd(obj) : 0;
+            U64 caller = (memory && reg[X64_RSP].u64) ? memory->readq(reg[X64_RSP].u64) : 0;
+            U32 pid    = (thread && thread->process) ? thread->process->id : 0;
+            {
+                std::lock_guard<std::mutex> lk(g_refRingMutex);
+                if (refNow == 0) {
+                    // THE BUG: releasing an object whose refcount is already 0.
+                    U64 ops = memory ? memory->readq(obj + 8) : 0;
+                    klog_fmt("REFWATCH: *** DOUBLE-RELEASE *** pid=%u obj=0x%llx refcount=0 "
+                             "ops=0x%llx caller=0x%llx (caller-PIE=0x%llx)",
+                             (unsigned)pid, (unsigned long long)obj,
+                             (unsigned long long)ops, (unsigned long long)caller,
+                             (unsigned long long)(caller >= 0x400000000ULL ? caller - 0x400000000ULL : caller));
+                    // First 32 bytes of the dead object for ops/struct identification.
+                    char hx[128] = {0};
+                    for (int i = 0; i < 32; i++)
+                        snprintf(hx + i * 3, 4, "%02x ", memory ? memory->readb(obj + i) : 0);
+                    klog_fmt("REFWATCH:   obj[0..32]= %s", hx);
+                    // Replay any earlier release of THIS object from the ring — the
+                    // legitimate final release + its caller, to pair against this
+                    // buggy one. (Newest-first.)
+                    for (U32 k = 0; k < 64; k++) {
+                        U32 idx = (g_refRingNext + 64 - 1 - k) % 64;
+                        if (g_refRing[idx].obj == obj) {
+                            klog_fmt("REFWATCH:   prior release of obj=0x%llx: caller=0x%llx (PIE=0x%llx) refBefore=%u pid=%u",
+                                     (unsigned long long)obj,
+                                     (unsigned long long)g_refRing[idx].caller,
+                                     (unsigned long long)(g_refRing[idx].caller >= 0x400000000ULL ? g_refRing[idx].caller - 0x400000000ULL : g_refRing[idx].caller),
+                                     g_refRing[idx].refBefore, g_refRing[idx].pid);
+                        }
+                    }
+                    // Dump the wineserver write ring filtered to this object's
+                    // body (refcount + list linkage) — shows every write to the
+                    // dead object's next/prev/refcount + the issuing RIP, so we
+                    // can tell a stray/duplicate LINK write (emulator-induced)
+                    // from a genuine wine double-link. (BW64_MEMRING must be set.)
+                    kmemory64DumpMemRing(obj);
+                }
+                // Record every release (including this fatal one) into the ring.
+                g_refRing[g_refRingNext % 64] = { obj, caller, refNow, pid };
+                g_refRingNext++;
+            }
+        }
+    }
 
     Prefixes p;
     U32 opOff = consumePrefixes(p);

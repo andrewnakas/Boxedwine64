@@ -207,6 +207,11 @@ public:
     // guest-heap corruption ASan can't see. No-op unless the env var is set.
     void strayWriteCheck(U64 dstGuest, U64 len);
 
+    // BW64_MEMRING (see kmemory64.cpp): record a wineserver guest write + its
+    // issuing RIP into a ring, dumped at the malloc/refcount abort to find the
+    // write that corrupted a heap chunk. No-op unless the env var is set.
+    void recordMemWrite(U64 addr, U64 len, U64 value);
+
 private:
     KProcess* process;
     std::unordered_map<U64, std::unique_ptr<K64Page>> pages;
@@ -253,6 +258,11 @@ private:
     U8* commitPageLocked(U64 pageNum, U32 flagsIfNew);
     K64Page* getPage(U64 pageNum) const;
 };
+
+// BW64_MEMRING dump (see kmemory64.cpp): print the recent wineserver guest-write
+// ring, flagging any write near `nearAddr` (a malloc-dump corrupted-chunk
+// candidate; pass 0 to skip correlation). Called from the abort path.
+void kmemory64DumpMemRing(U64 nearAddr);
 
 #endif // BOXEDWINE_GUEST_X64
 #endif
