@@ -156,6 +156,7 @@ namespace {
         X_ImageText8            = 76,
         X_ImageText16           = 77,
         X_CreateColormap        = 78,
+        X_FreeColormap          = 79,
         X_QueryColors           = 91,
         X_QueryBestSize         = 97,
         X_GetKeyboardMapping    = 101,
@@ -669,6 +670,7 @@ void XWireConnection::processOneRequest(const uint8_t* req, uint32_t len) {
         case X_DeleteProperty:
         case X_CreatePixmap:
         case X_CreateColormap:
+        case X_FreeColormap:
         case X_PolyFillRectangle:
         case X_CopyArea:
         case X_ChangeProperty:

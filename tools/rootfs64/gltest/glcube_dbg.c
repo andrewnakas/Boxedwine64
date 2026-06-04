@@ -23,7 +23,7 @@
 #define DBG(msg) do{ fprintf(stderr,"GLCUBE_DBG: " msg "\n"); fflush(stderr);}while(0)
 
 static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
-    if (m == WM_CLOSE || m == WM_DESTROY) { PostQuitMessage(0); return 0; }
+    if (m == WM_CLOSE || m == WM_DESTROY) { fprintf(stderr,"GLCUBE_DBG: WndProc msg=0x%x (%s) -> PostQuitMessage\n",(unsigned)m, m==WM_CLOSE?"WM_CLOSE":"WM_DESTROY"); fflush(stderr); PostQuitMessage(0); return 0; }
     return DefWindowProc(h, m, w, l);
 }
 
@@ -98,7 +98,7 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR cmd, int show) {
     int frames = 0;
     DBG("entering render loop"); for (;;) {
         while (PeekMessageA(&msg, 0, 0, 0, PM_REMOVE)) {
-            if (msg.message == WM_QUIT) { DBG("got WM_QUIT -> exiting"); goto done; }
+            if (msg.message == WM_QUIT) { DBG("got WM_QUIT -> exiting"); goto done; } else { fprintf(stderr,"GLCUBE_DBG: msg=0x%x\n",(unsigned)msg.message); fflush(stderr); }
             TranslateMessage(&msg);
             DispatchMessageA(&msg);
         }
