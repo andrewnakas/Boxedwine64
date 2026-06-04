@@ -194,6 +194,13 @@ public:
     // FPE_INTDIV=1), `trapNo` the x86 vector (0 = #DE), `faultAddr` -> si_addr.
     bool raiseSyncFault(U32 sig, U32 trapNo, S32 siCode, U64 faultAddr);
 
+    // Deliver any pending, unmasked async signals queued on this thread by
+    // another thread (cross-thread tkill/tgkill — e.g. wineserver's SIGUSR1
+    // APC nudge). Called by the scheduler at the start of this thread's slice,
+    // before it runs guest code, so the frame is built while the thread is
+    // parked. Returns true if a signal was delivered (rip now in a handler).
+    bool deliverPendingSignals();
+
     void push64(U64 value);
     U64  pop64();
 

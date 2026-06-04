@@ -124,6 +124,7 @@
 #define X64_SYS_pipe2             293
 #define X64_SYS_getdents64        217
 #define X64_SYS_tgkill            234
+#define X64_SYS_tkill             200
 #define X64_SYS_prlimit64         302
 #define X64_SYS_getrlimit         97
 #define X64_SYS_setrlimit         160
@@ -2126,6 +2127,37 @@ static bool deliverSignalSync(CPU64* cpu, U32 sig) {
     return true;
 }
 
+// Deliver one pending, unmasked, installed async signal queued on this thread by
+// a cross-thread tkill/tgkill. Called by the scheduler at the start of the
+// thread's slice (the thread is parked, so building a frame on its CPU64 is
+// safe). At most one per call — the handler runs, and any further pending
+// signals are taken on subsequent slices (after rt_sigreturn unmasks). Returns
+// true if a signal was delivered.
+bool CPU64::deliverPendingSignals() {
+    if (!this->thread) return false;
+    U64 pending;
+    {
+        BOXEDWINE_CRITICAL_SECTION_WITH_MUTEX(this->thread->pendingSignalsMutex);
+        pending = this->thread->pendingSignals & ~this->sigMask;
+    }
+    if (!pending) return false;
+    for (U32 sig = 1; sig <= 64; sig++) {
+        U64 bit = 1ULL << (sig - 1);
+        if (!(pending & bit)) continue;
+        // Only consume the bit if we can actually deliver it (a handler is
+        // installed). If it's SIG_DFL/IGN/uninstalled, leave it pending — for
+        // the wineserver SIGUSR1-APC case the handler is always installed by the
+        // time wineserver signals the client; an undeliverable signal shouldn't
+        // be silently dropped here.
+        if (deliverSignalSync(this, sig)) {
+            BOXEDWINE_CRITICAL_SECTION_WITH_MUTEX(this->thread->pendingSignalsMutex);
+            this->thread->pendingSignals &= ~bit;
+            return true;
+        }
+    }
+    return false;
+}
+
 // Synchronously deliver a hardware-trap-derived signal (SIGFPE on #DE,
 // SIGSEGV on a page fault, ...) at the faulting instruction. Unlike
 // deliverSignalSync (used for raise()/tgkill self), this synthesizes a real
@@ -2604,6 +2636,7 @@ static const char* x64SyscallName(U64 nr) {
         case 231: return "exit_group";
         case 232: return "epoll_wait";
         case 233: return "epoll_ctl";
+        case 200: return "tkill";
         case 234: return "tgkill";
         case 257: return "openat";
         case 262: return "newfstatat";
@@ -2938,21 +2971,43 @@ void ksyscall64(CPU64* cpu) {
             }
             break;
         }
-        case X64_SYS_tgkill: {
-            // tgkill(tgid, tid, sig). Single-thread world: any tid that
-            // matches our own gets the signal delivered synchronously to
-            // ourselves. Wrong-tid targets fall back to ESRCH so callers
-            // can detect a stale tid (matches kernel behaviour).
-            U64 ourTid = cpu->thread ? (U64)cpu->thread->id : 1;
-            U32 sig    = (U32)a3;
-            if (sig == 0) {
-                // sig=0 is the "is this tid alive?" probe — answer "yes"
-                // for our own tid, "no" otherwise. Don't deliver.
-                ret = (a2 == ourTid) ? 0 : (U64)-K_ESRCH;
+        case X64_SYS_tkill:   // tkill(tid, sig)         — a2 unused (tid in a1)
+        case X64_SYS_tgkill: { // tgkill(tgid, tid, sig) — tid in a2
+            // Deliver a signal to a specific thread, possibly in ANOTHER process.
+            // wineserver does exactly this: send_thread_signal() (server/ptrace.c)
+            // does tkill/tgkill(client_pid, client_tid, SIGUSR1) to make a client
+            // thread run a queued APC. The old handler only ever signaled SELF
+            // (returned ESRCH for any tid != our own), so wineserver's APC
+            // delivery ALWAYS failed -> queue_apc() returned 0 -> async_terminate
+            // fell through to a SYNCHRONOUS async_set_result that dropped the
+            // async-queue's reference EARLY -> free_async_queue then released it
+            // AGAIN -> the deterministic teardown double-free (bug #2: the
+            // release_object refcount assert / tcache / double-linked-list faces).
+            // Now: tgkill carries tid in a2, tkill in a1; route cross-thread
+            // through a real per-thread delivery.
+            bool isTgkill = (nr == X64_SYS_tgkill);
+            U32 targetTid = (U32)(isTgkill ? a2 : a1);
+            U32 sig       = (U32)(isTgkill ? a3 : a2);
+            U64 ourTid    = cpu->thread ? (U64)cpu->thread->id : 1;
+            if (targetTid != (U32)ourTid) {
+                KThread* target = KSystem::getThreadById(targetTid);
+                if (!target) { ret = (U64)-K_ESRCH; break; }
+                if (sig == 0) { ret = 0; break; } // liveness probe — target exists
+                // Async cross-thread delivery: arm the target's pending-signal;
+                // the 64-bit scheduler delivers it (deliverSignalSync) at the
+                // target's next slice, before it runs guest code. We can't build
+                // a signal frame here because the target may be executing on a
+                // different host thread.
+                {
+                    BOXEDWINE_CRITICAL_SECTION_WITH_MUTEX(target->pendingSignalsMutex);
+                    target->pendingSignals |= (1ULL << (sig - 1));
+                }
+                ret = 0;
                 break;
             }
-            if (a2 != ourTid) {
-                ret = (U64)-K_ESRCH;
+            if (sig == 0) {
+                // sig=0 to our own tid is a liveness probe — we're alive.
+                ret = 0;
                 break;
             }
             // Set RAX to the syscall's return value *before* building the

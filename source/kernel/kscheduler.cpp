@@ -169,6 +169,14 @@ void runThreadSlice(KThread* thread) {
         CPU64* cpu64 = thread->cpu64 ? thread->cpu64 : thread->process->cpu64;
         if (cpu64) {
             cpu64->yield = false;
+            // Take any cross-thread async signal queued on us (e.g. wineserver's
+            // SIGUSR1 APC nudge via tkill/tgkill) BEFORE running guest code. The
+            // thread is parked here, so building the signal frame on its own
+            // CPU64 is safe. Delivery redirects rip into the handler; the slice
+            // then runs the handler. (Fixes bug #2: without this, wineserver's
+            // cross-thread APC signal was lost, forcing a synchronous
+            // async_set_result that double-freed an async during teardown.)
+            cpu64->deliverPendingSignals();
             try {
                 // Bounded slice: run a slice and return so sibling threads get
                 // CPU time. Only `yield` (the exit/exit_group syscall) is
