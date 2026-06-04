@@ -818,6 +818,15 @@ static U64 sys_openat64(CPU64* cpu, U64 dirfd, U64 pathAddr, U64 flags, U64 /*mo
         std::memset(path, 0, sizeof(path));
         std::strncpy(path, process->exe.c_str(), sizeof(path) - 1);
     }
+    // BW64_DLLPATH: trace the loader's DLL/dir search for the failing first
+    // process — logs every path that mentions the wine install dir, system32,
+    // or a builtin DLL, so we can see WHICH search dirs ntdll constructs (the
+    // bootstrap process never probes x86_64-windows -> "could not load kernel32").
+    if (getenv("BW64_DLLPATH") && (strstr(path, "wine") || strstr(path, "system32") ||
+                                   strstr(path, "x86_64-windows"))) {
+        klog_fmt("DLLPATH pid=%d openat('%s') flags=0x%llx", (int)process->id, path,
+                 (unsigned long long)flags);
+    }
     bool isAbs = (path[0] == '/');
     if (!isAbs && (S32)dirfd != K_AT_FDCWD) {
         klog_fmt("sys_openat64: relative path '%s' with dirfd=%d not yet supported",
@@ -845,6 +854,13 @@ static U64 sys_openat64(CPU64* cpu, U64 dirfd, U64 pathAddr, U64 flags, U64 /*mo
     if (getenv("BW64_DLLTRACE") && (strstr(path, ".dll") || strstr(path, ".exe") ||
                                     strstr(path, "x86_64-windows") || strstr(path, "x86_64-unix"))) {
         klog_fmt("DLLTRACE pid=%d OPEN  '%s' -> fd %d", (int)process->id, path, (int)result->handle);
+    }
+    // BW64_DIRTRACE: log every O_DIRECTORY open (flags&0x10000) so we can see
+    // exactly which directories the failing loader enumerates while hunting for
+    // kernel32.dll, and whether the open itself succeeds.
+    if (getenv("BW64_DIRTRACE") && ((flags & 0x10000) != 0)) {
+        klog_fmt("DIRTRACE pid=%d OPENDIR '%s' -> fd %d (flags=0x%llx)",
+                 (int)process->id, path, (int)result->handle, (unsigned long long)flags);
     }
     // Feed the GUI loading screen's activity log: surface the meaningful things
     // wine loads during the boot storm (DLLs/EXEs, the graphics/font stack) so
@@ -888,16 +904,36 @@ static U64 sys_getdents64_real(CPU64* cpu, U64 fd, U64 dirp, U64 count) {
     // contract and the existing self-test, which runs with no real process).
     if (!dirp) return (U64)-K_EFAULT;
     if (!cpu->thread || !cpu->thread->process) return (U64)-K_ENOSYS;
+    bool dt = getenv("BW64_DIRTRACE") != nullptr;
+    int dtpid = (int)cpu->thread->process->id;
     KFileDescriptorPtr fdesc = cpu->thread->process->getFileDescriptor((FD)fd);
-    if (!fdesc) return (U64)-9; // -EBADF
+    if (!fdesc) { if (dt) klog_fmt("DIRTRACE pid=%d getdents64 fd=%llu -> EBADF (no fdesc)", dtpid, (unsigned long long)fd); return (U64)-9; } // -EBADF
     std::shared_ptr<KFile> kfile = std::dynamic_pointer_cast<KFile>(fdesc->kobject);
-    if (!kfile || !kfile->openFile || !kfile->openFile->node) return (U64)-K_ENOTDIR;
+    if (!kfile || !kfile->openFile || !kfile->openFile->node) { if (dt) klog_fmt("DIRTRACE pid=%d getdents64 fd=%llu -> ENOTDIR (no kfile/openFile/node)", dtpid, (unsigned long long)fd); return (U64)-K_ENOTDIR; }
     FsOpenNode* openNode = kfile->openFile;
-    if (!openNode->node->isDirectory()) return (U64)-K_ENOTDIR;
+    if (!openNode->node->isDirectory()) { if (dt) klog_fmt("DIRTRACE pid=%d getdents64 path='%s' -> ENOTDIR (not a directory)", dtpid, openNode->node->path.c_str()); return (U64)-K_ENOTDIR; }
 
     U32 entries = openNode->getDirectoryEntryCount();
     U64 len = 0;
     U64 pos = dirp;
+    // BW64_DIRTRACE: log each getdents64 directory's path, entry count, file
+    // pointer (resume index), and whether kernel32.dll is among the names. The
+    // residual "could not load kernel32.dll" failure loops openat(O_DIRECTORY)+
+    // getdents64 over the wine builtin DLL dir — this proves whether the listing
+    // actually surfaces kernel32.dll for the failing process.
+    if (getenv("BW64_DIRTRACE")) {
+        bool hasK32 = false; int found = 0;
+        for (U32 j = 0; j < entries; j++) {
+            BString nm; std::shared_ptr<FsNode> e = openNode->getDirectoryEntry(j, nm);
+            if (!e) continue;
+            found++;
+            if (strcasecmp(nm.c_str(), "kernel32.dll") == 0) hasK32 = true;
+        }
+        klog_fmt("DIRTRACE pid=%d path='%s' entries=%u realFound=%d fp=%u kernel32=%d",
+                 (int)cpu->thread->process->id,
+                 openNode->node->path.c_str(), entries, found,
+                 (U32)openNode->getFilePointer(), hasK32 ? 1 : 0);
+    }
     for (U32 i = (U32)openNode->getFilePointer(); i < entries; i++) {
         BString name;
         std::shared_ptr<FsNode> entry = openNode->getDirectoryEntry(i, name);
