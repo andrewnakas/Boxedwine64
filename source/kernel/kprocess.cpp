@@ -1773,6 +1773,16 @@ U32 KProcess::clone64(KThread* thread, U64 flags, U64 child_stack, U64 ptid, U64
         this->memory64->writed(ptid, newThread->id);
     }
 
+    // BW64_THREADLOG: witness how many host threads each guest process runs.
+    // Decisive for bug #2: if wineserver only ever has ONE guest thread, the
+    // "concurrent async-queue list surgery" race is impossible and the
+    // free_async_queue double-release must be a request-ORDERING issue instead.
+    if (getenv("BW64_THREADLOG")) {
+        klog_fmt("THREADLOG: clone64 pid=%u (%s) -> new tid=%u (parent tid=%u)",
+                 (unsigned)this->id,
+                 this->exe.length() ? this->exe.c_str() : this->name.c_str(),
+                 (unsigned)newThread->id, (unsigned)thread->id);
+    }
     scheduleThread(newThread);
     return newThread->id;
 }
