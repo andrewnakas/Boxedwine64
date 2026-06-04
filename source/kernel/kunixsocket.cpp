@@ -30,24 +30,29 @@ KUnixSocketObject::KUnixSocketObject(U32 domain, U32 type, U32 protocol) : KSock
 {
 }
 
-KUnixSocketObject::~KUnixSocketObject() {    
+KUnixSocketObject::~KUnixSocketObject() {
     if (this->node) {
         std::shared_ptr<FsNode> parent = this->node->getParent().lock();
         if (parent) {
             parent->removeChildByName(this->node->name);
         }
-    }    
+    }
 
     std::shared_ptr<KUnixSocketObject> con = this->connection.lock();
     if (con) {
+        // BW64_SOCKDTOR: witness a connected stream socket being destroyed.
+        if (std::getenv("BW64_SOCKDTOR") && this->type == K_SOCK_STREAM && this->connected) {
+            KThread* dt = KThread::currentThread();
+            klog_fmt("SOCKDTOR: destroying connected stream sock this=%p pid=%u "
+                     "peer=%p peerPid=%u byThreadPid=%d byTid=%d",
+                     (void*)this, (unsigned)this->pid, (void*)con.get(),
+                     (unsigned)con->pid,
+                     (int)(dt && dt->process ? dt->process->id : -1),
+                     (int)(dt ? dt->id : -1));
+        }
         BOXEDWINE_CRITICAL_SECTION_WITH_CONDITION(con->lockCond);
         con = this->connection.lock();
         if (con) {
-            // BW64_WSREAD witness: when a client socket is destroyed we tell the
-            // peer (wineserver) EOF. Log whether the peer STILL had unread request
-            // bytes/records buffered at that moment — an EOF-before-drain means
-            // wineserver tears down the client without processing requests it
-            // already sent (the suspected disconnect-cascade double-release).
             if (getenv("BW64_WSREAD")) {
                 klog_fmt("WSDISC: peer EOF set — pid=%u recvUsed=%u msgs=%u (this pid=%u)",
                          (unsigned)con->pid, (unsigned)con->recvBuffer.size_used(),
@@ -59,7 +64,7 @@ KUnixSocketObject::~KUnixSocketObject() {
             BOXEDWINE_CONDITION_SIGNAL_ALL(con->lockCond);
         }
     }
-    
+
     std::shared_ptr<KUnixSocketObject> c = this->connecting.lock();
     if (c) {
         BOXEDWINE_CRITICAL_SECTION_WITH_CONDITION(c->lockCond);
@@ -184,6 +189,13 @@ U32 KUnixSocketObject::internal_write(KThread* thread, const std::shared_ptr<KUn
         return len;
     }
     if (this->outClosed || !con) {
+        // 64-bit threads must not take the SIGPIPE/-K_CONTINUE path (mis-delivered
+        // on the 32-bit cpu, sentinel leaks as a short write -> wine "partial
+        // write"); return a clean -EPIPE like Linux. See writeNative for the full
+        // rationale.
+        if (thread->cpu64) {
+            return -K_EPIPE;
+        }
         return writePipeClosed(thread, false);
     }
     //printf("internal_write: %0.8X size=%d capacity=%d writeLen=%d", (int)&this->connection->recvBuffer, (int)this->connection->recvBuffer.size(), (int)this->connection->recvBuffer.capacity(), len);
@@ -257,6 +269,45 @@ U32 KUnixSocketObject::writeNative(U8* buffer, U32 len) {
     std::shared_ptr<KUnixSocketObject> con = this->connection.lock();
     if (this->outClosed || !con) {
 		KThread* thread = KThread::currentThread();
+        // BW64_WRITECLOSED: the wineserver request-socket write hits this branch
+        // mid-boot and returns -K_CONTINUE (from writePipeClosed's SIGPIPE path),
+        // which leaks to wine as a bogus byte count -> "partial write". Log WHY:
+        // is the peer genuinely outClosed, or did the connection weak_ptr fail to
+        // lock (a transient under MT, peer object still alive elsewhere)?
+        if (std::getenv("BW64_WRITECLOSED")) {
+            klog_fmt("WRITECLOSED: this=%p pid=%d tid=%d len=%u outClosed=%d con=%s inClosed=%d type=%d connected=%d",
+                     (void*)this,
+                     (int)(thread && thread->process ? thread->process->id : -1),
+                     (int)(thread ? thread->id : -1),
+                     (unsigned)len, (int)this->outClosed,
+                     con ? "alive" : "NULL", (int)this->inClosed, (int)this->type,
+                     (int)this->connected);
+        }
+        // A connected stream socket whose peer weak_ptr momentarily fails to lock
+        // (peer object transiently unreferenced under fd-table churn at boot)
+        // is NOT a broken pipe: returning the SIGPIPE/-K_CONTINUE sentinel leaks
+        // out of sys_write64 as a bogus byte count and wine reports "partial
+        // write" -> fatal client error. Treat "connected, not explicitly closed,
+        // peer not lockable" as a transient -EWOULDBLOCK so a blocking writer
+        // retries (the wineserver request socket is blocking) instead of dying.
+        if (!this->outClosed && this->connected && !con) {
+            return -K_EWOULDBLOCK;
+        }
+        // Broken pipe: the peer endpoint is gone. writePipeClosed() raises SIGPIPE
+        // via the 32-bit KThread::runSignal, which (a) builds the signal frame on
+        // the UNUSED 32-bit this->cpu for a 64-bit thread (mis-delivery) and (b)
+        // returns -K_CONTINUE, a sentinel the 64-bit dispatcher leaves in RAX as a
+        // garbage "bytes written" count -> wine reads a short write on its
+        // wineserver request socket -> "partial write" -> fatal client error +
+        // wineserver heap corruption as it reaps the broken client. Real Linux
+        // write-to-broken-pipe with SIGPIPE ignored (wine always SIG_IGNs it)
+        // simply returns -EPIPE. So for a 64-bit thread, return a clean -EPIPE and
+        // never leak the -K_CONTINUE sentinel; the 32-bit path keeps its existing
+        // SIGPIPE behaviour. (See [[project_boxedwine64_bug2_teardown]] for the
+        // same 32-bit-runSignal-on-a-64-bit-thread mis-delivery class.)
+        if (thread && thread->cpu64) {
+            return -K_EPIPE;
+        }
         if (thread) {
             return writePipeClosed(thread, false);
         }
@@ -885,6 +936,16 @@ U32 KUnixSocketObject::sendmsg(KThread* thread, const KFileDescriptorPtr& fd, U3
                 KSocketMsgObject d;
                 d.object = f->kobject;
                 d.accessFlags = f->accessFlags;
+                // BW64_SOCKDTOR: witness the SENDER passing a fd via SCM_RIGHTS —
+                // which pid sends which kobject. Pairs with the recvmsg install +
+                // SOCKCLOSE pointer trace to see how a socket ends up shared across
+                // processes (the dup-vs-share question).
+                if (std::getenv("BW64_SOCKDTOR")) {
+                    klog_fmt("SCMSEND: pid=%d tid=%d sends kobj=%p type=%d (use_count=%ld)",
+                             (int)thread->process->id, (int)thread->id,
+                             (void*)f->kobject.get(), (int)f->kobject->type,
+                             f->kobject.use_count());
+                }
                 msg->objects.push_back(d);
             }
         }				
@@ -998,6 +1059,17 @@ U32 KUnixSocketObject::recvmsg(KThread* thread, const KFileDescriptorPtr& fd, U3
 
         for (;i<hdr.msg_controllen/16 && i<msg->objects.size();i++) {
             KFileDescriptorPtr recvFd = thread->process->allocFileDescriptor(msg->objects[i].object, msg->objects[i].accessFlags, 0, -1, 0);
+            // BW64_SOCKDTOR: witness the RECEIVER installing a passed fd. The
+            // object is SHARED (same shared_ptr) with the sender's fd — this is
+            // the share-vs-dup site. Log the kobj + the receiver's new fd + the
+            // post-install use_count (how many fd tables now reference it).
+            if (std::getenv("BW64_SOCKDTOR")) {
+                klog_fmt("SCMRECV: pid=%d tid=%d installs kobj=%p as fd=%d type=%d (use_count=%ld)",
+                         (int)thread->process->id, (int)thread->id,
+                         (void*)msg->objects[i].object.get(), (int)recvFd->handle,
+                         (int)msg->objects[i].object->type,
+                         msg->objects[i].object.use_count());
+            }
             writeCMsgHdr(thread, hdr.msg_control + i * 16, 16, K_SOL_SOCKET, K_SCM_RIGHTS);
             memory->writed(hdr.msg_control + i * 16 + 12, recvFd->handle);
         }

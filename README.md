@@ -2,7 +2,11 @@
 
 **Boxedwine64** is a fork of [Boxedwine](https://github.com/danoon2/Boxedwine) that adds x86\_64 guest support so it can run 64-bit Wine (`wine64`) and 64-bit Linux ELF binaries. Boxedwine itself is a userland emulator: it implements an x86 CPU and a fake Linux kernel, then runs Wine on top of that so Windows applications execute without a real Linux host.
 
-This fork is a **work in progress**, but a substantial one: real Debian `wine64` now boots a Windows program (`notepad.exe`) all the way to a **visible, rendered GUI window** on macOS arm64, driving real `wineserver64`, `winex11`, FreeType/fontconfig text, and an in-process X11 wire server. The 32-bit code path remains fully functional and unchanged. The 64-bit code path is gated behind `BOXEDWINE_GUEST_X64` and was built out entirely by running real binaries and implementing each opcode/syscall they touch.
+This fork is a **work in progress**, but a substantial one: real Debian `wine64` now boots Windows programs all the way to a **visible, rendered GUI window** on macOS arm64 — including a **hardware-accelerated OpenGL 3D app (a spinning, shaded cube via WGL → host GL)** — driving real `wineserver64`, `winex11`, FreeType/fontconfig text, and an in-process X11 wire server. The 32-bit code path remains fully functional and unchanged. The 64-bit code path is gated behind `BOXEDWINE_GUEST_X64` and was built out entirely by running real binaries and implementing each opcode/syscall they touch.
+
+![wine64 OpenGL glcube.exe rendering a spinning 3D cube in Boxedwine64 on macOS](docs/images/glcube-gui.png)
+
+*Real `wine64 glcube.exe` running under Boxedwine64 on macOS arm64 — a WGL/OpenGL 3D cube rendered through wine's GL stack to the host's Metal-backed OpenGL, presented in a live SDL window.*
 
 ![wine64 notepad.exe rendering a real GUI window in Boxedwine64 on macOS](docs/images/notepad-gui.png)
 
@@ -32,6 +36,25 @@ events hit-test to the topmost window under the cursor, so clicks land on the
 dialog and not the window behind it), and the file is written through wine's
 `C:` drive to the host filesystem (`tools/rootfs64/root/home/username/`).
 
+**3D / OpenGL now works** (`wine64 glcube.exe` renders a spinning shaded cube),
+which required closing two bugs that previously made any idling/3D app a "boot
+lottery":
+
+- A connected-socket teardown could make a 64-bit client's write to its
+  wineserver request socket return the internal `-K_CONTINUE` sentinel (from the
+  SIGPIPE path, which is mis-delivered on a 64-bit thread), which wine read as a
+  short "partial write" and turned into a fatal client error + wineserver heap
+  corruption. A broken-pipe write on a 64-bit thread now returns a clean
+  `-EPIPE`, exactly as Linux does when `SIGPIPE` is ignored (wine always ignores
+  it).
+- `sched_yield` set the per-CPU `yield` flag, which the multi-threaded run loop
+  interprets as "this thread has exited" — so **every guest `sched_yield`
+  silently destroyed the calling thread**. wine's `Sleep()`/message-pump
+  short-wait spins on `sched_yield`, so any app that idled lost its main thread
+  and hung. `sched_yield` no longer sets that flag in the multi-threaded build
+  (it just relinquishes the host CPU), so the message pump runs and 3D apps
+  reach their render loop.
+
 Boots now reach a painted window in **~25 s** rather than appearing to hang for
 minutes: a per-CPU instruction-fetch page cache removed a per-byte
 mutex+hashmap lookup that was pinning a core inside wineserver's name-table
@@ -56,6 +79,12 @@ The 64-bit guest path can:
 
 ### What works end-to-end
 
+- **`wine64 glcube.exe`** → a real **OpenGL 3D app**: boots the full GUI chain,
+  creates a WGL context, and **renders a spinning, Gouraud-shaded cube** through
+  wine's GL stack onto the host's Metal-backed OpenGL, presented in a live SDL
+  window. This exercises the complete path — message pump, `wglCreateContext`/
+  `wglMakeCurrent`, GL command translation, and `SwapBuffers` — not just 2D GDI.
+  Launch with `tools/run_wine64_gui.sh 'C:\glcube.exe'`.
 - **`wine64 notepad.exe`** → boots the full `wineboot → services.exe → winex11`
   chain and **renders a visible notepad window** on macOS: real PE image
   loading, NT-syscall dispatch, an in-process X11 wire server, FreeType +

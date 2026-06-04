@@ -503,6 +503,21 @@ static U64 sys_write64(CPU64* cpu, U64 fd, U64 buf, U64 count) {
         return (U64)-K_EINVAL;
     }
     U32 wrote = fdesc->kobject->writeNative(buffer.data(), (U32)count);
+    // A connected stream socket whose peer object is TRANSIENTLY unreferenced
+    // under boot-time fd-table churn returns -K_EWOULDBLOCK (see
+    // KUnixSocketObject::writeNative). On a blocking fd this must not surface to
+    // the guest (wine treats a short/odd write to its wineserver request socket
+    // as fatal -> "partial write"). Retry a bounded number of host yields so the
+    // peer's strong ref reappears; only give up (real -EPIPE) if it never does.
+    if ((S32)wrote == -K_EWOULDBLOCK && fdesc->kobject->isBlocking()) {
+        for (int spin = 0; spin < 1000 && (S32)wrote == -K_EWOULDBLOCK; spin++) {
+            std::this_thread::yield();
+            wrote = fdesc->kobject->writeNative(buffer.data(), (U32)count);
+        }
+        if ((S32)wrote == -K_EWOULDBLOCK) {
+            wrote = (U32)-K_EPIPE; // peer truly gone after retries
+        }
+    }
     if (getenv("BW64_IPCDUMP")) {
         char hex[64] = {0}; int n = (int)((count < 16) ? count : 16);
         for (int i = 0; i < n; i++) snprintf(hex + i*3, 4, "%02x ", buffer[i]);
@@ -1008,6 +1023,42 @@ static U64 sys_openat64(CPU64* cpu, U64 dirfd, U64 pathAddr, U64 flags, U64 /*mo
 
 static U64 sys_close64(CPU64* cpu, U64 fd) {
     if (!cpu->thread || !cpu->thread->process) return (U64)-K_ENOSYS;
+    // BW64_SOCKDTOR: witness guest close() of a connected stream socket so we can
+    // tell a LEGITIMATE close(2) (wine really closed the fd) from a SPURIOUS GC
+    // (the object destructs while the fd is conceptually still open). Pairs with
+    // the SOCKDTOR dtor witness — match the kobject pointer across both.
+    if (std::getenv("BW64_SOCKDTOR")) {
+        KFileDescriptorPtr fdesc = cpu->thread->process->getFileDescriptor((FD)fd);
+        if (fdesc && fdesc->kobject && fdesc->kobject->type == KTYPE_UNIX_SOCKET) {
+            // use_count BEFORE the close is the decisive A-vs-B signal:
+            //   ==2 (this fdesc->kobject + the local fdesc copy held here) => this
+            //        close drops the LAST process ref -> the object destructs now
+            //        -> no other process's fd holds it => MODEL A (shared object).
+            //   > 2 => another fd table still references the SAME object, so this
+            //        close should NOT destruct it; the kill must be the peer-EOF
+            //        cascade from the OTHER end's dtor => MODEL B (peer cascade).
+            // (We hold one extra ref via `fdesc` here, so subtract it mentally:
+            //  raw==2 means exactly one real holder remains = the fd being closed.)
+            long uc = fdesc->kobject.use_count();
+            KUnixSocketObject* us = dynamic_cast<KUnixSocketObject*>(fdesc->kobject.get());
+            void* peer = nullptr;
+            int peerIn = -1, peerOut = -1, peerConn = -1;
+            int myIn = -1, myOut = -1, myConn = -1;
+            if (us) {
+                myIn = (int)us->inClosed; myOut = (int)us->outClosed; myConn = (int)us->connected;
+                std::shared_ptr<KUnixSocketObject> con = us->connection.lock();
+                if (con) {
+                    peer = (void*)con.get();
+                    peerIn = (int)con->inClosed; peerOut = (int)con->outClosed; peerConn = (int)con->connected;
+                }
+            }
+            klog_fmt("SOCKCLOSE: pid=%d tid=%d close(fd=%llu) kobj=%p use_count=%ld(raw,-1=fdesc) "
+                     "self{in=%d out=%d conn=%d} peer=%p peer{in=%d out=%d conn=%d}",
+                     (int)cpu->thread->process->id, (int)cpu->thread->id,
+                     (unsigned long long)fd, (void*)fdesc->kobject.get(),
+                     uc, myIn, myOut, myConn, peer, peerIn, peerOut, peerConn);
+        }
+    }
     return (U64)(S64)(S32)cpu->thread->process->close((FD)fd);
 }
 
@@ -3798,18 +3849,22 @@ void ksyscall64(CPU64* cpu) {
             break;
         }
         case X64_SYS_sched_yield:
-            // Actually yield the host thread, mirroring the 32-bit path
-            // (syscall.cpp syscall_sched_yield). It was a pure no-op here, which
-            // breaks wine's spin-then-yield waits: when a thread spin-loops on
-            // sched_yield (e.g. RtlpWaitForCriticalSection / a server_select
-            // retry loop), a no-op yield never relinquishes the core, so on a
-            // contended host the PEER thread/process that must run to signal the
-            // awaited event is starved and the waiter spins forever. Observed as
-            // gltri's main thread (pid 10) pinned in a write(6)/read(7) select +
-            // recvmsg + sched_yield loop after `first window mapped`, never
-            // reaching GL, while its signaler sat unscheduled. cpu->yield also
-            // nudges our cooperative scheduler to pick another guest thread.
+            // Relinquish the host CPU so a sibling guest thread/process that must
+            // run to signal an awaited event isn't starved while this thread
+            // spin-then-yields (RtlpWaitForCriticalSection, a server_select retry,
+            // or wine's NtDelayExecution short-sleep loop).
+            //
+            // In the MULTI-THREADED build each guest thread runs on its own host
+            // thread, so std::this_thread::yield() is the whole job. We must NOT
+            // set cpu->yield here: the MT run loop (normalPlatformMultiThreaded.cpp)
+            // treats `yield==true && !terminating` as "this thread is done" and
+            // BREAKS out — deleting the thread. That made any guest sched_yield
+            // (notably wine's Sleep() short-delay spin) silently destroy the
+            // calling thread mid-run -> the process went idle/hung. cpu->yield is
+            // only meaningful for the single-threaded cooperative scheduler.
+#ifndef BOXEDWINE_MULTI_THREADED
             cpu->yield = true;
+#endif
             std::this_thread::yield();
             ret = 0;
             break;
