@@ -1361,7 +1361,9 @@ static U64 sys_execve64(CPU64* cpu, U64 pathAddr, U64 argvAddr, U64 envpAddr) {
     std::vector<BString> envs;
     readStringArray64(cpu, argvAddr, args);
     readStringArray64(cpu, envpAddr, envs);
-    klog_fmt("sys_execve64: path='%s' argv0='%s' argc=%d envc=%d", path.c_str(),
+    klog_fmt("sys_execve64: pid=%d path='%s' argv0='%s' argc=%d envc=%d",
+             (int)(cpu->thread && cpu->thread->process ? cpu->thread->process->id : -1),
+             path.c_str(),
              args.empty() ? "" : args[0].c_str(), (int)args.size(), (int)envs.size());
     // Full argv dump — invaluable for telling which wine subprocess (wineboot/
     // services.exe/rpcss/plugplay/explorer) is being launched in the re-exec
