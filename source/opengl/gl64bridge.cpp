@@ -166,6 +166,17 @@ void readFloats(CPU64* cpu, U64 guestAddr, float* out, int count) {
 U64 gl64Bridge(CPU64* cpu, U64 fnId, U64 argsAddr) {
     std::lock_guard<std::recursive_mutex> lk(g_glMutex);
 
+    // BW64_GLTRACE: confirm the guest opengl32/winex11 is actually issuing the
+    // private gl64 trap (and which fn ids). If a GL app reaches a window but no
+    // GLTRACE line ever prints, the guest-side GL dll is NOT the gl64 build —
+    // it's trying the stock GLX path the wire server doesn't implement, so it
+    // never gets here. First hit + per-id-once keeps it cheap.
+    if (getenv("BW64_GLTRACE")) {
+        static std::atomic<bool> announced{false};
+        if (!announced.exchange(true))
+            klog_fmt("gl64: FIRST trap — guest IS using the gl64 bridge (fnId=%llu)",
+                     (unsigned long long)fnId);
+    }
     GL64Args args = {};
     if (argsAddr) {
         cpu->memory->memcpyFromGuest(&args, argsAddr, sizeof(args));

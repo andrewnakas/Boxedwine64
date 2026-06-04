@@ -309,6 +309,22 @@ static void crashRingRecord(U32 pid, U32 fd, const U8* data, U32 count) {
     if (!g_crashRingOn) return;
     crashRingPut('W', pid, fd, data, count, 0, 0);
 }
+// BW64_WSCONC: concurrency witness for the bug #2 teardown crash. wine's
+// wineserver is designed single-threaded (one epoll loop processes every
+// client request + disconnect strictly serially). If our MT model ever has two
+// HOST threads inside wineserver's own request processing at the same instant,
+// a close_handle's release_object can race the disconnect-cascade's release of
+// the same object -> refcount underflow -> the object.c:443 assert. This counts
+// how many host threads are concurrently reading wineserver's (pid 14) socket;
+// any value >1 is the smoking gun. Keyed by the READING process id so it only
+// arms for wineserver itself. Zero cost unless BW64_WSCONC is set.
+static bool g_wsConcInit = false, g_wsConcOn = false;
+static std::atomic<int> g_wsConcInflight{0};
+static std::atomic<int> g_wsConcMax{0};
+static bool wsConcEnabled() {
+    if (!g_wsConcInit) { g_wsConcOn = getenv("BW64_WSCONC") != nullptr; g_wsConcInit = true; }
+    return g_wsConcOn;
+}
 // Read-side recorder (used by sys_read64 / sys_recvmsg64 / the scm witness).
 // Gated by BW64_WSREAD AND the same ring being on so the dump path fires.
 static void crashRingRecordRead(char kind, U32 pid, U32 fd, const U8* data, U32 count, U32 extra0, U32 extra1) {
@@ -352,6 +368,42 @@ static U64 sys_write64(CPU64* cpu, U64 fd, U64 buf, U64 count) {
                         strstr((const char*)buffer.data(), "unimplemented function") ||
                         strstr((const char*)buffer.data(), "corrupted"))) {
             crashRingDump((const char*)buffer.data());
+            // BW64_WSBT: at the assert WRITE (glibc prints the message BEFORE
+            // abort()), wineserver's guest stack is still intact. Scan it for
+            // code-looking return addresses so addr2line on the wineserver binary
+            // can name the release_object CALLER (the buggy teardown path). The
+            // assert chain is __assert_fail -> release_object -> <culprit>. We
+            // print RIP + any stack word that lands in the wineserver text range
+            // [base, base+size). The image base is logged once at load (BW64_WSBT
+            // also enables that). Cheap: only on the abort path.
+            if (getenv("BW64_WSBT")) {
+                auto rdq = [&](U64 a) -> U64 {
+                    U64 v = 0;
+                    for (int b = 0; b < 8; b++) v |= ((U64)cpu->memory->readb(a + b)) << (b * 8);
+                    return v;
+                };
+                klog_fmt("WSBT: assert in pid=%u %s  RIP=%llx RSP=%llx RBP=%llx",
+                         (unsigned)wpid, wexe,
+                         (unsigned long long)cpu->rip,
+                         (unsigned long long)cpu->reg[X64_RSP].u64,
+                         (unsigned long long)cpu->reg[X64_RBP].u64);
+                U64 sp = cpu->reg[X64_RSP].u64;
+                // Walk a wide stack window; print every word that could be a
+                // return address into a mapped, executable-ish region. We don't
+                // know the exact text range here, so print all plausible code
+                // pointers (high-half canonical, page-aligned-ish) and let
+                // post-processing filter by the wineserver mmap range.
+                for (int i = 0; i < 160; i++) {
+                    U64 v = rdq(sp + (U64)i * 8);
+                    // Heuristic: wineserver/glibc code lives at low-ish 47-bit
+                    // addresses; skip obvious data (small ints, ASCII, stack ptrs
+                    // near sp). Print candidates with the 'CODE?' tag.
+                    if (v > 0x10000 && v < 0x800000000000ULL &&
+                        (v < sp - 0x100000 || v > sp + 0x100000)) {
+                        klog_fmt("WSBT:   [rsp+%03x] = 0x%llx", i * 8, (unsigned long long)v);
+                    }
+                }
+            }
         }
         // BW64_STUBDUMP: when wine reports a call to an unimplemented function,
         // dump the live register/stack state so we can identify the stub and the
@@ -754,6 +806,26 @@ static U64 sys_read64(CPU64* cpu, U64 fd, U64 buf, U64 count) {
         KUnixSocketObject* us = dynamic_cast<KUnixSocketObject*>(fdesc->kobject.get());
         if (us && !us->isXWire()) { wsSock = us; recvBefore = us->debugRecvUsed(); }
     }
+    // BW64_WSCONC concurrency witness: for a wineserver process, log this read
+    // with the guest thread id. If two different thread ids show overlapping
+    // reads of the SAME socket, wineserver is processing requests on >1 thread —
+    // the teardown double-release race. We log the live thread count for pid so
+    // ">1 thread for wineserver" is visible directly.
+    bool wsConcThis = false;
+    if (wsConcEnabled() && cpu->thread && cpu->thread->process &&
+        cpu->thread->process->exe.contains("wineserver")) {
+        KUnixSocketObject* us = dynamic_cast<KUnixSocketObject*>(fdesc->kobject.get());
+        if (us && !us->isXWire()) {
+            wsConcThis = true;
+            int now = ++g_wsConcInflight;
+            int prevMax = g_wsConcMax.load();
+            while (now > prevMax && !g_wsConcMax.compare_exchange_weak(prevMax, now)) {}
+            if (now > 1) {
+                klog_fmt("WSCONC: %d host threads concurrently in wineserver socket read! pid=%d tid=%d fd=%d",
+                         now, (int)cpu->thread->process->id, (int)cpu->thread->id, (int)fd);
+            }
+        }
+    }
     // Serialize against sys_mmap64_file (and other reads) on the shared per-zip
     // stream — see g_fileReadMutex. A KFile read that repositions a zip's shared
     // unzFile must not interleave with another thread's read/mmap of the same zip.
@@ -769,6 +841,7 @@ static U64 sys_read64(CPU64* cpu, U64 fd, U64 buf, U64 count) {
             got = fdesc->kobject->readNative(tmp.data(), (U32)count);
         }
     }
+    if (wsConcThis) { --g_wsConcInflight; }
     if ((S32)got < 0) {
         return (U64)(S64)(S32)got; // sign-extend kernel errno
     }
@@ -2250,6 +2323,28 @@ static U64 sys_sendmsg64(CPU64* cpu, U64 fd, U64 msg64, U64 flags) {
 static U64 sys_recvmsg64(CPU64* cpu, U64 fd, U64 msg64, U64 flags) {
     KThread* thread = cpu->thread;
     if (!thread || !thread->process) return (U64)-K_ENOSYS;
+    // BW64_WSCONC: wineserver reads protocol requests via recvmsg (SCM creds/fds),
+    // so the concurrency witness must cover this path too — sys_read64's hook
+    // alone reported 0 because the request stream never flows through read().
+    // We bracket the whole call (krecvmsg blocks) so a second wineserver host
+    // thread entering recvmsg while the first is still inside is visible.
+    bool wsConcRm = wsConcEnabled() && thread->process->exe.contains("wineserver");
+    struct WsConcGuard {
+        bool on; CPU64* cpu;
+        WsConcGuard(bool on, CPU64* cpu) : on(on), cpu(cpu) {
+            if (on) {
+                static bool announced = false;
+                int now = ++g_wsConcInflight;
+                if (!announced) { announced = true;
+                    klog_fmt("WSCONC: wineserver recvmsg path armed (first hit) pid=%d tid=%d",
+                             (int)cpu->thread->process->id, (int)cpu->thread->id); }
+                if (now > 1)
+                    klog_fmt("WSCONC: %d host threads concurrently in wineserver recvmsg! pid=%d tid=%d",
+                             now, (int)cpu->thread->process->id, (int)cpu->thread->id);
+            }
+        }
+        ~WsConcGuard() { if (on) --g_wsConcInflight; }
+    } wsConcGuard(wsConcRm, cpu);
     U32 base = msgScratch(thread);
     if (!base) return (U64)-K_EFAULT;
     KMemory* m32 = thread->memory;
