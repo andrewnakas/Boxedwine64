@@ -705,7 +705,24 @@ S64 KThread::futex64(U64 addr, U32 op, U32 value, U64 timeoutAddr, U32 val3) {
 #ifdef BOXEDWINE_MULTI_THREADED
             while (true) {
                 if (this->pendingSignals) {
-                    if (runSignals()) {
+                    // 64-bit thread: deliver via the 64-bit signal path
+                    // (deliverPendingSignals builds the frame on cpu64). The
+                    // generic runSignals() drives the 32-bit runSignal(), which
+                    // builds on the UNUSED 32-bit cpu for a 64-bit thread —
+                    // mis-delivering the cross-thread SIGUSR1 we now queue for
+                    // wineserver's APC nudge and, during teardown, re-entering
+                    // KProcess::signal/killAllThreads -> a futex/cleanup deadlock
+                    // (the "stuck on a loading screen" hang). Route 64-bit
+                    // threads to their own delivery; a delivered signal
+                    // interrupts the futex with EINTR (the handler runs, then
+                    // rt_sigreturn resumes the guest).
+                    bool delivered;
+                    if (this->cpu64) {
+                        delivered = this->cpu64->deliverPendingSignals();
+                    } else {
+                        delivered = runSignals();
+                    }
+                    if (delivered) {
                         freeFutex(f);
                         return -K_EINTR;
                     }

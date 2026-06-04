@@ -2993,6 +2993,13 @@ void ksyscall64(CPU64* cpu) {
                 KThread* target = KSystem::getThreadById(targetTid);
                 if (!target) { ret = (U64)-K_ESRCH; break; }
                 if (sig == 0) { ret = 0; break; } // liveness probe — target exists
+                // Don't arm a pending signal on a thread that is already tearing
+                // down: it will never reach a normal scheduler slice to take it,
+                // and a thread parked in futex64's wait loop during exit would
+                // otherwise keep trying to deliver it mid-kill — a teardown
+                // deadlock. The caller still sees success (the thread is on its
+                // way out, which is what a signal would have accomplished).
+                if (target->terminating) { ret = 0; break; }
                 // Async cross-thread delivery: arm the target's pending-signal;
                 // the 64-bit scheduler delivers it (deliverSignalSync) at the
                 // target's next slice, before it runs guest code. We can't build
