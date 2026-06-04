@@ -529,6 +529,11 @@ void XWireConnection::processOneRequest(const uint8_t* req, uint32_t len) {
             }
             if (found) {
                 ensureWindow();
+                // MapNotify FIRST: winex11 selects StructureNotifyMask and blocks
+                // its message pump waiting for it to confirm the window is
+                // viewable. Without it a GL app parks in GetMessage forever after
+                // mapping and never reaches its first frame.
+                sendMapNotify(wid);
                 // The host window + presentWindow are chosen lazily on the first
                 // PutImage (CreateWindow/Map geometry is unreliable — winex11
                 // sizes via ConfigureWindow). Here we just send the Expose that
@@ -1776,6 +1781,24 @@ void XWireConnection::sendFocusIn(uint32_t window) {
     e[3] = (uint8_t)(sequence >> 8);
     memcpy(e + 4, &window, 4);                 // event window
     e[8] = 0;                                  // mode = NotifyNormal
+    writeToClient(e, sizeof(e));
+}
+
+void XWireConnection::sendMapNotify(uint32_t window) {
+    // MapNotify (event code 19). winex11 selects StructureNotifyMask on its
+    // windows and BLOCKS in its message pump waiting for the MapNotify that
+    // confirms the window became viewable (X11DRV's wait_for_withdrawn_state /
+    // the map-state machine). Without it, a GL app's GetMessage/PeekMessage never
+    // settles after mapping — it parks forever before its first frame (the cube
+    // never draws). event-window(4) == window(8) for a top-level (we send the
+    // non-redirected form). override-redirect(12)=0.
+    uint8_t e[32] = {0};
+    e[0] = 19;                                 // MapNotify
+    e[2] = (uint8_t)(sequence & 0xff);
+    e[3] = (uint8_t)(sequence >> 8);
+    memcpy(e + 4, &window, 4);                 // event window
+    memcpy(e + 8, &window, 4);                 // window
+    e[12] = 0;                                 // override-redirect
     writeToClient(e, sizeof(e));
 }
 

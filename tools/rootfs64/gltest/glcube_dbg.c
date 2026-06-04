@@ -20,10 +20,16 @@
 #include <GL/gl.h>
 #include <math.h>
 #include <stdio.h>
+#include <io.h>
 #define DBG(msg) do{ fprintf(stderr,"GLCUBE_DBG: " msg "\n"); fflush(stderr);}while(0)
 
+static void rawlog(const char* s){ int n=0; while(s[n])n++; _write(2,s,n);} 
+static void rawlogm(const char* p, unsigned v){ char b[64]; int i=0; while(p[i]){b[i]=p[i];i++;} const char* hex="0123456789abcdef"; b[i++]='0';b[i++]='x'; for(int s=28;s>=0;s-=4) b[i++]=hex[(v>>s)&0xf]; b[i++]='\n'; _write(2,b,i);} 
 static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
-    if (m == WM_CLOSE || m == WM_DESTROY) { fprintf(stderr,"GLCUBE_DBG: WndProc msg=0x%x (%s) -> PostQuitMessage\n",(unsigned)m, m==WM_CLOSE?"WM_CLOSE":"WM_DESTROY"); fflush(stderr); PostQuitMessage(0); return 0; }
+    rawlogm("GLCUBE_WND: msg=", m);
+    if (m == WM_CLOSE || m == WM_DESTROY) { rawlog("GLCUBE_WND: CLOSE/DESTROY -> quit\n"); PostQuitMessage(0); return 0; }
+    if (m == WM_PAINT)    { PAINTSTRUCT ps; BeginPaint(h,&ps); EndPaint(h,&ps); return 0; } /* validate -> stop the paint storm */
+    if (m == WM_ERASEBKGND) return 1; /* we paint via GL; claim erased */
     return DefWindowProc(h, m, w, l);
 }
 
@@ -96,12 +102,15 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR cmd, int show) {
     MSG msg;
     float angle = 0.0f;
     int frames = 0;
+    int iter = 0;
     DBG("entering render loop"); for (;;) {
+        fprintf(stderr,"GLCUBE_DBG: iter=%d before PeekMessage drain\n",iter); fflush(stderr);
         while (PeekMessageA(&msg, 0, 0, 0, PM_REMOVE)) {
             if (msg.message == WM_QUIT) { DBG("got WM_QUIT -> exiting"); goto done; } else { fprintf(stderr,"GLCUBE_DBG: msg=0x%x\n",(unsigned)msg.message); fflush(stderr); }
             TranslateMessage(&msg);
             DispatchMessageA(&msg);
         }
+        fprintf(stderr,"GLCUBE_DBG: iter=%d PeekMessage drained, calling glClearColor\n",iter); fflush(stderr);
         glClearColor(0.1f, 0.1f, 0.15f, 1.0f);   /* dark slate background */
         glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
 
@@ -111,10 +120,11 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR cmd, int show) {
         glRotatef(angle * 0.7f, 0.0f, 1.0f, 0.0f);
         drawCube();
 
+        fprintf(stderr,"GLCUBE_DBG: iter=%d drew, SwapBuffers\n",iter); fflush(stderr);
         SwapBuffers(hdc);
         angle += 1.5f;
         if (angle >= 360.0f) angle -= 360.0f;
-        if (++frames > 100000) break;   /* safety cap */
+        iter++; if (++frames > 100000) break;   /* safety cap */
         Sleep(16);
     }
 done:

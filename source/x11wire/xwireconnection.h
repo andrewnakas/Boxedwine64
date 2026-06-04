@@ -69,6 +69,10 @@ public:
     // maps; GetInputFocus is also answered with the present window (not root).
     void sendFocusIn(uint32_t window);
 
+    // MapNotify (code 19) — winex11 selects StructureNotifyMask and blocks its
+    // message pump until it sees the window become viewable. Sent on X_MapWindow.
+    void sendMapNotify(uint32_t window);
+
     // Emit an EnterNotify/LeaveNotify crossing event (code 7/8). winex11 selects
     // for EnterWindowMask and uses the crossing to associate the pointer with
     // the window; without it clicks are mishandled (they defocus the edit and
