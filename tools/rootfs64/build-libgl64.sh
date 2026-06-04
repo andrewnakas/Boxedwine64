@@ -36,14 +36,16 @@ command -v ld.lld >/dev/null 2>&1 && LLD="${LLD:-ld.lld}"
 if command -v x86_64-linux-gnu-gcc >/dev/null 2>&1; then
     CC=x86_64-linux-gnu-gcc
     echo "--- using host $CC ---"
+    # NOTE: no --no-undefined — the shim imports malloc (for the XVisualInfo /
+    # FBConfig arrays wine XFree()s), resolved at load from the guest's libc.
     "$CC" -shared -fPIC -O2 -fvisibility=hidden -nostdlib -ffreestanding \
-        -Wl,-soname,libGL.so.1 -Wl,--no-undefined \
+        -Wl,-soname,libGL.so.1 \
         -o "$SRC/libGL.so.1" "$SRC/libgl64.c"
 elif command -v clang >/dev/null 2>&1 && [ -n "$LLD" ]; then
     echo "--- using host clang (x86_64-linux target) + $LLD ---"
     clang --target=x86_64-linux-gnu -fPIC -O2 -fvisibility=hidden -ffreestanding \
         -c "$SRC/libgl64.c" -o "$SRC/libgl64.o"
-    "$LLD" -shared -soname libGL.so.1 --no-undefined \
+    "$LLD" -shared -soname libGL.so.1 \
         -o "$SRC/libGL.so.1" "$SRC/libgl64.o"
     rm -f "$SRC/libgl64.o"
 else

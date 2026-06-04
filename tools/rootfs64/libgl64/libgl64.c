@@ -127,11 +127,28 @@ static inline uint64_t gl64_trap(uint64_t fnId, GL64Args* args) {
     return ret;
 }
 
+// Load-time witness: fire a gl64 trap with fnId=0 the moment winex11/opengl32
+// dlopens this libGL. The host bridge logs it under BW64_GLTRACE ("gl64: FIRST
+// trap fnId=0"). If that line never prints, the guest never loaded THIS libGL —
+// the GL-disable / ChoosePixelFormat=0 failure is in the dlopen, not downstream.
+__attribute__((constructor))
+static void gl64_loaded_witness(void) {
+    gl64_trap(0 /* sentinel: libGL loaded */, 0);
+}
+
 // Bit-cast helpers: floats/doubles travel as their raw bits in u64 slots.
 static inline uint64_t F2U(float f)  { uint32_t u; memcpy(&u, &f, 4); return (uint64_t)u; }
 static inline uint64_t D2U(double d) { uint64_t u; memcpy(&u, &d, 8); return u; }
 
 #define API __attribute__((visibility("default")))
+
+// wine's winex11 calls XFree()/free() on the XVisualInfo* and GLXFBConfig* arrays
+// returned by glXChooseVisual / glX*FBConfig* (it expects real Xlib-allocated,
+// freeable memory). Returning a static/.bss pointer makes that free() abort with
+// "free(): invalid pointer". This .so is freestanding (no libc linked) but is
+// dlopen'd into a process that HAS glibc, so the dynamic linker resolves malloc
+// from the guest libc at load time. Declare it; never free here (wine owns it).
+extern void* malloc(unsigned long size);
 
 // ---- GL minimal typedefs (match the platform C ABI) -------------------------
 typedef unsigned int   GLenum;
@@ -186,14 +203,16 @@ API const char* glXGetClientString(Display* dpy, int name) {
     return glXQueryServerString(dpy, 0, name);
 }
 API XVisualInfo* glXChooseVisual(Display* dpy, int screen, int* attribList) {
-    static XVisualInfo vi;
     GL64Args a = {{0}}; a.a[0]=(uint64_t)(uintptr_t)attribList;
     (void)gl64_trap(GL64_fn_glXChooseVisual, &a);
-    memset(&vi, 0, sizeof(vi));
-    vi.depth = 24; vi.c_class = 4 /*TrueColor*/; vi.bits_per_rgb = 8;
-    vi.red_mask = 0xff0000; vi.green_mask = 0x00ff00; vi.blue_mask = 0x0000ff;
-    vi.visualid = 0x21; vi.colormap_size = 256;
-    return &vi;
+    // Heap-allocate: wine XFree()s this. (See the malloc note above.)
+    XVisualInfo* vi = (XVisualInfo*)malloc(sizeof(XVisualInfo));
+    if (!vi) return 0;
+    memset(vi, 0, sizeof(*vi));
+    vi->depth = 24; vi->c_class = 4 /*TrueColor*/; vi->bits_per_rgb = 8;
+    vi->red_mask = 0xff0000; vi->green_mask = 0x00ff00; vi->blue_mask = 0x0000ff;
+    vi->visualid = 0x21; vi->colormap_size = 256;
+    return vi;
 }
 API GLXContext glXCreateContext(Display* dpy, XVisualInfo* vis, GLXContext share, int direct) {
     GL64Args a = {{0}}; a.a[0]=(uint64_t)(uintptr_t)vis; a.a[1]=(uint64_t)(uintptr_t)share; a.a[2]=(uint64_t)direct;
@@ -208,23 +227,27 @@ API GLXContext glXCreateNewContext(Display* dpy, GLXFBConfig config, int renderT
     GL64Args a = {{0}}; a.a[0]=(uint64_t)(uintptr_t)config; a.a[1]=(uint64_t)(uintptr_t)share; a.a[2]=(uint64_t)direct;
     return (GLXContext)(uintptr_t)gl64_trap(GL64_fn_glXCreateContext, &a);
 }
-// glXChooseFBConfig/glXGetFBConfigs return a host-allocated array. The guest
-// only needs a non-null, indexable handle: we hand back a static 1-element array
-// of opaque config ids so winex11's [i] access stays in our memory.
-static GLXFBConfig g_fbconfigs[1];
+// glXChooseFBConfig/glXGetFBConfigs return an array wine XFree()s — so malloc a
+// 1-element array of opaque config ids (NOT a static, which wine would invalid-
+// free). The element is an opaque id the host bridge tracks; winex11's [i] read
+// stays in this guest buffer.
 API GLXFBConfig* glXChooseFBConfig(Display* dpy, int screen, const int* attribs, int* nelements) {
     GL64Args a = {{0}}; a.a[0]=(uint64_t)screen; a.a[1]=(uint64_t)(uintptr_t)attribs; a.a[2]=(uint64_t)(uintptr_t)nelements;
     uint64_t id = gl64_trap(GL64_fn_glXChooseFBConfig, &a);
-    g_fbconfigs[0] = (GLXFBConfig)(uintptr_t)id;
+    GLXFBConfig* arr = (GLXFBConfig*)malloc(sizeof(GLXFBConfig));
+    if (!arr) { if (nelements) *nelements = 0; return 0; }
+    arr[0] = (GLXFBConfig)(uintptr_t)id;
     if (nelements) *nelements = 1;
-    return g_fbconfigs;
+    return arr;
 }
 API GLXFBConfig* glXGetFBConfigs(Display* dpy, int screen, int* nelements) {
     GL64Args a = {{0}}; a.a[0]=(uint64_t)screen; a.a[1]=(uint64_t)(uintptr_t)nelements;
     uint64_t id = gl64_trap(GL64_fn_glXGetFBConfigs, &a);
-    g_fbconfigs[0] = (GLXFBConfig)(uintptr_t)id;
+    GLXFBConfig* arr = (GLXFBConfig*)malloc(sizeof(GLXFBConfig));
+    if (!arr) { if (nelements) *nelements = 0; return 0; }
+    arr[0] = (GLXFBConfig)(uintptr_t)id;
     if (nelements) *nelements = 1;
-    return g_fbconfigs;
+    return arr;
 }
 API int glXGetFBConfigAttrib(Display* dpy, GLXFBConfig config, int attribute, int* value) {
     GL64Args a = {{0}}; a.a[0]=(uint64_t)(uintptr_t)config; a.a[1]=(uint64_t)attribute; a.a[2]=(uint64_t)(uintptr_t)value;
@@ -402,3 +425,6 @@ API GLproc glXGetProcAddressARB(const GLubyte* name) {
     return gl64_noop;
 }
 API GLproc glXGetProcAddress(const GLubyte* name) { return glXGetProcAddressARB(name); }
+
+// Full ALL_WGL_FUNCS coverage so wine's init_opengl dlsym loop succeeds.
+#include "libgl64_stubs.h"

@@ -97,4 +97,12 @@ void tickXWirePresent();
 union SDL_Event;
 void xwireForwardSdlEvent(const SDL_Event& e);
 
+// Run `fn` on the platform MAIN thread and block until it completes. macOS
+// requires SDL_CreateWindow / NSWindow on the main thread, but the gl64 bridge
+// runs on a guest thread — so it hands window creation here. The work is drained
+// by tickXWirePresent() (called from doMainLoop on the main thread). If called
+// FROM the main thread it runs inline. Safe before any sink is installed (still
+// pumped by the main loop). Defined in xwirepresentSDL.cpp.
+void xwireRunOnMainThread(const std::function<void()>& fn);
+
 #endif

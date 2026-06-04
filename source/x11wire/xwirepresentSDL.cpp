@@ -41,8 +41,45 @@
 #include <deque>
 #include <atomic>
 #include <vector>
+#include <functional>
+#include <condition_variable>
+
+// Defined in the multi-threaded main loop; true only on the platform main thread.
+bool isMainthread();
 
 namespace {
+
+// ---- main-thread work queue ------------------------------------------------
+// macOS forbids NSWindow/SDL_CreateWindow off the main thread, but the gl64
+// bridge runs on a guest thread. xwireRunOnMainThread() enqueues a closure that
+// the main loop drains (drainMainThreadWork below, from tickXWirePresent) and
+// blocks the caller until it has run.
+struct MainThreadJob {
+    const std::function<void()>* fn;
+    std::mutex m;
+    std::condition_variable cv;
+    bool done = false;
+};
+std::mutex g_mtwMutex;
+std::deque<MainThreadJob*> g_mtwQueue;
+
+void drainMainThreadWork() {
+    for (;;) {
+        MainThreadJob* job = nullptr;
+        {
+            std::lock_guard<std::mutex> lk(g_mtwMutex);
+            if (g_mtwQueue.empty()) break;
+            job = g_mtwQueue.front();
+            g_mtwQueue.pop_front();
+        }
+        (*job->fn)();
+        {
+            std::lock_guard<std::mutex> lk(job->m);
+            job->done = true;
+        }
+        job->cv.notify_one();
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Loading screen: a self-contained progress bar + status text rendered to the
@@ -365,9 +402,28 @@ void xwireForwardSdlEvent(const SDL_Event& e) {
     if (g_xwirePresentSink) g_sink.forwardSdlEvent(e);
 }
 
+// Run `fn` on the platform main thread, blocking until it completes. Inline if
+// already on the main thread; otherwise enqueue and wait for drainMainThreadWork
+// (called from tickXWirePresent on the main thread). See xwirepresent.h.
+void xwireRunOnMainThread(const std::function<void()>& fn) {
+    if (isMainthread()) { fn(); return; }
+    MainThreadJob job;
+    job.fn = &fn;
+    {
+        std::lock_guard<std::mutex> lk(g_mtwMutex);
+        g_mtwQueue.push_back(&job);
+    }
+    std::unique_lock<std::mutex> lk(job.m);
+    job.cv.wait(lk, [&]{ return job.done; });
+}
+
 // Drive present + input from the main loop (main thread). Safe to call when no
 // sink is installed.
 void tickXWirePresent() {
+    // Run any work the gl64 bridge (or others) deferred to the main thread —
+    // e.g. SDL_CreateWindow for the hidden GL target. Done unconditionally (even
+    // with no sink) so a headless-but-GL path still drains.
+    drainMainThreadWork();
     if (g_xwirePresentSink) {
         g_xwirePresentSink->tickMainThread();
         // Flush queued host input to the guest only when there IS input — a

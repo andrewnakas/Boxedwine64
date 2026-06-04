@@ -36,6 +36,8 @@
 #include <SDL.h>
 #include <SDL_opengl.h>
 #include <vector>
+#include <thread>
+#include <atomic>
 #include <cstring>
 #include <mutex>
 
@@ -66,10 +68,24 @@ U64 g_nextOpaqueId = 0x5000;
 std::vector<U8> g_rgba;   // glReadPixels output (RGBA, bottom-up)
 std::vector<U8> g_bgrx;   // converted, top-down, for submitFrame
 
-// Ensure the hidden GL context exists and is current. Returns false if GL is
-// unavailable (then the bridge degrades to no-ops so the guest keeps running).
+// Track which host thread currently holds the GL context. An SDL/Apple GL
+// context is current PER THREAD; the guest may issue GL calls from a different
+// host thread than the one glXMakeCurrent ran on (KThread64 = one host thread
+// per guest thread). Calling glViewport/glClear with no current context hangs or
+// faults in the Apple Metal-GL layer. So re-make-current whenever the calling
+// thread changes.
+static std::atomic<std::thread::id> g_glCurrentThread{};
+
+// Ensure the hidden GL context exists and is current ON THE CALLING THREAD.
+// Returns false if GL is unavailable (then the bridge degrades to no-ops so the
+// guest keeps running).
 bool ensureContext() {
     if (g_glContext) {
+        std::thread::id me = std::this_thread::get_id();
+        if (g_glCurrentThread.load() != me) {
+            SDL_GL_MakeCurrent(g_hiddenWindow, g_glContext);
+            g_glCurrentThread.store(me);
+        }
         return true;
     }
     if (g_glInitFailed) {
@@ -85,8 +101,15 @@ bool ensureContext() {
     SDL_GL_SetAttribute(SDL_GL_BLUE_SIZE, 8);
     SDL_GL_SetAttribute(SDL_GL_ALPHA_SIZE, 8);
 
-    g_hiddenWindow = SDL_CreateWindow("bw64-gl", 0, 0, g_drawW, g_drawH,
-                                      SDL_WINDOW_OPENGL | SDL_WINDOW_HIDDEN);
+    // macOS requires SDL_CreateWindow / NSWindow on the MAIN thread, but we run
+    // on a guest thread (whoever called glXCreateContext). Defer the window
+    // creation to the main loop and block until it's made. The GL CONTEXT is
+    // thread-affine, so we create + make it current on THIS (the gl64) thread
+    // after the window exists — the window just has to be born on the main one.
+    xwireRunOnMainThread([&]{
+        g_hiddenWindow = SDL_CreateWindow("bw64-gl", 0, 0, g_drawW, g_drawH,
+                                          SDL_WINDOW_OPENGL | SDL_WINDOW_HIDDEN);
+    });
     if (!g_hiddenWindow) {
         klog_fmt("gl64: SDL_CreateWindow(GL) failed: %s", SDL_GetError());
         g_glInitFailed = true;
@@ -101,6 +124,7 @@ bool ensureContext() {
         return false;
     }
     SDL_GL_MakeCurrent(g_hiddenWindow, g_glContext);
+    g_glCurrentThread.store(std::this_thread::get_id());
     klog_fmt("gl64: host GL up — vendor='%s' renderer='%s' version='%s'",
              (const char*)glGetString(GL_VENDOR),
              (const char*)glGetString(GL_RENDERER),
@@ -114,7 +138,10 @@ void resizeTarget(int w, int h) {
     if (w == g_drawW && h == g_drawH && g_hiddenWindow) return;
     g_drawW = w; g_drawH = h;
     if (g_hiddenWindow) {
-        SDL_SetWindowSize(g_hiddenWindow, w, h);
+        // SDL_SetWindowSize touches the NSWindow → must run on the macOS main
+        // thread, same as SDL_CreateWindow. Off-thread it hangs/crashes (this was
+        // the glViewport stall). Defer + block.
+        xwireRunOnMainThread([&]{ SDL_SetWindowSize(g_hiddenWindow, w, h); });
     }
 }
 
@@ -171,11 +198,15 @@ U64 gl64Bridge(CPU64* cpu, U64 fnId, U64 argsAddr) {
     // GLTRACE line ever prints, the guest-side GL dll is NOT the gl64 build —
     // it's trying the stock GLX path the wire server doesn't implement, so it
     // never gets here. First hit + per-id-once keeps it cheap.
-    if (getenv("BW64_GLTRACE")) {
+    if (const char* gt = getenv("BW64_GLTRACE")) {
         static std::atomic<bool> announced{false};
         if (!announced.exchange(true))
             klog_fmt("gl64: FIRST trap — guest IS using the gl64 bridge (fnId=%llu)",
                      (unsigned long long)fnId);
+        // BW64_GLTRACE=2: log EVERY call (fnId) — find the last GL call before a
+        // hang/crash. Noisy; only for pinpointing a stall.
+        if (gt[0] == '2')
+            klog_fmt("gl64: call fnId=%llu", (unsigned long long)fnId);
     }
     GL64Args args = {};
     if (argsAddr) {
