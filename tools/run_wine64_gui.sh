@@ -41,7 +41,7 @@ has_guest_exe() {
     esac
 }
 
-BOX="$ROOT_DIR/project/mac-xcode/build_dd/Build/Products/Release/Boxedwine.app/Contents/MacOS/Boxedwine"
+BOX="${BW64_BIN:-$ROOT_DIR/project/mac-xcode/build_dd/Build/Products/Release/Boxedwine.app/Contents/MacOS/Boxedwine}"
 if [ ! -x "$BOX" ]; then
     for p in "$HOME/Library/Developer/Xcode/DerivedData"/Boxedwine-*/Build/Products/*/Boxedwine.app/Contents/MacOS/Boxedwine; do
         [ -x "$p" ] && BOX="$p"
