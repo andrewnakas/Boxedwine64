@@ -125,9 +125,90 @@ if [ -z "$GUEST_PE" ]; then
     exit 1
 fi
 
-# ---- shared prefix prep (mirrors run_wine64.sh) ----
+# Prefix path (used by the staging workaround below and the prefix prep later).
 PREFIX="$BASE_ROOT/home/username/.wine"
-rm -f "$PREFIX"/regf*.tmp "$PREFIX/.update-timestamp" 2>/dev/null || true
+
+# Pin wine's prefix-update check OFF. wineboot's update_timestamp() compares the
+# CONTENTS of .wine/.update-timestamp against wine.inf's mtime and, if they don't
+# match (or the file is missing/0), runs a full multi-process `wineboot --update`
+# — the "The Wine configuration in … is being updated, please wait…" dialog that
+# then grinds in the slow prefix-init path. The wine source also honors the
+# literal string "disable" in that file to SKIP the update entirely
+# (programs/wineboot/wineboot.c: `if (!strncmp(buffer,"disable",...)) goto done;`).
+# This committed prefix is already initialized, so pin it to "disable" rather than
+# DELETING the timestamp (deleting it forced the update every run). Set
+# BW64_FORCE_UPDATE=1 to allow wine to update the prefix (e.g. after a wine bump).
+pin_update_timestamp() {
+    [ "${BW64_FORCE_UPDATE:-0}" = "1" ] && return 0
+    printf 'disable\n' > "$PREFIX/.update-timestamp" 2>/dev/null || true
+}
+
+# ---------------------------------------------------------------------------
+# Bootstrap-loader workaround (the "kernel32 / 3D no-opening" gate).
+#
+# The FIRST wine process (the one named on the cmdline = the bootstrap) only
+# searches its own application directory and C:\windows\system32 for builtin
+# DLLs — it never searches the wine builtin DLL dir (x86_64-windows, where
+# kernel32.dll actually lives). C:\windows\system32 in this prefix has no
+# kernel32.dll, so launching an exe that lives anywhere ELSE (e.g. C:\app.exe)
+# dies with "could not load kernel32.dll" (status c0000135) before it runs a
+# single instruction. Apps spawned LATER by wineserver/services don't hit this
+# (wineserver maps kernel32 for them), but the bootstrap does.
+#
+# Proven workaround: launch the exe from INSIDE the builtin dir, because wine
+# searches the main exe's own directory first and that dir holds every builtin
+# DLL. So we stage the target into the builtin dir (base-rootfs overlay, which
+# layers on top of wine64.zip) and launch it from there. Builtin-dir exes
+# (notepad, winecfg, ...) are launched as-is. Set BW64_NO_STAGE=1 to skip.
+# ---------------------------------------------------------------------------
+guest_to_host() {
+    # Map a guest path (/..., C:\..., or Z:\...) to its host file under the
+    # rootfs, so we can copy it. Echoes the host path or empty.
+    local g="$1" hp=""
+    case "$g" in
+        [A-Za-z]:\\*)
+            # Windows drive path -> dosdevices link target. c:->drive_c, z:->/
+            local drive="$(printf '%s' "$g" | cut -c1 | tr 'A-Z' 'a-z')"
+            local rest="$(printf '%s' "$g" | cut -c4- | tr '\\' '/')"
+            if [ "$drive" = "c" ]; then hp="$PREFIX/drive_c/$rest"
+            elif [ "$drive" = "z" ]; then hp="$BASE_ROOT/$rest"
+            else hp=""; fi
+            ;;
+        /*) hp="$BASE_ROOT$g" ;;   # absolute guest path = under rootfs root
+    esac
+    [ -n "$hp" ] && [ -f "$hp" ] && echo "$hp" || echo ""
+}
+
+if [ "${BW64_NO_STAGE:-0}" != "1" ]; then
+    case "$GUEST_PE" in
+        /$WIN_DIR/*)
+            : ;;  # already in the builtin dir — the bootstrap can find kernel32
+        *)
+            HOST_PE="$(guest_to_host "$GUEST_PE")"
+            if [ -n "$HOST_PE" ]; then
+                STAGE_DIR="$BASE_ROOT/$WIN_DIR"
+                STAGE_NAME="$(basename "$HOST_PE")"
+                mkdir -p "$STAGE_DIR"
+                # Only stage if not already provided by the zip/rootfs under that
+                # name; remove our staged copy on exit so the tree stays clean.
+                if [ ! -e "$STAGE_DIR/$STAGE_NAME" ]; then
+                    cp -f "$HOST_PE" "$STAGE_DIR/$STAGE_NAME"
+                    STAGED_COPY="$STAGE_DIR/$STAGE_NAME"
+                    trap 'rm -f "$STAGED_COPY" 2>/dev/null; rmdir -p "$(dirname "$STAGED_COPY")" 2>/dev/null || true' EXIT
+                fi
+                echo "stage:   '$GUEST_PE' -> /$WIN_DIR/$STAGE_NAME (bootstrap-loader workaround)"
+                GUEST_PE="/$WIN_DIR/$STAGE_NAME"
+            else
+                echo "warn:    could not locate '$GUEST_PE' on the host to stage it;" >&2
+                echo "         launching as-is may fail with 'could not load kernel32.dll'." >&2
+            fi
+            ;;
+    esac
+fi
+
+# ---- shared prefix prep (mirrors run_wine64.sh) ----
+rm -f "$PREFIX"/regf*.tmp 2>/dev/null || true
+pin_update_timestamp
 find "$BASE_ROOT/run/user/1000/wine" -maxdepth 1 -name 'server-1-*' \
     ! -name 'server-1-4ee' -exec rm -rf {} + 2>/dev/null || true
 
@@ -141,7 +222,8 @@ if [ ! -d "$PREFIX/drive_c/windows/system32" ]; then
         -env "WINESERVER=/usr/lib/wine/wineserver64" \
         -env "WINEDLLPATH=/usr/lib/x86_64-linux-gnu/wine" \
         /usr/lib/wine/wine64 wineboot --init >/dev/null 2>&1 || true
-    rm -f "$PREFIX"/regf*.tmp "$PREFIX/.update-timestamp" 2>/dev/null || true
+    rm -f "$PREFIX"/regf*.tmp 2>/dev/null || true
+    pin_update_timestamp
     find "$BASE_ROOT/run/user/1000/wine" -maxdepth 1 -name 'server-1-*' \
         ! -name 'server-1-4ee' -exec rm -rf {} + 2>/dev/null || true
 fi
@@ -194,7 +276,8 @@ run_box() {
 }
 
 cleanup_transients() {
-    rm -f "$PREFIX"/regf*.tmp "$PREFIX/.update-timestamp" 2>/dev/null || true
+    rm -f "$PREFIX"/regf*.tmp 2>/dev/null || true
+    pin_update_timestamp
     find "$BASE_ROOT/run/user/1000/wine" -maxdepth 1 -name 'server-1-*' \
         ! -name 'server-1-4ee' -exec rm -rf {} + 2>/dev/null || true
 }
