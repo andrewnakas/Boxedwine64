@@ -828,7 +828,11 @@ static U64 sys_openat64(CPU64* cpu, U64 dirfd, U64 pathAddr, U64 flags, U64 /*mo
     U32 rc = process->openFile(process->currentDirectory, BString::copy(path),
                                (U32)flags, result);
     if ((S32)rc < 0) {
-        if (getenv("BW64_SCDUMP")) {
+        if (getenv("BW64_DLLTRACE") && (strstr(path, ".dll") || strstr(path, ".exe") ||
+                                        strstr(path, "x86_64-windows") || strstr(path, "kernel32"))) {
+            klog_fmt("DLLTRACE pid=%d FAIL open('%s') rc=%d cwd='%s'",
+                     (int)process->id, path, (int)(S32)rc, process->currentDirectory.c_str());
+        } else if (getenv("BW64_SCDUMP")) {
             BString full = Fs::getFullPath(process->currentDirectory, BString::copy(path));
             klog_fmt("sys_openat64: open('%s') -> %d  [cwd='%s' full='%s' flags=0x%llx]",
                      path, (int)(S32)rc, process->currentDirectory.c_str(), full.c_str(),
@@ -837,6 +841,10 @@ static U64 sys_openat64(CPU64* cpu, U64 dirfd, U64 pathAddr, U64 flags, U64 /*mo
             klog_fmt("sys_openat64: open('%s') -> %d", path, (int)(S32)rc);
         }
         return (U64)(S64)(S32)rc;
+    }
+    if (getenv("BW64_DLLTRACE") && (strstr(path, ".dll") || strstr(path, ".exe") ||
+                                    strstr(path, "x86_64-windows") || strstr(path, "x86_64-unix"))) {
+        klog_fmt("DLLTRACE pid=%d OPEN  '%s' -> fd %d", (int)process->id, path, (int)result->handle);
     }
     // Feed the GUI loading screen's activity log: surface the meaningful things
     // wine loads during the boot storm (DLLs/EXEs, the graphics/font stack) so
@@ -1392,6 +1400,8 @@ static U64 sys_execve64(CPU64* cpu, U64 pathAddr, U64 argvAddr, U64 envpAddr) {
     for (auto& e : envs) {
         if (strncmp(e.c_str(), "WINELOADER=", 11) == 0)
             klog_fmt("sys_execve64:   env %s", e.c_str());
+        if (getenv("BW64_ENVDUMP"))
+            klog_fmt("sys_execve64:   ENV %s", e.c_str());
     }
     // Drive the GUI loading-screen progress: the wine boot chain re-execs
     // wine64 with the next PE in argv (e.g. ".../services.exe", "winedevice.exe",
@@ -3572,20 +3582,29 @@ void ksyscall64(CPU64* cpu) {
             ret = sys_sched_setaffinity64(cpu, a1, a2, a3);
             break;
         case X64_SYS_kill: {
-            // kill(pid, sig). pid==0 means "current process group"; pid==our
-            // pid (or -1 for "all processes we can signal") means us.
-            // Single-process world: any of those paths target us. sig==0
-            // is a permission probe; succeed silently.
+            // kill(pid, sig). For a real target pid>0 route through the shared
+            // KSystem::kill so it consults the live process table — wineserver
+            // probes client liveness with kill(pid,0) and force-reaps dead
+            // clients with kill(pid,SIGKILL) during the multi-process boot
+            // teardown. The old "single-process world" stub answered kill(pid,0)
+            // as ALWAYS-alive (sig==0 short-circuited to 0 for ANY pid) and
+            // kill(otherpid,sig) as ALWAYS -ESRCH, so wineserver could neither
+            // detect a dead client nor kill it -> its reap state machine wedged
+            // and double-freed a process object (the "unsorted double linked
+            // list"/release_object heap corruption during boot-helper exit).
+            // KSystem::kill returns -ESRCH for a nonexistent pid and 0 for a
+            // live one (sig==0), matching POSIX and the 32-bit syscall_kill.
             U32 sig = (U32)a2;
-            if (sig == 0) { ret = 0; break; }
-            // For pid <= 0 or pid == our pid: deliver to self.
+            S64 spid = (S64)a1;
             U64 ourPid = cpu->thread && cpu->thread->process ?
                          (U64)cpu->thread->process->id : 1;
-            S64 spid = (S64)a1;
             if (spid > 0 && (U64)spid != ourPid) {
-                ret = (U64)-K_ESRCH;
+                ret = (U64)(S64)(S32)KSystem::kill((S32)spid, sig);
                 break;
             }
+            // pid<=0 (process group / broadcast) or our own pid: deliver to self
+            // synchronously, as before. sig==0 is a permission/liveness probe.
+            if (sig == 0) { ret = 0; break; }
             if (deliverSignalSync(cpu, sig)) {
                 ret = 0;
             } else {

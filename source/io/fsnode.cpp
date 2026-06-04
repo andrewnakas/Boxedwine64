@@ -64,10 +64,18 @@ void FsNode::loadChildren() {
             return;
         }
         this->hasLoadedChildrenFromFileSystem = true;
+        bool traceLink = getenv("BW64_LINKTRACE") && this->path.contains("dosdevices");
         if (this->nativePath.length()) {
             std::vector<Platform::ListNodeResult> results;
             Platform::listNodes(nativePath, results);
+            if (traceLink) {
+                klog_fmt("LINKTRACE loadChildren path='%s' native='%s' found %d entries",
+                         this->path.c_str(), this->nativePath.c_str(), (int)results.size());
+            }
             for (auto& n : results) {
+                if (traceLink) {
+                    klog_fmt("LINKTRACE   entry '%s' isDir=%d", n.name.c_str(), n.isDirectory?1:0);
+                }
                 BString localPath = this->path;
                 BString remotePath = this->nativePath.stringByApppendingPath(n.name);
                 if (!localPath.endsWith("/")) {
@@ -92,8 +100,12 @@ void FsNode::loadChildren() {
                         continue;
                     }
                     localPath = localPath.substr(0, localPath.length()-5);
+                    if (traceLink) {
+                        klog_fmt("LINKTRACE   -> link node localPath='%s' target='%s'",
+                                 localPath.c_str(), (const char*)tmp);
+                    }
                     Fs::addFileNode(localPath, BString::copy((const char*)tmp), remotePath, n.isDirectory, shared_from_this());
-                }           
+                }
             }
         }
     }
