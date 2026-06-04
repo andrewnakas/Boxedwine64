@@ -26,7 +26,10 @@ GUEST="${1:-/usr/lib/x86_64-linux-gnu/wine/x86_64-windows/sleepprobe.exe}"
 
 # Clean transient wineserver state; keep the committed prefix (do NOT wipe .reg).
 PREFIX="$BASE_ROOT/home/username/.wine"
-rm -f "$PREFIX"/regf*.tmp "$PREFIX/.update-timestamp" 2>/dev/null || true
+rm -f "$PREFIX"/regf*.tmp 2>/dev/null || true
+# Pin wine's prefix-update check off (literal "disable") so the run doesn't get
+# the "Wine configuration is being updated" dialog; deleting it forces an update.
+printf 'disable\n' > "$PREFIX/.update-timestamp" 2>/dev/null || true
 find "$BASE_ROOT/run/user/1000/wine" -maxdepth 1 -name 'server-1-*' \
     ! -name 'server-1-4ee' -exec rm -rf {} + 2>/dev/null || true
 

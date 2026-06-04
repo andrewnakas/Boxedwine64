@@ -39,7 +39,18 @@ shift || true
 # winex11 loads. Wipe that transient state so every run starts from the clean
 # committed prefix.
 PREFIX="$BASE_ROOT/home/username/.wine"
-rm -f "$PREFIX"/regf*.tmp "$PREFIX/.update-timestamp" 2>/dev/null || true
+rm -f "$PREFIX"/regf*.tmp 2>/dev/null || true
+# Pin wine's prefix-update check OFF. DELETING .update-timestamp (or leaving it
+# "0") makes wineboot run a full `wineboot --update` every launch — the
+# "The Wine configuration in … is being updated, please wait…" dialog. The
+# committed prefix is already initialized, so write the literal "disable" that
+# wine honors to skip the update (programs/wineboot/wineboot.c). Set
+# BW64_FORCE_UPDATE=1 to allow the update (e.g. after a wine version bump).
+if [ "${BW64_FORCE_UPDATE:-0}" = "1" ]; then
+    rm -f "$PREFIX/.update-timestamp" 2>/dev/null || true
+else
+    printf 'disable\n' > "$PREFIX/.update-timestamp" 2>/dev/null || true
+fi
 find "$BASE_ROOT/run/user/1000/wine" -maxdepth 1 -name 'server-1-*' \
     ! -name 'server-1-4ee' -exec rm -rf {} + 2>/dev/null || true
 
@@ -59,7 +70,10 @@ if [ ! -d "$PREFIX/drive_c/windows/system32" ]; then
         -env "WINESERVER=/usr/lib/wine/wineserver64" \
         -env "WINEDLLPATH=/usr/lib/x86_64-linux-gnu/wine" \
         /usr/lib/wine/wine64 wineboot --init >/dev/null 2>&1 || true
-    rm -f "$PREFIX"/regf*.tmp "$PREFIX/.update-timestamp" 2>/dev/null || true
+    rm -f "$PREFIX"/regf*.tmp 2>/dev/null || true
+    # Just initialized the prefix — pin the update check off so subsequent
+    # launches don't re-run wineboot --update (the "being updated" dialog).
+    [ "${BW64_FORCE_UPDATE:-0}" = "1" ] || printf 'disable\n' > "$PREFIX/.update-timestamp" 2>/dev/null || true
     find "$BASE_ROOT/run/user/1000/wine" -maxdepth 1 -name 'server-1-*' \
         ! -name 'server-1-4ee' -exec rm -rf {} + 2>/dev/null || true
 fi
