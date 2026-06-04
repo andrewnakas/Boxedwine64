@@ -6,7 +6,13 @@ This fork is a **work in progress**, but a substantial one: real Debian `wine64`
 
 ![wine64 OpenGL glcube.exe rendering a spinning 3D cube in Boxedwine64 on macOS](docs/images/glcube-gui.png)
 
-*Real `wine64 glcube.exe` running under Boxedwine64 on macOS arm64 — a WGL/OpenGL 3D cube rendered through wine's GL stack to the host's Metal-backed OpenGL, presented in a live SDL window.*
+*Real `wine64 glcube.exe` running under Boxedwine64 on macOS arm64 — a Win32
+WGL/OpenGL program drawing a depth-tested, Gouraud-shaded 3D cube. The guest's
+`opengl32.dll` calls flow through wine's GL stack, are translated by Boxedwine to
+the host's Metal-backed OpenGL, and the framebuffer is presented in a live SDL
+window. This is the whole pipeline — window creation, the Win32 message pump,
+`wglCreateContext`/`wglMakeCurrent`, per-frame GL command translation, and
+`SwapBuffers` — running end to end in the 64-bit emulator.*
 
 ![wine64 notepad.exe rendering a real GUI window in Boxedwine64 on macOS](docs/images/notepad-gui.png)
 
@@ -117,7 +123,93 @@ The 64-bit guest path can:
 ### What does not work yet
 
 - **No 64-bit JIT** — interpreter only (by design; v1 ships interpreter-only)
-- **No WASM `MEMORY64=2` build target yet**
+- **No WASM `MEMORY64=2` build target yet** (see [WebAssembly / browser](#webassembly-and-the-browser-the-next-frontier) below)
+- **X core-font text** (`PolyText8`/`PolyText16`) is unimplemented, so control/
+  dialog text drawn through X core fonts doesn't paint yet (notepad's main edit
+  area paints fine via GDI → `PutImage`)
+
+---
+
+## Graphics: 2D GDI and 3D OpenGL
+
+Boxedwine64 has **two complementary rendering paths**, and both now work end to
+end on macOS arm64. Neither needs a real X server, a real Linux host, or any
+Windows DLLs from Microsoft — it's stock Debian `wine64` driving Boxedwine's
+emulated kernel and an in-process display server.
+
+### The display stack
+
+Windows GUI apps under wine talk to `winex11.drv`, which speaks the **X11 wire
+protocol** over a socket to an X server. There is no X server on macOS, so
+Boxedwine64 ships an **in-process X11 wire server** (`source/x11wire/`): it
+accepts winex11's connection, answers the handshake, and implements the X
+requests wine actually issues — `CreateWindow`, `MapWindow`, `CreateGC`,
+`ConfigureWindow`, property/atom/selection requests, input grabs, and the
+drawing requests. Output is presented through **SDL** to a native macOS window;
+input (SDL key/mouse events) is translated back into X11 input events and
+delivered to the guest. The result is a real, movable, clickable window with
+wine's own cursor — no XQuartz, no host X server.
+
+### 2D — GDI / framebuffer apps (notepad)
+
+`notepad.exe` paints through the classic GDI path: wine rasterizes text and
+controls (FreeType + fontconfig for glyphs) into a client-side bitmap and pushes
+it to the window with `PutImage`/`CopyArea`/`PolyFillRectangle`/`CreateGC`. The
+wire server blits those into the SDL framebuffer. Hundreds of these requests
+flow per repaint; the window shows a live menu bar, scrollbar, status bar, and a
+blinking caret. **Interactive input works**: typing reaches the edit control,
+clicks place the caret, menus open as composited top-level windows, and the
+Save As common dialog round-trips a file to the host filesystem.
+
+### 3D — WGL / OpenGL apps (glcube)
+
+The headline result: **a Win32 OpenGL program renders real 3D**. `glcube.exe`
+is a plain WGL app — `ChoosePixelFormat`/`SetPixelFormat`,
+`wglCreateContext`/`wglMakeCurrent`, then a render loop issuing classic OpenGL
+(`glClear`, matrix setup, `glBegin`/`glVertex`/`glColor` for the cube faces,
+`SwapBuffers`). The call chain is:
+
+```
+glcube.exe → opengl32.dll (wine) → Boxedwine GL translation → host OpenGL (Metal-backed on Apple GPUs) → SDL present
+```
+
+Boxedwine intercepts the guest's GL entry points and replays them against the
+host's OpenGL context, so the cube is **actually drawn by the Mac GPU**, not
+softrendered. Depth testing, per-vertex color interpolation (the blue/green/
+magenta faces), the perspective projection, and continuous animation via
+`SwapBuffers` all run from inside the emulated 64-bit process. Launch it with:
+
+```sh
+tools/run_wine64_gui.sh 'C:\glcube.exe'
+```
+
+### What it took to get here
+
+3D and any idling/animated app were previously a **"boot lottery"** — they'd
+intermittently die or hang before reaching their render loop. Two emulator bugs
+were responsible, both now fixed:
+
+- **Broken-pipe writes leaked an internal sentinel.** When a connected unix
+  socket's peer was gone, a 64-bit client's write took wine's SIGPIPE path,
+  which is mis-delivered on the unused 32-bit CPU for a 64-bit thread and
+  returned the `-K_CONTINUE` restart sentinel. The 64-bit syscall dispatcher
+  left that in `RAX` as a bogus byte count, so wine read a short **"partial
+  write"** on its wineserver request socket → fatal client error + wineserver
+  heap corruption. A 64-bit broken-pipe write now returns a clean **`-EPIPE`**,
+  exactly as Linux does when `SIGPIPE` is ignored (wine always ignores it).
+- **`sched_yield` destroyed the calling thread.** The 64-bit `sched_yield` set
+  the per-CPU `yield` flag, which the multi-threaded run loop interprets as
+  "this thread has finished" and tears the thread down. wine's `Sleep()` and the
+  Win32 message pump spin on `sched_yield` while idling, so **every idling app
+  silently lost its main thread and hung**. In the multi-threaded build
+  `sched_yield` now only relinquishes the host CPU (`std::this_thread::yield`)
+  and never signals thread exit, so the message pump runs and 3D apps reach —
+  and stay in — their render loop.
+
+With those fixed, `glcube.exe` renders the spinning cube, `notepad.exe` boots to
+an interactive window, and the bare message-pump / sleep probes
+(`tools/rootfs64/gltest/`) iterate cleanly. The 64-bit `--x64-selftest` stays at
+**234/234**.
 
 ---
 
@@ -135,7 +227,7 @@ This project drives the [`docs/PLAN_64BIT.md`](docs/PLAN_64BIT.md) §3.7–§3.1
 | **F — Windows PE + GUI** | populate the prefix with Windows PE files, then the X server / GUI path; interactive input + a working common dialog | ✅ Complete — notepad paints, takes keyboard+mouse, and Save As writes a file to the host |
 | **G — App breadth + X completeness** | get a spread of bundled apps (winecfg, regedit, clock, write, …) usable, fill the remaining X core opcodes they need | ⏳ Next |
 | **H — Interpreter throughput** | close the gap to interactive speed: faster hot-path decode, fewer per-op map lookups, block/trace caching | 🟡 In progress — instruction-fetch page cache + profiled hot-opcode dispatch hoist landed (`BW64_OPPROF`); full decoded-block cache still open |
-| **I — WASM memory64 + v1 polish** | Emscripten `MEMORY64=2`, slim wine64 package, lazy DLL fetch, browser tests | ⏳ Not started |
+| **I — WASM memory64 + v1 polish** | Emscripten `-sMEMORY64`, Web Workers + SharedArrayBuffer threading, WebGL GL backend, lazy DLL fetch, browser tests — see [WebAssembly / browser](#webassembly-and-the-browser-the-next-frontier) | ⏳ Not started |
 
 The commit log (`git log --oneline`) is the canonical, blow-by-blow record of the
 bring-up — each commit names the opcode or syscall and the real binary that
@@ -174,6 +266,53 @@ The most useful work, in rough priority order:
 5. **Regression coverage.** Add a headless smoke test that boots `wineboot
    --init` + a non-interactive PE to a known exit, so the memory/mmap changes
    here can't silently regress. Keep `--x64-selftest` at 234/234.
+
+---
+
+## WebAssembly and the browser (the next frontier)
+
+The original 32-bit Boxedwine already runs **entirely in the browser** via
+Emscripten/WASM (that's how [boxedwine.org](https://www.boxedwine.org) runs
+Windows apps with no install). The north star for this fork is the same thing
+for 64-bit: **`wine64` — and a spinning OpenGL cube — running in a browser tab**,
+no native app, no server round-trip.
+
+### Why it isn't automatic
+
+The 32-bit path fits a classic WASM linear memory (32-bit pointers in a ≤4 GB
+`ArrayBuffer`). A 64-bit guest needs **64-bit pointers**, which means
+**WebAssembly Memory64** (the `memory64` proposal, `wasm64` / `-sMEMORY64`).
+That changes pointer width across the whole emulator and is the single biggest
+prerequisite. Memory64 is now shipping in current Chrome/Firefox, so the target
+is finally realistic.
+
+### The plan (Milestone I)
+
+1. **Build the 64-bit core for `wasm64`.** Compile the `BOXEDWINE_GUEST_X64`
+   sources with Emscripten `-sMEMORY64=1`, audit every place that assumes a
+   32-bit host pointer or casts pointers to `U32`, and get `--x64-selftest`
+   (234/234) green inside Node/`d8` under wasm64.
+2. **Port the kernel I/O surface to the browser.** The desktop build uses host
+   threads, real sockets, and SDL. In the browser that becomes Web Workers +
+   `SharedArrayBuffer` for the `clone`/futex threading model (the same approach
+   32-bit Boxedwine already uses), an in-memory socketpair/epoll shim for the
+   wineserver IPC (no real fds), and WebGL/WebGL2 (or WebGPU) as the GL backend
+   behind the same GL-translation layer that today targets host OpenGL.
+3. **Make the rootfs streamable.** Today the glibc + wine64 zips are mounted from
+   disk. In the browser they need **lazy, range-fetched DLL/zip loading** (pull
+   `kernel32`/`opengl32`/etc. on demand) so the page starts fast instead of
+   downloading a full prefix up front.
+4. **Render path: glcube in WebGL.** The GL command stream that currently drives
+   host OpenGL is the natural bridge — retarget it at a WebGL2 context on an HTML
+   `<canvas>`, keep `SwapBuffers` mapped to `requestAnimationFrame`, and the same
+   `glcube.exe` should draw in a tab.
+5. **Browser test harness + v1 polish.** Headless-Chrome smoke tests
+   (boot → window-map → first frame), a slimmed wine64 package, and the demo
+   page.
+
+If you want to help, the highest-leverage WASM task today is **step 1** — a clean
+`-sMEMORY64` build with the self-test passing. The pointer-width audit is
+mechanical but broad, and it unblocks everything else.
 
 ---
 
