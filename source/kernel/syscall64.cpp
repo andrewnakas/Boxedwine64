@@ -945,11 +945,28 @@ static U64 sys_pread64(CPU64* cpu, U64 fd, U64 buf, U64 count, U64 offset) {
     if (!fdesc->canRead()) return (U64)-K_EINVAL;
     if (count == 0) return 0;
     if (count > (1ULL << 20)) count = 1ULL << 20;
-    S64 savedPos = fdesc->kobject->getPos();
-    fdesc->kobject->seek((S64)offset);
     std::vector<U8> tmp((size_t)count);
-    U32 got = fdesc->kobject->readNative(tmp.data(), (U32)count);
-    fdesc->kobject->seek(savedPos);
+    U32 got;
+    // Same zip-stream hazard as sys_mmap64_file / sys_read64: this seek+read+seek
+    // is unsynchronized, and wine's PE loader + glibc ld.so pread DLL/DSO headers
+    // from the SHARED per-zip stream. Serialize file reads (KFile only — a
+    // blocking socket pread must not hold the global lock). Without this, a
+    // header pread races a concurrent mmap of the same zip entry and reads the
+    // wrong bytes (the residual "could not load kernel32.dll" path after the
+    // mmap/read serialization fixed the segment-map corruption).
+    std::shared_ptr<KFile> pkfile = std::dynamic_pointer_cast<KFile>(fdesc->kobject);
+    if (pkfile) {
+        std::lock_guard<std::mutex> lk(g_fileReadMutex);
+        S64 savedPos = fdesc->kobject->getPos();
+        fdesc->kobject->seek((S64)offset);
+        got = fdesc->kobject->readNative(tmp.data(), (U32)count);
+        fdesc->kobject->seek(savedPos);
+    } else {
+        S64 savedPos = fdesc->kobject->getPos();
+        fdesc->kobject->seek((S64)offset);
+        got = fdesc->kobject->readNative(tmp.data(), (U32)count);
+        fdesc->kobject->seek(savedPos);
+    }
     if ((S32)got < 0) return (U64)(S64)(S32)got;
     if (got > 0) cpu->memory->memcpyToGuest(buf, tmp.data(), got);
     return (U64)got;
