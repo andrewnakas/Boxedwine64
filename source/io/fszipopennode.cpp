@@ -95,7 +95,7 @@ U32 FsZipOpenNode::readNative(U8* buffer, U32 len) {
     BOXEDWINE_CRITICAL_SECTION_WITH_MUTEX(*getReadMutex());
     std::shared_ptr<FsZip> fsZip = zipNode->fsZip.lock();
     if (fsZip) {
-        fsZip->setupZipRead(this->offset, this->pos);
+        fsZip->setupZipRead(this->offset, this->pos, this);
         result = unzReadCurrentFile(fsZip->zipfile, buffer, len);
         this->pos += result;
         fsZip->lastZipFileOffset = this->pos;

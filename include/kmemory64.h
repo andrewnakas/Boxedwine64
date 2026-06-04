@@ -246,6 +246,11 @@ private:
     void rangeRemoveLocked(U64 startPage, U64 pageCount);
 
     K64Page* getOrAllocPage(U64 pageNum, U32 flagsIfNew);
+    // Allocate (if absent) AND commit a page's backing buffer atomically under
+    // pagesMutex; returns the committed buffer. Closes a lost-write race where two
+    // host threads first-touching the same page each `new` a buffer and one
+    // thread's write lands in an orphaned buffer (see definition).
+    U8* commitPageLocked(U64 pageNum, U32 flagsIfNew);
     K64Page* getPage(U64 pageNum) const;
 };
 

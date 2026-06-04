@@ -52,6 +52,15 @@ public:
 
     U64 lastZipOffset = 0xFFFFFFFFFFFFFFFFl;
     U64 lastZipFileOffset = 0;
+    // Identity of the FsZipOpenNode that last positioned the shared unzFile
+    // stream. The (lastZipOffset, lastZipFileOffset) fast-path skip is only valid
+    // when the SAME node reads forward; two nodes of the same zip entry (e.g. two
+    // wine processes mmap'ing winex11.drv concurrently, each with its own per-node
+    // `pos`) interleave across readMutex and leave the shared stream at the OTHER
+    // node's position, so trusting the skip reads the wrong file bytes -> a DLL
+    // image mapped from the wrong offset -> corrupted IAT -> wild jump. Force a
+    // reposition whenever the requesting node differs from the last one.
+    const void* lastReadOwner = nullptr;
 
     // Set by init() when the zip layout indicates an x86_64-linux/wine64
     // rootfs: presence of any of `x86_64-linux-gnu/`, `wine/x86_64-unix/`,
@@ -64,7 +73,7 @@ public:
 
     BOXEDWINE_MUTEX readMutex;
 
-    void setupZipRead(U64 zipOffset, U64 zipFileOffset);
+    void setupZipRead(U64 zipOffset, U64 zipFileOffset, const void* owner = nullptr);
     void remove(BString localPath);
 
     static bool readFileFromZip(BString zipFile, BString file, BString& result);

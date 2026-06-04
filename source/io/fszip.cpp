@@ -30,15 +30,24 @@ extern "C"
 #include <time.h>
 #include <string.h>
 
-void FsZip::setupZipRead(U64 zipOffset, U64 zipFileOffset) {
-#ifdef BOXEDWINE_ZLIB    
-    if (zipOffset != lastZipOffset || zipFileOffset < lastZipFileOffset) {
+void FsZip::setupZipRead(U64 zipOffset, U64 zipFileOffset, const void* owner) {
+#ifdef BOXEDWINE_ZLIB
+    // The (lastZipOffset, lastZipFileOffset) skip-ahead is only valid when the
+    // stream is exactly where THIS reader last left it. If a different open-node
+    // touched the shared unzFile in between (two processes mmap'ing the same zip
+    // entry concurrently — each FsZipOpenNode has its own `pos`, but they share
+    // this one decompression stream), the skip would fast-forward by the wrong
+    // distance and decode the wrong file bytes. Forcing a fresh reopen+seek on an
+    // owner change keeps each read positioned by its own (offset,pos).
+    bool ownerChanged = (owner != lastReadOwner);
+    if (zipOffset != lastZipOffset || zipFileOffset < lastZipFileOffset || ownerChanged) {
         unzCloseCurrentFile(this->zipfile);
         unzSetOffset64(this->zipfile, zipOffset);
         lastZipFileOffset = 0;
         unzOpenCurrentFile(this->zipfile);
         lastZipOffset = zipOffset;
     }
+    lastReadOwner = owner;
     if (zipFileOffset != lastZipFileOffset) {
         char tmp[4096] = {};
         U32 todo = (U32)(zipFileOffset - lastZipFileOffset);

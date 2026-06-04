@@ -144,6 +144,27 @@ K64Page* KMemory64::getOrAllocPage(U64 pageNum, U32 flagsIfNew) {
     return raw;
 }
 
+// Allocate (if needed) AND commit a page's backing buffer atomically under
+// pagesMutex, returning the committed buffer. MT-CRITICAL: wine processes are
+// multi-threaded (each guest process runs every thread on its own host thread,
+// all sharing this KMemory64). The old write path did getOrAllocPage() under the
+// lock, then called page->commit() LOCK-FREE. Two host threads writing the same
+// not-yet-committed page would both see data==nullptr and both `new` a buffer:
+// one alloc wins the `data=` store, the other thread then memcpy's into an
+// ORPHANED buffer — a silently LOST WRITE. During the boot storm that lost write
+// landed in a freshly-loaded image (a relocated IAT slot / function pointer), so
+// the page later read back stale/zero -> a wild indirect call into garbage
+// (RIP=0x10270 / data executed as code) -> "could not load kernel32.dll" ->
+// cascading wineserver heap corruption. Folding commit() into the locked region
+// makes first-touch commit atomic so no write is lost. (Once committed, `data`
+// is stable — munmap/PROT_NONE only decommit unpinned pages wine isn't actively
+// writing — so the subsequent lock-free memcpy is safe.)
+U8* KMemory64::commitPageLocked(U64 pageNum, U32 flagsIfNew) {
+    BOXEDWINE_CRITICAL_SECTION_WITH_MUTEX(pagesMutex);
+    K64Page* page = getOrAllocPage(pageNum, flagsIfNew); // recursive mutex: re-enter OK
+    return page->commit();
+}
+
 U64 KMemory64::committedPageCount() const {
     // Pages that actually hold a backing buffer (touched), as opposed to merely
     // reserved address space (data==nullptr). The gap between this and
@@ -411,7 +432,8 @@ void KMemory64::memcpyToGuest(U64 dstGuest, const void* src, U64 len) {
         U64 v = 0;
         U64 within = (g_watchAddr >= dstGuest) ? (g_watchAddr - dstGuest) : 0;
         if (within + 8 <= len) std::memcpy(&v, (const U8*)src + within, 8);
-        klog_fmt("BW64_WATCH: write to 0x%llx (watch 0x%llx) len=%llu first8=0x%llx",
+        klog_fmt("BW64_WATCH: pid=%d write to 0x%llx (watch 0x%llx) len=%llu first8=0x%llx",
+                 (int)(process ? process->id : -1),
                  (unsigned long long)dstGuest, (unsigned long long)g_watchAddr,
                  (unsigned long long)len, (unsigned long long)v);
     }
@@ -420,8 +442,8 @@ void KMemory64::memcpyToGuest(U64 dstGuest, const void* src, U64 len) {
         U64 offsetInPage = dstGuest & K64_PAGE_MASK;
         U64 chunk = K64_PAGE_SIZE - offsetInPage;
         if (chunk > len) chunk = len;
-        K64Page* page = getOrAllocPage(pageNum, K64_PAGE_MAPPED | K64_PAGE_READ | K64_PAGE_WRITE);
-        ::memcpy(page->commit() + offsetInPage, s, (size_t)chunk); // commit-on-write
+        U8* data = commitPageLocked(pageNum, K64_PAGE_MAPPED | K64_PAGE_READ | K64_PAGE_WRITE);
+        ::memcpy(data + offsetInPage, s, (size_t)chunk); // commit-on-write (MT-safe)
         dstGuest += chunk;
         s += chunk;
         len -= chunk;
@@ -455,8 +477,8 @@ void KMemory64::memsetGuest(U64 dstGuest, U8 value, U64 len) {
         U64 offsetInPage = dstGuest & K64_PAGE_MASK;
         U64 chunk = K64_PAGE_SIZE - offsetInPage;
         if (chunk > len) chunk = len;
-        K64Page* page = getOrAllocPage(pageNum, K64_PAGE_MAPPED | K64_PAGE_READ | K64_PAGE_WRITE);
-        ::memset(page->commit() + offsetInPage, value, (size_t)chunk); // commit-on-write
+        U8* data = commitPageLocked(pageNum, K64_PAGE_MAPPED | K64_PAGE_READ | K64_PAGE_WRITE);
+        ::memset(data + offsetInPage, value, (size_t)chunk); // commit-on-write (MT-safe)
         dstGuest += chunk;
         len -= chunk;
     }
@@ -481,8 +503,8 @@ U64 KMemory64::readq(U64 addr) {
 
 void KMemory64::writeb(U64 addr, U8 value) {
     strayWriteCheck(addr, 1);
-    K64Page* p = getOrAllocPage(addr >> K64_PAGE_SHIFT, K64_PAGE_MAPPED | K64_PAGE_READ | K64_PAGE_WRITE);
-    p->commit()[addr & K64_PAGE_MASK] = value; // commit-on-write
+    U8* data = commitPageLocked(addr >> K64_PAGE_SHIFT, K64_PAGE_MAPPED | K64_PAGE_READ | K64_PAGE_WRITE);
+    data[addr & K64_PAGE_MASK] = value; // commit-on-write (MT-safe)
 }
 
 U8* KMemory64::getRamPtr(U64 addr, U32 len) {
@@ -491,16 +513,23 @@ U8* KMemory64::getRamPtr(U64 addr, U32 len) {
         // Would span two pages — host pointer wouldn't be contiguous.
         return nullptr;
     }
-    K64Page* page = getOrAllocPage(addr >> K64_PAGE_SHIFT,
-                                   K64_PAGE_MAPPED | K64_PAGE_READ | K64_PAGE_WRITE);
-    // Commit + PIN. Callers (the 64-bit futex table, atomic RMW in common_lock)
-    // keep this raw host pointer across a blocking wait. If a concurrent munmap
-    // decommitted the buffer, a re-commit would move it and the futex wake would
-    // target a stale address. The pin flag tells munmap/mprotect to free the
-    // address space but LEAVE this page's buffer in place. Once allocated, the
-    // buffer is never reallocated, so the returned pointer stays valid.
-    page->flags |= K64_PAGE_PINNED;
-    return page->commit() + offsetInPage;
+    // Commit + PIN atomically under pagesMutex. Callers (the 64-bit futex table,
+    // atomic RMW in common_lock) keep this raw host pointer across a blocking
+    // wait. If a concurrent munmap decommitted the buffer, a re-commit would move
+    // it and the futex wake would target a stale address. The pin flag tells
+    // munmap/mprotect to free the address space but LEAVE this page's buffer in
+    // place. Once allocated, the buffer is never reallocated, so the returned
+    // pointer stays valid. The commit must be locked (see commitPageLocked) so a
+    // sibling thread's first-touch of the same page can't orphan our buffer.
+    U8* data;
+    {
+        BOXEDWINE_CRITICAL_SECTION_WITH_MUTEX(pagesMutex);
+        K64Page* page = getOrAllocPage(addr >> K64_PAGE_SHIFT,
+                                       K64_PAGE_MAPPED | K64_PAGE_READ | K64_PAGE_WRITE);
+        page->flags |= K64_PAGE_PINNED;
+        data = page->commit();
+    }
+    return data + offsetInPage;
 }
 
 void KMemory64::writew(U64 addr, U16 value) { memcpyToGuest(addr, &value, 2); }

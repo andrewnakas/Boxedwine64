@@ -270,6 +270,18 @@
 //       'S'=sendmsg scm_rights fd sent (e0=#fds, e1=first guest fd).
 // extra0/extra1 carry per-kind context (see crashRingRecordRead callers).
 struct CrashRingEntry { char kind; U32 pid; U32 fd; U32 len; U32 extra0; U32 extra1; U8 hdr[16]; };
+// Serializes guest file reads (sys_read64 + sys_mmap64_file) against the shared
+// per-zip decompression stream. wine's DLLs live in wine64.zip; every
+// FsZipOpenNode of the same entry shares ONE unzFile + position state, and the
+// seek()+readNative() that maps a DLL segment is several un-co-locked calls. Two
+// wine processes loading the same DLL on separate host threads otherwise
+// interleave seek/read and each reads from the OTHER's file position — splatter-
+// ing a DLL's MZ header over its own .text/.data/IAT, corrupting the IAT, and
+// producing a wild indirect call into low memory (RIP=0x10270) -> "could not load
+// kernel32.dll" -> cascading wineserver heap corruption. Holding this lock across
+// the whole read makes file reads atomic. Not perf-critical (DLL load path).
+static std::mutex g_fileReadMutex;
+
 static CrashRingEntry g_crashRing[64];
 static std::atomic<U32> g_crashRingPos{0};
 static bool g_crashRingOn = false;
@@ -742,7 +754,21 @@ static U64 sys_read64(CPU64* cpu, U64 fd, U64 buf, U64 count) {
         KUnixSocketObject* us = dynamic_cast<KUnixSocketObject*>(fdesc->kobject.get());
         if (us && !us->isXWire()) { wsSock = us; recvBefore = us->debugRecvUsed(); }
     }
-    U32 got = fdesc->kobject->readNative(tmp.data(), (U32)count);
+    // Serialize against sys_mmap64_file (and other reads) on the shared per-zip
+    // stream — see g_fileReadMutex. A KFile read that repositions a zip's shared
+    // unzFile must not interleave with another thread's read/mmap of the same zip.
+    // ONLY lock for real files (KFile): a blocking socket/pipe read must NOT hold
+    // this global lock or it stalls every other process's file reads (deadlock).
+    U32 got;
+    {
+        std::shared_ptr<KFile> rkfile = std::dynamic_pointer_cast<KFile>(fdesc->kobject);
+        if (rkfile) {
+            std::lock_guard<std::mutex> lk(g_fileReadMutex);
+            got = fdesc->kobject->readNative(tmp.data(), (U32)count);
+        } else {
+            got = fdesc->kobject->readNative(tmp.data(), (U32)count);
+        }
+    }
     if ((S32)got < 0) {
         return (U64)(S64)(S32)got; // sign-extend kernel errno
     }
@@ -1187,11 +1213,44 @@ static U64 sys_mmap64_file(CPU64* cpu, U64 addr, U64 length, U64 prot,
         if (!tailSave.empty()) cpu->memory->memcpyToGuest(fileEnd, tailSave.data(), tail);
     }
     // Read [offset, offset+length) and copy into [addr, addr+length).
+    // MT-CRITICAL: the seek()+readNative()+seek() sequence is THREE separate calls
+    // that must not interleave with another thread's file read. For zip-backed
+    // files (wine's DLLs live in wine64.zip) every FsZipOpenNode shares ONE
+    // underlying decompression stream (FsZip::zipfile) plus its position state;
+    // readNative only locks its own body, so when two wine processes mmap the same
+    // DLL concurrently on separate host threads their seek/read interleave and
+    // each reads from the OTHER's file position — splattering e.g. winex11.drv's
+    // MZ header (file offset 0) over its .text/.data/IAT -> corrupted IAT pointers
+    // -> a wild indirect call into low memory (RIP=0x10270) -> "could not load
+    // kernel32.dll" -> cascading wineserver heap corruption. A process-global lock
+    // across the whole seek+read+restore makes each file-mmap read atomic. DLL
+    // loading is not perf-critical, so the serialization cost is acceptable.
     std::vector<U8> buf((size_t)length);
-    S64 saved = kfile->openFile->getFilePointer();
-    kfile->openFile->seek((S64)offset);
-    U32 got = kfile->openFile->readNative(buf.data(), (U32)length);
-    kfile->openFile->seek(saved);
+    U32 got;
+    {
+        std::lock_guard<std::mutex> lk(g_fileReadMutex);
+        S64 saved = kfile->openFile->getFilePointer();
+        kfile->openFile->seek((S64)offset);
+        got = kfile->openFile->readNative(buf.data(), (U32)length);
+        kfile->openFile->seek(saved);
+    }
+    // BW64_MAPWATCH=0xADDR: log every file-mmap that lands in [ADDR, ADDR+0x20000)
+    // with its file offset — to catch a segment being (re)mapped from the WRONG
+    // file offset (e.g. offset 0 = the MZ header splattered over .text/.data/IAT).
+    {
+        static const char* mw = std::getenv("BW64_MAPWATCH");
+        if (mw) {
+            U64 wa = std::strtoull(mw, nullptr, 0);
+            if (addr < wa + 0x20000 && addr + length > wa) {
+                U64 f8 = 0; if (got >= 8) std::memcpy(&f8, buf.data(), 8);
+                klog_fmt("MAPWATCH pid=%d addr=0x%llx len=0x%llx offset=0x%llx prot=0x%x flags=0x%x got=%u first8=0x%llx file='%s'",
+                         (int)cpu->thread->process->id, (unsigned long long)addr,
+                         (unsigned long long)length, (unsigned long long)offset, (unsigned)prot,
+                         (unsigned)flags, got, (unsigned long long)f8,
+                         kfile->openFile->node ? kfile->openFile->node->path.c_str() : "?");
+            }
+        }
+    }
     if (got > 0) {
         cpu->memory->memcpyToGuest(addr, buf.data(), got);
     }
