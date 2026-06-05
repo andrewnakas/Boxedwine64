@@ -69,7 +69,16 @@ wasm64-mt: export TARGET_EXEC := boxedwine64.html
 # 512MB heap (observed OOM at "enlarge memory arrays to 536875008"). Growth lets
 # the (shared, pthread) heap expand at runtime. Scoped to this target so the
 # headless selftest builds keep the cheaper fixed heap.
-wasm64-mt: export EXTRA_LD_FLAGS := -pthread -sPTHREAD_POOL_SIZE=32 -sPROXY_TO_PTHREAD=1 -sOFFSCREENCANVAS_SUPPORT=0 -sALLOW_MEMORY_GROWTH=1 -sMAXIMUM_MEMORY=2147483648 --js-library=boxedwine-multithreaded-audio.js
+#
+# LEGACY_GL_EMULATION: the gl64 host bridge (source/opengl/gl64bridge.cpp) drives
+# the guest's fixed-function GL (glBegin/glEnd, matrix stack, glColor/glVertex,
+# lighting) — none of which exist in WebGL2/GLES3. Emscripten's glemu layer
+# synthesizes shaders for the FFP, so the bridge's existing native-GL code path
+# keeps working under WASM. It pulls in FULL_ES2 and needs WebGL2 allowed, hence
+# MAX_WEBGL_VERSION=2. We render the cube into an app-created FBO and glReadPixels
+# it back through the X11-wire present sink, so we do NOT need OFFSCREEN_FRAMEBUFFER
+# (that's only for compositing a pthread's GL straight to the page canvas).
+wasm64-mt: export EXTRA_LD_FLAGS := -pthread -sPTHREAD_POOL_SIZE=32 -sPROXY_TO_PTHREAD=1 -sOFFSCREENCANVAS_SUPPORT=0 -sALLOW_MEMORY_GROWTH=1 -sMAXIMUM_MEMORY=2147483648 -sLEGACY_GL_EMULATION=1 -sMAX_WEBGL_VERSION=2 --js-library=boxedwine-multithreaded-audio.js
 wasm64-mt: export ASSET_FILES := boxedwine.css boxedwine-shell.js wine64.html wine64-launcher.js $(ZIP_ASSET_FILES)
 
 cpus := $(shell getconf _NPROCESSORS_ONLN 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || grep -c ^processor /proc/cpuinfo 2>/dev/null || echo 1)
