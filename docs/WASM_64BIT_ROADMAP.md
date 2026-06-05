@@ -1,9 +1,10 @@
 # 64-bit WASM Roadmap — running wine64 in the browser
 
 **Status:** Milestone I in progress. The 64-bit guest core runs in WASM headless
-(both `wasm32` and `-sMEMORY64`/wasm64) and the multi-threaded **browser** build
-loads in a tab. Remaining work is the rootfs, the GL backend, the wineserver IPC
-shim, and a browser test harness.
+(both `wasm32` and `-sMEMORY64`/wasm64), and the multi-threaded **browser** build
+now **boots real `wine64` in a tab** — `wine64 --version` → `wine-8.0`, clean
+`exit_group(0)`, verified in headless Chrome. Remaining work is the GL backend
+(WebGL), lazy/streamable rootfs, the in-browser wineserver IPC shim, and CI.
 
 This file is the actionable hand-off for finishing "wine64 in a browser tab." A
 fresh session should be able to read this top-to-bottom and continue. See also
@@ -31,14 +32,51 @@ All make targets below are in `project/emscripten/` (`cd project/emscripten`).
 | `wasm64-selftest` | `make wasm64-selftest` | 64-bit core builds on wasm32 host | `node Build/Wasm64SelfTest/boxedwine64-selftest.js --x64-selftest` → `234 passed, 0 failed` |
 | `wasm64-runelf` | `make wasm64-runelf` | a real static x86_64 ELF loads + runs (loader64 + SysV stack + syscall64) | `node Build/Wasm64RunElf/boxedwine64-runelf.js --x64-run-elf tools/x64test/wasm/hello_static` → prints message, clean `exit_group` |
 | `wasm64-selftest-mem64` | `make wasm64-selftest-mem64` | true 64-bit host pointers (`-sMEMORY64`) | **Node 24:** `node Build/Wasm64SelfTestMem64/boxedwine64-selftest-mem64.js --x64-selftest` → 234/234 |
-| `wasm64-mt` | `make wasm64-mt` | 64-bit core + browser threading (Workers + SharedArrayBuffer) loads in a tab | serve + open (below); WASM instantiates, 64-Worker pthread pool up, canvas live, waits on `boxedwine.zip` |
+| `wasm64-mt` | `make wasm64-mt` | 64-bit core + browser threading (Workers + SharedArrayBuffer) + **real `wine64` boots in a tab** | serve + open the wine64 launcher (below) → console prints `wine-8.0 (Debian 8.0~repack-4)`, clean `exit_group(0)` |
 
-Serving the browser build (needs COOP/COEP for `SharedArrayBuffer`):
+### Running real wine64 in a browser tab  ✅
+
+The `wasm64-mt` build ships a dedicated launcher — `wine64.html` +
+`wine64-launcher.js` — that loads the two layered 64-bit rootfs zips into the
+WASM VFS and passes the same argv the native headless command uses. It is
+separate from the generic 32-bit `boxedwine-shell.js`/`shell.html` (single
+`boxedwine.zip`, many query-param quirks).
 
 ```sh
 cd project/emscripten
-node server.mjs 8000
-# open http://127.0.0.1:8000/Build/Wasm64Mt/boxedwine64.html
+# the launcher fetches the zips relative to wine64.html; symlink them into the
+# build dir (cheap — no 200MB copy):
+ln -sf ../../../../tools/rootfs64/dist/glibc-rootfs64.zip Build/Wasm64Mt/glibc-rootfs64.zip
+ln -sf ../../../../tools/rootfs64/dist/wine64.zip          Build/Wasm64Mt/wine64.zip
+node server.mjs 8000   # sets COOP/COEP so SharedArrayBuffer / crossOriginIsolated works
+# open http://127.0.0.1:8000/Build/Wasm64Mt/wine64.html
+```
+
+Launcher query params (all optional):
+
+- `?p=--version` — program + args for wine64 (default `--version`; URL-encode
+  spaces as `%20`).
+- `?boot=1` — run `wineboot --init` instead (full prefix bring-up; sets
+  `HOME`/`WINEPREFIX`/`WINESERVER`).
+- `?novideo=1` — headless (no SDL window); fastest for the `--version` smoke.
+- `?base=<url>` — where the zips are fetched from (default `./`).
+
+**Verified:** `wine64.html?novideo=1` → the browser console (and the on-page
+`#output` textarea) prints `wine-8.0 (Debian 8.0~repack-4)` followed by
+`CPU64: exit_group syscall, status=0`. Real x86_64 `wine64` executing in WASM in
+a tab.
+
+**Headless test harness:** `cdp-attach.mjs` attaches to an already-running
+Chrome's DevTools endpoint (`--remote-debugging-port=9222 --no-sandbox
+--enable-features=SharedArrayBuffer`), opens the page, and streams console +
+`#output` until a match string appears or it times out — no npm deps (raw CDP
+over a built-in-only WebSocket client). Note: a fresh headless Chrome needs
+`--no-sandbox` on macOS or it dies with a Mach-port permission error, and
+`crossOriginIsolated` is only true with COOP/COEP **and** `SharedArrayBuffer`
+enabled.
+
+```sh
+node cdp-attach.mjs "http://127.0.0.1:8000/Build/Wasm64Mt/wine64.html?novideo=1" 180000 "wine-8.0"
 ```
 
 ### Key facts learned (don't re-discover these)
@@ -59,42 +97,19 @@ node server.mjs 8000
 
 ---
 
-## Remaining work to a first "wine64 in a tab" demo
+## Remaining work
 
-Ordered by leverage. Steps 1 and 2 are the minimum for a *visible* boot; step 3
-is what makes it *fast/shippable*.
+### 1. Boot a 64-bit rootfs in `wasm64-mt`  ✅ DONE
 
-### 1. Boot a 64-bit rootfs in `wasm64-mt`  ← highest leverage
+`wine64.html` + `wine64-launcher.js` load `glibc-rootfs64.zip` +
+`wine64.zip` as layered `-zip` mounts and pass the native-equivalent argv;
+`wine64 --version` prints `wine-8.0` and exits cleanly in a tab (see "Running
+real wine64 in a browser tab" above). `wineboot --init` is reachable with
+`?boot=1` (next: confirm it completes the wineserver handshake in-tab — same code
+path as the native headless run; the in-browser wineserver IPC is step 4).
 
-The page currently 404s on `boxedwine.zip` and stops. The 64-bit rootfs zips
-already exist:
-
-- `tools/rootfs64/dist/glibc-rootfs64.zip` (~9.8 MB)
-- `tools/rootfs64/dist/wine64.zip` (~205 MB)
-
-(Rebuild with `tools/rootfs64/build-wine64-zip.sh`; needs Docker for the Debian
-amd64 image. See its header comment.)
-
-Tasks:
-- Get these zips served as the build's root FS. The shell (`boxedwine-shell.js` +
-  `shell.html`) loads a single `boxedwine.zip` by default and can take `?app=`/`?p=`
-  query params (see `docs/How-To-Create-FileSystem-For-Web.md`). Decide whether to
-  (a) concatenate/repackage into one `boxedwine.zip`, or (b) extend the shell to
-  mount multiple layered zips (the native path already mounts both via `-zip`).
-- The launcher must treat the guest as 64-bit: `FsZip::guestIs64` trips on paths
-  like `x86_64-linux-gnu/`, `/lib64/`, `x86_64-unix/`, `x86_64-windows/` (already
-  true for these zips).
-- The headless command line that works natively is the reference for the args the
-  shell must pass (see README "How to build", the wineboot/`--version` invocations):
-  `WINEDLLPATH`, `WINEPREFIX`, `WINESERVER=/usr/lib/wine/wineserver64`, etc.
-- 205 MB up front is too big for a real demo but fine as a first **correctness**
-  milestone — get *something* (e.g. `wine64 --version`, then `wineboot --init`)
-  to run in the tab before optimizing size. Slim the package and/or do step 3
-  afterward.
-
-Verify: open the page (served as above); the guest should reach the same point it
-does headlessly (`wine-8.0` version print → wineserver handshake). Use the
-browser-test agent / headless Chrome to capture console.
+The two zips still load 205 MB up front into the WASM VFS — fine for the
+correctness milestone, addressed by step 3 (streaming) for a shippable demo.
 
 ### 2. WebGL GL backend (`source/opengl/gl64bridge.cpp`)  ← needed for glcube
 
@@ -143,7 +158,11 @@ package. The demo page. Wire into CI (`Jenkinsfile` builds the other web targets
 
 - Build targets: `project/emscripten/makefile` (per-target env blocks + recursive
   `$(MAKE)`; the `wasm64-*` targets define `BOXEDWINE_GUEST_X64`).
-- Browser shell: `project/emscripten/{shell.html,boxedwine-shell.js,boxedwine.css,server.mjs}`.
+- Browser shell (32-bit, generic): `project/emscripten/{shell.html,boxedwine-shell.js,boxedwine.css,server.mjs}`.
+- **wine64 browser launcher: `project/emscripten/{wine64.html,wine64-launcher.js}`** —
+  loads the two layered 64-bit zips + passes the wine64 argv.
+- Headless test driver (no deps, raw CDP): `project/emscripten/cdp-attach.mjs`
+  (attach to a running Chrome) / `cdp-test.mjs` (launch one).
 - 64-bit core: `source/emulation/cpu/cpu64*.cpp`, `source/kernel/kmemory64.cpp`,
   `source/kernel/syscall64.cpp`, `source/kernel/loader/loader64.cpp`.
 - GL bridge: `source/opengl/gl64bridge.cpp` (+ `.h`, `_abi.h`).

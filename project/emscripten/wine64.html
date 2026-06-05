@@ -1,0 +1,45 @@
+<!doctype html>
+<html lang="en-us">
+  <head>
+    <meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+    <title>wine64 in the browser — Boxedwine64</title>
+    <meta name="description" content="64-bit Boxedwine: real wine64 running in WebAssembly">
+    <link rel="stylesheet" type="text/css" href="boxedwine.css">
+    <style>
+      body { font-family: system-ui, sans-serif; margin: 0; padding: 1em; background:#1d1f21; color:#c5c8c6; }
+      h1 { font-size: 1.1em; margin: 0 0 .4em; }
+      #status { font-size:.9em; min-height:1.2em; color:#81a2be; }
+      #output { width: 100%; box-sizing:border-box; background:#101214; color:#c5c8c6;
+                border:1px solid #373b41; font-family: ui-monospace, monospace; font-size:.85em; }
+      .hint { font-size:.8em; color:#969896; margin-top:.5em; }
+      .hint code { color:#b294bb; }
+      #canvas { background:#000; }
+    </style>
+  </head>
+  <body>
+    <h1>wine64 &middot; WebAssembly (64-bit Boxedwine)</h1>
+    <div id="loading">
+      <span id="spinner" class="spinner" style="display:inline-block;width:14px;height:14px;vertical-align:middle"></span>
+      <span class="emscripten" id="status">Downloading...</span>
+      <progress value="0" max="100" id="progress" hidden></progress>
+    </div>
+    <div id="dropzone">
+      <div class="emscripten_border">
+        <canvas class="emscripten" id="canvas" oncontextmenu="event.preventDefault()"></canvas>
+      </div>
+    </div>
+    <div id="console">
+      <textarea class="emscripten" id="output" rows="20" readonly></textarea>
+    </div>
+    <div class="hint">
+      Default: <code>wine64 --version</code>.
+      Try <code>?boot=1</code> (wineboot --init),
+      <code>?p=notepad.exe</code> (needs GL/X11),
+      <code>?novideo=1</code> (headless).
+      Must be served cross-origin-isolated (COOP/COEP) — use <code>node server.mjs</code>.
+    </div>
+
+    <script src="wine64-launcher.js"></script>
+    <script async type="text/javascript" src="boxedwine64.js"></script>
+  </body>
+</html>

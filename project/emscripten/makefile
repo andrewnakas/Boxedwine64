@@ -65,7 +65,7 @@ wasm64-mt: export BUILD_DIR := Build/Wasm64Mt
 wasm64-mt: export SHELL_FILE := shell.html
 wasm64-mt: export TARGET_EXEC := boxedwine64.html
 wasm64-mt: export EXTRA_LD_FLAGS := -pthread -sPTHREAD_POOL_SIZE=32 -sPROXY_TO_PTHREAD=1 -sOFFSCREENCANVAS_SUPPORT=0 --js-library=boxedwine-multithreaded-audio.js
-wasm64-mt: export ASSET_FILES := boxedwine.css boxedwine-shell.js $(ZIP_ASSET_FILES)
+wasm64-mt: export ASSET_FILES := boxedwine.css boxedwine-shell.js wine64.html wine64-launcher.js $(ZIP_ASSET_FILES)
 
 cpus := $(shell getconf _NPROCESSORS_ONLN 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || grep -c ^processor /proc/cpuinfo 2>/dev/null || echo 1)
 make_jobs := $(shell n='$(cpus)'; expr "$$n" : '^[0-9][0-9]*$$' >/dev/null && [ "$$n" -gt 2 ] && expr "$$n" - 1)
