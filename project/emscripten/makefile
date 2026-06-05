@@ -1,6 +1,6 @@
 ifndef BUILD_DIR
 
-.PHONY: default all clean release test multiThreaded
+.PHONY: default all clean release test multiThreaded wasm64-selftest wasm64-runelf wasm64-selftest-mem64 wasm64-mt
 
 ZIP_ASSET_FILES := $(wildcard *.zip)
 
@@ -20,6 +20,53 @@ multiThreaded: export SHELL_FILE := shell.html
 multiThreaded: export EXTRA_LD_FLAGS := -pthread -sPTHREAD_POOL_SIZE=32 -sPROXY_TO_PTHREAD=1 -sOFFSCREENCANVAS_SUPPORT=0 --js-library=boxedwine-multithreaded-audio.js
 multiThreaded: export ASSET_FILES := boxedwine.css boxedwine-shell.js $(ZIP_ASSET_FILES)
 
+# 64-bit guest core, headless, for Node. Builds the BOXEDWINE_GUEST_X64 sources
+# (lit up by the -D below — they are #ifdef-guarded and compiled-but-empty in the
+# other targets) and reaches the in-process interpreter smoke test via the
+# existing main -> boxedmain --x64-selftest path (source/sdl/main.cpp:220).
+# Emits a plain .js (no --shell-file: SHELL_LDFLAGS only triggers on a .html
+# TARGET_EXEC) so it runs under `node`. wasm32 host is fine: KMemory64 is a
+# software page table keyed on U64 guest addresses, so guest pointer width is
+# independent of host pointer width (-sMEMORY64 is a later milestone).
+wasm64-selftest: export BUILD_DIR := Build/Wasm64SelfTest
+wasm64-selftest: export EXTRA_CPP_FLAGS := -DBOXEDWINE_GUEST_X64=1
+wasm64-selftest: export TARGET_EXEC := boxedwine64-selftest.js
+wasm64-selftest: export EXTRA_LD_FLAGS := -sENVIRONMENT=node -sEXIT_RUNTIME=1
+
+# Same 64-bit core, but loads + runs a real x86_64 ELF off the host disk:
+#   node Build/Wasm64RunElf/boxedwine64-runelf.js --x64-run-elf /path/to/elf
+# Uses NODERAWFS so the guest loader's fopen() hits the host filesystem (so the
+# same static/dynamic ELFs the native --x64-run-elf accepts work unchanged).
+# With no path arg it runs the embedded hand-built hello-world ELF.
+wasm64-runelf: export BUILD_DIR := Build/Wasm64RunElf
+wasm64-runelf: export EXTRA_CPP_FLAGS := -DBOXEDWINE_GUEST_X64=1
+wasm64-runelf: export TARGET_EXEC := boxedwine64-runelf.js
+wasm64-runelf: export FS_LDFLAGS := -sNODERAWFS=1
+wasm64-runelf: export EXTRA_LD_FLAGS := -sENVIRONMENT=node -sEXIT_RUNTIME=1
+
+# wasm64 (Memory64) variant of the self-test: same sources, but the WASM module
+# uses 64-bit linear-memory addressing (-sMEMORY64=1), so the host `void*` is
+# 64-bit too. This is the build that surfaces any genuine 32-bit-host-pointer
+# assumption the wasm32 build hid. Needs a Memory64-capable engine (recent Node /
+# d8 / Chrome / Firefox). -sMEMORY64 must be on both compile and link.
+wasm64-selftest-mem64: export BUILD_DIR := Build/Wasm64SelfTestMem64
+wasm64-selftest-mem64: export EXTRA_CPP_FLAGS := -DBOXEDWINE_GUEST_X64=1 -sMEMORY64=1
+wasm64-selftest-mem64: export TARGET_EXEC := boxedwine64-selftest-mem64.js
+wasm64-selftest-mem64: export EXTRA_LD_FLAGS := -sMEMORY64=1 -sENVIRONMENT=node -sEXIT_RUNTIME=1
+
+# Browser target for the 64-bit guest: the BOXEDWINE_GUEST_X64 core wired into the
+# same multi-threaded browser machinery the 32-bit web build already uses
+# (pthreads -> Web Workers, PROXY_TO_PTHREAD, SharedArrayBuffer for the
+# clone/futex threading model, canvas via shell.html). This is the foundation for
+# running wine64 in a tab; full GL (WebGL backend) and lazy rootfs come on top.
+# Produces boxedwine64.html — serve cross-origin-isolated (node server.mjs).
+wasm64-mt: export EXTRA_CPP_FLAGS := -DBOXEDWINE_GUEST_X64=1 -DBOXEDWINE_MULTI_THREADED -pthread
+wasm64-mt: export BUILD_DIR := Build/Wasm64Mt
+wasm64-mt: export SHELL_FILE := shell.html
+wasm64-mt: export TARGET_EXEC := boxedwine64.html
+wasm64-mt: export EXTRA_LD_FLAGS := -pthread -sPTHREAD_POOL_SIZE=32 -sPROXY_TO_PTHREAD=1 -sOFFSCREENCANVAS_SUPPORT=0 --js-library=boxedwine-multithreaded-audio.js
+wasm64-mt: export ASSET_FILES := boxedwine.css boxedwine-shell.js $(ZIP_ASSET_FILES)
+
 cpus := $(shell getconf _NPROCESSORS_ONLN 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || grep -c ^processor /proc/cpuinfo 2>/dev/null || echo 1)
 make_jobs := $(shell n='$(cpus)'; expr "$$n" : '^[0-9][0-9]*$$' >/dev/null && [ "$$n" -gt 2 ] && expr "$$n" - 1)
 
@@ -27,7 +74,7 @@ ifneq ($(make_jobs),)
 export MAKEFLAGS := -j $(make_jobs)
 $(info MAKEFLAGS is $(MAKEFLAGS))
 endif
-release test multiThreaded:
+release test multiThreaded wasm64-selftest wasm64-runelf wasm64-selftest-mem64 wasm64-mt:
 	@$(MAKE)
 
 clean:
@@ -55,6 +102,11 @@ SOURCES += $(wildcard $(PROJDIR)/source/opengl/sdl/*.cpp)
 SOURCES += $(wildcard $(PROJDIR)/source/opengl/*.cpp)
 SOURCES += $(wildcard $(PROJDIR)/source/vulkan/*.cpp)
 SOURCES += $(wildcard $(PROJDIR)/source/x11/*.cpp)
+# XWire X11-over-unix-socket server: kunixsocket/startupArgs/knativeinputSDL
+# reference XWireServer + installXWireSink/xwireForwardSdlEvent, whose defs live
+# here. Most are no-ops without BOXEDWINE_GUEST_X64; xwirepresentSDL.cpp is fully
+# GUEST_X64-gated. Needed so the single-threaded 64-bit build links.
+SOURCES += $(wildcard $(PROJDIR)/source/x11wire/*.cpp)
 SOURCES += $(PROJDIR)/lib/zlib/contrib/minizip/ioapi.c
 SOURCES += $(PROJDIR)/lib/zlib/contrib/minizip/mztools.c
 SOURCES += $(PROJDIR)/lib/zlib/contrib/minizip/unzip.c
@@ -80,6 +132,7 @@ TEST_SOURCES += $(wildcard $(PROJDIR)/source/opengl/sdl/*.cpp)
 TEST_SOURCES += $(wildcard $(PROJDIR)/source/opengl/*.cpp)
 TEST_SOURCES += $(wildcard $(PROJDIR)/source/vulkan/*.cpp)
 TEST_SOURCES += $(wildcard $(PROJDIR)/source/x11/*.cpp)
+TEST_SOURCES += $(wildcard $(PROJDIR)/source/x11wire/*.cpp)
 TEST_SOURCES += $(PROJDIR)/lib/zlib/contrib/minizip/ioapi.c
 TEST_SOURCES += $(PROJDIR)/lib/zlib/contrib/minizip/mztools.c
 TEST_SOURCES += $(PROJDIR)/lib/zlib/contrib/minizip/unzip.c
@@ -104,7 +157,12 @@ CXXFLAGS ?= -std=c++20
 CPPFLAGS ?= -O3 -s USE_SDL=2 -s USE_ZLIB=1 -DBOXEDWINE_ZLIB -DSDL2=1 -DBOXEDWINE_DISABLE_UI -DSIMDE_SSE2_NO_NATIVE $(GCC_EXTRA_FLAGS) -Wall -Wno-deprecated-pragma -Wno-format-security -Wno-unused-private-field -Wno-invalid-offsetof -Wno-delete-incomplete -Wno-unused-result -Wno-unknown-pragmas -Wno-unused-local-typedefs -Wno-unused-variable -Wno-unused-function -Wno-unused-but-set-variable -mtail-call $(INCLUDES) $(EXTRA_CPP_FLAGS)
 
 SHELL_LDFLAGS := $(if $(filter %.html,$(TARGET_EXEC)),--shell-file $(SHELL_FILE),)
-LDFLAGS = -s FORCE_FILESYSTEM -lidbfs.js -s USE_SDL=2 -s USE_ZLIB=1 -fwasm-exceptions -s INITIAL_MEMORY=536870912 $(SHELL_LDFLAGS) -s EXPORTED_RUNTIME_METHODS='["addRunDependency", "removeRunDependency","ERRNO_CODES","ccall","FS"]' -mtail-call $(EXTRA_LD_FLAGS)
+# Filesystem backend. The browser targets persist a guest FS to IndexedDB
+# (idbfs). The headless Node run-elf target overrides this with NODERAWFS so the
+# guest's loader can fopen() a real x86_64 ELF straight off the host disk
+# (NODERAWFS replaces the whole VFS and is mutually exclusive with idbfs).
+FS_LDFLAGS ?= -s FORCE_FILESYSTEM -lidbfs.js
+LDFLAGS = $(FS_LDFLAGS) -s USE_SDL=2 -s USE_ZLIB=1 -fwasm-exceptions -s INITIAL_MEMORY=536870912 $(SHELL_LDFLAGS) -s EXPORTED_RUNTIME_METHODS='["addRunDependency", "removeRunDependency","ERRNO_CODES","ccall","FS"]' -mtail-call $(EXTRA_LD_FLAGS)
 
 #$(TEST_BUILD_DIR)/boxedwineTest: $(TEST_OBJS)
 #	$(CC) $(TEST_OBJS) -o $@ $(LDFLAGS)

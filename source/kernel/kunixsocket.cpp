@@ -977,8 +977,12 @@ U32 KUnixSocketObject::sendmsg(KThread* thread, const KFileDescriptorPtr& fd, U3
         // onPeerWrote() runs the parser, which reacquires con->lockCond inside
         // readNativeNonBlocking. con->lockCond->m is a plain std::mutex, so we
         // must drop our lock first or self-deadlock. boxedWineCriticalSection is
-        // the unique_lock created by BOXEDWINE_CRITICAL_SECTION_WITH_CONDITION.
+        // the unique_lock created by BOXEDWINE_CRITICAL_SECTION_WITH_CONDITION —
+        // which only exists in the multi-threaded build; single-threaded has no
+        // lock to drop (and no reentrancy to deadlock against), so skip it.
+#ifdef BOXEDWINE_MULTI_THREADED
         boxedWineCriticalSection.unlock();
+#endif
         con->onPeerWrote();
         return result;
     }

@@ -92,7 +92,11 @@ char* platform_strcasestr(const char* s1, const char* s2);
 #define ALL_CODE_ANALYSIS_WARNINGS 0
 #pragma clang diagnostic ignored "-Winvalid-offsetof"
 #include <limits.h>
-#if ( __WORDSIZE == 64 )
+// BOXEDWINE_64 means "the HOST has 64-bit pointers" (selects 64-bit RAM indices
+// in the softmmu, etc.). __WORDSIZE is the usual signal, but Emscripten's wasm64
+// mode (-sMEMORY64) gives 8-byte pointers while still reporting __WORDSIZE==32,
+// so also key off the pointer width directly via __SIZEOF_POINTER__ / __wasm64__.
+#if ( __WORDSIZE == 64 ) || ( defined(__SIZEOF_POINTER__) && __SIZEOF_POINTER__ == 8 ) || defined(__wasm64__)
 #define BOXEDWINE_64   1
 #endif
 #define PLATFORM_STAT_STRUCT struct stat
