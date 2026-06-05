@@ -122,6 +122,29 @@
         });
     }
 
+    // --- writable WINEPREFIX -----------------------------------------------
+    // Guest "/" maps to the Emscripten MEMFS dir passed via -root (ROON = /root).
+    // wine64 chdir()s into WINEPREFIX before creating it, so HOME (/winePrefix)
+    // and the prefix dir must already exist as writable dirs. Create them in the
+    // host MEMFS under ROOT so the guest sees writable /winePrefix/.wine.
+    function mkdirHost(path) {
+        try { Module.FS.mkdir(path); } catch (e) { /* EEXIST is fine */ }
+    }
+    function prepareWinePrefix() {
+        // ROOT (/root in MEMFS) is the guest "/". Boxedwine MKDIR()s ROOT itself
+        // inside main(), but that runs AFTER this preRun hook, so create the full
+        // chain here (ROOT first) — a later MKDIR of an existing dir is a no-op.
+        mkdirHost(ROOT);
+        mkdirHost(ROOT + "/winePrefix");
+        mkdirHost(ROOT + "/winePrefix/.wine");
+        try {
+            var st = Module.FS.stat(ROOT + "/winePrefix/.wine");
+            console.log("created writable WINEPREFIX at " + ROOT + "/winePrefix/.wine (mode " + st.mode.toString(8) + ")");
+        } catch (e) {
+            console.error("WINEPREFIX dir NOT created: " + e);
+        }
+    }
+
     // --- orchestration ------------------------------------------------------
     // The zips are large (wine64.zip ~205MB); fetch them, drop them in the VFS,
     // push the argv, then release the run dependency so main() proceeds.
@@ -147,6 +170,8 @@
                 if (progressElement) progressElement.hidden = true;
                 if (spinnerElement) spinnerElement.hidden = true;
                 setStatusText(DO_BOOT ? "Booting wine prefix..." : "Starting wine64...");
+
+                if (DO_BOOT) prepareWinePrefix();
 
                 var args = buildArguments();
                 for (var i = 0; i < args.length; i++) Module["arguments"].push(args[i]);

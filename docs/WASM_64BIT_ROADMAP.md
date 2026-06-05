@@ -61,10 +61,27 @@ Launcher query params (all optional):
 - `?novideo=1` — headless (no SDL window); fastest for the `--version` smoke.
 - `?base=<url>` — where the zips are fetched from (default `./`).
 
-**Verified:** `wine64.html?novideo=1` → the browser console (and the on-page
-`#output` textarea) prints `wine-8.0 (Debian 8.0~repack-4)` followed by
-`CPU64: exit_group syscall, status=0`. Real x86_64 `wine64` executing in WASM in
-a tab.
+**Verified (two depths):**
+
+- `wine64.html?novideo=1` → the browser console (and the on-page `#output`
+  textarea) prints `wine-8.0 (Debian 8.0~repack-4)` then
+  `CPU64: exit_group syscall, status=0`. Real x86_64 `wine64` executing in WASM.
+- `wine64.html?novideo=1&boot=1` → the **full `wineboot --init` boot stack runs
+  in the tab**: `wineserver64` forks and stays resident, the in-process X11 wire
+  server (`XWireServer`) accepts client connections and completes handshakes
+  (`vendor=Boxedwine root=0x260 visual=0x21`), the process tree forks/execs/exits
+  cleanly across ~7 guest pids, and **`XWire: first window mapped`** — a window
+  is mapped (present sink=headless under `?novideo=1`). 13.5k lines of boot
+  activity, **no OOM / no abort**. (Capture ends at the test's 180s cap, not a
+  crash; SHAPE/MIT-SHM/FreeType warnings are the slim-rootfs / headless-sink
+  gaps.) A trimmed reference trace is saved at
+  [`../tools/x64test/wasm/wineboot-browser-boot.log`](../tools/x64test/wasm/wineboot-browser-boot.log).
+
+Two things made the deep boot work and are baked in: the launcher pre-creates a
+writable `WINEPREFIX` (`/winePrefix/.wine`) in MEMFS before boot (wine64 chdir's
+into it before creating it), and `wasm64-mt` links with
+`-sALLOW_MEMORY_GROWTH=1 -sMAXIMUM_MEMORY=2GB` (the multi-process boot OOMs a
+fixed 512 MB heap).
 
 **Headless test harness:** `cdp-attach.mjs` attaches to an already-running
 Chrome's DevTools endpoint (`--remote-debugging-port=9222 --no-sandbox
@@ -102,11 +119,12 @@ node cdp-attach.mjs "http://127.0.0.1:8000/Build/Wasm64Mt/wine64.html?novideo=1"
 ### 1. Boot a 64-bit rootfs in `wasm64-mt`  ✅ DONE
 
 `wine64.html` + `wine64-launcher.js` load `glibc-rootfs64.zip` +
-`wine64.zip` as layered `-zip` mounts and pass the native-equivalent argv;
-`wine64 --version` prints `wine-8.0` and exits cleanly in a tab (see "Running
-real wine64 in a browser tab" above). `wineboot --init` is reachable with
-`?boot=1` (next: confirm it completes the wineserver handshake in-tab — same code
-path as the native headless run; the in-browser wineserver IPC is step 4).
+`wine64.zip` as layered `-zip` mounts and pass the native-equivalent argv.
+`wine64 --version` prints `wine-8.0` and exits cleanly; **`?boot=1` drives the
+full `wineboot --init` through wineserver64 + the X11 wire server to a mapped
+window in the tab** (see "Running real wine64 in a browser tab" above). The
+writable-WINEPREFIX + `ALLOW_MEMORY_GROWTH` fixes that unlocked the deep boot are
+in the launcher / makefile.
 
 The two zips still load 205 MB up front into the WASM VFS — fine for the
 correctness milestone, addressed by step 3 (streaming) for a shippable demo.

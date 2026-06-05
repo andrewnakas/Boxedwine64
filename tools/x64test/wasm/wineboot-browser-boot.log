@@ -1,0 +1,54 @@
+# wineboot --init running in a browser tab (wasm64-mt, headless XWire sink)
+#
+# Captured from http://127.0.0.1:8000/Build/Wasm64Mt/wine64.html?novideo=1&boot=1
+# via project/emscripten/cdp-attach.mjs (headless Chrome, crossOriginIsolated).
+# Loader/relocation spam and the libc tls-search probes are stripped; this is
+# the salient boot trace. No OOM, no abort: wineserver64 + the in-process X11
+# wire server come up, X11 clients connect and handshake, and the first window
+# is mapped (present sink=headless under ?novideo=1). Capture ends at the test's
+# 180s cap, not a crash. SHAPE/MIT-SHM/FreeType warnings are the slim-rootfs /
+# headless-sink gaps, not failures.
+# -----------------------------------------------------------------------------
+Xlib:  extension "SHAPE" missing on display ":0".
+[guest fd=2 pid=31 wine64] Xlib:  extension "SHAPE" missing on display ":0".
+
+Xlib:  extension "SHAPE" missing on display ":0".
+[guest fd=2 pid=31 wine64] Xlib:  extension "SHAPE" missing on display ":0".
+
+Xlib:  extension "SHAPE" missing on display ":0".
+CPU64: exit_group syscall, status=0  pid=35 exe='/usr/lib/wine/wine64'
+XWireServer: accepted X11 client connection (now 6 open)
+XWire: handshake complete (vendor=Boxedwine root=0x260 visual=0x21), 124 body bytes
+CPU64: exit syscall, status=0  pid=22 exe='/usr/lib/wine/wine64'
+XWireServer: accepted X11 client connection (now 7 open)
+XWire: handshake complete (vendor=Boxedwine root=0x260 visual=0x21), 124 body bytes
+XWireServer: accepted X11 client connection (now 8 open)
+XWire: handshake complete (vendor=Boxedwine root=0x260 visual=0x21), 124 body bytes
+[guest fd=2 pid=18 wine64] Xlib:  extension "MIT-SHM" missing on display ":0".
+
+Xlib:  extension "MIT-SHM" missing on display ":0".
+XWire: first window mapped (present sink=headless)
+XWireServer: accepted X11 client connection (now 9 open)
+XWire: handshake complete (vendor=Boxedwine root=0x260 visual=0x21), 124 body bytes
+CPU64: exit syscall, status=0  pid=22 exe='/usr/lib/wine/wine64'
+CPU64: exit_group syscall, status=0  pid=27 exe='/usr/lib/wine/wine64'
+CPU64: exit_group syscall, status=0  pid=41 exe='/usr/lib/wine/wine64'
+sys_execve64: pid=43 path='/usr/lib/wine/wine64-preloader' argv0='/usr/lib/wine/wine64-preloader' argc=7 envc=16
+sys_execve64: pid=43 path='/usr/lib/wine/wine64' argv0='/usr/lib/wine/wine64' argc=6 envc=16
+[guest fd=2 pid=43 wine64] wine: could not open working directory L"C:\\windows\\system32\\", starting in the Windows directory.
+
+wine: could not open working directory L"C:\\windows\\system32\\", starting in the Windows directory.
+[guest fd=2 pid=43 wine64] Wine cannot find the FreeType font library.  To enable Wine to
+use TrueType fonts please install a version of FreeType greater than
+or equal to 2.0.5.
+http://www.freetype.org
+
+Wine cannot find the FreeType font library.  To enable Wine to
+use TrueType fonts please install a version of FreeType greater than
+or equal to 2.0.5.
+http://www.freetype.org
+XWireServer: accepted X11 client connection (now 10 open)
+XWire: handshake complete (vendor=Boxedwine root=0x260 visual=0x21), 124 body bytes
+CPU64: exit syscall, status=0  pid=22 exe='/usr/lib/wine/wine64'
+XWireServer: accepted X11 client connection (now 11 open)
+XWire: handshake complete (vendor=Boxedwine root=0x260 visual=0x21), 124 body bytes

@@ -64,7 +64,12 @@ wasm64-mt: export EXTRA_CPP_FLAGS := -DBOXEDWINE_GUEST_X64=1 -DBOXEDWINE_MULTI_T
 wasm64-mt: export BUILD_DIR := Build/Wasm64Mt
 wasm64-mt: export SHELL_FILE := shell.html
 wasm64-mt: export TARGET_EXEC := boxedwine64.html
-wasm64-mt: export EXTRA_LD_FLAGS := -pthread -sPTHREAD_POOL_SIZE=32 -sPROXY_TO_PTHREAD=1 -sOFFSCREENCANVAS_SUPPORT=0 --js-library=boxedwine-multithreaded-audio.js
+# ALLOW_MEMORY_GROWTH: wineboot --init forks wineserver64 + several wine64
+# children, each mounting the 205MB rootfs zip; the full boot blows past a fixed
+# 512MB heap (observed OOM at "enlarge memory arrays to 536875008"). Growth lets
+# the (shared, pthread) heap expand at runtime. Scoped to this target so the
+# headless selftest builds keep the cheaper fixed heap.
+wasm64-mt: export EXTRA_LD_FLAGS := -pthread -sPTHREAD_POOL_SIZE=32 -sPROXY_TO_PTHREAD=1 -sOFFSCREENCANVAS_SUPPORT=0 -sALLOW_MEMORY_GROWTH=1 -sMAXIMUM_MEMORY=2147483648 --js-library=boxedwine-multithreaded-audio.js
 wasm64-mt: export ASSET_FILES := boxedwine.css boxedwine-shell.js wine64.html wine64-launcher.js $(ZIP_ASSET_FILES)
 
 cpus := $(shell getconf _NPROCESSORS_ONLN 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || grep -c ^processor /proc/cpuinfo 2>/dev/null || echo 1)

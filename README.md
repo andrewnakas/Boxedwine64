@@ -229,7 +229,7 @@ This project drives the [`docs/PLAN_64BIT.md`](docs/PLAN_64BIT.md) §3.7–§3.1
 | **F — Windows PE + GUI** | populate the prefix with Windows PE files, then the X server / GUI path; interactive input + a working common dialog | ✅ Complete — notepad paints, takes keyboard+mouse, and Save As writes a file to the host |
 | **G — App breadth + X completeness** | get a spread of bundled apps (winecfg, regedit, clock, write, …) usable, fill the remaining X core opcodes they need | ⏳ Next |
 | **H — Interpreter throughput** | close the gap to interactive speed: faster hot-path decode, fewer per-op map lookups, block/trace caching | 🟡 In progress — instruction-fetch page cache + profiled hot-opcode dispatch hoist landed (`BW64_OPPROF`); full decoded-block cache still open |
-| **I — WASM memory64 + v1 polish** | Emscripten `-sMEMORY64`, Web Workers + SharedArrayBuffer threading, WebGL GL backend, lazy DLL fetch, browser tests — see [WebAssembly / browser](#webassembly-and-the-browser-the-next-frontier) | 🟡 In progress — 64-bit core builds & self-tests headless in Node on both `wasm32` (`make wasm64-selftest`, 234/234) and **`-sMEMORY64`/wasm64** (`make wasm64-selftest-mem64`, 234/234, Node 24); a real static x86_64 ELF runs via `make wasm64-runelf`; and a **multi-threaded browser build** (`make wasm64-mt`) now **boots real `wine64` in a tab** — `Build/Wasm64Mt/wine64.html` mounts the layered 64-bit zips and runs `wine64 --version` → `wine-8.0`, clean `exit_group(0)`, verified in headless Chrome. Remaining: WebGL GL backend (glcube), lazy/streamable 64-bit rootfs, in-browser wineserver IPC, CI browser tests |
+| **I — WASM memory64 + v1 polish** | Emscripten `-sMEMORY64`, Web Workers + SharedArrayBuffer threading, WebGL GL backend, lazy DLL fetch, browser tests — see [WebAssembly / browser](#webassembly-and-the-browser-the-next-frontier) | 🟡 In progress — 64-bit core builds & self-tests headless in Node on both `wasm32` (`make wasm64-selftest`, 234/234) and **`-sMEMORY64`/wasm64** (`make wasm64-selftest-mem64`, 234/234, Node 24); a real static x86_64 ELF runs via `make wasm64-runelf`; and a **multi-threaded browser build** (`make wasm64-mt`) now **boots real `wine64` in a tab** — `Build/Wasm64Mt/wine64.html` mounts the layered 64-bit zips: `wine64 --version` → `wine-8.0` clean `exit_group(0)`, and `?boot=1` drives the **full `wineboot --init` through `wineserver64` + the X11 wire server to a mapped window** (no OOM/abort), all verified in headless Chrome. Remaining: WebGL GL backend (glcube draws on canvas), lazy/streamable 64-bit rootfs, harden the in-browser wineserver IPC (some socket syscalls still stubbed), CI browser tests |
 
 The commit log (`git log --oneline`) is the canonical, blow-by-blow record of the
 bring-up — each commit names the opcode or syscall and the real binary that
@@ -311,14 +311,19 @@ is finally realistic.
    32-bit Boxedwine already uses), an in-memory socketpair/epoll shim for the
    wineserver IPC (no real fds), and WebGL/WebGL2 (or WebGPU) as the GL backend
    behind the same GL-translation layer that today targets host OpenGL.
-   *Status:* the **threading half is up and real `wine64` boots in a tab** —
-   `make wasm64-mt` builds the 64-bit core with `BOXEDWINE_MULTI_THREADED -pthread
-   -sPROXY_TO_PTHREAD`, the page brings up a 64-worker pthread pool over
+   *Status:* the **threading + IPC halves are up and real `wine64` boots in a
+   tab** — `make wasm64-mt` builds the 64-bit core with `BOXEDWINE_MULTI_THREADED
+   -pthread -sPROXY_TO_PTHREAD`, the page brings up a 64-worker pthread pool over
    `SharedArrayBuffer`, mounts the layered `glibc-rootfs64.zip` + `wine64.zip`, and
    runs `wine64 --version` → **`wine-8.0 (Debian 8.0~repack-4)`, clean
-   `exit_group(0)`, verified in headless Chrome** (open
-   `Build/Wasm64Mt/wine64.html`; `?boot=1` drives `wineboot --init`). Remaining
-   here: the wineserver IPC shim and the WebGL GL backend (step 4) — note
+   `exit_group(0)`**. With `?boot=1` the **full `wineboot --init` boots in the tab**:
+   `wineserver64` forks and stays resident, the in-process X11 wire server accepts
+   client connections and completes handshakes across the process tree, and the
+   **first window is mapped** — no OOM, no abort, all verified in headless Chrome
+   (open `Build/Wasm64Mt/wine64.html`; trace at
+   `tools/x64test/wasm/wineboot-browser-boot.log`). Remaining here: harden the
+   in-browser wineserver IPC (a couple of socket syscalls — `socketpair`,
+   `setsockopt` — still warn unsupported) and the WebGL GL backend (step 4) — note
    `source/opengl/gl64bridge.cpp` currently asks SDL for a desktop
    **compatibility-profile** GL context, which WebGL2 (GLES3-like) does not
    provide, so that's the real porting work, not a flag flip.
