@@ -60,6 +60,59 @@
     </div>
 
     <script src="wine64-launcher.js"></script>
-    <script async type="text/javascript" src="boxedwine64.js"></script>
+    <!-- Gate the Emscripten module on cross-origin isolation. The wasm64-mt build
+         needs SharedArrayBuffer AND creates a WebGL2 context (the gl64 bridge),
+         both of which require crossOriginIsolated===true. On `node server.mjs`
+         (real COOP/COEP headers) that's true on first paint, so the module loads
+         immediately. On GitHub Pages, coi-serviceworker.js injects the headers
+         client-side but only takes effect after it reloads the page once; until
+         then crossOriginIsolated is false. If we let boxedwine64.js boot anyway
+         (as a bare `<script async>` did), the page that isn't yet isolated races
+         the SW reload and emscripten_webgl_create_context fails ->
+         "ensureContext FAILED" -> the cube never renders. So: only inject
+         boxedwine64.js once the page is actually isolated; otherwise wait for the
+         coi shim's reload (poll briefly, then surface an error rather than booting
+         into a guaranteed GL failure). -->
+    <script>
+      (function () {
+        var statusEl = document.getElementById("status");
+        function setStatus(t) { if (statusEl) statusEl.innerHTML = t; }
+        function loadModule() {
+          var s = document.createElement("script");
+          s.async = true;
+          s.type = "text/javascript";
+          s.src = "boxedwine64.js";
+          document.body.appendChild(s);
+        }
+        // Already isolated (real headers, or the coi reload already landed): go.
+        if (window.crossOriginIsolated) { loadModule(); return; }
+        // Browsers without the crossOriginIsolated concept can't be gated; the
+        // coi shim already gave up there, so just try to boot.
+        if (typeof window.crossOriginIsolated === "undefined") { loadModule(); return; }
+        // Not isolated yet. coi-serviceworker.js registers + reloads the page to
+        // turn isolation on; that reload usually fires before we get here. If it
+        // hasn't, poll for isolation (the SW may be activating) and only boot once
+        // it's true. Give it a bounded window so a permanently-unisolated page
+        // shows a clear message instead of hanging the user on a GL failure.
+        setStatus("Enabling cross-origin isolation (service worker)…");
+        var waited = 0, STEP = 250, LIMIT = 15000;
+        var iv = setInterval(function () {
+          if (window.crossOriginIsolated) {
+            clearInterval(iv);
+            loadModule();
+            return;
+          }
+          waited += STEP;
+          if (waited >= LIMIT) {
+            clearInterval(iv);
+            setStatus("Could not enable cross-origin isolation — try a hard reload " +
+                      "(⌘/Ctrl+Shift+R). SharedArrayBuffer/WebGL need COOP/COEP.");
+            console.error("crossOriginIsolated is still false after " + LIMIT +
+                          "ms; not booting (WebGL context would fail). The " +
+                          "coi-serviceworker reload may not have taken effect.");
+          }
+        }, STEP);
+      })();
+    </script>
   </body>
 </html>
