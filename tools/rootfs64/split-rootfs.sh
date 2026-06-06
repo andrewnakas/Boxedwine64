@@ -54,6 +54,10 @@ for zip in "${ZIPS[@]}"; do
     echo "split-rootfs: WARNING: $src not found, skipping" >&2
     continue
   fi
+  # Resolve to an ABSOLUTE path: the large-zip branch below `cd`s into $OUT_DIR
+  # before running `split`, so a relative $src (e.g. tools/rootfs64/dist/...)
+  # would no longer resolve there and split would fail with "No such file".
+  case "$src" in /*) : ;; *) src="$(cd "$(dirname "$src")" && pwd)/$(basename "$src")" ;; esac
   total=$(filesize "$src")
   # Clear any stale parts for this zip from a previous run.
   rm -f "$OUT_DIR/$zip" "$OUT_DIR/$zip".part[0-9]* "$OUT_DIR/$zip.manifest.json"

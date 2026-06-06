@@ -82,6 +82,39 @@ copy /usr/lib/x86_64-linux-gnu/libgcc_s.so.1
 # libfreetype: wine probes it for font rendering ("Wine cannot find the FreeType
 # font library"); harmless to omit but cheap to ship.
 copy /usr/lib/x86_64-linux-gnu/libfreetype.so.6
+# winex11.drv dlopens these X11 client libs at runtime (NOT via DT_NEEDED, so ldd
+# never lists them and the closure above drops them — the base set libX11/libxcb/
+# libXext IS pulled because the wine modules link it, but these higher libs are
+# not). Without them, window/visual setup for the GL window aborts and the app
+# exits cleanly (status=0) BEFORE the first gl64 trap — the glcube "stuck on the
+# launcher screen" symptom seen on a real browser. Ship each one AND its own
+# transitive closure (Xcursor needs Xfixes, Xrandr needs Xrender, etc.) so the
+# guest ld.so resolves every DT_NEEDED. The guest searches /lib AND /usr/lib
+# (x86_64-linux-gnu); copy() preserves the source path, so stage from /usr/lib
+# (debian usr-merge: same inode as /lib) AND drop a /lib copy to match where the
+# base X libs already live (glibc-rootfs64.zip's lib/ tree).
+x11_dlopen_libs=(
+  /usr/lib/x86_64-linux-gnu/libXrender.so.1     # alpha/render visuals (core for GL win)
+  /usr/lib/x86_64-linux-gnu/libXcursor.so.1      # themed cursors
+  /usr/lib/x86_64-linux-gnu/libXfixes.so.3       # dep of Xcursor/Xcomposite
+  /usr/lib/x86_64-linux-gnu/libXcomposite.so.1   # composite redirection
+  /usr/lib/x86_64-linux-gnu/libXi.so.6           # XInput2
+  /usr/lib/x86_64-linux-gnu/libXinerama.so.1     # multi-monitor probe
+  /usr/lib/x86_64-linux-gnu/libXxf86vm.so.1      # mode/gamma probe
+  /usr/lib/x86_64-linux-gnu/libXrandr.so.2       # randr (commonly probed alongside)
+)
+mkdir -p "$STAGE/lib/x86_64-linux-gnu"
+for xl in "${x11_dlopen_libs[@]}"; do
+  copy "$xl"                                       # -> /usr/lib/x86_64-linux-gnu
+  [ -e "$xl" ] && cp -aL "$(readlink -f "$xl")" "$STAGE/lib/x86_64-linux-gnu/$(basename "$xl")"
+  # also pull each lib's own resolved closure (deref real path; ldd lists deps)
+  if [ -e "$xl" ]; then
+    for dep in $(ldd "$(readlink -f "$xl")" 2>/dev/null | awk "/=>/ {print \$3}" | grep -E "^/" | sort -u); do
+      copy "$dep"
+      cp -aL "$(readlink -f "$dep")" "$STAGE/lib/x86_64-linux-gnu/$(basename "$dep")" 2>/dev/null || true
+    done
+  fi
+done
 mkdir -p "$STAGE/etc"; : > "$STAGE/etc/ld.so.cache"
 
 echo "--- copying wine64 loader + wineserver + module trees ---"
