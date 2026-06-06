@@ -825,6 +825,32 @@ U64 gl64Bridge(CPU64* cpu, U64 fnId, U64 argsAddr) {
                                      "depthAttachName=%d DEPTH_BITS=%d glErr=0x%x",
                                      fbo, (unsigned)g_emFbo, st, (int)dtest, (int)dmask, dfunc,
                                      dtype, dname, dbits, err);
+                            // Dump glemu's JS-side matrices. The native cube is
+                            // perfect, so the WASM-only suspects are (a) glemu's
+                            // matrix tracking and (b) the immediate-mode replay. The
+                            // pinwheel looks like the modelview translate (0,0,-6)
+                            // isn't applied. mv = GLImmediate.matrix[0] (MODELVIEW),
+                            // proj = matrix[1] (PROJECTION). In column-major, a
+                            // translate(0,0,-6) puts -6 at index 14. Report key cells
+                            // + the active matrix mode so we can see what glemu has.
+                            // NB: EM_ASM passes its body through the C preprocessor,
+                            // which splits on UNPARENTHESIZED commas — so no `var a,b;`
+                            // and no bare `[a,b]` at statement level. Keep commas
+                            // inside (), and one declaration per statement.
+                            EM_ASM({
+                                try {
+                                    if (typeof GLImmediate === 'undefined') { console.log('gl64 MTXDBG: no GLImmediate'); return; }
+                                    var m = GLImmediate.matrix;
+                                    var mm = GLImmediate.currentMatrix;
+                                    var f = function(a, i){ return (a && a[i] !== undefined) ? Number(a[i]).toFixed(3) : 'NA'; };
+                                    var mv = m ? m[0] : null;
+                                    var pr = m ? m[1] : null;
+                                    var s = 'gl64 MTXDBG: currentMatrix=' + mm + ' nMatrices=' + (m ? m.length : 'NA');
+                                    s += ' MV[0/5/10/12/13/14/15]=' + f(mv,0) + '/' + f(mv,5) + '/' + f(mv,10) + '/' + f(mv,12) + '/' + f(mv,13) + '/' + f(mv,14) + '/' + f(mv,15);
+                                    s += ' PROJ[0/5/10/11/14/15]=' + f(pr,0) + '/' + f(pr,5) + '/' + f(pr,10) + '/' + f(pr,11) + '/' + f(pr,14) + '/' + f(pr,15);
+                                    console.log(s);
+                                } catch(e){ console.log('gl64 MTXDBG err: ' + e); }
+                            });
                         }
                     }
                 });
