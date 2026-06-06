@@ -131,6 +131,16 @@ cp -aL /usr/lib/x86_64-linux-gnu/wine/x86_64-windows "$STAGE/usr/lib/x86_64-linu
 # wine resolves these as <bindir>/../../share/wine, i.e. /usr/share/wine.
 mkdir -p "$STAGE/usr/share"
 cp -aL /usr/share/wine "$STAGE/usr/share/"
+# X11 locale DATA (libx11-data: /usr/share/X11/locale/{locale.alias,locale.dir,
+# compose.dir,<locale>/XLC_LOCALE,...}). libX11 reads these during XOpenIM /
+# XSetLocaleModifiers when a GUI app (e.g. glcube via winex11) opens the display;
+# missing them, X locale init fails and the app exits cleanly (status=0) BEFORE
+# any gl64 GL trap — the second layer of the "stuck on launcher" symptom after the
+# dlopen X libs above. Pure data (no DT_NEEDED), so the ldd closure never pulls it.
+if [ -d /usr/share/X11/locale ]; then
+  mkdir -p "$STAGE/usr/share/X11"
+  cp -aL /usr/share/X11/locale "$STAGE/usr/share/X11/"
+fi
 
 # Convenience launch symlinks at canonical wine paths.
 mkdir -p "$STAGE/usr/bin"
