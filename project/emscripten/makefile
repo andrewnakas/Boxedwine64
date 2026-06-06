@@ -69,7 +69,16 @@ wasm64-selftest-mem64: export EXTRA_LD_FLAGS := -sMEMORY64=1 -sENVIRONMENT=node 
 # DISABLE_GL_EXTENSIONS empties the large legacy 32-bit glfunctions_ext* marshaling
 # (unused by the 64-bit bridge) so enabling BOXEDWINE_OPENGL doesn't bloat/break the
 # WASM link.
-wasm64-mt: export EXTRA_CPP_FLAGS := -DBOXEDWINE_GUEST_X64=1 -DBOXEDWINE_MULTI_THREADED -DBOXEDWINE_OPENGL -DDISABLE_GL_EXTENSIONS -pthread
+# GLH names the header pulled in by `#include GLH` in the opengl sources
+# (platform*/platformOpenGL.cpp, source/opengl/glcommon.cpp, …) — it supplies the
+# GL types (GLenum/GLfloat/…) that glfunctions.h references. The rest of the tree
+# (MSVC project, etc.) sets GLH=<sdl_opengl.h>; we do the same so SDL2's GL header
+# (under Emscripten: the GLES2/WebGL2 headers) provides those types. The angle
+# brackets are quoted so make/shell don't treat them as redirections. Without this
+# the BOXEDWINE_OPENGL build fails with "unknown type name 'GLenum'" on a CLEAN
+# tree (a stale .o hid it locally). DISABLE_GL_EXTENSIONS empties the large legacy
+# 32-bit glfunctions_ext* marshaling (unused by the 64-bit gl64 bridge).
+wasm64-mt: export EXTRA_CPP_FLAGS := -DBOXEDWINE_GUEST_X64=1 -DBOXEDWINE_MULTI_THREADED -DBOXEDWINE_OPENGL '-DGLH=<SDL_opengl.h>' -DDISABLE_GL_EXTENSIONS -pthread
 wasm64-mt: export BUILD_DIR := Build/Wasm64Mt
 wasm64-mt: export SHELL_FILE := shell.html
 wasm64-mt: export TARGET_EXEC := boxedwine64.html
