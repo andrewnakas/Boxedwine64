@@ -2,7 +2,7 @@
 
 **Boxedwine64** is a fork of [Boxedwine](https://github.com/danoon2/Boxedwine) that adds x86\_64 guest support so it can run 64-bit Wine (`wine64`) and 64-bit Linux ELF binaries. Boxedwine itself is a userland emulator: it implements an x86 CPU and a fake Linux kernel, then runs Wine on top of that so Windows applications execute without a real Linux host.
 
-This fork is a **work in progress**, but a substantial one: real Debian `wine64` now boots Windows programs all the way to a **visible, rendered GUI window** on macOS arm64 — including a **hardware-accelerated OpenGL 3D app (a spinning, shaded cube via WGL → host GL)** — driving real `wineserver64`, `winex11`, FreeType/fontconfig text, and an in-process X11 wire server. The 32-bit code path remains fully functional and unchanged. The 64-bit code path is gated behind `BOXEDWINE_GUEST_X64` and was built out entirely by running real binaries and implementing each opcode/syscall they touch.
+This fork is a **work in progress**, but a substantial one: real Debian `wine64` boots Windows programs all the way to a **visible, rendered GUI window** — both natively on macOS arm64 and **in a browser tab via WebAssembly** (`-sMEMORY64` + Web Workers/`SharedArrayBuffer`). That includes a **hardware-accelerated OpenGL 3D app (a spinning, shaded cube via WGL → host GL / WebGL2)** and interactive `notepad.exe` (File ▸ Save As, plus a "download my files" button in the browser), driving real `wineserver64`, `winex11`, FreeType/fontconfig text, and an in-process X11 wire server. The 32-bit code path remains fully functional and unchanged. The 64-bit code path is gated behind `BOXEDWINE_GUEST_X64` and was built out entirely by running real binaries and implementing each opcode/syscall they touch.
 
 ![wine64 OpenGL glcube.exe rendering a spinning 3D cube in Boxedwine64 on macOS](docs/images/glcube-gui.png)
 
@@ -123,9 +123,10 @@ The 64-bit guest path can:
 ### What does not work yet
 
 - **No 64-bit JIT** — interpreter only (by design; v1 ships interpreter-only)
-- **No WASM `MEMORY64=2` build target yet** — but the 64-bit core now builds under
-  Emscripten and passes `--x64-selftest` headless in Node via `make wasm64-selftest`
-  (a `wasm32` host build; see [WebAssembly / browser](#webassembly-and-the-browser-the-next-frontier) below)
+- **No lazy/streamable rootfs in the browser yet** — the WASM build mounts the
+  full `wine64.zip` (~196 MB) up front, so first boot is slow (~2.5 min). The core
+  itself runs under `-sMEMORY64` and renders GUIs in a tab — see
+  [WebAssembly / browser](#webassembly-and-the-browser) below.
 - **X core-font text** (`PolyText8`/`PolyText16`) is unimplemented, so control/
   dialog text drawn through X core fonts doesn't paint yet (notepad's main edit
   area paints fine via GDI → `PutImage`)
@@ -229,7 +230,7 @@ This project drives the [`docs/PLAN_64BIT.md`](docs/PLAN_64BIT.md) §3.7–§3.1
 | **F — Windows PE + GUI** | populate the prefix with Windows PE files, then the X server / GUI path; interactive input + a working common dialog | ✅ Complete — notepad paints, takes keyboard+mouse, and Save As writes a file to the host |
 | **G — App breadth + X completeness** | get a spread of bundled apps (winecfg, regedit, clock, write, …) usable, fill the remaining X core opcodes they need | ⏳ Next |
 | **H — Interpreter throughput** | close the gap to interactive speed: faster hot-path decode, fewer per-op map lookups, block/trace caching | 🟡 In progress — instruction-fetch page cache + profiled hot-opcode dispatch hoist landed (`BW64_OPPROF`); full decoded-block cache still open |
-| **I — WASM memory64 + v1 polish** | Emscripten `-sMEMORY64`, Web Workers + SharedArrayBuffer threading, WebGL GL backend, lazy DLL fetch, browser tests — see [WebAssembly / browser](#webassembly-and-the-browser-the-next-frontier) | 🟡 In progress — 64-bit core builds & self-tests headless in Node on both `wasm32` (`make wasm64-selftest`, 234/234) and **`-sMEMORY64`/wasm64** (`make wasm64-selftest-mem64`, 234/234, Node 24); a real static x86_64 ELF runs via `make wasm64-runelf`; and a **multi-threaded browser build** (`make wasm64-mt`) now **boots real `wine64` in a tab** — `Build/Wasm64Mt/wine64.html` mounts the layered 64-bit zips: `wine64 --version` → `wine-8.0` clean `exit_group(0)`, and `?boot=1` drives the **full `wineboot --init` through `wineserver64` + the X11 wire server to a mapped window** (no OOM/abort), all verified in headless Chrome. Remaining: WebGL GL backend (glcube draws on canvas), lazy/streamable 64-bit rootfs, harden the in-browser wineserver IPC (some socket syscalls still stubbed), CI browser tests |
+| **I — WASM memory64 + v1 polish** | Emscripten `-sMEMORY64`, Web Workers + SharedArrayBuffer threading, WebGL GL backend, lazy DLL fetch, browser tests — see [WebAssembly / browser](#webassembly-and-the-browser) | 🟢 Mostly there — self-tests pass headless in Node on `wasm32` and `-sMEMORY64` (234/234); the **multi-threaded browser build** (`make wasm64-mt`) **renders GUIs in a tab**: `glcube.exe` spins via the WebGL2 backend and `notepad.exe` is interactive (File ▸ Save As + a "download my files" button), verified in Chrome and Safari. Remaining: lazy/streamable rootfs (so the page doesn't pull ~196 MB up front), CI browser tests, and a couple of still-stubbed wineserver socket syscalls |
 
 The commit log (`git log --oneline`) is the canonical, blow-by-blow record of the
 bring-up — each commit names the opcode or syscall and the real binary that
@@ -271,84 +272,65 @@ The most useful work, in rough priority order:
 
 ---
 
-## WebAssembly and the browser (the next frontier)
+## WebAssembly and the browser
 
-The original 32-bit Boxedwine already runs **entirely in the browser** via
-Emscripten/WASM (that's how [boxedwine.org](https://www.boxedwine.org) runs
-Windows apps with no install). The north star for this fork is the same thing
-for 64-bit: **`wine64` — and a spinning OpenGL cube — running in a browser tab**,
-no native app, no server round-trip.
+`wine64` runs in a browser tab — no native app, no server round-trip. The same
+`glcube.exe` (spinning 3D cube) and `notepad.exe` (interactive GUI, File ▸ Save As
+to a downloadable file) that run on the desktop also run in Chrome/Safari on the
+WASM build.
 
-### Why it isn't automatic
+### Why 64-bit needs WASM Memory64
 
 The 32-bit path fits a classic WASM linear memory (32-bit pointers in a ≤4 GB
-`ArrayBuffer`). A 64-bit guest needs **64-bit pointers**, which means
-**WebAssembly Memory64** (the `memory64` proposal, `wasm64` / `-sMEMORY64`).
-That changes pointer width across the whole emulator and is the single biggest
-prerequisite. Memory64 is now shipping in current Chrome/Firefox, so the target
-is finally realistic.
+`ArrayBuffer`). A 64-bit guest needs 64-bit pointers, which means **WebAssembly
+Memory64** (`-sMEMORY64`). That's now shipping in current Chrome/Firefox. The one
+fix that unblocked it: make `BOXEDWINE_64` track the real host pointer width
+instead of `__WORDSIZE` (Emscripten's wasm64 keeps `__WORDSIZE==32` while pointers
+are 8 bytes). The interpreter core had no other hidden 32-bit-host assumption —
+`KMemory64` is already a software page table keyed on `U64` guest addresses, so
+guest pointer width is independent of host pointer width.
 
-### The plan (Milestone I)
+### How it works in the browser
 
-1. **Build the 64-bit core for WASM.** ✅ **Done** — `make wasm64-selftest` (in
-   `project/emscripten`) compiles the `BOXEDWINE_GUEST_X64` sources under Emscripten
-   and `--x64-selftest` (234/234) passes headless in Node. This turned out to work on
-   a plain **`wasm32`** host: `KMemory64` is a software page table keyed on `U64`
-   guest addresses, so guest pointer width is independent of host pointer width — no
-   `-sMEMORY64` needed for the self-test. A true **`-sMEMORY64` (wasm64) build also
-   works** now (`make wasm64-selftest-mem64`, 234/234 under Node 24): the only fix
-   needed was making `BOXEDWINE_64` track the real host pointer width rather than
-   `__WORDSIZE` (Emscripten's wasm64 keeps `__WORDSIZE==32` while pointers are 8
-   bytes) — confirming the interpreter core had no hidden 32-bit-host assumption.
-   Beyond the self-test, `make wasm64-runelf` runs a **real x86_64 ELF** in WASM:
-   `node …/boxedwine64-runelf.js --x64-run-elf <elf>` loads the segments, builds the
-   SysV init stack, and interprets from `_start` through the guest's syscalls. A
-   846 KB statically-linked musl binary runs to a clean `exit_group` today (loader64
-   + syscall64 validated headless under Node).
-2. **Port the kernel I/O surface to the browser.** The desktop build uses host
-   threads, real sockets, and SDL. In the browser that becomes Web Workers +
-   `SharedArrayBuffer` for the `clone`/futex threading model (the same approach
-   32-bit Boxedwine already uses), an in-memory socketpair/epoll shim for the
-   wineserver IPC (no real fds), and WebGL/WebGL2 (or WebGPU) as the GL backend
-   behind the same GL-translation layer that today targets host OpenGL.
-   *Status:* the **threading + IPC halves are up and real `wine64` boots in a
-   tab** — `make wasm64-mt` builds the 64-bit core with `BOXEDWINE_MULTI_THREADED
-   -pthread -sPROXY_TO_PTHREAD`, the page brings up a 64-worker pthread pool over
-   `SharedArrayBuffer`, mounts the layered `glibc-rootfs64.zip` + `wine64.zip`, and
-   runs `wine64 --version` → **`wine-8.0 (Debian 8.0~repack-4)`, clean
-   `exit_group(0)`**. With `?boot=1` the **full `wineboot --init` boots in the tab**:
-   `wineserver64` forks and stays resident, the in-process X11 wire server accepts
-   client connections and completes handshakes across the process tree, and the
-   **first window is mapped** — no OOM, no abort, all verified in headless Chrome
-   (open `Build/Wasm64Mt/wine64.html`; trace at
-   `tools/x64test/wasm/wineboot-browser-boot.log`). Remaining here: harden the
-   in-browser wineserver IPC (a couple of socket syscalls — `socketpair`,
-   `setsockopt` — still warn unsupported) and the WebGL GL backend (step 4) — note
-   `source/opengl/gl64bridge.cpp` currently asks SDL for a desktop
-   **compatibility-profile** GL context, which WebGL2 (GLES3-like) does not
-   provide, so that's the real porting work, not a flag flip.
-3. **Make the rootfs streamable.** Today the glibc + wine64 zips are mounted from
-   disk. In the browser they need **lazy, range-fetched DLL/zip loading** (pull
-   `kernel32`/`opengl32`/etc. on demand) so the page starts fast instead of
-   downloading a full prefix up front.
-4. **Render path: glcube in WebGL.** The GL command stream that currently drives
-   host OpenGL is the natural bridge — retarget it at a WebGL2 context on an HTML
-   `<canvas>`, keep `SwapBuffers` mapped to `requestAnimationFrame`, and the same
-   `glcube.exe` should draw in a tab.
-5. **Browser test harness + v1 polish.** Headless-Chrome smoke tests
-   (boot → window-map → first frame), a slimmed wine64 package, and the demo
-   page.
+`make wasm64-mt` (in `project/emscripten`) builds the 64-bit core with
+`BOXEDWINE_MULTI_THREADED -pthread -sPROXY_TO_PTHREAD -sMEMORY64`. The page maps
+each piece of the desktop's host I/O surface onto a browser primitive:
 
-Step 1 is **done** (headless Node, both `wasm32` and `-sMEMORY64`), and step 2's
-threading half is done — **the browser build now boots real `wine64` in a tab**
-(`make wasm64-mt`, open `Build/Wasm64Mt/wine64.html`; the launcher mounts the
-zips from `tools/rootfs64/dist/`). The highest-leverage tasks now are **the WebGL
-backend** for glcube (step 4) and **lazy/streamable rootfs** (step 3, so the page
-doesn't pull 205 MB up front), with the in-browser wineserver IPC shim behind
-them for the full `wineboot`→GUI path.
+| Desktop | Browser |
+|---|---|
+| host threads (`clone`/futex) | Web Workers + `SharedArrayBuffer` pthread pool |
+| real sockets for wineserver IPC | in-memory socketpair/epoll shim (no real fds) |
+| host OpenGL (Metal-backed) | WebGL2 on an HTML `<canvas>`, `SwapBuffers`→`requestAnimationFrame` |
+| disk-mounted rootfs zips | `fetch()`ed into the Emscripten MEMFS, mounted by `FsZip` |
 
-> **Continuing this work:** the full actionable hand-off — every build target,
-> verify command, the fixes already made, and the remaining steps in order — is in
+`wine64.html` + `wine64-launcher.js` are the launcher. It fetches the layered
+64-bit zips (`glibc-rootfs64.zip`, `wine64.zip`, and a tiny pre-booted prefix
+`prefix64.zip`), mounts them at `/`, and runs `wine64 <prog>` against the prefix so
+the page skips `wineboot --init`. Cross-origin isolation (COOP/COEP) is **required**
+for `SharedArrayBuffer` — serve via `node project/emscripten/server.mjs`, which
+sets those headers.
+
+```sh
+cd project/emscripten
+make wasm64-mt
+node server.mjs 8123
+# then open (cross-origin-isolated):
+#   http://127.0.0.1:8123/Build/Wasm64Mt/wine64.html               -> wine64 --version
+#   http://127.0.0.1:8123/Build/Wasm64Mt/wine64.html?p=glcube.exe  -> spinning GL cube
+#   http://127.0.0.1:8123/Build/Wasm64Mt/wine64.html?p=notepad.exe -> notepad (Save As + Download)
+```
+
+The pre-booted prefix is built by `tools/rootfs64/build-prefix64.sh`; the page's
+"Download my files" button zips everything the guest saved (its `Z:\home\username`
+default dir plus `Documents`/`Desktop`) out of MEMFS to your machine.
+
+**Known rough edges:** first boot is slow (~2.5 min — the full ~196 MB `wine64.zip`
+is fetched up front; lazy/range-fetched DLL loading is the next streamability win),
+and a couple of wineserver socket syscalls (`socketpair`, `setsockopt`) still warn
+unsupported on the IPC shim.
+
+> **Continuing this work:** the full hand-off — every build target, verify command,
+> the fixes already made, and remaining steps — is in
 > [`docs/WASM_64BIT_ROADMAP.md`](docs/WASM_64BIT_ROADMAP.md).
 
 ---
@@ -403,6 +385,17 @@ Run a static-PIE x86\_64 ELF (cross-compile with `zig cc -target x86_64-linux-mu
 "$BW" --x64-run-elf /tmp/hello
 tools/x64test/run-static-elf-suite.sh          # requires zig
 ```
+
+Build and run the **WebAssembly / browser** target (real `wine64` in a tab):
+
+```sh
+cd project/emscripten
+make wasm64-mt          # 64-bit core, multi-threaded, -sMEMORY64
+node server.mjs 8123    # serves Build/Wasm64Mt with COOP/COEP (required for SAB)
+# open http://127.0.0.1:8123/Build/Wasm64Mt/wine64.html?p=notepad.exe
+```
+
+See [WebAssembly and the browser](#webassembly-and-the-browser) for how it works.
 
 For 32-bit builds and the original Wine flow, see the upstream [How-To-Build-Boxedwine.md](docs/How-To-Build-Boxedwine.md).
 

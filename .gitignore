@@ -42,3 +42,13 @@ lib/mac
 project/mac-xcode/Boxedwine/DerivedDataCoverage
 *.xcresult
 *.profraw
+
+# macOS + local dev/debug artifacts
+.DS_Store
+**/.DS_Store
+console_*.log
+project/mac-xcode/build_*/
+# headless-browser test screenshots dropped at repo root
+/s[0-9]*.png
+/s_*.png
+/saveas_*.png

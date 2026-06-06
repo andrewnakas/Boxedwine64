@@ -14,6 +14,11 @@
       .hint { font-size:.8em; color:#969896; margin-top:.5em; }
       .hint code { color:#b294bb; }
       #canvas { background:#000; }
+      #toolbar { margin:.4em 0; }
+      #toolbar button { font:inherit; font-size:.85em; color:#c5c8c6; background:#282a2e;
+                border:1px solid #373b41; border-radius:4px; padding:.3em .7em; cursor:pointer; }
+      #toolbar button:hover { background:#373b41; }
+      #toolbar .tbhint { font-size:.78em; color:#969896; margin-left:.6em; }
     </style>
   </head>
   <body>
@@ -22,6 +27,10 @@
       <span id="spinner" class="spinner" style="display:inline-block;width:14px;height:14px;vertical-align:middle"></span>
       <span class="emscripten" id="status">Downloading...</span>
       <progress value="0" max="100" id="progress" hidden></progress>
+    </div>
+    <div id="toolbar">
+      <button type="button" onclick="window.downloadSavedFiles && window.downloadSavedFiles()">⤓ Download my files</button>
+      <span class="tbhint">zips your saved files (Z:\home\username + Documents/Desktop) — save from the app first</span>
     </div>
     <div id="dropzone">
       <div class="emscripten_border">

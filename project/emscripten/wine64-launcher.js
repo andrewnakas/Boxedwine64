@@ -177,6 +177,165 @@
         }
     }
 
+    // --- download files the user saved -------------------------------------
+    // Notepad (and any guest app) writes through Boxedwine's kernel to the
+    // WRITABLE native root, which is this Emscripten MEMFS under ROOT (/root).
+    // Two save locations matter, both rooted in MEMFS:
+    //
+    //   * Z:\home\username  — wine's DEFAULT save dir. z: maps to guest "/",
+    //     guest "/" maps to MEMFS ROOT, and HOME is /home/username, so this is
+    //     MEMFS ROOT + "/home/username". This is where files land if the user
+    //     just hits Save without browsing. NOTE this dir also contains the whole
+    //     .wine prefix (registry, glcube.exe, …) — we EXCLUDE .wine so prefix
+    //     internals don't leak into the download.
+    //   * C:\users\username — the shell "Documents/Desktop" profile. c: maps to
+    //     .../drive_c, so this is ROOT + "/home/username/.wine/drive_c/users/
+    //     username". Holds many empty Wine shell-folder dirs (AppData, Searches,
+    //     Links, …) we DON'T want to walk.
+    //
+    // To keep the zip clean we grab only the places users actually save:
+    //   - regular files sitting directly in Z:\home\username  (minus .wine)
+    //   - regular files directly in C:\users\username
+    //   - everything under Documents\ and Desktop\ of BOTH homes (recursively)
+    // Packed into a STORE-only zip (no deps; Notepad text doesn't need DEFLATE)
+    // and handed to the browser. Mirrors the FS.readdir/FS.readFile + Blob +
+    // anchor pattern proven in boxedwine-shell.js (the 32-bit web shell).
+    var HOME_IN_MEMFS = ROOT + "/home/username";                       // Z:\home\username
+    var PROFILE_IN_MEMFS = HOME_IN_MEMFS + "/.wine/drive_c/users/username"; // C:\users\username
+
+    function fsIsDir(path) {
+        try { return Module.FS.isDir(Module.FS.stat(path).mode); }
+        catch (e) { return false; }
+    }
+
+    function readFileSafe(path) {
+        try { return Module.FS.readFile(path, { encoding: "binary" }); }
+        catch (e) { return null; /* unreadable (e.g. a dangling link) */ }
+    }
+
+    // Collect ONLY the regular files directly inside `dir` (no recursion),
+    // naming them relative to `base`. `skip` is an optional set of child names
+    // to ignore (e.g. ".wine" so we don't recurse the prefix — though we don't
+    // recurse here anyway, it documents intent and guards a future change).
+    function collectTopLevelFiles(dir, base, out, skip) {
+        var entries;
+        try { entries = Module.FS.readdir(dir); } catch (e) { return; }
+        entries.forEach(function (name) {
+            if (name === "." || name === ".." || name === ".keep") return;
+            if (skip && skip[name]) return;
+            var full = dir + "/" + name;
+            if (fsIsDir(full)) return; // skip subfolders at the root level
+            var data = readFileSafe(full);
+            if (data) out.push({ name: full.slice(base.length + 1), data: data });
+        });
+    }
+
+    // Recursively collect every regular file under `dir`, naming relative to
+    // `base` (so the zip preserves the folder layout, e.g. Documents/foo.txt).
+    function collectFiles(dir, base, out) {
+        var entries;
+        try { entries = Module.FS.readdir(dir); } catch (e) { return; }
+        entries.forEach(function (name) {
+            if (name === "." || name === ".." || name === ".keep") return;
+            var full = dir + "/" + name;
+            if (fsIsDir(full)) {
+                collectFiles(full, base, out);
+            } else {
+                var data = readFileSafe(full);
+                if (data) out.push({ name: full.slice(base.length + 1), data: data });
+            }
+        });
+    }
+
+    // Minimal STORE-only (compression method 0) ZIP writer. Enough to bundle
+    // saved text files into one download without pulling in a zip library.
+    function buildStoreZip(files) {
+        function crc32(bytes) {
+            var c, table = buildStoreZip._t || (buildStoreZip._t = (function () {
+                var t = new Uint32Array(256);
+                for (var n = 0; n < 256; n++) {
+                    c = n;
+                    for (var k = 0; k < 8; k++) c = (c & 1) ? (0xEDB88320 ^ (c >>> 1)) : (c >>> 1);
+                    t[n] = c >>> 0;
+                }
+                return t;
+            })());
+            c = 0xFFFFFFFF;
+            for (var i = 0; i < bytes.length; i++) c = table[(c ^ bytes[i]) & 0xFF] ^ (c >>> 8);
+            return (c ^ 0xFFFFFFFF) >>> 0;
+        }
+        var enc = new TextEncoder();
+        var locals = [], central = [], offset = 0;
+        function u16(v) { return [v & 0xFF, (v >>> 8) & 0xFF]; }
+        function u32(v) { return [v & 0xFF, (v >>> 8) & 0xFF, (v >>> 16) & 0xFF, (v >>> 24) & 0xFF]; }
+        files.forEach(function (f) {
+            var nameBytes = enc.encode(f.name);
+            var crc = crc32(f.data), sz = f.data.length;
+            var local = [].concat(
+                u32(0x04034b50), u16(20), u16(0), u16(0), u16(0), u16(0),
+                u32(crc), u32(sz), u32(sz), u16(nameBytes.length), u16(0)
+            );
+            locals.push(new Uint8Array(local), nameBytes, f.data);
+            central.push([].concat(
+                u32(0x02014b50), u16(20), u16(20), u16(0), u16(0), u16(0), u16(0),
+                u32(crc), u32(sz), u32(sz), u16(nameBytes.length),
+                u16(0), u16(0), u16(0), u16(0), u32(0), u32(offset)
+            ), nameBytes);
+            offset += local.length + nameBytes.length + sz;
+        });
+        var centralStart = offset, centralSize = 0;
+        var centralChunks = [];
+        central.forEach(function (c) {
+            var u = (c instanceof Uint8Array) ? c : new Uint8Array(c);
+            centralChunks.push(u); centralSize += u.length;
+        });
+        var end = new Uint8Array([].concat(
+            u32(0x06054b50), u16(0), u16(0), u16(files.length), u16(files.length),
+            u32(centralSize), u32(centralStart), u16(0)
+        ));
+        return new Blob(locals.concat(centralChunks, [end]), { type: "application/zip" });
+    }
+
+    function downloadSavedFiles() {
+        if (!window.Module || !Module.FS) {
+            alert("Filesystem not ready yet — wait for the app to finish loading.");
+            return;
+        }
+        var files = [];
+        // (1) wine's DEFAULT save dir Z:\home\username — top-level files (minus
+        // the .wine prefix) plus its Documents\/Desktop\ trees. Name these under
+        // a "home/" prefix so they can't collide with the C: profile's files.
+        collectTopLevelFiles(HOME_IN_MEMFS, ROOT, files, { ".wine": 1 });
+        collectFiles(HOME_IN_MEMFS + "/Documents", ROOT, files);
+        collectFiles(HOME_IN_MEMFS + "/Desktop", ROOT, files);
+        // (2) The C:\users\username shell profile — top-level files plus its
+        // Documents\/Desktop\ trees. Named "users/username/..." (relative to its
+        // own grandparent) to keep them distinct from the Z: home above.
+        var PROFILE_BASE = HOME_IN_MEMFS + "/.wine/drive_c";
+        collectTopLevelFiles(PROFILE_IN_MEMFS, PROFILE_BASE, files);
+        collectFiles(PROFILE_IN_MEMFS + "/Documents", PROFILE_BASE, files);
+        collectFiles(PROFILE_IN_MEMFS + "/Desktop", PROFILE_BASE, files);
+        if (!files.length) {
+            alert("No saved files found yet.\n\nSave a file from the app first " +
+                  "(e.g. Notepad → File → Save As, into Documents or Desktop), " +
+                  "then click Download again.");
+            return;
+        }
+        var blob = buildStoreZip(files);
+        var ts = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
+        var a = document.createElement("a");
+        a.href = URL.createObjectURL(blob);
+        a.download = "wine64-files-" + ts + ".zip";
+        document.body.appendChild(a);
+        a.click();
+        document.body.removeChild(a);
+        setTimeout(function () { URL.revokeObjectURL(a.href); }, 10000);
+        console.log("downloadSavedFiles: zipped " + files.length + " file(s): " +
+                    files.map(function (f) { return f.name; }).join(", "));
+    }
+    // Expose so the HTML button's onclick can reach it.
+    window.downloadSavedFiles = downloadSavedFiles;
+
     // --- orchestration ------------------------------------------------------
     // The zips are large (wine64.zip ~205MB); fetch them, drop them in the VFS,
     // push the argv, then release the run dependency so main() proceeds.
