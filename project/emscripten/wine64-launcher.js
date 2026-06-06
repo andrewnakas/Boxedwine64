@@ -467,6 +467,9 @@
         arguments: [],
         canvas: canvas,
         preRun: [function () {
+            // TEMP DEBUG: host-side GL trace (read via getenv in gl64bridge.cpp).
+            // Emscripten getenv() reads Module.ENV; set it before main() runs.
+            try { Module["ENV"] = Module["ENV"] || {}; Module["ENV"]["BW64_GLTRACE"] = "1"; } catch (e) {}
             // Hold main() until the rootfs is in the VFS.
             Module["addRunDependency"]("loadWine64Fs");
             loadFilesystem();

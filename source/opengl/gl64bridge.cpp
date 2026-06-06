@@ -618,7 +618,26 @@ U64 gl64Bridge(CPU64* cpu, U64 fnId, U64 argsAddr) {
             if (ensureContext()) GL_MT(glClearColor(af(args,0), af(args,1), af(args,2), af(args,3)));
             return 0;
         case GL64_fn_glClear:
-            if (g_glContext) GL_MT(glClear((GLbitfield)ai(args,0)));
+            if (g_glContext) {
+#ifdef __EMSCRIPTEN__
+                // Bind our own offscreen FBO (the one with a DEPTH attachment)
+                // before clearing, so the whole frame — clear, depth test, draw —
+                // targets it. glcube does glClear first each frame, so this is the
+                // per-frame entry point. Without it, after the first
+                // readbackAndPresent / glemu shader flush leaves Emscripten's
+                // renderViaOffscreenBackBuffer FBO bound, subsequent frames clear &
+                // depth-test against a target with no usable depth buffer, so
+                // GL_DEPTH_TEST silently does nothing and the cube's back faces
+                // draw over the front ones — the "abstract overlapping triangles,
+                // no occlusion" symptom. readbackAndPresent rebinds it for
+                // glReadPixels anyway, so keeping it bound the whole frame is
+                // consistent.
+                GL_MT({ if (g_emFbo) glBindFramebuffer(GL_FRAMEBUFFER, g_emFbo);
+                        glClear((GLbitfield)ai(args,0)); });
+#else
+                GL_MT(glClear((GLbitfield)ai(args,0)));
+#endif
+            }
             return 0;
         case GL64_fn_glClearDepth:
             if (g_glContext) GL_MT(glClearDepth(ad(args,0)));
@@ -771,9 +790,43 @@ U64 gl64Bridge(CPU64* cpu, U64 fnId, U64 argsAddr) {
                 // Single cross-thread hop: replay the whole primitive block.
                 GLenum mode = g_immMode;
                 glOnMain([&]{
+                    // Keep drawing targeted at our depth-equipped offscreen FBO.
+                    // glemu's LEGACY_GL_EMULATION shader flush (and Emscripten's
+                    // offscreen-backbuffer machinery) can rebind the framebuffer
+                    // between glClear and here, so re-bind before each primitive
+                    // block or the depth test runs against the wrong target and
+                    // the cube loses hidden-surface removal.
+                    if (g_emFbo) glBindFramebuffer(GL_FRAMEBUFFER, g_emFbo);
                     glBegin(mode);
                     for (const ImmOp& op : g_immOps) replayImmOp(op);
                     glEnd();
+                    // TEMP one-shot depth diagnostic (gated on BW64_GLTRACE): report
+                    // the actual depth state on the bound FBO at draw time so we can
+                    // see WHY hidden-surface removal isn't happening.
+                    if (getenv("BW64_GLTRACE")) {
+                        static bool reported = false;
+                        if (!reported) {
+                            reported = true;
+                            GLint fbo = -1, dtype = -1, dname = -1, dbits = -1;
+                            GLboolean dtest = glIsEnabled(GL_DEPTH_TEST);
+                            GLboolean dmask = GL_FALSE;
+                            glGetBooleanv(GL_DEPTH_WRITEMASK, &dmask);
+                            GLint dfunc = 0; glGetIntegerv(GL_DEPTH_FUNC, &dfunc);
+                            glGetIntegerv(GL_FRAMEBUFFER_BINDING, &fbo);
+                            GLenum st = glCheckFramebufferStatus(GL_FRAMEBUFFER);
+                            glGetFramebufferAttachmentParameteriv(GL_FRAMEBUFFER,
+                                GL_DEPTH_ATTACHMENT, GL_FRAMEBUFFER_ATTACHMENT_OBJECT_TYPE, &dtype);
+                            glGetFramebufferAttachmentParameteriv(GL_FRAMEBUFFER,
+                                GL_DEPTH_ATTACHMENT, GL_FRAMEBUFFER_ATTACHMENT_OBJECT_NAME, &dname);
+                            glGetIntegerv(GL_DEPTH_BITS, &dbits);
+                            GLenum err = glGetError();
+                            klog_fmt("gl64 DEPTHDBG: boundFbo=%d g_emFbo=%u status=0x%x "
+                                     "DEPTH_TEST=%d writemask=%d func=0x%x depthAttachType=0x%x "
+                                     "depthAttachName=%d DEPTH_BITS=%d glErr=0x%x",
+                                     fbo, (unsigned)g_emFbo, st, (int)dtest, (int)dmask, dfunc,
+                                     dtype, dname, dbits, err);
+                        }
+                    }
                 });
                 g_inImmediate = false;
                 g_immOps.clear();
