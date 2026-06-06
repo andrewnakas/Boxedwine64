@@ -12,30 +12,44 @@
 // Query params (all optional):
 //   ?p=--version            program + args for wine64 (default: --version)
 //                           space-separated; URL-encode spaces as %20.
-//   ?boot=1                 boot the prefix: runs `wineboot --init` with HOME/
-//                           WINEPREFIX/WINESERVER env instead of a bare program.
-//                           NOTE: in-tab this currently runs the full execve
-//                           chain (wine64-preloader -> wine64) and then stops at
-//                           `chdir /winePrefix/.wine: No such file or directory`
-//                           because the read-only zip overlay has no writable
-//                           WINEPREFIX and there is no in-browser wineserver IPC
-//                           yet (roadmap steps 3/4). `--version` is the verified
-//                           correctness boot; `?boot=1` is a progress probe.
+//                           When a program (other than --version) is given, the
+//                           launcher mounts a third zip — prefix64.zip — that
+//                           carries a PRE-BOOTED .wine prefix (registry +
+//                           dosdevices/c:,z: + glcube.exe) at /home/username, and
+//                           runs the program with HOME=/home/username /
+//                           WINEPREFIX=/home/username/.wine. wine sees an existing
+//                           prefix and SKIPS `wineboot --init`. This sidesteps the
+//                           unsolved in-browser wineserver-daemonize boot (see
+//                           ?boot=1) and is the path that can actually reach pixels
+//                           (e.g. ?p=glcube.exe).
+//   ?boot=1                 boot the prefix from scratch: runs `wineboot --init`
+//                           with HOME=/winePrefix. NOTE: in-tab this still STALLS —
+//                           wineserver64 exits status=0 right after launch (no
+//                           surviving daemon), dosdevices/c: is never created, and
+//                           every spawned wine process loops on ENOENT. Kept as a
+//                           progress probe for the wineserver-IPC roadmap work; use
+//                           ?p=<prog> (pre-booted prefix) to actually run programs.
 //   ?base=<url>             base URL the zips are fetched from (default: "./").
 //   ?novideo=1              pass -novideo (headless; no SDL window).
 //
 // Examples:
 //   wine64.html                      -> wine64 --version  (fast correctness boot)
-//   wine64.html?boot=1               -> wineboot --init   (full prefix bring-up)
-//   wine64.html?p=notepad.exe        -> wine64 notepad.exe (GUI, needs GL/X11)
+//   wine64.html?boot=1               -> wineboot --init   (stalls; roadmap probe)
+//   wine64.html?p=glcube.exe         -> wine64 glcube.exe  (pre-booted prefix; GL)
+//   wine64.html?p=notepad.exe        -> wine64 notepad.exe (pre-booted prefix)
 
 (function () {
     "use strict";
 
     var GLIBC_ZIP = "glibc-rootfs64.zip";
     var WINE_ZIP = "wine64.zip";
+    var PREFIX_ZIP = "prefix64.zip"; // pre-booted .wine prefix (+glcube.exe), ~257KB
     var ROOT = "/root";
     var WINE64 = "/usr/lib/wine/wine64";
+    // The pre-booted prefix in PREFIX_ZIP lives here (dosdevices c: -> ../drive_c,
+    // z: -> /). Running a program with these is what lets wine skip wineboot.
+    var PREFIX_HOME = "/home/username";
+    var PREFIX_WINE = "/home/username/.wine";
 
     // --- query params -------------------------------------------------------
     function param(key) {
@@ -48,6 +62,9 @@
     var DO_BOOT = param("boot") === "1";
     var NOVIDEO = param("novideo") === "1";
     var PROG = param("p"); // may be null
+    // Run a real program against the pre-booted prefix when ?p= names something
+    // other than the bare --version correctness boot (and we're not doing ?boot=1).
+    var USE_PREFIX = !DO_BOOT && PROG && PROG.length && PROG !== "--version";
 
     // --- DOM hooks ----------------------------------------------------------
     var statusElement = document.getElementById("status");
@@ -61,6 +78,9 @@
     // --- build the wine64 argv ----------------------------------------------
     function buildArguments() {
         var args = ["-root", ROOT, "-zip", GLIBC_ZIP, "-zip", WINE_ZIP];
+        // The pre-booted prefix is a third overlay; mount it only when we'll use
+        // it, so the bare --version / ?boot=1 paths stay byte-for-byte unchanged.
+        if (USE_PREFIX) args.push("-zip", PREFIX_ZIP);
         if (NOVIDEO) args.push("-novideo");
 
         if (DO_BOOT) {
@@ -70,8 +90,20 @@
             args.push("-env", "WINESERVER=/usr/lib/wine/wineserver64");
             args.push("-env", "WINEDLLPATH=/usr/lib/x86_64-linux-gnu/wine");
             args.push(WINE64, "wineboot", "--init");
+        } else if (USE_PREFIX) {
+            // Run a program against the PRE-BOOTED prefix (prefix64.zip). HOME +
+            // WINEPREFIX point at the existing /home/username/.wine, so wine finds
+            // a populated prefix and does NOT run wineboot --init.
+            args.push("-env", "HOME=" + PREFIX_HOME);
+            args.push("-env", "WINEPREFIX=" + PREFIX_WINE);
+            args.push("-env", "WINESERVER=/usr/lib/wine/wineserver64");
+            args.push("-env", "WINEDLLPATH=/usr/lib/x86_64-linux-gnu/wine");
+            args.push(WINE64);
+            PROG.split(/\s+/).forEach(function (tok) {
+                if (tok.length) args.push(tok);
+            });
         } else {
-            // Bare wine64 <program...>; default to --version.
+            // Bare wine64 --version (correctness boot, no prefix needed).
             args.push("-env", "WINEDLLPATH=/usr/lib/x86_64-linux-gnu/wine");
             args.push("-env", "WINESERVER=/usr/lib/wine/wineserver64");
             args.push(WINE64);
@@ -167,9 +199,18 @@
             })
             .then(function () {
                 wineDone = true;
+                // Third overlay: the tiny pre-booted prefix (+glcube.exe), only
+                // when we'll actually run a program against it.
+                if (USE_PREFIX) {
+                    return fetchZipToVfs(PREFIX_ZIP, function (r, t) { report(PREFIX_ZIP, r, t); });
+                }
+            })
+            .then(function () {
                 if (progressElement) progressElement.hidden = true;
                 if (spinnerElement) spinnerElement.hidden = true;
-                setStatusText(DO_BOOT ? "Booting wine prefix..." : "Starting wine64...");
+                setStatusText(DO_BOOT ? "Booting wine prefix..." :
+                              USE_PREFIX ? "Starting " + PROG + " (pre-booted prefix)..." :
+                              "Starting wine64...");
 
                 if (DO_BOOT) prepareWinePrefix();
 

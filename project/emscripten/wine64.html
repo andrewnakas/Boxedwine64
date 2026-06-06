@@ -28,6 +28,11 @@
         <canvas class="emscripten" id="canvas" oncontextmenu="event.preventDefault()"></canvas>
       </div>
     </div>
+    <!-- Dedicated offscreen canvas for the gl64 WebGL2 bridge. A canvas can hold
+         only one context, and #canvas is owned by SDL's renderer, so the gl64
+         host context lives on its own hidden canvas. Pre-created here (not from
+         C++) so no DOM access is needed off the browser main thread. -->
+    <canvas id="gl64canvas" width="1024" height="1024" style="display:none"></canvas>
     <div id="console">
       <textarea class="emscripten" id="output" rows="20" readonly></textarea>
     </div>

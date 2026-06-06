@@ -49,7 +49,15 @@
 // is marshaled to the platform MAIN thread (which owns GL and runs the present
 // loop) via xwireRunOnMainThread. Guest-memory reads/writes stay on the calling
 // thread; only the gl* calls hop.
+// <GL/gl.h> alone declares the FFP + GLES2 basics but NOT the FBO/renderbuffer
+// entry points (glGenFramebuffers, glBindFramebuffer, glRenderbufferStorage, ...);
+// those live in <GL/glext.h> and need GL_GLEXT_PROTOTYPES to get real prototypes
+// (not just function-pointer typedefs). They are core in WebGL2/GLES3, so Emscripten
+// links them. We render offscreen into an FBO, hence these are required.
+#define GL_GLEXT_PROTOTYPES
 #include <GL/gl.h>
+#include <GL/glext.h>
+#include <emscripten/emscripten.h>
 #include <emscripten/html5.h>
 #include <emscripten/html5_webgl.h>
 #else
@@ -60,6 +68,26 @@
 #include <atomic>
 #include <cstring>
 #include <mutex>
+
+#ifdef __EMSCRIPTEN__
+// Emscripten's -sLEGACY_GL_EMULATION supplies most fixed-function entry points,
+// but a few FFP lighting/material scalars are missing from its glemu and don't
+// link: glLightf, glMaterialf, glColorMaterial. The *fv (vector) variants DO
+// link, so route the scalars through them (1-element param). glColorMaterial has
+// no glemu equivalent — Emscripten's FFP shader synthesis already folds glColor
+// into the material, so a no-op preserves the visible result. These shims keep
+// the bridge's call sites (GL_MT(glLightf(...)) etc.) unchanged.
+static inline void bw_glLightf(GLenum light, GLenum pname, GLfloat v) {
+    GLfloat p[1] = { v }; glLightfv(light, pname, p);
+}
+static inline void bw_glMaterialf(GLenum face, GLenum pname, GLfloat v) {
+    GLfloat p[1] = { v }; glMaterialfv(face, pname, p);
+}
+static inline void bw_glColorMaterial(GLenum, GLenum) { /* glemu folds glColor */ }
+#define glLightf        bw_glLightf
+#define glMaterialf     bw_glMaterialf
+#define glColorMaterial bw_glColorMaterial
+#endif
 
 // ---------------------------------------------------------------------------
 // Host GL context + offscreen target. One per process for first light (wine
@@ -104,12 +132,22 @@ inline void glOnMain(Fn&& fn) {
 // Run a GL statement on the main thread. Used to wrap the inline gl* calls
 // scattered through the switch so they execute on the context-owning thread.
 #define GL_MT(stmt) glOnMain([&]{ stmt; })
+// Record an immediate-mode call (color/normal/vertex) into g_immOps when inside
+// a glBegin..glEnd block so it can be replayed in one hop at glEnd; otherwise
+// (a stray color/normal outside glBegin/glEnd) fall back to a direct hop. fn is
+// the GL64_fn_* id; a0..a3 are the float args; stmt is the direct GL call.
+#define RECORD_IMM(fn, a0, a1, a2, a3, stmt)                       \
+    do {                                                          \
+        if (g_inImmediate) g_immOps.push_back(ImmOp{(U16)(fn), {(a0),(a1),(a2),(a3)}}); \
+        else GL_MT(stmt);                                         \
+    } while (0)
 #else
 // Native: the existing code is already on a GL-capable thread (re-make-current
 // handled in ensureContext); run inline.
 template <typename Fn>
 inline void glOnMain(Fn&& fn) { fn(); }
 #define GL_MT(stmt) do { stmt; } while (0)
+#define RECORD_IMM(fn, a0, a1, a2, a3, stmt) do { stmt; } while (0)
 #endif
 
 // Current drawable as the guest sees it (the X window id winex11 passed to
@@ -125,6 +163,42 @@ U64 g_nextOpaqueId = 0x5000;
 // Readback scratch buffers.
 std::vector<U8> g_rgba;   // glReadPixels output (RGBA, bottom-up)
 std::vector<U8> g_bgrx;   // converted, top-down, for submitFrame
+
+#ifdef __EMSCRIPTEN__
+// --- immediate-mode batching ------------------------------------------------
+// Every gl* call normally hops to the GL-owning thread via glOnMain (a blocking
+// xwireRunOnMainThread round-trip). Inside a glBegin/glEnd block that is one hop
+// PER glVertex/glColor/glNormal — for glcube ~26 blocking hops per face group,
+// so the cube renders at seconds-per-frame and never looks animated even though
+// the guest advances its rotation every frame (glcube.c: angle += 1.5f).
+//
+// LEGACY_GL_EMULATION only buffers immediate-mode data in JS until glEnd flushes
+// it, so the individual calls have no observable GL side effects before glEnd.
+// That lets us RECORD them host-side (on the calling thread, under g_glMutex —
+// gl64Bridge already holds it, so recording is serialized) and REPLAY the whole
+// glBegin..glEnd as a SINGLE glOnMain hop at glEnd. One hop per primitive block
+// instead of one per vertex.
+struct ImmOp {
+    U16   fn;        // GL64_fn_* of the recorded immediate-mode call
+    float f[4];      // up to 4 float args (color4f/vertex3f/normal3f/...)
+};
+bool               g_inImmediate = false;   // between glBegin and glEnd
+GLenum             g_immMode     = 0;        // mode passed to glBegin
+std::vector<ImmOp> g_immOps;                 // recorded calls, replayed at glEnd
+
+// Replay one recorded immediate-mode op on the GL thread (called inside the
+// single glEnd glOnMain hop). Mirrors the per-case GL calls below.
+inline void replayImmOp(const ImmOp& op) {
+    switch (op.fn) {
+        case GL64_fn_glColor3f:  glColor3f(op.f[0], op.f[1], op.f[2]); break;
+        case GL64_fn_glColor4f:  glColor4f(op.f[0], op.f[1], op.f[2], op.f[3]); break;
+        case GL64_fn_glNormal3f: glNormal3f(op.f[0], op.f[1], op.f[2]); break;
+        case GL64_fn_glVertex2f: glVertex2f(op.f[0], op.f[1]); break;
+        case GL64_fn_glVertex3f: glVertex3f(op.f[0], op.f[1], op.f[2]); break;
+        default: break;
+    }
+}
+#endif
 
 #ifndef __EMSCRIPTEN__
 // Track which host thread currently holds the GL context. An SDL/Apple GL
@@ -178,23 +252,133 @@ bool ensureContext() {
         attr.stencil = false;
         attr.antialias = false;
         attr.enableExtensionsByDefault = true;
-        // Render into our own FBO, so the target canvas selector is irrelevant;
-        // "#canvas" is the page canvas the SDL renderer also uses, but we never
-        // present to it from this context — we glReadPixels and hand off.
-        g_emCtx = emscripten_webgl_create_context("#canvas", &attr);
+        // This code runs on the platform "main" thread (the PROXY_TO_PTHREAD main
+        // pthread). The build transfers #gl64canvas to THIS pthread at startup as an
+        // OffscreenCanvas (-sOFFSCREENCANVAS_SUPPORT=1 -sOFFSCREENCANVASES_TO_PTHREAD=
+        // '#gl64canvas'), so we can create a REAL, thread-owned WebGL2 context here
+        // — no proxyContextToMainThread. That real context gives glemu a usable JS
+        // GLctx object (with .createShader etc.) so the FFP→shader synthesis behind
+        // glBegin/glEnd works on this thread. renderViaOffscreenBackBuffer lets a
+        // single frame be composited across event callbacks and presented via an
+        // explicit swap (we glReadPixels our FBO and hand off to the X11 sink).
+        attr.renderViaOffscreenBackBuffer = true;
+        // A canvas can hold only ONE context. The page's "#canvas" is already
+        // owned by SDL's emscripten renderer (SDL_CreateRenderer makes a WebGL
+        // context on it), so emscripten_webgl_create_context("#canvas") FAILS.
+        // We render offscreen into our own FBO and glReadPixels the result to the
+        // present sink — never to a page canvas — so we just need our OWN canvas.
+        // The transferred OffscreenCanvas lives in GL.offscreenCanvases['#gl64canvas']
+        // ON THIS pthread (its control was transferred off the DOM element by
+        // -sOFFSCREENCANVASES_TO_PTHREAD), so create the context here directly.
+        g_emCtx = emscripten_webgl_create_context("#gl64canvas", &attr);
         if (!g_emCtx) {
-            klog_fmt("gl64: emscripten_webgl_create_context failed");
+            klog_fmt("gl64: emscripten_webgl_create_context failed (own canvas)");
             return;
         }
         emscripten_webgl_make_context_current(g_emCtx);
         emBuildFbo(g_drawW, g_drawH);
+        // LEGACY_GL_EMULATION's immediate-mode state (GLImmediate.matrix /
+        // matrixStack / temp vertex buffers / TexEnvJIT) is initialized by
+        // GLImmediate.init(), which Emscripten only registers as a
+        // Browser.moduleContextCreatedCallbacks hook — fired for contexts made via
+        // the SDL/Browser path, NOT for our emscripten_webgl_create_context. Without
+        // it, GLImmediate.matrix is still [] when the guest calls glMatrixMode/
+        // glLoadIdentity (fnId 260/261), so mat4.identity(undefined) throws "Cannot
+        // read properties of undefined". Run it here, on THIS (the GL-owning) thread
+        // — the same thread the GL_MT immediate-mode ops will run on — so the matrix
+        // stack & temp buffers exist before the first glMatrixMode. Guarded: init()
+        // sets GLImmediate.initted, so only run it the first time.
+        int gli = EM_ASM_INT({
+            // GLImmediate.init() early-returns unless Browser.useWebGL is true (set
+            // by the SDL/Browser context path we bypass), AND SDL's own context
+            // creation fires init() first — with useWebGL false — so it sets
+            // initted=true but leaves matrix/matrixStack/matrixVersion EMPTY. The
+            // guest's first glLoadIdentity (fnId 261) then crashes on the empty
+            // arrays. Force useWebGL on and re-run init(). init() touches GLctx
+            // (getParameter/TexEnvJIT) which can THROW on our proxied context BEFORE
+            // it reaches the matrix loop — so if init left the matrices empty, build
+            // them directly here (matrixLib is module-scope, no GLctx needed). The
+            // matrix stack is all glMatrixMode/glLoadIdentity/glFrustum/glRotate need.
+            // Return a status code so the host can log what happened.
+            var rc = 0;
+            try {
+                if (typeof Browser !== 'undefined') Browser.useWebGL = true;
+                if (typeof GLImmediate === 'undefined') return 1;
+                // GLImmediate.init()'s FIRST line does
+                //   GLImmediate.MAX_TEXTURES = Math.min(Module["GL_MAX_TEXTURE_IMAGE_UNITS"]
+                //                                       || GLctx.getParameter(...), 28);
+                // On our proxied context GLctx is the raw integer handle (no
+                // .getParameter), so that throws and init() aborts before building
+                // rendererCache/TexEnvJIT/temp buffers. Pre-seed the Module override so
+                // init() takes the `||` short-circuit and never touches GLctx — letting
+                // it run to completion. 8 texture units is plenty for glcube's FFP.
+                if (typeof Module !== 'undefined' && !Module["GL_MAX_TEXTURE_IMAGE_UNITS"])
+                    Module["GL_MAX_TEXTURE_IMAGE_UNITS"] = 8;
+                if (typeof GLImmediate.init === 'function' &&
+                    (!GLImmediate.matrix || GLImmediate.matrix.length === 0)) {
+                    GLImmediate.initted = false;
+                    try { GLImmediate.init(); rc = 2; } catch (e) { rc = 3; }
+                }
+                // If init() still threw before building the renderer cache (needed by
+                // glEnd's flush: rendererCache.getStaticKeyView()), build it directly.
+                if (!GLImmediate.rendererCache && GLImmediate.MapTreeLib) {
+                    GLImmediate.rendererCache = GLImmediate.MapTreeLib.create();
+                    rc += 40; // marks the rendererCache fallback ran
+                }
+                // Fallback: build whatever GLImmediate.init() left unset. init() can
+                // throw on our proxied context (GLctx.getParameter/TexEnvJIT) AFTER
+                // setting initted but BEFORE the matrix loop and the temp-buffer
+                // allocations, so both the matrix stack AND the vertex temp buffers
+                // can be missing. The matrix stack feeds glMatrixMode/glLoadIdentity/
+                // glFrustum/glRotate; the temp buffers (tempData/vertexDataU8) feed
+                // glColor/glVertex inside glBegin/glEnd. matrixLib + MAX_TEMP_BUFFER_SIZE
+                // are module-scope (no GLctx needed), so we can build all of it here.
+                if ((!GLImmediate.matrix || GLImmediate.matrix.length === 0) &&
+                    GLImmediate.matrixLib) {
+                    var n = 2 + (GLImmediate.MAX_TEXTURES > 0 ? GLImmediate.MAX_TEXTURES : 0);
+                    GLImmediate.matrix = [];
+                    GLImmediate.matrixStack = [];
+                    GLImmediate.matrixVersion = [];
+                    for (var i = 0; i < n; i++) {
+                        GLImmediate.matrixStack.push([]);
+                        GLImmediate.matrixVersion.push(0);
+                        var m = GLImmediate.matrixLib.mat4.create();
+                        GLImmediate.matrixLib.mat4.identity(m);
+                        GLImmediate.matrix.push(m);
+                    }
+                    rc += 10; // marks the matrix fallback ran
+                }
+                // Vertex temp buffers for immediate-mode glColor/glVertex (the
+                // glBegin/glEnd path). Without these, glColor3f writes to a null
+                // vertexDataU8 and crashes ("Cannot set properties of null").
+                if (!GLImmediate.vertexDataU8 && typeof GL !== 'undefined' &&
+                    GL.MAX_TEMP_BUFFER_SIZE) {
+                    GLImmediate.tempData = new Float32Array(GL.MAX_TEMP_BUFFER_SIZE >> 2);
+                    GLImmediate.indexData = new Uint16Array(GL.MAX_TEMP_BUFFER_SIZE >> 1);
+                    GLImmediate.vertexDataU8 = new Uint8Array(GLImmediate.tempData.buffer);
+                    if (!GLImmediate.clientColor)
+                        GLImmediate.clientColor = new Float32Array([1, 1, 1, 1]);
+                    try {
+                        if (typeof GL.generateTempBuffers === 'function')
+                            GL.generateTempBuffers(true, GL.currentContext);
+                    } catch (e) {}
+                    rc += 20; // marks the vertex-buffer fallback ran
+                }
+                return rc + (GLImmediate.matrix ? GLImmediate.matrix.length * 100 : 0);
+            } catch (e) { return 99; }
+        });
+        if (getenv("BW64_GLTRACE"))
+            klog_fmt("gl64: GLImmediate init rc=%d (rc%%100: 2=init-ok 3=init-threw "
+                     "+10=matrix +20=vbuf +40=rendererCache fallback; rc/100=matrix.length)", gli);
         klog_fmt("gl64: host GL up (WebGL2) — vendor='%s' renderer='%s' version='%s'",
                  (const char*)glGetString(GL_VENDOR),
                  (const char*)glGetString(GL_RENDERER),
                  (const char*)glGetString(GL_VERSION));
     });
-    if (!g_emCtx) { g_glInitFailed = true; return false; }
+    if (!g_emCtx) { g_glInitFailed = true; klog_fmt("gl64: ensureContext FAILED (emCtx still 0 after glOnMain)"); return false; }
     g_glContext = (void*)1; // sentinel: the rest of the file checks g_glContext
+    if (getenv("BW64_GLTRACE"))
+        klog_fmt("gl64: ensureContext OK (emCtx=%llu)", (unsigned long long)g_emCtx);
     return true;
 #else
     if (g_glContext) {
@@ -332,8 +516,6 @@ U64 gl64Bridge(CPU64* cpu, U64 fnId, U64 argsAddr) {
         if (!announced.exchange(true))
             klog_fmt("gl64: FIRST trap — guest IS using the gl64 bridge (fnId=%llu)",
                      (unsigned long long)fnId);
-        // BW64_GLTRACE=2: log EVERY call (fnId) — find the last GL call before a
-        // hang/crash. Noisy; only for pinpointing a stall.
         if (gt[0] == '2')
             klog_fmt("gl64: call fnId=%llu", (unsigned long long)fnId);
     }
@@ -343,6 +525,16 @@ U64 gl64Bridge(CPU64* cpu, U64 fnId, U64 argsAddr) {
     }
 
     switch (fnId) {
+        // fnId 0 is the guest libGL's load-time witness (an __attribute__((constructor))
+        // fires gl64_trap(0, NULL) the moment winex11/opengl32 dlopens libGL.so.1 — see
+        // tools/rootfs64/libgl64/libgl64.c). It carries no args; just acknowledge it so
+        // it doesn't fall to the "unimplemented fn id" default. Proves the guest is on
+        // the gl64 bridge before any real GLX call.
+        case 0:
+            if (getenv("BW64_GLTRACE"))
+                klog_fmt("gl64: FIRST trap fnId=0 (guest libGL.so.1 loaded)");
+            return 0;
+
         // === GLX / context bootstrap =====================================
         case GL64_fn_glXQueryVersion: {
             // args[0]=out major*, args[1]=out minor* -> write 1.4, return True
@@ -493,10 +685,12 @@ U64 gl64Bridge(CPU64* cpu, U64 fnId, U64 argsAddr) {
             return 0;
         }
         case GL64_fn_glColor3f:
-            if (g_glContext) GL_MT(glColor3f(af(args,0), af(args,1), af(args,2)));
+            if (g_glContext) RECORD_IMM(GL64_fn_glColor3f, af(args,0), af(args,1), af(args,2), 0,
+                                        glColor3f(af(args,0), af(args,1), af(args,2)));
             return 0;
         case GL64_fn_glColor4f:
-            if (g_glContext) GL_MT(glColor4f(af(args,0), af(args,1), af(args,2), af(args,3)));
+            if (g_glContext) RECORD_IMM(GL64_fn_glColor4f, af(args,0), af(args,1), af(args,2), af(args,3),
+                                        glColor4f(af(args,0), af(args,1), af(args,2), af(args,3)));
             return 0;
 
         // === core GL: matrices ===========================================
@@ -553,21 +747,48 @@ U64 gl64Bridge(CPU64* cpu, U64 fnId, U64 argsAddr) {
             if (g_glContext) GL_MT(glColorMaterial((GLenum)ai(args,0), (GLenum)ai(args,1)));
             return 0;
         case GL64_fn_glNormal3f:
-            if (g_glContext) GL_MT(glNormal3f(af(args,0), af(args,1), af(args,2)));
+            if (g_glContext) RECORD_IMM(GL64_fn_glNormal3f, af(args,0), af(args,1), af(args,2), 0,
+                                        glNormal3f(af(args,0), af(args,1), af(args,2)));
             return 0;
 
         // === core GL: immediate-mode geometry ============================
+        // On WASM, glBegin..glEnd is recorded host-side and replayed in ONE
+        // glOnMain hop at glEnd (see g_immOps). Native runs each call inline.
         case GL64_fn_glBegin:
-            if (g_glContext) GL_MT(glBegin((GLenum)ai(args,0)));
+            if (g_glContext) {
+#ifdef __EMSCRIPTEN__
+                g_inImmediate = true;
+                g_immMode = (GLenum)ai(args,0);
+                g_immOps.clear();
+#else
+                glBegin((GLenum)ai(args,0));
+#endif
+            }
             return 0;
         case GL64_fn_glEnd:
-            if (g_glContext) GL_MT(glEnd());
+            if (g_glContext) {
+#ifdef __EMSCRIPTEN__
+                // Single cross-thread hop: replay the whole primitive block.
+                GLenum mode = g_immMode;
+                glOnMain([&]{
+                    glBegin(mode);
+                    for (const ImmOp& op : g_immOps) replayImmOp(op);
+                    glEnd();
+                });
+                g_inImmediate = false;
+                g_immOps.clear();
+#else
+                glEnd();
+#endif
+            }
             return 0;
         case GL64_fn_glVertex2f:
-            if (g_glContext) GL_MT(glVertex2f(af(args,0), af(args,1)));
+            if (g_glContext) RECORD_IMM(GL64_fn_glVertex2f, af(args,0), af(args,1), 0, 0,
+                                        glVertex2f(af(args,0), af(args,1)));
             return 0;
         case GL64_fn_glVertex3f:
-            if (g_glContext) GL_MT(glVertex3f(af(args,0), af(args,1), af(args,2)));
+            if (g_glContext) RECORD_IMM(GL64_fn_glVertex3f, af(args,0), af(args,1), af(args,2), 0,
+                                        glVertex3f(af(args,0), af(args,1), af(args,2)));
             return 0;
 
         default:

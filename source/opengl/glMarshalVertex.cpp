@@ -18,7 +18,10 @@
 
 #include "boxedwine.h"
 
-#ifdef BOXEDWINE_OPENGL
+// gl64bridge.cpp replaces this legacy 32-bit GL marshaling for the x64 guest,
+// and these files include the native GL header (GLH) which the WASM/WebGL2 build
+// does not provide -- so compile them out when building the 64-bit guest.
+#if defined(BOXEDWINE_OPENGL) && !defined(BOXEDWINE_GUEST_X64)
 #include GLH
 #include "glcommon.h"
 #include "glMarshal.h"

@@ -1048,6 +1048,9 @@ void XWireConnection::processOneRequest(const uint8_t* req, uint32_t len) {
             // GLX glue may still send a couple of reply-expecting requests during
             // init. Answer them minimally so wine never blocks waiting on a reply.
             uint8_t minor = req[1];
+            if (getenv("BW64_XWIRE"))
+                klog_fmt("XWire: GLX minor=%d seq=%d reqlen=%d", (int)minor, (int)sequence,
+                         (int)(((uint32_t)req[2] | ((uint32_t)req[3] << 8))));
             switch (minor) {
                 case X_GLXQueryVersion: {
                     // reply: major(4)=1, minor(4)=4 in the reply body

@@ -60,7 +60,16 @@ wasm64-selftest-mem64: export EXTRA_LD_FLAGS := -sMEMORY64=1 -sENVIRONMENT=node 
 # clone/futex threading model, canvas via shell.html). This is the foundation for
 # running wine64 in a tab; full GL (WebGL backend) and lazy rootfs come on top.
 # Produces boxedwine64.html — serve cross-origin-isolated (node server.mjs).
-wasm64-mt: export EXTRA_CPP_FLAGS := -DBOXEDWINE_GUEST_X64=1 -DBOXEDWINE_MULTI_THREADED -pthread
+# BOXEDWINE_OPENGL compiles in source/opengl/gl64bridge.cpp — the guest->host GL
+# bridge whose host (__EMSCRIPTEN__) path drives WebGL2. Without it the whole file
+# (and the `case GL64_SYSCALL_NR` dispatch in syscall64.cpp) is #ifdef'd out, so
+# the guest's GL trap (magic syscall 0x474C0000) falls through to the unimplemented
+# default and the app crashes right after mapping its window. The LD-side GL flags
+# below (LEGACY_GL_EMULATION, MAX_WEBGL_VERSION=2) are inert without this define.
+# DISABLE_GL_EXTENSIONS empties the large legacy 32-bit glfunctions_ext* marshaling
+# (unused by the 64-bit bridge) so enabling BOXEDWINE_OPENGL doesn't bloat/break the
+# WASM link.
+wasm64-mt: export EXTRA_CPP_FLAGS := -DBOXEDWINE_GUEST_X64=1 -DBOXEDWINE_MULTI_THREADED -DBOXEDWINE_OPENGL -DDISABLE_GL_EXTENSIONS -pthread
 wasm64-mt: export BUILD_DIR := Build/Wasm64Mt
 wasm64-mt: export SHELL_FILE := shell.html
 wasm64-mt: export TARGET_EXEC := boxedwine64.html
@@ -76,9 +85,26 @@ wasm64-mt: export TARGET_EXEC := boxedwine64.html
 # synthesizes shaders for the FFP, so the bridge's existing native-GL code path
 # keeps working under WASM. It pulls in FULL_ES2 and needs WebGL2 allowed, hence
 # MAX_WEBGL_VERSION=2. We render the cube into an app-created FBO and glReadPixels
-# it back through the X11-wire present sink, so we do NOT need OFFSCREEN_FRAMEBUFFER
-# (that's only for compositing a pthread's GL straight to the page canvas).
-wasm64-mt: export EXTRA_LD_FLAGS := -pthread -sPTHREAD_POOL_SIZE=32 -sPROXY_TO_PTHREAD=1 -sOFFSCREENCANVAS_SUPPORT=0 -sALLOW_MEMORY_GROWTH=1 -sMAXIMUM_MEMORY=2147483648 -sLEGACY_GL_EMULATION=1 -sMAX_WEBGL_VERSION=2 --js-library=boxedwine-multithreaded-audio.js
+# it back through the X11-wire present sink.
+#
+# OFFSCREENCANVAS_SUPPORT=1 + OFFSCREENCANVASES_TO_PTHREAD='#gl64canvas': the gl64
+# trap runs on a guest worker and marshals every GL call to the platform main
+# thread (the PROXY_TO_PTHREAD main pthread that runs doMainLoop). For glemu's FFP
+# shader synthesis to work there it needs a REAL WebGL context object on that
+# thread — NOT the integer handle a proxyContextToMainThread context exposes (with
+# that, GLctx.createShader is undefined and glBegin/glEnd's renderer throws). So we
+# instead TRANSFER the dedicated #gl64canvas to the pthread at startup as an
+# OffscreenCanvas; the bridge then creates a real, thread-owned WebGL2 context on
+# it (no proxying), giving glemu a usable GLctx. #canvas stays on the browser main
+# thread for SDL's 2D present. OFFSCREEN_FRAMEBUFFER=1 provides the explicit-swap
+# path OffscreenCanvas contexts use.
+# ASSERTIONS=0: Emscripten's LEGACY_GL_EMULATION immediate-mode flush has an
+# over-strict debug assert (`numVertices` must be an integer) that aborts on the
+# floating-point round-trip numVertices = 4*(stride*count/4)/stride even when the
+# value is effectively integral. It's a debug-only check (compiled out in
+# production); disabling assertions removes it so the cube's glBegin/glEnd geometry
+# actually flushes to a draw call.
+wasm64-mt: export EXTRA_LD_FLAGS := -pthread -sPTHREAD_POOL_SIZE=32 -sPROXY_TO_PTHREAD=1 -sOFFSCREENCANVAS_SUPPORT=1 -sOFFSCREENCANVASES_TO_PTHREAD=\#gl64canvas -sOFFSCREEN_FRAMEBUFFER=1 -sALLOW_MEMORY_GROWTH=1 -sMAXIMUM_MEMORY=2147483648 -sLEGACY_GL_EMULATION=1 -sMAX_WEBGL_VERSION=2 -sASSERTIONS=0 --js-library=boxedwine-multithreaded-audio.js
 wasm64-mt: export ASSET_FILES := boxedwine.css boxedwine-shell.js wine64.html wine64-launcher.js $(ZIP_ASSET_FILES)
 
 cpus := $(shell getconf _NPROCESSORS_ONLN 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || grep -c ^processor /proc/cpuinfo 2>/dev/null || echo 1)
@@ -176,7 +202,7 @@ SHELL_LDFLAGS := $(if $(filter %.html,$(TARGET_EXEC)),--shell-file $(SHELL_FILE)
 # guest's loader can fopen() a real x86_64 ELF straight off the host disk
 # (NODERAWFS replaces the whole VFS and is mutually exclusive with idbfs).
 FS_LDFLAGS ?= -s FORCE_FILESYSTEM -lidbfs.js
-LDFLAGS = $(FS_LDFLAGS) -s USE_SDL=2 -s USE_ZLIB=1 -fwasm-exceptions -s INITIAL_MEMORY=536870912 $(SHELL_LDFLAGS) -s EXPORTED_RUNTIME_METHODS='["addRunDependency", "removeRunDependency","ERRNO_CODES","ccall","FS"]' -mtail-call $(EXTRA_LD_FLAGS)
+LDFLAGS = $(FS_LDFLAGS) -s USE_SDL=2 -s USE_ZLIB=1 -fwasm-exceptions -s INITIAL_MEMORY=536870912 $(SHELL_LDFLAGS) -s EXPORTED_RUNTIME_METHODS='["addRunDependency", "removeRunDependency","ERRNO_CODES","ccall","FS","abort","wasmMemory"]' -mtail-call $(EXTRA_LD_FLAGS)
 
 #$(TEST_BUILD_DIR)/boxedwineTest: $(TEST_OBJS)
 #	$(CC) $(TEST_OBJS) -o $@ $(LDFLAGS)

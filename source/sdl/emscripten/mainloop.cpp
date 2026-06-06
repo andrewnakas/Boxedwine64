@@ -23,6 +23,9 @@
 
 #ifdef BOXEDWINE_MULTI_THREADED
 #include "knativethread.h"
+#ifdef BOXEDWINE_GUEST_X64
+#include "../../x11wire/xwirepresent.h"
+#endif
 
 U32 getNextTimer();
 void runTimers();
@@ -52,12 +55,52 @@ static BString getSize(int pages)
 extern int allocatedRamPages;
 void mainloop() {
     isMainThread = true;
+#ifdef BOXEDWINE_GUEST_X64
+        // LEGACY_GL_EMULATION registers GL.newRenderingFrameStarted() as a
+        // preMainLoop hook that runs HERE, on this main-loop thread, every frame.
+        // It indexes GL.currentContext's temp vertex buffers — but the gl64 bridge
+        // creates its WebGL2 context with proxyContextToMainThread, so on this
+        // thread GL.currentContext is the raw integer handle (GL.currentContextIsProxied
+        // = true), not a context object. Its only guard is `if (!GL.currentContext)`,
+        // which the nonzero integer passes, so it then does
+        // `(integer).tempVertexBufferCounters1[i] = 0` -> "Cannot set properties of
+        // undefined", which kills this main loop and deadlocks every glOnMain. Patch
+        // the hook IN THIS THREAD's GL instance (the one the hook actually uses) to
+        // also bail for a proxied context. Once (static guard); near-zero cost after.
+        static bool framePatched = false;
+        if (!framePatched) {
+            framePatched = true;
+            EM_ASM({
+                try {
+                    if (typeof GL !== 'undefined' && GL.newRenderingFrameStarted &&
+                        !GL.newRenderingFrameStarted.__bw64Patched) {
+                        var orig = GL.newRenderingFrameStarted;
+                        GL.newRenderingFrameStarted = function() {
+                            if (GL.currentContextIsProxied ||
+                                !GL.currentContext ||
+                                typeof GL.currentContext !== 'object') return;
+                            return orig.apply(this, arguments);
+                        };
+                        GL.newRenderingFrameStarted.__bw64Patched = true;
+                    }
+                } catch (e) {}
+            });
+        }
+        // Present the in-process X11 wire server's latest frame AND drain work the
+        // gl64 bridge deferred to the main thread (WebGL context creation, FBO
+        // setup, glReadPixels). The gl64 trap runs on a guest worker thread that
+        // can't touch the thread-affine WebGL context, so it enqueues closures via
+        // xwireRunOnMainThread and BLOCKS until drainMainThreadWork() (inside
+        // tickXWirePresent) runs them here. Without this call those jobs never run
+        // and the guest's glXCreateContext hangs forever (black canvas).
+        tickXWirePresent();
+#endif
         U32 t = KSystem::getMilliesSinceStart();
         U32 nextTimer = getNextTimer();
         if (nextTimer == 0) {
             runTimers();
         }
-           
+
         if (lastTitleUpdate + 5000 < t) {
             lastTitleUpdate = t;
             BString title;
