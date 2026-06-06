@@ -583,8 +583,16 @@ bool StartUpArgs::apply() {
     KNativeAudio::init();
 #ifdef BOXEDWINE_OPENGL
     PlatformOpenGL::init();
-    gl_init(this->glExt);        
-#endif   
+    // gl_init() wires up the legacy 32-bit guest->host GL callback table
+    // (glcommon.cpp). The 64-bit guest routes GL through the gl64 bridge
+    // (source/opengl/gl64bridge.cpp, the GL64_SYSCALL_NR trap) instead, and
+    // glcommon.cpp deliberately omits gl_init(BString) when BOXEDWINE_GUEST_X64
+    // is defined — so calling it here would be an undefined symbol at link time.
+    // Skip it for the X64 guest; the bridge needs no such table.
+#ifndef BOXEDWINE_GUEST_X64
+    gl_init(this->glExt);
+#endif
+#endif
 #ifdef BOXEDWINE_VULKAN
     vulkan_init();
 #endif
