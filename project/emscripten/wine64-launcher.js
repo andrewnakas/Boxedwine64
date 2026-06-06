@@ -31,6 +31,16 @@
 //                           ?p=<prog> (pre-booted prefix) to actually run programs.
 //   ?base=<url>             base URL the zips are fetched from (default: "./").
 //   ?novideo=1              pass -novideo (headless; no SDL window).
+//   ?chunked=1              fetch each rootfs zip via a <zip>.manifest.json that
+//                           lists <zip>.partNNN pieces, and concatenate them in
+//                           the browser before mounting. This is how the GitHub
+//                           Pages deploy serves the 196 MB wine64.zip: Pages caps
+//                           files at 100 MB and (being unable to set CORP headers)
+//                           can't satisfy COEP require-corp for a cross-origin
+//                           Release asset, so the zip is split into <100 MB
+//                           SAME-ORIGIN parts (tools/rootfs64/split-rootfs.sh).
+//                           Without this flag (e.g. local `node server.mjs`) the
+//                           whole zips are fetched directly — unchanged behaviour.
 //
 // Examples:
 //   wine64.html                      -> wine64 --version  (fast correctness boot)
@@ -61,6 +71,7 @@
     if (BASE.length && !BASE.endsWith("/")) BASE += "/";
     var DO_BOOT = param("boot") === "1";
     var NOVIDEO = param("novideo") === "1";
+    var CHUNKED = param("chunked") === "1"; // fetch zips as <zip>.partNNN via manifest
     var PROG = param("p"); // may be null
     // Run a real program against the pre-booted prefix when ?p= names something
     // other than the bare --version correctness boot (and we're not doing ?boot=1).
@@ -115,14 +126,20 @@
         return args;
     }
 
-    // --- fetch a zip into the Emscripten VFS with progress -------------------
-    function fetchZipToVfs(name, onProgress) {
-        return fetch(BASE + name).then(function (resp) {
-            if (!resp.ok) throw new Error("fetch " + name + " -> HTTP " + resp.status);
-            var total = Number(resp.headers.get("Content-Length")) || 0;
-            if (!resp.body || !total) {
+    // --- fetch one URL to a Uint8Array, streaming progress ------------------
+    // `baseReceived` lets callers offset the progress so a multi-part download
+    // reports cumulative bytes against a known grand total.
+    function fetchBytes(url, label, onProgress, baseReceived, grandTotal) {
+        baseReceived = baseReceived || 0;
+        return fetch(url).then(function (resp) {
+            if (!resp.ok) throw new Error("fetch " + url + " -> HTTP " + resp.status);
+            var partTotal = Number(resp.headers.get("Content-Length")) || 0;
+            var total = grandTotal || partTotal;
+            if (!resp.body || !partTotal) {
                 return resp.arrayBuffer().then(function (buf) {
-                    return new Uint8Array(buf);
+                    var b = new Uint8Array(buf);
+                    if (onProgress) onProgress(label, baseReceived + b.length, total);
+                    return b;
                 });
             }
             var reader = resp.body.getReader();
@@ -138,19 +155,65 @@
                     }
                     chunks.push(r.value);
                     received += r.value.length;
-                    if (onProgress) onProgress(received, total);
+                    if (onProgress) onProgress(label, baseReceived + received, total);
                     return pump();
                 });
             })();
-        }).then(function (bytes) {
-            try {
-                Module.FS.createDataFile("/", name, bytes, true, true);
-            } catch (e) {
-                console.log("createDataFile " + name + " failed: " + e);
-                throw e;
-            }
-            console.log("loaded " + name + " (" + bytes.length + " bytes) into VFS");
-            return bytes.length;
+        });
+    }
+
+    function dropBytesIntoVfs(name, bytes) {
+        try {
+            Module.FS.createDataFile("/", name, bytes, true, true);
+        } catch (e) {
+            console.log("createDataFile " + name + " failed: " + e);
+            throw e;
+        }
+        console.log("loaded " + name + " (" + bytes.length + " bytes) into VFS");
+        return bytes.length;
+    }
+
+    // --- fetch a zip into the Emscripten VFS with progress -------------------
+    // Two paths, selected by the ?chunked flag:
+    //   * whole-file: fetch BASE/<name> directly (local `node server.mjs`).
+    //   * chunked: fetch BASE/<name>.manifest.json, then each listed part, and
+    //     concatenate them into the original <name> bytes. This is how GitHub
+    //     Pages serves wine64.zip (split <100 MB, same-origin) — see
+    //     tools/rootfs64/split-rootfs.sh and ?chunked above.
+    // Both end by createDataFile()ing the *original* zip name into the VFS, so the
+    // wine64 argv (`-zip <name>`) is identical regardless of how it was fetched.
+    function fetchZipToVfs(name, onProgress) {
+        if (!CHUNKED) {
+            return fetchBytes(BASE + name, name, onProgress).then(function (bytes) {
+                return dropBytesIntoVfs(name, bytes);
+            });
+        }
+        // Chunked: read the manifest, then pull and stitch the parts.
+        return fetch(BASE + name + ".manifest.json").then(function (resp) {
+            if (!resp.ok) throw new Error("fetch " + name + ".manifest.json -> HTTP " + resp.status);
+            return resp.json();
+        }).then(function (manifest) {
+            var parts = manifest.parts || [name];
+            var total = Number(manifest.totalBytes) || 0;
+            var out = new Uint8Array(total);
+            var offset = 0;
+            // Fetch parts sequentially (keeps peak memory to ~one part + the
+            // assembled buffer, and reports monotonic cumulative progress).
+            return parts.reduce(function (chain, part) {
+                return chain.then(function () {
+                    var atStart = offset;
+                    return fetchBytes(BASE + part, name, onProgress, atStart, total)
+                        .then(function (bytes) {
+                            out.set(bytes, offset);
+                            offset += bytes.length;
+                        });
+                });
+            }, Promise.resolve()).then(function () {
+                if (total && offset !== total) {
+                    throw new Error(name + ": assembled " + offset + " bytes, manifest said " + total);
+                }
+                return dropBytesIntoVfs(name, out);
+            });
         });
     }
 
@@ -351,17 +414,19 @@
                 progressElement.max = total;
             }
         }
-        fetchZipToVfs(GLIBC_ZIP, function (r, t) { report(GLIBC_ZIP, r, t); })
+        // report(label, recv, total) matches fetchBytes's onProgress(label, …)
+        // signature, so it can be passed straight through.
+        fetchZipToVfs(GLIBC_ZIP, report)
             .then(function () {
                 glibcDone = true;
-                return fetchZipToVfs(WINE_ZIP, function (r, t) { report(WINE_ZIP, r, t); });
+                return fetchZipToVfs(WINE_ZIP, report);
             })
             .then(function () {
                 wineDone = true;
                 // Third overlay: the tiny pre-booted prefix (+glcube.exe), only
                 // when we'll actually run a program against it.
                 if (USE_PREFIX) {
-                    return fetchZipToVfs(PREFIX_ZIP, function (r, t) { report(PREFIX_ZIP, r, t); });
+                    return fetchZipToVfs(PREFIX_ZIP, report);
                 }
             })
             .then(function () {

@@ -1,0 +1,143 @@
+# Build the in-browser 64-bit Boxedwine (wasm64-mt) and publish it to GitHub Pages.
+#
+# What gets served (all SAME-ORIGIN on Pages, which is what makes it work — see
+# below): wine64.html + wine64-launcher.js + coi-serviceworker.js + the freshly
+# built boxedwine64.{js,wasm} + the rootfs zips. The big rootfs (wine64.zip is
+# ~196 MB, over Pages' 100 MB/file limit) is shipped as <100 MB parts produced by
+# tools/rootfs64/split-rootfs.sh; the launcher fetches each <zip>.manifest.json
+# and concatenates the parts in the browser (?chunked=1).
+#
+# Why not a Release asset for the big zip? A cross-origin-isolated page (required
+# for SharedArrayBuffer/pthreads) under COEP `require-corp` can only load
+# subresources that are same-origin or carry a Cross-Origin-Resource-Policy
+# header. GitHub Release assets (release-assets.githubusercontent.com) send NO
+# CORP/CORS header, so the page would be blocked from fetching them. Splitting the
+# zip onto Pages keeps every fetch same-origin and sidesteps the problem entirely.
+# (coi-serviceworker.js supplies the COOP/COEP that Pages itself can't set.)
+#
+# The rootfs is expensive to build (Docker apt-get of Debian wine64; see
+# tools/rootfs64/build-wine64-zip.sh) and not reproducible in CI, so it is built
+# ONCE locally, split, and uploaded to a Release tagged `rootfs-pages`. This
+# workflow only DOWNLOADS those split parts and bundles them — it never rebuilds
+# the 196 MB rootfs. Refresh it with: tools/rootfs64/publish-rootfs-release.sh.
+name: Deploy wasm64 to Pages
+
+on:
+  push:
+    branches: [master]
+    # Only rebuild when something that affects the deployed site changes.
+    paths:
+      - "source/**"
+      - "include/**"
+      - "platform/**"
+      - "lib/**"
+      - "project/emscripten/**"
+      - "tools/rootfs64/split-rootfs.sh"
+      - ".github/workflows/deploy-pages.yml"
+  workflow_dispatch: {}
+
+# The official Pages flow: build an artifact, then deploy it. No gh-pages branch.
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# Allow one concurrent deployment; don't cancel an in-progress one (the wasm
+# build is long and we don't want a half-published site).
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+# The tag holding the pre-split rootfs parts (built locally, see header).
+env:
+  ROOTFS_RELEASE_TAG: rootfs-pages
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Emscripten
+        uses: mymindstorm/setup-emsdk@v14
+        with:
+          version: latest
+          actions-cache-folder: emsdk-cache
+
+      - name: Build wasm64-mt
+        working-directory: project/emscripten
+        # Produces boxedwine64.{html,js,wasm} + copies the launcher/coi/css assets
+        # into Build/Wasm64Mt. The heavy LD flags (PROXY_TO_PTHREAD, MAXIMUM_MEMORY,
+        # OFFSCREENCANVAS, LEGACY_GL_EMULATION, …) are baked into the makefile target.
+        # The rootfs *.zip aren't present in CI, so the asset-copy step simply skips
+        # them (the makefile guards each copy with `if [ -e ]`); we add them below.
+        run: make wasm64-mt
+
+      - name: Download split rootfs from Release
+        # The parts + manifests were uploaded by publish-rootfs-release.sh. Pull
+        # them straight into the Build output so they ride onto Pages same-origin.
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          out="project/emscripten/Build/Wasm64Mt"
+          echo "Downloading rootfs parts from release '$ROOTFS_RELEASE_TAG'..."
+          gh release download "$ROOTFS_RELEASE_TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --dir "$out" \
+            --pattern '*.zip' \
+            --pattern '*.zip.part*' \
+            --pattern '*.manifest.json' \
+            --clobber
+          echo "Rootfs assets in $out:"
+          ls -la "$out" | grep -E 'zip|manifest' || true
+
+      - name: Assemble _site
+        run: |
+          set -euo pipefail
+          src="project/emscripten/Build/Wasm64Mt"
+          site="_site"
+          mkdir -p "$site"
+          # The page, launcher, COI shim, the Emscripten module, and the rootfs.
+          # wine64.html is the entry point; also expose it as index.html so the
+          # bare site URL lands on the wine64 page with chunked fetch enabled.
+          cp "$src/wine64.html"            "$site/"
+          cp "$src/wine64-launcher.js"     "$site/"
+          cp "$src/coi-serviceworker.js"   "$site/"
+          cp "$src/boxedwine.css"          "$site/" 2>/dev/null || true
+          cp "$src/boxedwine64.js"         "$site/"
+          cp "$src/boxedwine64.wasm"       "$site/"
+          # Rootfs: whole small zips + split big-zip parts + every manifest.
+          cp "$src"/*.zip                  "$site/" 2>/dev/null || true
+          cp "$src"/*.zip.part*            "$site/" 2>/dev/null || true
+          cp "$src"/*.manifest.json        "$site/"
+          # Landing page: redirect "/" to the wine64 launcher with ?chunked=1 so
+          # the split rootfs is fetched + reassembled. ?p=notepad.exe gives a GUI
+          # out of the box; drop the query to get the bare `wine64 --version` boot.
+          cat > "$site/index.html" <<'HTML'
+          <!doctype html><meta charset="utf-8">
+          <title>Boxedwine64 — wine64 in the browser</title>
+          <meta http-equiv="refresh" content="0; url=wine64.html?chunked=1&p=notepad.exe">
+          <p>Loading <a href="wine64.html?chunked=1&p=notepad.exe">wine64 in the browser</a>…</p>
+          HTML
+          # GitHub Pages strips dotfiles and won't serve _site as-is without this;
+          # also disables Jekyll so files like coi-serviceworker.js pass through.
+          touch "$site/.nojekyll"
+          echo "Assembled site:"; ls -la "$site"
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: _site
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4

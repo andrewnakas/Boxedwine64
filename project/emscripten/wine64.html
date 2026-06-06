@@ -2,6 +2,12 @@
 <html lang="en-us">
   <head>
     <meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+    <!-- Cross-origin isolation for SharedArrayBuffer. On GitHub Pages (which can't
+         set COOP/COEP response headers) this service worker injects them client-side
+         so crossOriginIsolated becomes true; on a server that already sends the
+         headers (node server.mjs) it detects isolation and no-ops. Must run before
+         the Emscripten module loads. See coi-serviceworker.js. -->
+    <script src="coi-serviceworker.js"></script>
     <title>wine64 in the browser — Boxedwine64</title>
     <meta name="description" content="64-bit Boxedwine: real wine64 running in WebAssembly">
     <link rel="stylesheet" type="text/css" href="boxedwine.css">

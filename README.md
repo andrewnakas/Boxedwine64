@@ -329,6 +329,38 @@ is fetched up front; lazy/range-fetched DLL loading is the next streamability wi
 and a couple of wineserver socket syscalls (`socketpair`, `setsockopt`) still warn
 unsupported on the IPC shim.
 
+### Deploying to GitHub Pages
+
+`.github/workflows/deploy-pages.yml` builds `wasm64-mt` in CI and publishes the
+launcher to GitHub Pages on every push to `master` (or via *Run workflow*). Two
+constraints shape the deploy:
+
+* **No server headers.** Pages can't set COOP/COEP, which `SharedArrayBuffer`
+  needs. `coi-serviceworker.js` injects them client-side so the page becomes
+  cross-origin-isolated (it no-ops under `server.mjs`, which already sets them).
+* **100 MB/file limit.** `wine64.zip` is ~196 MB. A GitHub *Release* asset would
+  dodge the size cap but is served with **no `Cross-Origin-Resource-Policy`
+  header**, so a cross-origin-isolated page (COEP `require-corp`) can't fetch it.
+  Instead `tools/rootfs64/split-rootfs.sh` splits it into <100 MB **same-origin**
+  parts plus a `*.manifest.json`; the launcher fetches the parts and concatenates
+  them in-browser (`?chunked=1`) into byte-identical `wine64.zip`. Same-origin ⇒
+  COEP is satisfied with no cross-origin fetch at all.
+
+The rootfs is a heavy Docker build (`build-wine64-zip.sh`), so it's built **once
+locally**, split, and parked on a `rootfs-pages` Release that CI only *downloads*
+(never the runtime browser fetch). One-time setup:
+
+```sh
+# 1. build the rootfs zips (Docker), then publish the split parts to a Release:
+tools/rootfs64/build-wine64-zip.sh          # produces dist/{glibc-rootfs64,wine64}.zip
+tools/rootfs64/build-prefix64.sh            # produces dist/prefix64.zip
+tools/rootfs64/publish-rootfs-release.sh    # splits + uploads to the rootfs-pages Release
+# 2. in repo Settings ▸ Pages, set Source = "GitHub Actions", then push to master.
+```
+
+The published site lands at `https://<user>.github.io/Boxedwine64/` and opens
+`wine64.html?chunked=1&p=notepad.exe` by default.
+
 > **Continuing this work:** the full hand-off — every build target, verify command,
 > the fixes already made, and remaining steps — is in
 > [`docs/WASM_64BIT_ROADMAP.md`](docs/WASM_64BIT_ROADMAP.md).

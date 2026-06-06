@@ -105,7 +105,7 @@ wasm64-mt: export TARGET_EXEC := boxedwine64.html
 # production); disabling assertions removes it so the cube's glBegin/glEnd geometry
 # actually flushes to a draw call.
 wasm64-mt: export EXTRA_LD_FLAGS := -pthread -sPTHREAD_POOL_SIZE=32 -sPROXY_TO_PTHREAD=1 -sOFFSCREENCANVAS_SUPPORT=1 -sOFFSCREENCANVASES_TO_PTHREAD=\#gl64canvas -sOFFSCREEN_FRAMEBUFFER=1 -sALLOW_MEMORY_GROWTH=1 -sMAXIMUM_MEMORY=2147483648 -sLEGACY_GL_EMULATION=1 -sMAX_WEBGL_VERSION=2 -sASSERTIONS=0 --js-library=boxedwine-multithreaded-audio.js
-wasm64-mt: export ASSET_FILES := boxedwine.css boxedwine-shell.js wine64.html wine64-launcher.js $(ZIP_ASSET_FILES)
+wasm64-mt: export ASSET_FILES := boxedwine.css boxedwine-shell.js wine64.html wine64-launcher.js coi-serviceworker.js $(ZIP_ASSET_FILES)
 
 cpus := $(shell getconf _NPROCESSORS_ONLN 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || grep -c ^processor /proc/cpuinfo 2>/dev/null || echo 1)
 make_jobs := $(shell n='$(cpus)'; expr "$$n" : '^[0-9][0-9]*$$' >/dev/null && [ "$$n" -gt 2 ] && expr "$$n" - 1)

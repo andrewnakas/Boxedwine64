@@ -38,7 +38,13 @@ tools/vulkan/gen/
 tools/BoxedwineRunner/out/
 lib/mac
 .vs/
-.github/
+# .github/ was ignored wholesale; un-ignore just the workflows dir so the Pages
+# deploy workflow is tracked (it builds + publishes the in-browser wasm64-mt
+# build). Everything else under .github/ stays ignored.
+.github/*
+!.github/workflows/
+.github/workflows/*
+!.github/workflows/deploy-pages.yml
 project/mac-xcode/Boxedwine/DerivedDataCoverage
 *.xcresult
 *.profraw
