@@ -55,14 +55,22 @@
 //
 // PERSISTENT WINE SESSION (the real "load a new app into the SAME running wine"):
 // By default (?session=1, implied whenever a real program is requested) the boot
-// argv starts ONLY a long-lived foreground wineserver (`wineserver64 -f -p`)
-// against the pre-booted prefix. Because the emscripten main loop only quits when
-// the last guest thread exits (platformThreadCount==0 -> SDL_QUIT), that resident
-// wineserver keeps the whole kernel — prefix, X11 wire server, GL context —
-// warm between apps. The requested app, and every later window.launchApp("<prog>"),
-// is then spawned INTO that running kernel with NO page reload, via the C bridge
+// argv launches the requested app the SAME proven way as ?session=0
+// (`wine64 <prog>` against the pre-booted prefix) — this brings up wineserver AND
+// the wine service stack (services.exe, plugplay, …) a GUI app needs. Then, once
+// the kernel is up, the launcher pins the running wineserver persistent by
+// spawning `wineserver64 -p` into it. Because the emscripten main loop only quits
+// when the last guest thread exits (platformThreadCount==0 -> SDL_QUIT), that
+// pinned server keeps the whole kernel — prefix, X11 wire server, GL context —
+// warm even after the app exits. Every later window.launchApp("<prog>") is then
+// spawned INTO that running kernel with NO page reload, via the C bridge
 // bw64_spawn() (source/sdl/emscripten/wine64session.cpp). The app bar in
 // wine64.html calls launchApp().
+//
+// (An earlier design booted a BARE `wineserver64 -f -p` first and spawned the app
+// after; that server never started the wine services, so a GUI app cold-started
+// them and a failure cascaded to exit_group(1). Booting the app normally avoids
+// that by reusing the known-good bring-up.)
 //
 // FALLBACK — reload-based switching (?session=0): launchApp() navigates to the
 // new app's URL (?p=<prog>) for a clean page boot. The rootfs is NOT re-downloaded
@@ -170,14 +178,19 @@
             args.push("-env", "WINEDLLPATH=/usr/lib/x86_64-linux-gnu/wine");
             args.push(WINE64, "wineboot", "--init");
         } else if (SESSION) {
-            // PERSISTENT SESSION: boot a long-lived FOREGROUND wineserver against
-            // the pre-booted prefix. -f keeps it in the foreground (no fork — the
-            // in-emulator daemonize path is unreliable) so it stays a live guest
-            // thread; -p makes it persist forever. While it lives the emulator
-            // never quits, so the requested app (and every later one) is spawned
-            // INTO this kernel via bw64_spawn — see maybeStartSessionApp().
+            // PERSISTENT SESSION. Boot the requested app the SAME proven way as
+            // ?session=0 (wine64 <prog> against the pre-booted prefix) — this
+            // brings up wineserver AND the wine service stack (services.exe,
+            // plugplay, …) that a GUI app needs, exactly as the known-good path.
+            // A bare `wineserver64 -f -p` boot does NOT start those services, so
+            // the app's wine would cold-start them and one failing cascades to an
+            // exit_group(1). The difference from ?session=0 is only what happens
+            // AFTER: we keep the kernel alive (so the emulator's main loop doesn't
+            // quit when the app exits) by spawning `wineserver64 -p` right after
+            // boot to pin the running server persistent (see maybeStartSessionApp),
+            // and switch apps via bw64_spawn with no reload.
             prefixEnv().forEach(function (kv) { args.push("-env", kv); });
-            args.push(WINESERVER64, "-f", "-p");
+            wineProgArgv(PROG).forEach(function (tok) { args.push(tok); });
         } else if (USE_PREFIX) {
             // Run a program against the PRE-BOOTED prefix (prefix64.zip). HOME +
             // WINEPREFIX point at the existing /home/username/.wine, so wine finds
@@ -569,10 +582,12 @@
 
                 M["removeRunDependency"]("loadWine64Fs");
 
-                // In session mode the boot argv above started only the persistent
-                // wineserver; spawn the actually-requested app into it once the
-                // kernel reports the session is ready (bw64_session_ready).
-                if (SESSION) maybeStartSessionApp(PROG);
+                // In session mode the boot argv launched the requested app the
+                // normal way (which brings up wineserver + services). Once the
+                // kernel is up, pin the running wineserver persistent so the
+                // emulator's main loop won't quit when the app later exits — that
+                // resident server is what makes this a persistent session.
+                if (SESSION) pinSessionServerWhenReady();
             })
             .catch(function (err) {
                 console.error("wine64-launcher failed: " + err);
@@ -684,34 +699,43 @@
     function sessionReady() {
         return callExport("bw64_session_ready", [], []) === 1;
     }
-    // Spawn `wine64 <prog>` into the live kernel (no reload). Returns true if the
-    // C side scheduled the process. The spawn is marshalled onto the main-loop
-    // thread inside bw64_spawn, so it's safe to call from here.
-    function spawnIntoSession(prog) {
-        var argv = wineProgArgv(prog).join("\n");
+    // Spawn an arbitrary guest argv (array) into the live kernel, sharing the
+    // session's prefix env. Returns true if the C side scheduled the process.
+    // The spawn is marshalled onto the main-loop thread inside bw64_spawn.
+    function spawnArgv(argvArray, label) {
+        var argv = argvArray.join("\n");
         var env = prefixEnv().join("\n");
         var r = callExport("bw64_spawn", ["string", "string"], [argv, env]);
         if (r === 1) {
-            console.log("session: spawned " + prog + " into the running wine");
+            console.log("session: spawned " + (label || argvArray.join(" ")) + " into the running wine");
             return true;
         }
-        console.warn("session: spawn of " + prog + " did not schedule (r=" + r + ")");
+        console.warn("session: spawn of " + (label || argvArray.join(" ")) + " did not schedule (r=" + r + ")");
         return false;
     }
-    // After boot, wait for the session to come up, then spawn the first app.
-    function maybeStartSessionApp(prog) {
-        if (!prog || !prog.length || prog === "--version") return;
+    // Spawn `wine64 <prog>` into the live kernel (no reload).
+    function spawnIntoSession(prog) {
+        return spawnArgv(wineProgArgv(prog), prog);
+    }
+    // Once the kernel is up, pin the running wineserver persistent so the
+    // emulator's main loop won't quit when the booted app later exits. We spawn
+    // `wineserver64 -p` (persistent, no timeout): it connects to the already-
+    // running server and bumps it to never-exit, then returns. This is what keeps
+    // the prefix/X11/GL warm so later launchApp() spawns land in the SAME wine.
+    var sessionServerPinned = false;
+    function pinSessionServerWhenReady() {
         var waited = 0, STEP = 100, LIMIT = 60000;
         (function poll() {
             if (sessionReady()) {
-                setStatusText("Starting " + prog + " (session)…");
-                spawnIntoSession(prog);
+                if (!sessionServerPinned) {
+                    sessionServerPinned = true;
+                    spawnArgv([WINESERVER64, "-p"], "wineserver64 -p (pin persistent)");
+                }
                 return;
             }
             waited += STEP;
             if (waited >= LIMIT) {
                 console.error("session never became ready after " + LIMIT + "ms");
-                setStatusText("wine session did not start — try ?session=0");
                 return;
             }
             setTimeout(poll, STEP);
