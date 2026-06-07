@@ -23,7 +23,7 @@
 // Persistent in-browser wine session (source/sdl/emscripten/wine64session.cpp):
 // remember the boot launch params so later in-session app spawns reuse them.
 void bw64SessionRememberContext(const BString& workingDir, int userId, int groupId,
-                                int effectiveUserId, int effectiveGroupId);
+                                int effectiveUserId, int effectiveGroupId, U32 bootPid);
 #endif
 
 #include "devtty.h"
@@ -612,17 +612,20 @@ bool StartUpArgs::apply() {
         }
         klog_nonewline("\n");
         bool result = false;
+        U32 bootPid = 0;
         {
             KProcessPtr process = KProcess::create();// keep in this small scope so we don't hold onto it for the life of the program
             KThread* thread = process->startProcess(this->workingDir, this->args, this->envValues, this->userId, this->groupId, this->effectiveUserId, this->effectiveGroupId);
             result = thread != nullptr;
+            if (result) bootPid = process->id;
         }
 #if defined(__EMSCRIPTEN__) && defined(BOXEDWINE_MULTI_THREADED) && defined(BOXEDWINE_GUEST_X64)
-        // Boot process is up — record its launch params so the JS launcher can
-        // spawn further apps into THIS running kernel (persistent wine session)
-        // without reloading the page. See wine64session.cpp.
+        // Boot process is up — record its launch params + pid so the JS launcher
+        // can spawn further apps into THIS running kernel (persistent wine
+        // session) without reloading, and close the boot app on the first switch.
+        // See wine64session.cpp.
         bw64SessionRememberContext(this->workingDir, this->userId, this->groupId,
-                                   this->effectiveUserId, this->effectiveGroupId);
+                                   this->effectiveUserId, this->effectiveGroupId, bootPid);
 #endif
         if (result) {
             if (!doMainLoop()) {

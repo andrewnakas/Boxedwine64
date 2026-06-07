@@ -129,6 +129,13 @@ public:
     // NOT held (it locks internally). Cheap no-op when nothing is dirty.
     void composeAndPresent();
 
+    // Persistent-session app switch: drop every non-root window and clear the
+    // base (presentWindow=0) so the NEXT app's first-mapped window is adopted as
+    // the base instead of compositing the new app onto the closed app's larger
+    // window. Called from the session bridge after killing the previous app.
+    // Locks regMutex internally.
+    void resetForAppSwitch();
+
     // Selection (clipboard) ownership: selection-atom -> owner window. wine's
     // clipboard manager does SetSelectionOwner then polls GetSelectionOwner to
     // confirm it owns CLIPBOARD/PRIMARY; if we never record the owner the poll

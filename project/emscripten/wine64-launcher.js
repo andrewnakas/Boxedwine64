@@ -699,9 +699,17 @@
     function sessionReady() {
         return callExport("bw64_session_ready", [], []) === 1;
     }
+    function lastSpawnedPid() {
+        return callExport("bw64_last_spawned_pid", [], []) || 0;
+    }
+    // The pid of the app currently shown on the canvas — the one to close when the
+    // user switches. Seeded from the boot app once the session is ready, then
+    // updated to each newly-spawned app's pid. (The wineserver64 -p pin spawn also
+    // bumps the C-side last-spawned pid, so we capture the boot pid BEFORE pinning
+    // and only re-read after real app spawns.)
+    var currentAppPid = 0;
     // Spawn an arbitrary guest argv (array) into the live kernel, sharing the
-    // session's prefix env. Returns true if the C side scheduled the process.
-    // The spawn is marshalled onto the main-loop thread inside bw64_spawn.
+    // session's prefix env. Returns true if the C side queued the process.
     function spawnArgv(argvArray, label) {
         var argv = argvArray.join("\n");
         var env = prefixEnv().join("\n");
@@ -713,14 +721,34 @@
         console.warn("session: spawn of " + (label || argvArray.join(" ")) + " did not schedule (r=" + r + ")");
         return false;
     }
-    // Spawn `wine64 <prog>` into the live kernel (no reload).
+    // Switch to `prog` IN-SESSION: close the current app, clear the presented
+    // window so the new app's window becomes the base, spawn the new app, then
+    // adopt its pid as the current app once the kernel reports it.
     function spawnIntoSession(prog) {
-        return spawnArgv(wineProgArgv(prog), prog);
+        // 1. Close the previously-shown app (SIGTERM via the C bridge), queued
+        //    ahead of the new spawn so the order is kill-then-spawn.
+        if (currentAppPid) {
+            callExport("bw64_kill", ["number"], [currentAppPid]);
+        }
+        // 2. Drop the old window from the present sink so the new app is shown.
+        try { callExport("bw64_reset_present", [], []); } catch (e) {}
+        // 3. Spawn the new app.
+        var pidBefore = lastSpawnedPid();
+        if (!spawnArgv(wineProgArgv(prog), prog)) return false;
+        // 4. Adopt the new app's pid as "current" once the spawn lands (the C
+        //    side publishes it after startProcess on the next main-loop tick).
+        var waited = 0, STEP = 80, LIMIT = 8000;
+        (function pollPid() {
+            var pid = lastSpawnedPid();
+            if (pid && pid !== pidBefore) { currentAppPid = pid; return; }
+            waited += STEP;
+            if (waited < LIMIT) setTimeout(pollPid, STEP);
+        })();
+        return true;
     }
-    // Once the kernel is up, pin the running wineserver persistent so the
-    // emulator's main loop won't quit when the booted app later exits. We spawn
-    // `wineserver64 -p` (persistent, no timeout): it connects to the already-
-    // running server and bumps it to never-exit, then returns. This is what keeps
+    // Once the kernel is up: remember the boot app as the current app, then pin
+    // the running wineserver persistent (spawn `wineserver64 -p`) so the
+    // emulator's main loop won't quit when an app later exits — that's what keeps
     // the prefix/X11/GL warm so later launchApp() spawns land in the SAME wine.
     var sessionServerPinned = false;
     function pinSessionServerWhenReady() {
@@ -729,6 +757,10 @@
             if (sessionReady()) {
                 if (!sessionServerPinned) {
                     sessionServerPinned = true;
+                    // Capture the boot app pid BEFORE the pin spawn overwrites the
+                    // C-side last-spawned pid.
+                    currentAppPid = lastSpawnedPid();
+                    console.log("session: boot app pid=" + currentAppPid);
                     spawnArgv([WINESERVER64, "-p"], "wineserver64 -p (pin persistent)");
                 }
                 return;

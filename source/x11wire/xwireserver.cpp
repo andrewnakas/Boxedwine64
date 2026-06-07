@@ -152,6 +152,24 @@ void XWireServer::composeAndPresent() {
     g_xwirePresentSink->submitFrame(baseId, hostW, hostH, canvas.data(), (uint32_t)hostW * bpp);
 }
 
+void XWireServer::resetForAppSwitch() {
+    std::lock_guard<std::mutex> lk(regMutex);
+    // Keep root windows; drop every app-created window so a stale closed-app
+    // window can't remain the base or composite as an overlay.
+    for (auto it = windows.begin(); it != windows.end(); ) {
+        if (it->second.isRoot) { ++it; continue; }
+        it = windows.erase(it);
+    }
+    presentWindow = 0;  // next app's first PutImage/map becomes the new base
+    klog("XWire: reset for app switch (windows cleared, presentWindow=0)");
+}
+
+// Free-function shim so the persistent-session bridge (wine64session.cpp) can
+// trigger an app-switch reset without including the XWire header.
+void bw64ResetPresentForSwitch() {
+    XWireServer::instance().resetForAppSwitch();
+}
+
 // Flush queued host input to every connection from the main thread's present
 // tick, so an idle app (not sending requests) still gets keystrokes/clicks.
 void XWireServer::pumpInput() {

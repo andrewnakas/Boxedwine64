@@ -56,6 +56,7 @@
 #include "kprocess.h"
 #include "ksystem.h"
 #include "kthread.h"
+#include "ksignal.h" // K_SIGTERM
 
 #include <atomic>
 #include <vector>
@@ -76,18 +77,26 @@ struct Wine64SessionCtx {
 };
 static Wine64SessionCtx g_sessionCtx;
 
-// A queued in-session app launch.
-struct Wine64SpawnReq {
-    std::vector<BString> argv;
-    std::vector<BString> env;
+// A queued in-session command: either spawn an app or kill a process. Both run
+// on the main-loop thread, in order, so a "kill old app then spawn new app"
+// switch is sequenced correctly.
+struct Wine64Req {
+    enum Kind { Spawn, Kill } kind = Spawn;
+    std::vector<BString> argv;   // Spawn
+    std::vector<BString> env;    // Spawn
+    U32 pid = 0;                 // Kill
 };
 
-// Pending spawn requests, guarded by an atomic_flag spinlock. A spinlock (busy
-// CAS, no futex) is used deliberately: bw64_spawn() runs on the browser main
+// Pending requests, guarded by an atomic_flag spinlock. A spinlock (busy CAS, no
+// futex) is used deliberately: bw64_spawn()/bw64_kill() run on the browser main
 // thread, where a blocking lock (Atomics.wait) is illegal. The critical section
 // is tiny (a vector move), so the spin is negligible.
-static std::vector<Wine64SpawnReq> g_pending;
+static std::vector<Wine64Req> g_pending;
 static std::atomic_flag g_pendingLock = ATOMIC_FLAG_INIT;
+
+// The pid of the most recently spawned app, published for JS so it can ask us to
+// kill the previous app when the user switches (close-previous-on-switch).
+static std::atomic<U32> g_lastSpawnedPid{0};
 
 static void pendingLockAcquire() { while (g_pendingLock.test_and_set(std::memory_order_acquire)) {} }
 static void pendingLockRelease() { g_pendingLock.clear(std::memory_order_release); }
@@ -95,14 +104,18 @@ static void pendingLockRelease() { g_pendingLock.clear(std::memory_order_release
 // Called from StartUpArgs::apply() right before doMainLoop so the spawn bridge
 // has the same launch parameters the boot process used.
 void bw64SessionRememberContext(const BString& workingDir, int userId, int groupId,
-                                int effectiveUserId, int effectiveGroupId) {
+                                int effectiveUserId, int effectiveGroupId, U32 bootPid) {
     g_sessionCtx.workingDir = workingDir;
     g_sessionCtx.userId = userId;
     g_sessionCtx.groupId = groupId;
     g_sessionCtx.effectiveUserId = effectiveUserId;
     g_sessionCtx.effectiveGroupId = effectiveGroupId;
+    // Seed the "current app" pid with the boot app, so the FIRST switch closes
+    // notepad (the booted app) and not nothing. Later bridge spawns update it.
+    g_lastSpawnedPid.store(bootPid, std::memory_order_release);
     g_sessionCtx.valid.store(true, std::memory_order_release);
-    klog_fmt("wine64session: context captured (cwd=%s uid=%d)", workingDir.c_str(), userId);
+    klog_fmt("wine64session: context captured (cwd=%s uid=%d bootPid=%d)",
+             workingDir.c_str(), userId, (int)bootPid);
 }
 
 // JS hands argv and env as '\n'-joined strings (newlines never appear in a
@@ -122,8 +135,12 @@ static std::vector<BString> splitLines(const char* joined) {
     return out;
 }
 
+// Defined in source/x11wire/xwireserver.cpp (calls XWireServer::resetForAppSwitch);
+// forward-declared here to avoid pulling the whole XWire header into this bridge.
+void bw64ResetPresentForSwitch();
+
 // The actual spawn — runs on the main-loop thread (see THREADING note).
-static void doSpawn(const Wine64SpawnReq& req) {
+static void doSpawn(const Wine64Req& req) {
     if (req.argv.empty()) {
         klog("wine64session: spawn with empty argv — ignoring");
         return;
@@ -145,21 +162,37 @@ static void doSpawn(const Wine64SpawnReq& req) {
                                                 g_sessionCtx.effectiveGroupId);
         if (!thread) {
             klog("wine64session: startProcess FAILED");
+        } else {
+            g_lastSpawnedPid.store(process->id, std::memory_order_release);
+            klog_fmt("wine64session: spawned pid=%d", (int)process->id);
         }
     }
     KThread::setCurrentThread(saved);
 }
 
-// Drain queued spawns. MUST be called from the main-loop thread (mainloop.cpp
+// Kill a previously-spawned app (close-previous-on-switch). SIGTERM lets wine
+// shut the app's windows + wineserver client down cleanly; the wineserver itself
+// stays (it was pinned persistent), so the session survives. Runs on the
+// main-loop thread.
+static void doKill(U32 pid) {
+    if (!pid) return;
+    klog_fmt("wine64session: killing previous app pid=%d", (int)pid);
+    KSystem::kill((S32)pid, K_SIGTERM);
+}
+
+// Drain queued requests. MUST be called from the main-loop thread (mainloop.cpp
 // calls it once per tick). Swaps the queue out under the spinlock, then runs the
-// spawns outside the lock so startProcess can take its own kernel locks freely.
+// requests outside the lock so kernel ops can take their own locks freely.
 void bw64SessionDrainSpawns() {
     if (!g_sessionCtx.valid.load(std::memory_order_acquire)) return;
-    std::vector<Wine64SpawnReq> todo;
+    std::vector<Wine64Req> todo;
     pendingLockAcquire();
     if (!g_pending.empty()) todo.swap(g_pending);
     pendingLockRelease();
-    for (auto& req : todo) doSpawn(req);
+    for (auto& req : todo) {
+        if (req.kind == Wine64Req::Kill) doKill(req.pid);
+        else doSpawn(req);
+    }
 }
 
 // --- exported JS entry points -------------------------------------------------
@@ -169,7 +202,8 @@ void bw64SessionDrainSpawns() {
 // blocking — safe to call from the browser main thread.
 extern "C" EMSCRIPTEN_KEEPALIVE int bw64_spawn(const char* argvJoined, const char* envJoined) {
     if (!g_sessionCtx.valid.load(std::memory_order_acquire)) return 0;
-    Wine64SpawnReq req;
+    Wine64Req req;
+    req.kind = Wine64Req::Spawn;
     req.argv = splitLines(argvJoined);
     req.env = splitLines(envJoined);
     if (req.argv.empty()) return 0;
@@ -177,6 +211,34 @@ extern "C" EMSCRIPTEN_KEEPALIVE int bw64_spawn(const char* argvJoined, const cha
     g_pending.push_back(std::move(req));
     pendingLockRelease();
     return 1;
+}
+
+// bw64_kill: queue a SIGTERM for a previously-spawned app pid (switch = close the
+// old app first). Queued ahead of the new app's spawn so they're ordered. NON-
+// blocking. Returns 1 if queued.
+extern "C" EMSCRIPTEN_KEEPALIVE int bw64_kill(int pid) {
+    if (!g_sessionCtx.valid.load(std::memory_order_acquire) || pid <= 0) return 0;
+    Wine64Req req;
+    req.kind = Wine64Req::Kill;
+    req.pid = (U32)pid;
+    pendingLockAcquire();
+    g_pending.push_back(std::move(req));
+    pendingLockRelease();
+    return 1;
+}
+
+// bw64_last_spawned_pid: the pid of the most recently spawned app, so JS can
+// remember which process to kill on the next switch.
+extern "C" EMSCRIPTEN_KEEPALIVE int bw64_last_spawned_pid() {
+    return (int)g_lastSpawnedPid.load(std::memory_order_acquire);
+}
+
+// bw64_reset_present: clear the XWire base window so the next app's first window
+// becomes the presented base (instead of compositing onto the closed app's
+// larger window). Safe to call from the browser main thread — it locks the
+// XWire registry mutex internally and touches no per-thread kernel state.
+extern "C" EMSCRIPTEN_KEEPALIVE void bw64_reset_present() {
+    bw64ResetPresentForSwitch();
 }
 
 // Whether the persistent session is up (context captured == boot completed).
