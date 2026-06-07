@@ -48,16 +48,17 @@
 //   wine64.html?p=glcube.exe         -> wine64 glcube.exe  (pre-booted prefix; GL)
 //   wine64.html?p=notepad.exe        -> wine64 notepad.exe (pre-booted prefix)
 //
-// IN-PAGE APP SWITCHING (no full reload): after the first boot, the fetched
-// rootfs zip bytes are kept in `zipCache` (module scope, survives across
-// relaunches). window.launchApp("<prog>") tears down the running wasm instance
-// — terminate its pthreads, drop the runtime globals, and REPLACE the canvases
-// (an OffscreenCanvas transferred to a pthread via OFFSCREENCANVASES_TO_PTHREAD
-// can't be transferred twice, so each relaunch needs a fresh #gl64canvas /
-// #canvas) — then boots a fresh module against the cached bytes (zero refetch).
-// The app bar in wine64.html calls launchApp(); this is NOT in-session process
-// spawning (that needs the unsolved in-browser wineserver daemon), it's a fast
-// local re-boot of wine with a new program, skipping the ~200MB download.
+// APP SWITCHING (reload-based): window.launchApp("<prog>") navigates to the new
+// app's URL (?p=<prog>), giving a clean page boot for each program. The rootfs is
+// NOT re-downloaded over the network — the immutable .zip/.part assets carry a
+// long-lived Cache-Control, so the browser serves them from its HTTP cache and a
+// switch is a fast local reboot. A true in-page swap (no reload) is impossible
+// here because this build is not MODULARIZE'd: boxedwine64.js declares top-level
+// globals (e.g. `class ExitStatus`) in the page realm, so re-running it throws
+// "duplicate variable", and the gl64 OffscreenCanvas (OFFSCREENCANVASES_TO_PTHREAD)
+// can't be transferred twice. The app bar in wine64.html calls launchApp(). This
+// is also NOT in-session process spawning (loading a new app into the SAME running
+// wine) — that needs the unsolved in-browser wineserver daemon (see ?boot=1).
 
 (function () {
     "use strict";
@@ -97,12 +98,6 @@
     }
     // Initial config from the URL (?boot / ?novideo / ?p).
     applyRunConfig(param("p"), { boot: param("boot") === "1", novideo: param("novideo") === "1" });
-
-    // --- rootfs byte cache --------------------------------------------------
-    // The big win for in-page app switching: keep the fetched zip bytes here so a
-    // relaunch never re-downloads the ~200MB rootfs. Keyed by zip name -> Uint8Array.
-    var zipCache = Object.create(null);
-    var relaunchCount = 0; // 0 = first boot from the page load; >0 = launchApp reboot
 
     // --- DOM hooks ----------------------------------------------------------
     var statusElement = document.getElementById("status");
@@ -189,21 +184,35 @@
         });
     }
 
-    // Wait until the Emscripten runtime's FS is actually available. preRun runs
-    // before main(), but with -pthread/PROXY_TO_PTHREAD the FS object isn't always
-    // populated on window.Module the instant a zip fetch resolves — so a fast
-    // fetch (cache hit) can reach createDataFile before Module.FS exists, giving
-    // "undefined is not an object (evaluating 'Module.FS.createDataFile')". Poll
-    // briefly for FS (or the FS_createDataFile helper export) before writing.
+    // The LIVE Emscripten module. CRUCIAL: with the classic global-Module pattern
+    // (this build is not MODULARIZE'd) the runtime copies our config object's
+    // properties into its OWN internal Module and attaches FS / addRunDependency /
+    // createDataFile to THAT — it does not necessarily write them back onto
+    // window.Module. So window.Module.FS can stay undefined forever even though the
+    // runtime is fully up. Inside a preRun callback the `Module` identifier IS that
+    // live object, so loadFilesystem captures it here and everything that needs FS
+    // / removeRunDependency uses it instead of window.Module.
+    var liveModule = null;
+
+    // The live module's FS (see liveModule note). Falls back to window.Module.FS.
+    // May be undefined before the runtime is up — callers that run after boot
+    // (download button, prefix prep) are fine since FS exists by then.
+    function getFS() {
+        var M = liveModule || window.Module;
+        return M ? M.FS : undefined;
+    }
+
+    // Resolve the FS object from the live module. preRun runs before main(), and FS
+    // (with createDataFile) is already available there — that's exactly when files
+    // are meant to be written into the VFS. Returns the FS object, or null if only
+    // the FS_createDataFile helper export exists (we handle both call shapes).
     function whenFsReady() {
         return new Promise(function (resolve, reject) {
             var waited = 0, STEP = 30, LIMIT = 30000;
             (function poll() {
-                var M = window.Module;
-                if (M && M.FS && typeof M.FS.createDataFile === "function") return resolve(M.FS);
-                // Some builds only expose the FS_createDataFile helper, not FS.* —
-                // accept that too (we wrap it to the same call shape below).
-                if (M && typeof M.FS_createDataFile === "function") return resolve(null);
+                var M = liveModule || window.Module;
+                if (M && M.FS && typeof M.FS.createDataFile === "function") return resolve({ fs: M.FS });
+                if (M && typeof M.FS_createDataFile === "function") return resolve({ fs: null, M: M });
                 waited += STEP;
                 if (waited >= LIMIT) return reject(new Error("Module.FS never became ready (" + LIMIT + "ms)"));
                 setTimeout(poll, STEP);
@@ -212,17 +221,14 @@
     }
 
     function dropBytesIntoVfs(name, bytes) {
-        return whenFsReady().then(function (FS) {
+        return whenFsReady().then(function (r) {
             try {
-                if (FS) FS.createDataFile("/", name, bytes, true, true);
-                else window.Module.FS_createDataFile("/", name, bytes, true, true);
+                if (r.fs) r.fs.createDataFile("/", name, bytes, true, true);
+                else r.M.FS_createDataFile("/", name, bytes, true, true);
             } catch (e) {
                 console.log("createDataFile " + name + " failed: " + e);
                 throw e;
             }
-            // Cache the bytes so a later in-page relaunch (launchApp) can skip the
-            // network entirely and just re-drop them into the fresh instance's VFS.
-            zipCache[name] = bytes;
             console.log("loaded " + name + " (" + bytes.length + " bytes) into VFS");
             return bytes.length;
         });
@@ -238,13 +244,6 @@
     // Both end by createDataFile()ing the *original* zip name into the VFS, so the
     // wine64 argv (`-zip <name>`) is identical regardless of how it was fetched.
     function fetchZipToVfs(name, onProgress) {
-        // In-page relaunch: bytes already in memory from a prior boot — re-drop
-        // them into the new instance's VFS without touching the network.
-        if (zipCache[name]) {
-            var cached = zipCache[name];
-            if (onProgress) onProgress(name, cached.length, cached.length);
-            return dropBytesIntoVfs(name, cached);
-        }
         // Whole-file path. If it 404s (e.g. on GitHub Pages, where wine64.zip is
         // shipped only as split parts), transparently fall back to chunked — so
         // the page works regardless of whether ?chunked=1 was on the URL. Explicit
@@ -298,7 +297,7 @@
     // and the prefix dir must already exist as writable dirs. Create them in the
     // host MEMFS under ROOT so the guest sees writable /winePrefix/.wine.
     function mkdirHost(path) {
-        try { Module.FS.mkdir(path); } catch (e) { /* EEXIST is fine */ }
+        try { getFS().mkdir(path); } catch (e) { /* EEXIST is fine */ }
     }
     function prepareWinePrefix() {
         // ROOT (/root in MEMFS) is the guest "/". Boxedwine MKDIR()s ROOT itself
@@ -308,7 +307,7 @@
         mkdirHost(ROOT + "/winePrefix");
         mkdirHost(ROOT + "/winePrefix/.wine");
         try {
-            var st = Module.FS.stat(ROOT + "/winePrefix/.wine");
+            var st = getFS().stat(ROOT + "/winePrefix/.wine");
             console.log("created writable WINEPREFIX at " + ROOT + "/winePrefix/.wine (mode " + st.mode.toString(8) + ")");
         } catch (e) {
             console.error("WINEPREFIX dir NOT created: " + e);
@@ -342,12 +341,12 @@
     var PROFILE_IN_MEMFS = HOME_IN_MEMFS + "/.wine/drive_c/users/username"; // C:\users\username
 
     function fsIsDir(path) {
-        try { return Module.FS.isDir(Module.FS.stat(path).mode); }
+        try { return getFS().isDir(getFS().stat(path).mode); }
         catch (e) { return false; }
     }
 
     function readFileSafe(path) {
-        try { return Module.FS.readFile(path, { encoding: "binary" }); }
+        try { return getFS().readFile(path, { encoding: "binary" }); }
         catch (e) { return null; /* unreadable (e.g. a dangling link) */ }
     }
 
@@ -357,7 +356,7 @@
     // recurse here anyway, it documents intent and guards a future change).
     function collectTopLevelFiles(dir, base, out, skip) {
         var entries;
-        try { entries = Module.FS.readdir(dir); } catch (e) { return; }
+        try { entries = getFS().readdir(dir); } catch (e) { return; }
         entries.forEach(function (name) {
             if (name === "." || name === ".." || name === ".keep") return;
             if (skip && skip[name]) return;
@@ -372,7 +371,7 @@
     // `base` (so the zip preserves the folder layout, e.g. Documents/foo.txt).
     function collectFiles(dir, base, out) {
         var entries;
-        try { entries = Module.FS.readdir(dir); } catch (e) { return; }
+        try { entries = getFS().readdir(dir); } catch (e) { return; }
         entries.forEach(function (name) {
             if (name === "." || name === ".." || name === ".keep") return;
             var full = dir + "/" + name;
@@ -435,7 +434,7 @@
     }
 
     function downloadSavedFiles() {
-        if (!window.Module || !Module.FS) {
+        if (!window.Module || !getFS()) {
             alert("Filesystem not ready yet — wait for the app to finish loading.");
             return;
         }
@@ -477,11 +476,10 @@
     // --- orchestration ------------------------------------------------------
     // The zips are large (wine64.zip ~205MB) on the FIRST boot; fetch them, drop
     // them in the VFS, push the argv, then release the run dependency so main()
-    // proceeds. On an in-page relaunch the bytes come from zipCache (no network).
-    // `els` are resolved fresh per boot (the canvas is replaced on relaunch).
+    // proceeds. App switches reload the page, so on a switch the zips come from
+    // the browser's HTTP cache (immutable assets) rather than the network.
     function loadFilesystem(els) {
-        console.log("wine64-launcher: loading 64-bit rootfs from " + (BASE || "./") +
-                    (relaunchCount ? " (cached, relaunch #" + relaunchCount + ")" : ""));
+        console.log("wine64-launcher: loading 64-bit rootfs from " + (BASE || "./"));
         function report(name, recv, total) {
             var pct = total ? Math.round((recv / total) * 100) : 0;
             setStatusText("Loading " + name + " " + pct + "%");
@@ -513,61 +511,17 @@
 
                 if (DO_BOOT) prepareWinePrefix();
 
+                var M = liveModule || window.Module;
                 var args = buildArguments();
-                for (var i = 0; i < args.length; i++) window.Module["arguments"].push(args[i]);
+                for (var i = 0; i < args.length; i++) M["arguments"].push(args[i]);
                 console.log("wine64 argv: " + JSON.stringify(args));
 
-                window.Module["removeRunDependency"]("loadWine64Fs");
+                M["removeRunDependency"]("loadWine64Fs");
             })
             .catch(function (err) {
                 console.error("wine64-launcher failed: " + err);
                 setStatusText("Failed to load rootfs: " + err);
             });
-    }
-
-    // --- in-page relaunch teardown ------------------------------------------
-    // A wasm64-mt instance can't simply re-run in the same page: its pthread
-    // workers and (crucially) the OffscreenCanvas transferred to a pthread via
-    // OFFSCREENCANVASES_TO_PTHREAD live on. transferControlToOffscreen() can only
-    // be called ONCE per canvas, so a second instance MUST get brand-new canvas
-    // elements. Tear the old instance down: stop its threads, drop the runtime
-    // globals, remove the old <script> + canvases, and recreate fresh canvases.
-    function teardownInstance() {
-        var M = window.Module;
-        // 1. Terminate the old instance's pthread workers (best-effort).
-        try {
-            if (M && M.PThread && typeof M.PThread.terminateAllThreads === "function") {
-                M.PThread.terminateAllThreads();
-            }
-        } catch (e) { console.warn("teardown: terminateAllThreads: " + e); }
-        // 2. Remove the old module <script> so the fresh one re-executes cleanly.
-        try {
-            var old = document.getElementById("boxedwine64-module-script");
-            if (old && old.parentNode) old.parentNode.removeChild(old);
-        } catch (e) {}
-        // 3. Replace the canvases. The transferred #gl64canvas can't be reused;
-        //    #canvas likewise carries a dead SDL/WebGL context. Recreate both with
-        //    the same ids/attrs so the fresh boot transfers untouched canvases.
-        replaceCanvas("gl64canvas", function (c) {
-            c.width = 1024; c.height = 1024; c.style.display = "none";
-        });
-        replaceCanvas("canvas", function (c) {
-            c.className = "emscripten";
-            c.setAttribute("oncontextmenu", "event.preventDefault()");
-            c.width = 800; c.height = 600;
-        });
-        // 4. Drop the runtime globals the next instance must not inherit.
-        try { delete window.Module; } catch (e) { window.Module = undefined; }
-        try { delete window.wasmMemory; } catch (e) {}
-    }
-
-    function replaceCanvas(id, configure) {
-        var old = document.getElementById(id);
-        if (!old || !old.parentNode) return;
-        var fresh = document.createElement("canvas");
-        fresh.id = id;
-        if (configure) configure(fresh);
-        old.parentNode.replaceChild(fresh, old);
     }
 
     // --- one boot of the wasm module ----------------------------------------
@@ -595,11 +549,16 @@
             arguments: [],
             canvas: canvas,
             preRun: [function () {
+                // Inside preRun the `Module` identifier is the LIVE Emscripten
+                // module (the one that actually owns FS / run dependencies), which
+                // is NOT necessarily === window.Module. Capture it so loadFilesystem
+                // and the FS writes target the real object.
+                liveModule = (typeof Module !== "undefined") ? Module : window.Module;
                 // Host-side GL trace (read via getenv in gl64bridge.cpp). Emscripten
                 // getenv() reads Module.ENV; set it before main() runs.
-                try { Module["ENV"] = Module["ENV"] || {}; Module["ENV"]["BW64_GLTRACE"] = "1"; } catch (e) {}
+                try { liveModule["ENV"] = liveModule["ENV"] || {}; liveModule["ENV"]["BW64_GLTRACE"] = "1"; } catch (e) {}
                 // Hold main() until the rootfs is in the VFS.
-                Module["addRunDependency"]("loadWine64Fs");
+                liveModule["addRunDependency"]("loadWine64Fs");
                 loadFilesystem(els);
             }],
             print: function () {
@@ -655,50 +614,35 @@
         }, STEP);
     }
 
-    // --- public: launch another app in-page (no full reload) ----------------
-    // Reuses the cached rootfs bytes; tears down the running instance and boots a
-    // fresh one for `prog`. opts: { boot, novideo } mirror the query params.
-    var relaunchInFlight = false;
+    // --- public: switch to another app (reload-based) -----------------------
+    // Navigate to the new app's URL. This re-boots the page cleanly for `prog`.
+    //
+    // Why a reload and not a true in-page swap: this wasm64-mt build is NOT
+    // MODULARIZE'd — boxedwine64.js declares top-level globals (e.g. `class
+    // ExitStatus`) in the page's realm, so re-running it to start a second app
+    // throws "Can't create duplicate variable: 'ExitStatus'". And the gl64
+    // OffscreenCanvas is transferred to a pthread (OFFSCREENCANVASES_TO_PTHREAD),
+    // which can't be transferred twice. A clean navigation sidesteps both. The
+    // rootfs isn't re-downloaded over the network — the browser serves the zips
+    // from its HTTP cache (the deploy/server send long-lived Cache-Control on the
+    // immutable .zip/.part assets), so a switch is a fast local reboot. (A true
+    // "load a new app into the SAME running wine" needs a persistent in-browser
+    // wineserver — the unsolved roadmap item; see ?boot=1.)
+    //
+    // opts: { boot, novideo } mirror the query params. Existing params (notably
+    // ?chunked=1 on GitHub Pages) are preserved.
     function launchApp(prog, opts) {
-        if (relaunchInFlight) { console.warn("launchApp ignored: a relaunch is in flight"); return; }
-        if (!Object.keys(zipCache).length) {
-            // Nothing cached yet (first boot still downloading) — fall back to a
-            // navigation so we don't boot with an empty VFS. Preserve the existing
-            // params (esp. ?chunked=1 on GitHub Pages) and just swap p/boot/novideo.
-            try {
-                var navUrl = new URL(window.location.href);
-                navUrl.searchParams.set("p", prog);
-                if (opts && opts.boot) navUrl.searchParams.set("boot", "1"); else navUrl.searchParams.delete("boot");
-                if (opts && opts.novideo) navUrl.searchParams.set("novideo", "1"); else navUrl.searchParams.delete("novideo");
-                window.location.href = navUrl.toString();
-            } catch (e) {
-                window.location.search = "?p=" + encodeURIComponent(prog);
-            }
-            return;
-        }
-        relaunchInFlight = true;
-        relaunchCount++;
-        applyRunConfig(prog, opts);
-        // Reflect the choice in the URL bar without reloading, so a manual refresh
-        // or shared link reproduces it.
+        if (window.setActiveApp) try { window.setActiveApp(prog); } catch (e) {}
+        setStatusText("Switching to " + prog + "…");
         try {
             var url = new URL(window.location.href);
             url.searchParams.set("p", prog);
             if (opts && opts.boot) url.searchParams.set("boot", "1"); else url.searchParams.delete("boot");
             if (opts && opts.novideo) url.searchParams.set("novideo", "1"); else url.searchParams.delete("novideo");
-            window.history.replaceState(null, "", url.toString());
-        } catch (e) {}
-        if (window.setActiveApp) try { window.setActiveApp(prog); } catch (e) {}
-        setStatusText("Switching to " + prog + "…");
-        var sp = document.getElementById("spinner");
-        if (sp) sp.hidden = false;
-        teardownInstance();
-        // Give the terminated workers / replaced canvases a tick to settle before
-        // the fresh instance grabs SharedArrayBuffer + transfers the new canvas.
-        setTimeout(function () {
-            relaunchInFlight = false;
-            bootWine();
-        }, 150);
+            window.location.href = url.toString();
+        } catch (e) {
+            window.location.search = "?p=" + encodeURIComponent(prog);
+        }
     }
     window.launchApp = launchApp;
     // Expose so the HTML button's onclick can reach it.

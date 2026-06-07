@@ -45,13 +45,21 @@ const server = createServer(async (request, response) => {
 
     const finalPath = info.isDirectory() ? join(filePath, "boxedwine.html") : filePath;
     const finalInfo = info.isDirectory() ? await stat(finalPath) : info;
-    response.writeHead(200, {
+    // The rootfs is immutable content addressed by name — let the browser cache it
+    // long-term so an app switch (which reloads the page) re-reads the ~200MB
+    // rootfs from cache instead of re-downloading. The page/launcher/wasm stay
+    // revalidated so code changes show up on reload.
+    const ext = extname(finalPath);
+    const immutable = ext === ".zip" || ext === ".part" || /\.zip\.part\d+$/.test(finalPath);
+    const headers = {
         "Content-Length": finalInfo.size,
-        "Content-Type": mimeTypes.get(extname(finalPath)) || "application/octet-stream",
+        "Content-Type": mimeTypes.get(ext) || "application/octet-stream",
         "Cross-Origin-Embedder-Policy": "require-corp",
         "Cross-Origin-Opener-Policy": "same-origin",
         "Cross-Origin-Resource-Policy": "same-origin",
-    });
+        "Cache-Control": immutable ? "public, max-age=31536000, immutable" : "no-cache",
+    };
+    response.writeHead(200, headers);
     createReadStream(finalPath).pipe(response);
 });
 
