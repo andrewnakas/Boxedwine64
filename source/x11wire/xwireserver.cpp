@@ -154,14 +154,15 @@ void XWireServer::composeAndPresent() {
 
 void XWireServer::resetForAppSwitch() {
     std::lock_guard<std::mutex> lk(regMutex);
-    // Keep root windows; drop every app-created window so a stale closed-app
-    // window can't remain the base or composite as an overlay.
-    for (auto it = windows.begin(); it != windows.end(); ) {
-        if (it->second.isRoot) { ++it; continue; }
-        it = windows.erase(it);
-    }
-    presentWindow = 0;  // next app's first PutImage/map becomes the new base
-    klog("XWire: reset for app switch (windows cleared, presentWindow=0)");
+    // Only clear the base selection — do NOT wipe the window registry. The
+    // previous app's windows are removed when its X11 connection closes (after we
+    // SIGTERM it); the NEW app's window must survive. With presentWindow=0 the
+    // next composeAndPresent re-elects the base from whatever windows remain
+    // (the new app's), so the canvas switches to it. (Wiping all windows here
+    // would also delete the new app's just-mapped window, leaving a blank canvas
+    // since the app won't re-map it.)
+    presentWindow = 0;
+    klog("XWire: reset for app switch (presentWindow=0; re-elect base)");
 }
 
 // Free-function shim so the persistent-session bridge (wine64session.cpp) can
