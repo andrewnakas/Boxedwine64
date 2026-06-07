@@ -20,7 +20,8 @@
 #include "knativesystem.h"
 #include <SDL.h>
 #ifdef __EMSCRIPTEN__
-#include <emscripten/emscripten.h> // emscripten_is_main_browser_thread (KNativeSystem::exit)
+#include <emscripten/emscripten.h>
+#include <emscripten/threading.h> // emscripten_is_main_browser_thread (KNativeSystem::exit)
 #endif
 #include "knativescreenSDL.h"
 #include "kvulkanSDL.h"
