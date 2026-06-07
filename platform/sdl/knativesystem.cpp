@@ -19,6 +19,9 @@
 #include "boxedwine.h"
 #include "knativesystem.h"
 #include <SDL.h>
+#ifdef __EMSCRIPTEN__
+#include <emscripten/emscripten.h> // emscripten_is_main_browser_thread (KNativeSystem::exit)
+#endif
 #include "knativescreenSDL.h"
 #include "kvulkanSDL.h"
 #include "../../source/x11/x11.h"
@@ -147,7 +150,21 @@ void KNativeSystem::scheduledNewThread(KThread* thread) {
 }
 
 void KNativeSystem::exit(const char* msg, U32 code) {
+    // Always log first: the message box can't be shown from a Web Worker (SDL's
+    // emscripten backend implements SDL_ShowSimpleMessageBox as alert(), and
+    // alert is undefined off the main browser thread — calling it there throws a
+    // ReferenceError that crashes the worker and HIDES this message). Logging
+    // makes the real fatal reason reachable in the console regardless of thread.
+    klog_fmt("KNativeSystem::exit(%d): %s", code, msg ? msg : "");
+#ifdef __EMSCRIPTEN__
+    // Only pop the (alert-based) message box on the main browser thread; on a
+    // worker it would throw. The klog above already surfaced the message.
+    if (emscripten_is_main_browser_thread()) {
+        SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR, "Error", msg, nullptr);
+    }
+#else
     SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR, "Error", msg, nullptr);
+#endif
     _exit(code);
 }
 
