@@ -4,6 +4,10 @@
 
 This fork is a **work in progress**, but a substantial one: real Debian `wine64` boots Windows programs all the way to a **visible, rendered GUI window** — both natively on macOS arm64 and **in a browser tab via WebAssembly** (`-sMEMORY64` + Web Workers/`SharedArrayBuffer`). That includes a **hardware-accelerated OpenGL 3D app (a spinning, shaded cube via WGL → host GL / WebGL2)** and interactive `notepad.exe` (File ▸ Save As, plus a "download my files" button in the browser), driving real `wineserver64`, `winex11`, FreeType/fontconfig text, and an in-process X11 wire server. The 32-bit code path remains fully functional and unchanged. The 64-bit code path is gated behind `BOXEDWINE_GUEST_X64` and was built out entirely by running real binaries and implementing each opcode/syscall they touch.
 
+> ### ▶ [**Try the live demo: real `wine64` in your browser**](https://andrewnakas.github.io/Boxedwine64/)
+>
+> Open <https://andrewnakas.github.io/Boxedwine64/> in a recent Chrome/Edge/Safari. After the one-time rootfs download, use the **app bar** at the top to switch between the **spinning OpenGL cube** (`glcube`) and interactive **Notepad** — apps swap **in-page with no reload** (the rootfs is downloaded once and reused). First load is ~196 MB and takes a minute; give the cube ~20–30 s to boot.
+
 ![wine64 OpenGL glcube.exe rendering a spinning 3D cube in Boxedwine64 on macOS](docs/images/glcube-gui.png)
 
 *Real `wine64 glcube.exe` running under Boxedwine64 on macOS arm64 — a Win32
@@ -309,6 +313,16 @@ each piece of the desktop's host I/O surface onto a browser primitive:
 the page skips `wineboot --init`. Cross-origin isolation (COOP/COEP) is **required**
 for `SharedArrayBuffer` — serve via `node project/emscripten/server.mjs`, which
 sets those headers.
+
+The page has an **app bar** (glcube / Notepad) that switches apps **in-page with
+no full reload**: the fetched rootfs bytes are cached in JS (`zipCache`), so a
+relaunch tears down the running wasm instance — terminate its pthreads and
+**replace the canvases** (an `OffscreenCanvas` transferred to a pthread via
+`OFFSCREENCANVASES_TO_PTHREAD` can't be transferred twice, so each relaunch needs
+a fresh `#gl64canvas`/`#canvas`) — and boots a fresh module against the cached
+bytes (zero refetch). This is a fast local re-boot of wine with a new program,
+**not** in-session process spawning (that needs a persistent in-browser
+`wineserver`, which is still on the roadmap).
 
 ```sh
 cd project/emscripten

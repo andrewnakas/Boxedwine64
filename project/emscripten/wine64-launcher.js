@@ -47,6 +47,17 @@
 //   wine64.html?boot=1               -> wineboot --init   (stalls; roadmap probe)
 //   wine64.html?p=glcube.exe         -> wine64 glcube.exe  (pre-booted prefix; GL)
 //   wine64.html?p=notepad.exe        -> wine64 notepad.exe (pre-booted prefix)
+//
+// IN-PAGE APP SWITCHING (no full reload): after the first boot, the fetched
+// rootfs zip bytes are kept in `zipCache` (module scope, survives across
+// relaunches). window.launchApp("<prog>") tears down the running wasm instance
+// — terminate its pthreads, drop the runtime globals, and REPLACE the canvases
+// (an OffscreenCanvas transferred to a pthread via OFFSCREENCANVASES_TO_PTHREAD
+// can't be transferred twice, so each relaunch needs a fresh #gl64canvas /
+// #canvas) — then boots a fresh module against the cached bytes (zero refetch).
+// The app bar in wine64.html calls launchApp(); this is NOT in-session process
+// spawning (that needs the unsolved in-browser wineserver daemon), it's a fast
+// local re-boot of wine with a new program, skipping the ~200MB download.
 
 (function () {
     "use strict";
@@ -69,13 +80,29 @@
     var BASE = param("base");
     if (BASE === null) BASE = "./";
     if (BASE.length && !BASE.endsWith("/")) BASE += "/";
-    var DO_BOOT = param("boot") === "1";
-    var NOVIDEO = param("novideo") === "1";
     var CHUNKED = param("chunked") === "1"; // fetch zips as <zip>.partNNN via manifest
-    var PROG = param("p"); // may be null
-    // Run a real program against the pre-booted prefix when ?p= names something
-    // other than the bare --version correctness boot (and we're not doing ?boot=1).
-    var USE_PREFIX = !DO_BOOT && PROG && PROG.length && PROG !== "--version";
+
+    // --- current run configuration ------------------------------------------
+    // These describe the run being booted RIGHT NOW. The bare-page defaults come
+    // from the query string; launchApp() rewrites them per relaunch (no reload).
+    var DO_BOOT, NOVIDEO, PROG, USE_PREFIX;
+    function applyRunConfig(prog, opts) {
+        opts = opts || {};
+        PROG = prog;
+        DO_BOOT = !!opts.boot;
+        NOVIDEO = !!opts.novideo;
+        // Run a real program against the pre-booted prefix when a program (other
+        // than the bare --version correctness boot) is named and we're not booting.
+        USE_PREFIX = !DO_BOOT && PROG && PROG.length && PROG !== "--version";
+    }
+    // Initial config from the URL (?boot / ?novideo / ?p).
+    applyRunConfig(param("p"), { boot: param("boot") === "1", novideo: param("novideo") === "1" });
+
+    // --- rootfs byte cache --------------------------------------------------
+    // The big win for in-page app switching: keep the fetched zip bytes here so a
+    // relaunch never re-downloads the ~200MB rootfs. Keyed by zip name -> Uint8Array.
+    var zipCache = Object.create(null);
+    var relaunchCount = 0; // 0 = first boot from the page load; >0 = launchApp reboot
 
     // --- DOM hooks ----------------------------------------------------------
     var statusElement = document.getElementById("status");
@@ -169,6 +196,9 @@
             console.log("createDataFile " + name + " failed: " + e);
             throw e;
         }
+        // Cache the bytes so a later in-page relaunch (launchApp) can skip the
+        // network entirely and just re-drop them into the fresh instance's VFS.
+        zipCache[name] = bytes;
         console.log("loaded " + name + " (" + bytes.length + " bytes) into VFS");
         return bytes.length;
     }
@@ -183,6 +213,14 @@
     // Both end by createDataFile()ing the *original* zip name into the VFS, so the
     // wine64 argv (`-zip <name>`) is identical regardless of how it was fetched.
     function fetchZipToVfs(name, onProgress) {
+        // In-page relaunch: bytes already in memory from a prior boot — re-drop
+        // them into the new instance's VFS without touching the network.
+        if (zipCache[name]) {
+            var cached = zipCache[name];
+            if (onProgress) onProgress(name, cached.length, cached.length);
+            dropBytesIntoVfs(name, cached);
+            return Promise.resolve(cached.length);
+        }
         if (!CHUNKED) {
             return fetchBytes(BASE + name, name, onProgress).then(function (bytes) {
                 return dropBytesIntoVfs(name, bytes);
@@ -400,29 +438,29 @@
     window.downloadSavedFiles = downloadSavedFiles;
 
     // --- orchestration ------------------------------------------------------
-    // The zips are large (wine64.zip ~205MB); fetch them, drop them in the VFS,
-    // push the argv, then release the run dependency so main() proceeds.
-    function loadFilesystem() {
-        console.log("wine64-launcher: loading 64-bit rootfs from " + (BASE || "./"));
-        var glibcDone = false, wineDone = false;
+    // The zips are large (wine64.zip ~205MB) on the FIRST boot; fetch them, drop
+    // them in the VFS, push the argv, then release the run dependency so main()
+    // proceeds. On an in-page relaunch the bytes come from zipCache (no network).
+    // `els` are resolved fresh per boot (the canvas is replaced on relaunch).
+    function loadFilesystem(els) {
+        console.log("wine64-launcher: loading 64-bit rootfs from " + (BASE || "./") +
+                    (relaunchCount ? " (cached, relaunch #" + relaunchCount + ")" : ""));
         function report(name, recv, total) {
             var pct = total ? Math.round((recv / total) * 100) : 0;
-            setStatusText("Downloading " + name + " " + pct + "%");
-            if (progressElement) {
-                progressElement.hidden = false;
-                progressElement.value = recv;
-                progressElement.max = total;
+            setStatusText("Loading " + name + " " + pct + "%");
+            if (els.progress) {
+                els.progress.hidden = false;
+                els.progress.value = recv;
+                els.progress.max = total;
             }
         }
         // report(label, recv, total) matches fetchBytes's onProgress(label, …)
         // signature, so it can be passed straight through.
         fetchZipToVfs(GLIBC_ZIP, report)
             .then(function () {
-                glibcDone = true;
                 return fetchZipToVfs(WINE_ZIP, report);
             })
             .then(function () {
-                wineDone = true;
                 // Third overlay: the tiny pre-booted prefix (+glcube.exe), only
                 // when we'll actually run a program against it.
                 if (USE_PREFIX) {
@@ -430,8 +468,8 @@
                 }
             })
             .then(function () {
-                if (progressElement) progressElement.hidden = true;
-                if (spinnerElement) spinnerElement.hidden = true;
+                if (els.progress) els.progress.hidden = true;
+                if (els.spinner) els.spinner.hidden = true;
                 setStatusText(DO_BOOT ? "Booting wine prefix..." :
                               USE_PREFIX ? "Starting " + PROG + " (pre-booted prefix)..." :
                               "Starting wine64...");
@@ -439,10 +477,10 @@
                 if (DO_BOOT) prepareWinePrefix();
 
                 var args = buildArguments();
-                for (var i = 0; i < args.length; i++) Module["arguments"].push(args[i]);
+                for (var i = 0; i < args.length; i++) window.Module["arguments"].push(args[i]);
                 console.log("wine64 argv: " + JSON.stringify(args));
 
-                Module["removeRunDependency"]("loadWine64Fs");
+                window.Module["removeRunDependency"]("loadWine64Fs");
             })
             .catch(function (err) {
                 console.error("wine64-launcher failed: " + err);
@@ -450,56 +488,191 @@
             });
     }
 
-    // --- Emscripten Module --------------------------------------------------
-    var canvas = document.getElementById("canvas");
-    if (canvas) {
-        canvas.addEventListener("webglcontextlost", function (e) {
-            alert("WebGL context lost. Reload the page.");
-            e.preventDefault();
-        }, false);
-        canvas.width = 800;
-        canvas.height = 600;
+    // --- in-page relaunch teardown ------------------------------------------
+    // A wasm64-mt instance can't simply re-run in the same page: its pthread
+    // workers and (crucially) the OffscreenCanvas transferred to a pthread via
+    // OFFSCREENCANVASES_TO_PTHREAD live on. transferControlToOffscreen() can only
+    // be called ONCE per canvas, so a second instance MUST get brand-new canvas
+    // elements. Tear the old instance down: stop its threads, drop the runtime
+    // globals, remove the old <script> + canvases, and recreate fresh canvases.
+    function teardownInstance() {
+        var M = window.Module;
+        // 1. Terminate the old instance's pthread workers (best-effort).
+        try {
+            if (M && M.PThread && typeof M.PThread.terminateAllThreads === "function") {
+                M.PThread.terminateAllThreads();
+            }
+        } catch (e) { console.warn("teardown: terminateAllThreads: " + e); }
+        // 2. Remove the old module <script> so the fresh one re-executes cleanly.
+        try {
+            var old = document.getElementById("boxedwine64-module-script");
+            if (old && old.parentNode) old.parentNode.removeChild(old);
+        } catch (e) {}
+        // 3. Replace the canvases. The transferred #gl64canvas can't be reused;
+        //    #canvas likewise carries a dead SDL/WebGL context. Recreate both with
+        //    the same ids/attrs so the fresh boot transfers untouched canvases.
+        replaceCanvas("gl64canvas", function (c) {
+            c.width = 1024; c.height = 1024; c.style.display = "none";
+        });
+        replaceCanvas("canvas", function (c) {
+            c.className = "emscripten";
+            c.setAttribute("oncontextmenu", "event.preventDefault()");
+            c.width = 800; c.height = 600;
+        });
+        // 4. Drop the runtime globals the next instance must not inherit.
+        try { delete window.Module; } catch (e) { window.Module = undefined; }
+        try { delete window.wasmMemory; } catch (e) {}
     }
 
-    var outputEl = document.getElementById("output");
+    function replaceCanvas(id, configure) {
+        var old = document.getElementById(id);
+        if (!old || !old.parentNode) return;
+        var fresh = document.createElement("canvas");
+        fresh.id = id;
+        if (configure) configure(fresh);
+        old.parentNode.replaceChild(fresh, old);
+    }
 
-    window.Module = {
-        arguments: [],
-        canvas: canvas,
-        preRun: [function () {
-            // TEMP DEBUG: host-side GL trace (read via getenv in gl64bridge.cpp).
-            // Emscripten getenv() reads Module.ENV; set it before main() runs.
-            try { Module["ENV"] = Module["ENV"] || {}; Module["ENV"]["BW64_GLTRACE"] = "1"; } catch (e) {}
-            // Hold main() until the rootfs is in the VFS.
-            Module["addRunDependency"]("loadWine64Fs");
-            loadFilesystem();
-        }],
-        print: function () {
-            var text = Array.prototype.slice.call(arguments).join(" ");
-            console.log(text);
-            if (outputEl) {
-                outputEl.value += text + "\n";
-                outputEl.scrollTop = outputEl.scrollHeight;
-            }
-        },
-        printErr: function () {
-            var text = Array.prototype.slice.call(arguments).join(" ");
-            console.error(text);
-            if (outputEl) {
-                outputEl.value += text + "\n";
-                outputEl.scrollTop = outputEl.scrollHeight;
-            }
-        },
-        setStatus: function (text) {
-            if (text) setStatusText(text);
-        },
-        totalDependencies: 0,
-        monitorRunDependencies: function () {}
-    };
+    // --- one boot of the wasm module ----------------------------------------
+    // Builds a fresh window.Module against the current run config and appends the
+    // emscripten script so it boots. Safe to call repeatedly (teardown first).
+    function bootWine() {
+        var canvas = document.getElementById("canvas");
+        if (canvas) {
+            canvas.addEventListener("webglcontextlost", function (e) {
+                // On relaunch this is expected (we tear the old context down); only
+                // alarm the user on the live instance.
+                console.warn("webglcontextlost on #canvas");
+                e.preventDefault();
+            }, false);
+            canvas.width = 800;
+            canvas.height = 600;
+        }
+        var els = {
+            progress: document.getElementById("progress"),
+            spinner: document.getElementById("spinner"),
+            output: document.getElementById("output")
+        };
 
+        window.Module = {
+            arguments: [],
+            canvas: canvas,
+            preRun: [function () {
+                // Host-side GL trace (read via getenv in gl64bridge.cpp). Emscripten
+                // getenv() reads Module.ENV; set it before main() runs.
+                try { Module["ENV"] = Module["ENV"] || {}; Module["ENV"]["BW64_GLTRACE"] = "1"; } catch (e) {}
+                // Hold main() until the rootfs is in the VFS.
+                Module["addRunDependency"]("loadWine64Fs");
+                loadFilesystem(els);
+            }],
+            print: function () {
+                var text = Array.prototype.slice.call(arguments).join(" ");
+                console.log(text);
+                if (els.output) { els.output.value += text + "\n"; els.output.scrollTop = els.output.scrollHeight; }
+            },
+            printErr: function () {
+                var text = Array.prototype.slice.call(arguments).join(" ");
+                console.error(text);
+                if (els.output) { els.output.value += text + "\n"; els.output.scrollTop = els.output.scrollHeight; }
+            },
+            setStatus: function (text) { if (text) setStatusText(text); },
+            totalDependencies: 0,
+            monitorRunDependencies: function () {}
+        };
+
+        // Gate the emscripten glue on cross-origin isolation. The wasm64-mt build
+        // needs SharedArrayBuffer AND a WebGL2 context (the gl64 bridge), both of
+        // which require crossOriginIsolated===true. On `node server.mjs` (real
+        // COOP/COEP headers) that's true on first paint. On GitHub Pages,
+        // coi-serviceworker.js injects the headers but only after it reloads the
+        // page once; until then crossOriginIsolated is false and booting anyway
+        // makes emscripten_webgl_create_context fail ("ensureContext FAILED") so
+        // the cube never renders. So: only append the script once isolated.
+        function appendModuleScript() {
+            var s = document.createElement("script");
+            s.id = "boxedwine64-module-script";
+            s.async = true;
+            s.src = "boxedwine64.js";
+            document.body.appendChild(s);
+        }
+        if (window.crossOriginIsolated || typeof window.crossOriginIsolated === "undefined") {
+            // Already isolated (real headers / coi reload landed), or a browser with
+            // no isolation concept (coi shim gave up) — just boot.
+            appendModuleScript();
+            return;
+        }
+        // Not isolated yet: coi-serviceworker registers + reloads to turn it on.
+        // Poll briefly for isolation; surface a clear message if it never lands.
+        setStatusText("Enabling cross-origin isolation (service worker)…");
+        var waited = 0, STEP = 250, LIMIT = 15000;
+        var iv = setInterval(function () {
+            if (window.crossOriginIsolated) { clearInterval(iv); appendModuleScript(); return; }
+            waited += STEP;
+            if (waited >= LIMIT) {
+                clearInterval(iv);
+                setStatusText("Could not enable cross-origin isolation — try a hard reload " +
+                              "(⌘/Ctrl+Shift+R). SharedArrayBuffer/WebGL need COOP/COEP.");
+                console.error("crossOriginIsolated still false after " + LIMIT +
+                              "ms; not booting (WebGL context would fail).");
+            }
+        }, STEP);
+    }
+
+    // --- public: launch another app in-page (no full reload) ----------------
+    // Reuses the cached rootfs bytes; tears down the running instance and boots a
+    // fresh one for `prog`. opts: { boot, novideo } mirror the query params.
+    var relaunchInFlight = false;
+    function launchApp(prog, opts) {
+        if (relaunchInFlight) { console.warn("launchApp ignored: a relaunch is in flight"); return; }
+        if (!Object.keys(zipCache).length) {
+            // Nothing cached yet (first boot still downloading) — fall back to a
+            // navigation so we don't boot with an empty VFS. Preserve the existing
+            // params (esp. ?chunked=1 on GitHub Pages) and just swap p/boot/novideo.
+            try {
+                var navUrl = new URL(window.location.href);
+                navUrl.searchParams.set("p", prog);
+                if (opts && opts.boot) navUrl.searchParams.set("boot", "1"); else navUrl.searchParams.delete("boot");
+                if (opts && opts.novideo) navUrl.searchParams.set("novideo", "1"); else navUrl.searchParams.delete("novideo");
+                window.location.href = navUrl.toString();
+            } catch (e) {
+                window.location.search = "?p=" + encodeURIComponent(prog);
+            }
+            return;
+        }
+        relaunchInFlight = true;
+        relaunchCount++;
+        applyRunConfig(prog, opts);
+        // Reflect the choice in the URL bar without reloading, so a manual refresh
+        // or shared link reproduces it.
+        try {
+            var url = new URL(window.location.href);
+            url.searchParams.set("p", prog);
+            if (opts && opts.boot) url.searchParams.set("boot", "1"); else url.searchParams.delete("boot");
+            if (opts && opts.novideo) url.searchParams.set("novideo", "1"); else url.searchParams.delete("novideo");
+            window.history.replaceState(null, "", url.toString());
+        } catch (e) {}
+        if (window.setActiveApp) try { window.setActiveApp(prog); } catch (e) {}
+        setStatusText("Switching to " + prog + "…");
+        var sp = document.getElementById("spinner");
+        if (sp) sp.hidden = false;
+        teardownInstance();
+        // Give the terminated workers / replaced canvases a tick to settle before
+        // the fresh instance grabs SharedArrayBuffer + transfers the new canvas.
+        setTimeout(function () {
+            relaunchInFlight = false;
+            bootWine();
+        }, 150);
+    }
+    window.launchApp = launchApp;
+    // Expose so the HTML button's onclick can reach it.
+    window.downloadSavedFiles = downloadSavedFiles;
+
+    // --- first boot from the page load --------------------------------------
     setStatusText("Loading wine64 (WASM)...");
     window.onerror = function (msg, file, line, col, error) {
         setStatusText("Exception — see console");
         console.error(msg, file, line, col, error);
     };
+    if (window.setActiveApp) try { window.setActiveApp(PROG || "--version"); } catch (e) {}
+    bootWine();
 })();

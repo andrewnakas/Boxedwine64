@@ -77,6 +77,21 @@ echo "=== materializing C:\\users profile tree under $DRIVE_C ==="
 for d in "${PROFILE_DIRS[@]}"; do
   mkdir -p "$STAGE/$DRIVE_C/$d"
 done
+
+# Bundle the extra GL demo executables the app launcher offers (glcube.exe is
+# already in the base zip). The launcher's app bar (?p=<prog> / launchApp) runs
+# these against this pre-booted prefix, so they must live both at the HOME root
+# (Z:\home\username\<prog>) and under drive_c (C:\<prog>), mirroring glcube.exe.
+GLTEST="$HERE/gltest"
+for exe in gltri.exe; do
+  if [ -f "$GLTEST/$exe" ]; then
+    cp "$GLTEST/$exe" "$STAGE/home/username/$exe"
+    cp "$GLTEST/$exe" "$STAGE/$DRIVE_C/$exe"
+    echo "  + bundled $exe"
+  else
+    echo "  NOTE: $GLTEST/$exe missing — app-bar button for it will ENOENT." >&2
+  fi
+done
 # Drop a .keep in each leaf so the dir survives any tooling that prunes empties,
 # and so Save As shows a non-empty, browsable target. (zip stores empty dirs, but
 # the marker also makes the populated tree visible when debugging the VFS.)
