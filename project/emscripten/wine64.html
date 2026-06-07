@@ -26,15 +26,19 @@
       #toolbar button:hover { background:#373b41; }
       #toolbar .tbhint { font-size:.78em; color:#969896; margin-left:.6em; }
       /* App launcher bar — click to swap apps in-page (no full reload). */
-      #apps { margin:.5em 0 .3em; display:flex; flex-wrap:wrap; gap:.5em; align-items:center; }
-      #apps .applbl { font-size:.8em; color:#969896; margin-right:.2em; }
+      #apps { margin:.5em 0 .3em; }
+      .approw { display:flex; flex-wrap:wrap; gap:.45em; align-items:center; margin:.25em 0; }
+      .approw .applbl { font-size:.78em; color:#969896; min-width:5.5em; font-weight:600;
+                text-transform:uppercase; letter-spacing:.03em; }
+      .approw.experimental .applbl { color:#cc8866; }
       .appbtn { font:inherit; font-size:.85em; color:#c5c8c6; background:#282a2e;
-                border:1px solid #373b41; border-radius:6px; padding:.35em .8em; cursor:pointer;
-                display:flex; align-items:center; gap:.4em; }
+                border:1px solid #373b41; border-radius:6px; padding:.32em .7em; cursor:pointer;
+                display:flex; align-items:center; gap:.35em; }
       .appbtn:hover { background:#373b41; }
       .appbtn[aria-pressed="true"] { background:#373b41; border-color:#81a2be; color:#fff; }
       .appbtn .ico { font-size:1.05em; line-height:1; }
-      #apps .appshint { font-size:.78em; color:#969896; }
+      .approw.experimental .appbtn { border-style:dashed; opacity:.85; }
+      #apps .appshint { font-size:.78em; color:#969896; margin-top:.3em; }
     </style>
   </head>
   <body>
@@ -45,13 +49,43 @@
       <progress value="0" max="100" id="progress" hidden></progress>
     </div>
     <div id="apps">
-      <span class="applbl">Apps:</span>
       <!-- Buttons are wired up in the script below once the launcher is ready.
            Clicking swaps the running app in-page (reuses the downloaded rootfs,
-           no full reload). data-prog is the wine64 program to run. -->
-      <button type="button" class="appbtn" data-prog="glcube.exe"><span class="ico">🧊</span>glcube</button>
-      <button type="button" class="appbtn" data-prog="notepad.exe"><span class="ico">📝</span>Notepad</button>
-      <span class="appshint">first launch downloads the rootfs once; later switches are instant (no reload)</span>
+           no full reload). data-prog is the wine64 program to run. All of these
+           except glcube/gltri are wine BUILTINS already inside wine64.zip, so
+           they add ZERO download — wine resolves them from system32. -->
+      <div class="approw">
+        <span class="applbl">Apps</span>
+        <button type="button" class="appbtn" data-prog="notepad.exe"><span class="ico">📝</span>Notepad</button>
+        <button type="button" class="appbtn" data-prog="wordpad.exe"><span class="ico">📄</span>WordPad</button>
+        <button type="button" class="appbtn" data-prog="clock.exe"><span class="ico">🕑</span>Clock</button>
+        <button type="button" class="appbtn" data-prog="winecfg.exe"><span class="ico">⚙️</span>winecfg</button>
+        <button type="button" class="appbtn" data-prog="winefile.exe"><span class="ico">🗂️</span>Files</button>
+      </div>
+      <div class="approw">
+        <span class="applbl">Graphics</span>
+        <button type="button" class="appbtn" data-prog="glcube.exe"><span class="ico">🧊</span>glcube</button>
+      </div>
+      <div class="approw">
+        <span class="applbl">Games</span>
+        <button type="button" class="appbtn" data-prog="winemine.exe"><span class="ico">💣</span>Minesweeper</button>
+        <button type="button" class="appbtn" data-prog="snake.exe"><span class="ico">🐍</span>Snake</button>
+        <button type="button" class="appbtn" data-prog="tetris.exe"><span class="ico">🟦</span>Tetris</button>
+        <!-- doomgeneric (GPLv2) + freely-redistributable shareware doom1.wad.
+             -iwad points at the WAD's absolute guest path (z: maps to /, HOME is
+             /home/username, so the WAD sits at Z:\home\username\doom1.wad). -->
+        <button type="button" class="appbtn" data-prog="doom.exe -iwad Z:\home\username\doom1.wad"><span class="ico">👹</span>DOOM</button>
+      </div>
+      <div class="approw experimental">
+        <span class="applbl" title="May not render / may crash under the emulator yet">Experimental</span>
+        <button type="button" class="appbtn" data-prog="taskmgr.exe"><span class="ico">📊</span>Task Mgr</button>
+        <button type="button" class="appbtn" data-prog="regedit.exe"><span class="ico">🧾</span>regedit</button>
+        <button type="button" class="appbtn" data-prog="control.exe"><span class="ico">🎛️</span>control</button>
+        <button type="button" class="appbtn" data-prog="explorer.exe"><span class="ico">🪟</span>explorer</button>
+        <button type="button" class="appbtn" data-prog="iexplore.exe"><span class="ico">🌐</span>IE</button>
+        <button type="button" class="appbtn" data-prog="oleview.exe"><span class="ico">🔎</span>oleview</button>
+      </div>
+      <span class="appshint">first launch downloads the rootfs once; later switches are instant (no reload). Builtins (Notepad…Minesweeper) add no download. <b>Experimental</b> apps may not render yet.</span>
     </div>
     <div id="toolbar">
       <button type="button" onclick="window.downloadSavedFiles && window.downloadSavedFiles()">⤓ Download my files</button>

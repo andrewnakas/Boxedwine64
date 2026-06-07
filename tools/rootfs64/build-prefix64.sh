@@ -92,6 +92,22 @@ for exe in gltri.exe; do
     echo "  NOTE: $GLTEST/$exe missing — app-bar button for it will ENOENT." >&2
   fi
 done
+
+# Bundle the self-contained games the app launcher's "Games" row offers. These
+# are built from tools/rootfs64/games/src (Win32/GDI, mingw-w64 -> 64-bit PE; see
+# games/build-games.sh) plus the freely-redistributable shareware doom1.wad.
+# Same placement: HOME root + drive_c. doom.exe needs doom1.wad next to it AND is
+# launched with `-iwad Z:\home\username\doom1.wad` (see the app bar in wine64.html).
+GAMES="$HERE/games"
+for f in snake.exe tetris.exe doom.exe doom1.wad; do
+  if [ -f "$GAMES/$f" ]; then
+    cp "$GAMES/$f" "$STAGE/home/username/$f"
+    cp "$GAMES/$f" "$STAGE/$DRIVE_C/$f"
+    echo "  + bundled $f"
+  else
+    echo "  NOTE: $GAMES/$f missing — app-bar button for it will ENOENT." >&2
+  fi
+done
 # Drop a .keep in each leaf so the dir survives any tooling that prunes empties,
 # and so Save As shows a non-empty, browsable target. (zip stores empty dirs, but
 # the marker also makes the populated tree visible when debugging the VFS.)

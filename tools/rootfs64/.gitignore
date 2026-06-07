@@ -32,3 +32,6 @@ root/lib/x86_64-linux-gnu/libpcre2-8.so.0
 # committed boxedwine64/wine64-debian:bookworm docker image. Reproduce on demand;
 # never commit the zips or the intermediate staging tree.
 dist/
+
+# Split rootfs assets for the Pages Release (built by split-rootfs.sh; huge).
+pages-assets/
