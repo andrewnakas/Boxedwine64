@@ -813,6 +813,21 @@ U32 KProcess::execve(KThread* thread, BString path, std::vector<BString>& args, 
     cloneVM = false;
 
 #ifdef BOXEDWINE_GUEST_X64
+    // execvReset() just wiped this process's 32-bit KMemory, which holds the
+    // per-thread IPC bounce/scratch pages (sockaddr + msghdr) cached by thread
+    // id in syscall64.cpp. Drop those cache entries so the next socket bounce
+    // re-mmaps fresh scratch into the new address space instead of faulting on a
+    // stale address (KMemory::performOnMemory "failed to get ram"). Every thread
+    // id of this process (the survivor + any being torn down) is invalidated.
+    {
+        extern void bw64InvalidateScratchForThread(U32 threadId);
+        for (auto& t : this->threads) {
+            bw64InvalidateScratchForThread(t.key);
+        }
+    }
+#endif
+
+#ifdef BOXEDWINE_GUEST_X64
     // 64-bit re-exec (wine64 re-execs itself / spawns wineserver). The prior
     // program's KMemory64 still holds its pages and bump-allocator cursor, so
     // give the process a FRESH memory64 for the new image. We must NOT delete

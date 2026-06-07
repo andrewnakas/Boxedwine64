@@ -2347,11 +2347,23 @@ static U32 msgScratch(KThread* thread) {
     if (it != g_msgScratchByThread.end()) return it->second;
     U32 addr = thread->memory->mmap(thread, 0, MSG_SCRATCH_BYTES,
         K_PROT_READ | K_PROT_WRITE, K_MAP_ANONYMOUS | K_MAP_PRIVATE, -1, 0);
-    klog_fmt("msgScratch: tid=%d pid=%d mmap32 scratch -> 0x%X", thread->id,
-             (int)thread->process->id, addr);
     if (!addr) return 0;
     g_msgScratchByThread[thread->id] = addr;
     return addr;
+}
+
+// Invalidate the cached per-thread 32-bit IPC scratch addresses for a thread.
+// MUST be called whenever that thread's 32-bit KMemory is wiped — i.e. on
+// execve (execvReset frees the process's 32-bit mappings, including the scratch
+// page). Without this the cache hands back a stale address that is no longer
+// mapped, and the next sockaddr/msg bounce faults in KMemory::performOnMemory
+// ("failed to get ram"). This surfaced once the persistent-session spawn path
+// ran a guest through preloader->wine64 execs on a non-main worker: the scratch
+// was mmap'd before an execve and reused after it. See KProcess::execve.
+void bw64InvalidateScratchForThread(U32 threadId) {
+    BOXEDWINE_CRITICAL_SECTION_WITH_MUTEX(g_scratchMutex);
+    g_socketScratchByThread.erase(threadId);
+    g_msgScratchByThread.erase(threadId);
 }
 
 // 64-bit struct offsets (x86-64):
