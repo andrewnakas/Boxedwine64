@@ -19,6 +19,13 @@
 #include "boxedwine.h"
 #include "startupArgs.h"
 
+#if defined(__EMSCRIPTEN__) && defined(BOXEDWINE_MULTI_THREADED) && defined(BOXEDWINE_GUEST_X64)
+// Persistent in-browser wine session (source/sdl/emscripten/wine64session.cpp):
+// remember the boot launch params so later in-session app spawns reuse them.
+void bw64SessionRememberContext(const BString& workingDir, int userId, int groupId,
+                                int effectiveUserId, int effectiveGroupId);
+#endif
+
 #include "devtty.h"
 #include "devurandom.h"
 #include "devnull.h"
@@ -610,6 +617,13 @@ bool StartUpArgs::apply() {
             KThread* thread = process->startProcess(this->workingDir, this->args, this->envValues, this->userId, this->groupId, this->effectiveUserId, this->effectiveGroupId);
             result = thread != nullptr;
         }
+#if defined(__EMSCRIPTEN__) && defined(BOXEDWINE_MULTI_THREADED) && defined(BOXEDWINE_GUEST_X64)
+        // Boot process is up — record its launch params so the JS launcher can
+        // spawn further apps into THIS running kernel (persistent wine session)
+        // without reloading the page. See wine64session.cpp.
+        bw64SessionRememberContext(this->workingDir, this->userId, this->groupId,
+                                   this->effectiveUserId, this->effectiveGroupId);
+#endif
         if (result) {
             if (!doMainLoop()) {
                 return false; // doMainLoop should have handled any cleanup, like SDL_Quit if necessary

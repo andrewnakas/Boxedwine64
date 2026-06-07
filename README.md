@@ -6,7 +6,7 @@ This fork is a **work in progress**, but a substantial one: real Debian `wine64`
 
 > ### ▶ [**Try the live demo: real `wine64` in your browser**](https://andrewnakas.github.io/Boxedwine64/)
 >
-> Open <https://andrewnakas.github.io/Boxedwine64/> in a recent Chrome/Edge/Safari. After the one-time rootfs download, use the **app bar** at the top to switch between the **spinning OpenGL cube** (`glcube`) and interactive **Notepad** — apps swap **in-page with no reload** (the rootfs is downloaded once and reused). First load is ~196 MB and takes a minute; give the cube ~20–30 s to boot.
+> Open <https://andrewnakas.github.io/Boxedwine64/> in a recent Chrome/Edge/Safari. After the one-time rootfs download, use the **app bar** at the top to switch between the **spinning OpenGL cube** (`glcube`) and interactive **Notepad**. A **persistent in-browser `wineserver64`** stays resident, so launching an app **spawns it into the SAME running wine** — no page reload, the prefix and GL context stay warm between apps (this is the "load a new app into the same wine" item that was long on the roadmap; `?session=0` falls back to reload-per-app). First load is ~196 MB and takes a minute; give the cube ~20–30 s to boot.
 
 ![wine64 OpenGL glcube.exe rendering a spinning 3D cube in Boxedwine64 on macOS](docs/images/glcube-gui.png)
 
@@ -314,15 +314,26 @@ the page skips `wineboot --init`. Cross-origin isolation (COOP/COEP) is **requir
 for `SharedArrayBuffer` — serve via `node project/emscripten/server.mjs`, which
 sets those headers.
 
-The page has an **app bar** (glcube / Notepad) that switches apps **in-page with
-no full reload**: the fetched rootfs bytes are cached in JS (`zipCache`), so a
-relaunch tears down the running wasm instance — terminate its pthreads and
-**replace the canvases** (an `OffscreenCanvas` transferred to a pthread via
-`OFFSCREENCANVASES_TO_PTHREAD` can't be transferred twice, so each relaunch needs
-a fresh `#gl64canvas`/`#canvas`) — and boots a fresh module against the cached
-bytes (zero refetch). This is a fast local re-boot of wine with a new program,
-**not** in-session process spawning (that needs a persistent in-browser
-`wineserver`, which is still on the roadmap).
+The page has an **app bar** (glcube / Notepad) that does real **in-session
+process spawning** — the "load a new app into the SAME running wine" item that was
+long on the roadmap. The boot argv starts only a **long-lived foreground
+`wineserver64 -f -p`** against the pre-booted prefix (`-f` = no fork, since the
+in-emulator daemonize path is unreliable; `-p` = persist forever). Because the
+emscripten main loop only quits when the last guest thread exits
+(`platformThreadCount==0` → `SDL_QUIT`), that resident server keeps the whole
+kernel — prefix, X11 wire server, GL context — **warm between apps**. Each app the
+app bar requests is then spawned **into that running kernel** as `wine64 <app>`
+via a tiny C bridge (`source/sdl/emscripten/wine64session.cpp`): the launcher's
+`bw64_spawn()` (a `Module.ccall`) queues the launch behind a spinlock — non-
+blocking, safe on the browser main thread where `Atomics.wait` is illegal — and
+`mainloop()` drains the queue each tick, calling `KProcess::startProcess()` on the
+main-loop thread. **No page reload, no module re-instantiation, no rootfs refetch,
+and the previous app and the server keep running.** `?session=0` reverts to the
+older reload-per-app path (navigate to `?p=<prog>`, fresh boot, rootfs served from
+the immutable HTTP cache) — kept as a fallback since a true in-page *reboot* is
+impossible (this build isn't `MODULARIZE`'d, so re-running `boxedwine64.js` throws
+"duplicate variable", and the `#gl64canvas` `OffscreenCanvas` can't be transferred
+to a pthread twice).
 
 ```sh
 cd project/emscripten

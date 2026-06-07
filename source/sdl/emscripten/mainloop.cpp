@@ -30,6 +30,12 @@
 U32 getNextTimer();
 void runTimers();
 
+#ifdef BOXEDWINE_GUEST_X64
+// Persistent in-browser wine session (wine64session.cpp): drain any app-launch
+// requests JS queued via bw64_spawn and start them on THIS (main-loop) thread.
+void bw64SessionDrainSpawns();
+#endif
+
 extern std::atomic<int> platformThreadCount;
 
 static U32 lastTitleUpdate = 0;
@@ -94,6 +100,9 @@ void mainloop() {
         // tickXWirePresent) runs them here. Without this call those jobs never run
         // and the guest's glXCreateContext hangs forever (black canvas).
         tickXWirePresent();
+        // Persistent wine session: start any apps JS asked for (bw64_spawn) here
+        // on the main-loop thread, against the already-running wineserver/prefix.
+        bw64SessionDrainSpawns();
 #endif
         U32 t = KSystem::getMilliesSinceStart();
         U32 nextTimer = getNextTimer();

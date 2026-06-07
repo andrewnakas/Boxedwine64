@@ -29,6 +29,11 @@
 //                           every spawned wine process loops on ENOENT. Kept as a
 //                           progress probe for the wineserver-IPC roadmap work; use
 //                           ?p=<prog> (pre-booted prefix) to actually run programs.
+//   ?session=0              disable the persistent wine session (see below) and
+//                           use the old reload-per-app path: boot `wine64 <prog>`
+//                           directly and reload the page to switch apps. Default
+//                           (?session=1) keeps one wineserver resident and spawns
+//                           apps into it with no reload.
 //   ?base=<url>             base URL the zips are fetched from (default: "./").
 //   ?novideo=1              pass -novideo (headless; no SDL window).
 //   ?chunked=1              fetch each rootfs zip via a <zip>.manifest.json that
@@ -48,17 +53,25 @@
 //   wine64.html?p=glcube.exe         -> wine64 glcube.exe  (pre-booted prefix; GL)
 //   wine64.html?p=notepad.exe        -> wine64 notepad.exe (pre-booted prefix)
 //
-// APP SWITCHING (reload-based): window.launchApp("<prog>") navigates to the new
-// app's URL (?p=<prog>), giving a clean page boot for each program. The rootfs is
-// NOT re-downloaded over the network — the immutable .zip/.part assets carry a
-// long-lived Cache-Control, so the browser serves them from its HTTP cache and a
-// switch is a fast local reboot. A true in-page swap (no reload) is impossible
-// here because this build is not MODULARIZE'd: boxedwine64.js declares top-level
+// PERSISTENT WINE SESSION (the real "load a new app into the SAME running wine"):
+// By default (?session=1, implied whenever a real program is requested) the boot
+// argv starts ONLY a long-lived foreground wineserver (`wineserver64 -f -p`)
+// against the pre-booted prefix. Because the emscripten main loop only quits when
+// the last guest thread exits (platformThreadCount==0 -> SDL_QUIT), that resident
+// wineserver keeps the whole kernel — prefix, X11 wire server, GL context —
+// warm between apps. The requested app, and every later window.launchApp("<prog>"),
+// is then spawned INTO that running kernel with NO page reload, via the C bridge
+// bw64_spawn() (source/sdl/emscripten/wine64session.cpp). The app bar in
+// wine64.html calls launchApp().
+//
+// FALLBACK — reload-based switching (?session=0): launchApp() navigates to the
+// new app's URL (?p=<prog>) for a clean page boot. The rootfs is NOT re-downloaded
+// (immutable .zip/.part HTTP cache). A true in-page *reboot* is impossible here
+// because this build is not MODULARIZE'd: boxedwine64.js declares top-level
 // globals (e.g. `class ExitStatus`) in the page realm, so re-running it throws
 // "duplicate variable", and the gl64 OffscreenCanvas (OFFSCREENCANVASES_TO_PTHREAD)
-// can't be transferred twice. The app bar in wine64.html calls launchApp(). This
-// is also NOT in-session process spawning (loading a new app into the SAME running
-// wine) — that needs the unsolved in-browser wineserver daemon (see ?boot=1).
+// can't be transferred twice. (The session path above avoids re-running the glue
+// entirely — it never reboots, it spawns.)
 
 (function () {
     "use strict";
@@ -68,6 +81,7 @@
     var PREFIX_ZIP = "prefix64.zip"; // pre-booted .wine prefix (+glcube.exe), ~257KB
     var ROOT = "/root";
     var WINE64 = "/usr/lib/wine/wine64";
+    var WINESERVER64 = "/usr/lib/wine/wineserver64"; // real daemon binary (session mode)
     // The pre-booted prefix in PREFIX_ZIP lives here (dosdevices c: -> ../drive_c,
     // z: -> /). Running a program with these is what lets wine skip wineboot.
     var PREFIX_HOME = "/home/username";
@@ -86,7 +100,7 @@
     // --- current run configuration ------------------------------------------
     // These describe the run being booted RIGHT NOW. The bare-page defaults come
     // from the query string; launchApp() rewrites them per relaunch (no reload).
-    var DO_BOOT, NOVIDEO, PROG, USE_PREFIX;
+    var DO_BOOT, NOVIDEO, PROG, USE_PREFIX, SESSION;
     function applyRunConfig(prog, opts) {
         opts = opts || {};
         PROG = prog;
@@ -95,9 +109,21 @@
         // Run a real program against the pre-booted prefix when a program (other
         // than the bare --version correctness boot) is named and we're not booting.
         USE_PREFIX = !DO_BOOT && PROG && PROG.length && PROG !== "--version";
+        // PERSISTENT SESSION mode: instead of booting `wine64 <prog>` (which makes
+        // the whole emulator quit when <prog> exits), boot a long-lived foreground
+        // wineserver and then spawn each app INTO that running kernel via the
+        // bw64_spawn C bridge — no page reload, prefix/X11/GL stay warm. Only
+        // meaningful when we have a real program to run against the pre-booted
+        // prefix. On by default for that case; ?session=0 forces the old
+        // reload-per-app path; ?boot=1 (raw prefix bring-up probe) never uses it.
+        SESSION = USE_PREFIX && opts.session !== false;
     }
-    // Initial config from the URL (?boot / ?novideo / ?p).
-    applyRunConfig(param("p"), { boot: param("boot") === "1", novideo: param("novideo") === "1" });
+    // Initial config from the URL (?boot / ?novideo / ?p / ?session).
+    applyRunConfig(param("p"), {
+        boot: param("boot") === "1",
+        novideo: param("novideo") === "1",
+        session: param("session") !== "0"
+    });
 
     // --- DOM hooks ----------------------------------------------------------
     var statusElement = document.getElementById("status");
@@ -106,6 +132,26 @@
 
     function setStatusText(text) {
         if (statusElement) statusElement.innerHTML = text;
+    }
+
+    // The env every prefix-using process shares. Identical HOME / WINEPREFIX /
+    // WINESERVER mean the boot wineserver and every later `wine64 <app>` spawn
+    // talk to the SAME server socket (derived from WINEPREFIX) — that's what
+    // makes them one wine session. Returned as ["K=V", ...].
+    function prefixEnv() {
+        return [
+            "HOME=" + PREFIX_HOME,
+            "WINEPREFIX=" + PREFIX_WINE,
+            "WINESERVER=" + WINESERVER64,
+            "WINEDLLPATH=/usr/lib/x86_64-linux-gnu/wine"
+        ];
+    }
+
+    // argv for running a Windows/guest program under wine64: [wine64, tok, ...].
+    function wineProgArgv(prog) {
+        var argv = [WINE64];
+        (prog || "").split(/\s+/).forEach(function (tok) { if (tok.length) argv.push(tok); });
+        return argv;
     }
 
     // --- build the wine64 argv ----------------------------------------------
@@ -120,25 +166,29 @@
             // Full prefix bring-up + wineserver handshake.
             args.push("-env", "HOME=/winePrefix");
             args.push("-env", "WINEPREFIX=/winePrefix/.wine");
-            args.push("-env", "WINESERVER=/usr/lib/wine/wineserver64");
+            args.push("-env", "WINESERVER=" + WINESERVER64);
             args.push("-env", "WINEDLLPATH=/usr/lib/x86_64-linux-gnu/wine");
             args.push(WINE64, "wineboot", "--init");
+        } else if (SESSION) {
+            // PERSISTENT SESSION: boot a long-lived FOREGROUND wineserver against
+            // the pre-booted prefix. -f keeps it in the foreground (no fork — the
+            // in-emulator daemonize path is unreliable) so it stays a live guest
+            // thread; -p makes it persist forever. While it lives the emulator
+            // never quits, so the requested app (and every later one) is spawned
+            // INTO this kernel via bw64_spawn — see maybeStartSessionApp().
+            prefixEnv().forEach(function (kv) { args.push("-env", kv); });
+            args.push(WINESERVER64, "-f", "-p");
         } else if (USE_PREFIX) {
             // Run a program against the PRE-BOOTED prefix (prefix64.zip). HOME +
             // WINEPREFIX point at the existing /home/username/.wine, so wine finds
-            // a populated prefix and does NOT run wineboot --init.
-            args.push("-env", "HOME=" + PREFIX_HOME);
-            args.push("-env", "WINEPREFIX=" + PREFIX_WINE);
-            args.push("-env", "WINESERVER=/usr/lib/wine/wineserver64");
-            args.push("-env", "WINEDLLPATH=/usr/lib/x86_64-linux-gnu/wine");
-            args.push(WINE64);
-            PROG.split(/\s+/).forEach(function (tok) {
-                if (tok.length) args.push(tok);
-            });
+            // a populated prefix and does NOT run wineboot --init. (Legacy
+            // reload-per-app path; ?session=0.)
+            prefixEnv().forEach(function (kv) { args.push("-env", kv); });
+            wineProgArgv(PROG).forEach(function (tok) { args.push(tok); });
         } else {
             // Bare wine64 --version (correctness boot, no prefix needed).
             args.push("-env", "WINEDLLPATH=/usr/lib/x86_64-linux-gnu/wine");
-            args.push("-env", "WINESERVER=/usr/lib/wine/wineserver64");
+            args.push("-env", "WINESERVER=" + WINESERVER64);
             args.push(WINE64);
             var prog = (PROG && PROG.length) ? PROG : "--version";
             prog.split(/\s+/).forEach(function (tok) {
@@ -506,6 +556,7 @@
                 if (els.progress) els.progress.hidden = true;
                 if (els.spinner) els.spinner.hidden = true;
                 setStatusText(DO_BOOT ? "Booting wine prefix..." :
+                              SESSION ? "Starting wine session..." :
                               USE_PREFIX ? "Starting " + PROG + " (pre-booted prefix)..." :
                               "Starting wine64...");
 
@@ -517,6 +568,11 @@
                 console.log("wine64 argv: " + JSON.stringify(args));
 
                 M["removeRunDependency"]("loadWine64Fs");
+
+                // In session mode the boot argv above started only the persistent
+                // wineserver; spawn the actually-requested app into it once the
+                // kernel reports the session is ready (bw64_session_ready).
+                if (SESSION) maybeStartSessionApp(PROG);
             })
             .catch(function (err) {
                 console.error("wine64-launcher failed: " + err);
@@ -614,25 +670,77 @@
         }, STEP);
     }
 
-    // --- public: switch to another app (reload-based) -----------------------
-    // Navigate to the new app's URL. This re-boots the page cleanly for `prog`.
+    // --- persistent session: spawn an app into the RUNNING wine -------------
+    // The C side (source/sdl/emscripten/wine64session.cpp) exports:
+    //   int bw64_session_ready()                       -> 1 once boot captured ctx
+    //   int bw64_spawn(argvJoined, envJoined)          -> 1 if a process scheduled
+    // argv/env are '\n'-joined strings (no '\n' ever appears in our paths/values).
+    function callExport(name, argTypes, args) {
+        var M = liveModule || window.Module;
+        if (!M || typeof M.ccall !== "function") return null;
+        try { return M.ccall(name, "number", argTypes, args); }
+        catch (e) { console.warn("ccall " + name + " failed: " + e); return null; }
+    }
+    function sessionReady() {
+        return callExport("bw64_session_ready", [], []) === 1;
+    }
+    // Spawn `wine64 <prog>` into the live kernel (no reload). Returns true if the
+    // C side scheduled the process. The spawn is marshalled onto the main-loop
+    // thread inside bw64_spawn, so it's safe to call from here.
+    function spawnIntoSession(prog) {
+        var argv = wineProgArgv(prog).join("\n");
+        var env = prefixEnv().join("\n");
+        var r = callExport("bw64_spawn", ["string", "string"], [argv, env]);
+        if (r === 1) {
+            console.log("session: spawned " + prog + " into the running wine");
+            return true;
+        }
+        console.warn("session: spawn of " + prog + " did not schedule (r=" + r + ")");
+        return false;
+    }
+    // After boot, wait for the session to come up, then spawn the first app.
+    function maybeStartSessionApp(prog) {
+        if (!prog || !prog.length || prog === "--version") return;
+        var waited = 0, STEP = 100, LIMIT = 60000;
+        (function poll() {
+            if (sessionReady()) {
+                setStatusText("Starting " + prog + " (session)…");
+                spawnIntoSession(prog);
+                return;
+            }
+            waited += STEP;
+            if (waited >= LIMIT) {
+                console.error("session never became ready after " + LIMIT + "ms");
+                setStatusText("wine session did not start — try ?session=0");
+                return;
+            }
+            setTimeout(poll, STEP);
+        })();
+    }
+
+    // --- public: switch to another app --------------------------------------
+    // PREFERRED PATH (persistent session): if a live wine session exists, spawn
+    // the new app straight into it — no page reload, the prefix / X11 server / GL
+    // context all stay warm. This is the real "load a new app into the SAME
+    // running wine".
     //
-    // Why a reload and not a true in-page swap: this wasm64-mt build is NOT
-    // MODULARIZE'd — boxedwine64.js declares top-level globals (e.g. `class
-    // ExitStatus`) in the page's realm, so re-running it to start a second app
-    // throws "Can't create duplicate variable: 'ExitStatus'". And the gl64
-    // OffscreenCanvas is transferred to a pthread (OFFSCREENCANVASES_TO_PTHREAD),
-    // which can't be transferred twice. A clean navigation sidesteps both. The
-    // rootfs isn't re-downloaded over the network — the browser serves the zips
-    // from its HTTP cache (the deploy/server send long-lived Cache-Control on the
-    // immutable .zip/.part assets), so a switch is a fast local reboot. (A true
-    // "load a new app into the SAME running wine" needs a persistent in-browser
-    // wineserver — the unsolved roadmap item; see ?boot=1.)
+    // FALLBACK PATH (reload): if there's no live session (e.g. ?session=0, or the
+    // app was booted with ?boot=1, or the session never came up), navigate to the
+    // new app's URL for a clean reboot. A true in-page *reboot* is impossible here
+    // because this wasm64-mt build is NOT MODULARIZE'd — boxedwine64.js declares
+    // top-level globals (e.g. `class ExitStatus`) in the page realm, so re-running
+    // it throws "duplicate variable", and the gl64 OffscreenCanvas can't be
+    // transferred twice. The rootfs isn't re-downloaded (immutable HTTP cache).
     //
-    // opts: { boot, novideo } mirror the query params. Existing params (notably
-    // ?chunked=1 on GitHub Pages) are preserved.
+    // opts: { boot, novideo } mirror the query params; ?chunked=1 etc. preserved.
     function launchApp(prog, opts) {
         if (window.setActiveApp) try { window.setActiveApp(prog); } catch (e) {}
+        // In-session spawn when we can (default session mode, kernel up, real app).
+        if (SESSION && !(opts && opts.boot) && prog && prog !== "--version" && sessionReady()) {
+            setStatusText("Launching " + prog + " (session)…");
+            if (spawnIntoSession(prog)) return;
+            // fall through to reload if the spawn somehow failed
+        }
         setStatusText("Switching to " + prog + "…");
         try {
             var url = new URL(window.location.href);

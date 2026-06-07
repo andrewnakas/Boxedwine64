@@ -114,9 +114,10 @@
 
     <!-- Wire the app-launcher buttons BEFORE the launcher loads, so window.
          setActiveApp exists when the launcher's first boot calls it. Each button
-         calls window.launchApp(prog), which (after the first download) swaps the
-         running app in-page with no full reload. The cross-origin-isolation gate
-         and the actual module boot now live in wine64-launcher.js (bootWine). -->
+         calls window.launchApp(prog). In the default persistent-session mode that
+         SPAWNS the app into the already-running wine (no page reload, prefix/GL
+         stay warm); only ?session=0 falls back to a reload. The cross-origin-
+         isolation gate and the module boot live in wine64-launcher.js (bootWine). -->
     <script>
       (function () {
         // Reflect which app is active by pressing its button.

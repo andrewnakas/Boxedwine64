@@ -113,6 +113,12 @@ wasm64-mt: export TARGET_EXEC := boxedwine64.html
 # value is effectively integral. It's a debug-only check (compiled out in
 # production); disabling assertions removes it so the cube's glBegin/glEnd geometry
 # actually flushes to a draw call.
+# The persistent-session bridge (wine64session.cpp) is called from the launcher
+# via Module.ccall (getCFunc -> Module["_bw64_spawn"] / ["_bw64_session_ready"]).
+# Those functions carry EMSCRIPTEN_KEEPALIVE, which both keeps them through DCE and
+# adds them to EXPORTED_FUNCTIONS (merged with the pthread/PROXY_TO_PTHREAD feature
+# exports), so they're reachable from ccall without an explicit -sEXPORTED_FUNCTIONS
+# list (which would otherwise have to re-enumerate the feature exports too).
 wasm64-mt: export EXTRA_LD_FLAGS := -pthread -sPTHREAD_POOL_SIZE=32 -sPROXY_TO_PTHREAD=1 -sOFFSCREENCANVAS_SUPPORT=1 -sOFFSCREENCANVASES_TO_PTHREAD=\#gl64canvas -sOFFSCREEN_FRAMEBUFFER=1 -sALLOW_MEMORY_GROWTH=1 -sMAXIMUM_MEMORY=2147483648 -sLEGACY_GL_EMULATION=1 -sMAX_WEBGL_VERSION=2 -sASSERTIONS=0 --js-library=boxedwine-multithreaded-audio.js
 wasm64-mt: export ASSET_FILES := boxedwine.css boxedwine-shell.js wine64.html wine64-launcher.js coi-serviceworker.js $(ZIP_ASSET_FILES)
 
