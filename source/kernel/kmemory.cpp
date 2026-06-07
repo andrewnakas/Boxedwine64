@@ -642,7 +642,11 @@ void KMemory::performOnMemory(U32 address, U32 len, bool readOnly, std::function
 
     U8* ram = page->getRamPtr(&data->mmu[pageIndex], pageIndex, !readOnly, true, offset, todo);
     if (!ram) {
-        kpanic("KMemory::performOnMemory failed to get ram");
+        KThread* ct = KThread::currentThread();
+        kpanic_fmt("KMemory::performOnMemory failed to get ram addr=0x%X len=%d page=0x%X tid=%d pid=%d is64=%d",
+                   address, len, pageIndex, ct ? ct->id : -1,
+                   ct && ct->process ? (int)ct->process->id : -1,
+                   ct && ct->process ? (int)ct->process->is64Bit : -1);
     }
     if (!callback(ram, todo)) {
         return;

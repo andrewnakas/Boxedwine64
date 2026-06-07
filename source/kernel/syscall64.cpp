@@ -2347,6 +2347,8 @@ static U32 msgScratch(KThread* thread) {
     if (it != g_msgScratchByThread.end()) return it->second;
     U32 addr = thread->memory->mmap(thread, 0, MSG_SCRATCH_BYTES,
         K_PROT_READ | K_PROT_WRITE, K_MAP_ANONYMOUS | K_MAP_PRIVATE, -1, 0);
+    klog_fmt("msgScratch: tid=%d pid=%d mmap32 scratch -> 0x%X", thread->id,
+             (int)thread->process->id, addr);
     if (!addr) return 0;
     g_msgScratchByThread[thread->id] = addr;
     return addr;
