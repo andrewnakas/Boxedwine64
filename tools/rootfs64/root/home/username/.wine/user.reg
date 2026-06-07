@@ -156,6 +156,16 @@ WINE REGISTRY Version 2
 [Software\\Microsoft\\Internet Explorer\\Main\\FeatureControl] 1780372490
 #time=1dcf2438ff70e60
 
+[Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\Advanced] 1780611053
+#time=1dcf46f028dac7c
+
+[Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\ComDlg32\\LastVisitedMRU] 1780620005
+#time=1dcf483da0c8236
+"a"=hex:6e,00,6f,00,74,00,65,00,70,00,61,00,64,00,2e,00,65,00,78,00,65,00,00,\
+  00,5a,00,3a,00,5c,00,68,00,6f,00,6d,00,65,00,5c,00,75,00,73,00,65,00,72,00,\
+  6e,00,61,00,6d,00,65,00,00,00
+"MRUList"="a"
+
 [Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\Shell Folders] 1780373820
 #time=1dcf246a8ab83fc
 "Administrative Tools"="C:\\users\\username\\AppData\\Roaming\\Microsoft\\Windows\\Start Menu\\Programs\\Administrative Tools"
@@ -226,8 +236,8 @@ WINE REGISTRY Version 2
 [Software\\Wine\\DllOverrides] 1780332434
 #time=1dcf1e64ca67892
 
-[Software\\Wine\\Fonts] 1780373947
-#time=1dcf246f485938a
+[Software\\Wine\\Fonts] 1780610725
+#time=1dcf46e3f3c40c6
 "Codepages"="1252,437"
 "LogPixels"=dword:00000060
 

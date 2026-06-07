@@ -198,6 +198,61 @@ inline void replayImmOp(const ImmOp& op) {
         default: break;
     }
 }
+
+// Replay a recorded glBegin..glEnd block, re-emitting the CURRENT color (and
+// normal) immediately BEFORE every vertex.
+//
+// Why: Emscripten's LEGACY_GL_EMULATION (glemu) does NOT implement real OpenGL
+// "current attribute" semantics for immediate mode. Each glColor/glNormal/
+// glVertex appends one component to a single interleaved temp buffer and bumps
+// an attribute counter; at glEnd it derives a UNIFORM per-vertex stride from the
+// first occurrence of each attribute and the assumption that every attribute is
+// re-specified once per vertex (color, vertex, color, vertex, ...). glcube (like
+// most classic GL code) sets the color ONCE per face and then emits 4 vertices
+// (color, vertex, vertex, vertex, vertex). glemu then has 6 colors for 24
+// vertices, so the per-vertex stride it computed (1 color float + 4 position
+// floats = 20 bytes) no longer matches the data actually written, and
+// numVertices = 4*vertexCounter/stride is not even integral — the vertices get
+// read at the wrong offsets and the cube renders as scrambled rotating
+// triangles. (With ASSERTIONS=0 glemu's own "numVertices must be an integer"
+// guard is compiled out, so it fails silently.)
+//
+// Real GL says the current color/normal applies to every subsequent vertex, so
+// emitting one color+normal per vertex is semantically identical and gives glemu
+// the uniform color-per-vertex layout it requires. Native GL is unaffected
+// (this path is WASM-only and the redundant glColor calls are free there too).
+inline void replayImmBlock(const std::vector<ImmOp>& ops) {
+    bool  haveColor = false, haveNormal = false;
+    float col[4]  = {1, 1, 1, 1};
+    float norm[3] = {0, 0, 1};
+    for (const ImmOp& op : ops) {
+        switch (op.fn) {
+            case GL64_fn_glColor3f:
+                col[0] = op.f[0]; col[1] = op.f[1]; col[2] = op.f[2]; col[3] = 1.0f;
+                haveColor = true;
+                break;
+            case GL64_fn_glColor4f:
+                col[0] = op.f[0]; col[1] = op.f[1]; col[2] = op.f[2]; col[3] = op.f[3];
+                haveColor = true;
+                break;
+            case GL64_fn_glNormal3f:
+                norm[0] = op.f[0]; norm[1] = op.f[1]; norm[2] = op.f[2];
+                haveNormal = true;
+                break;
+            case GL64_fn_glVertex2f:
+            case GL64_fn_glVertex3f:
+                // Re-assert the current attributes for THIS vertex so glemu sees
+                // one color (and normal) per vertex — a uniform interleaved layout.
+                if (haveColor)  glColor4f(col[0], col[1], col[2], col[3]);
+                if (haveNormal) glNormal3f(norm[0], norm[1], norm[2]);
+                if (op.fn == GL64_fn_glVertex2f) glVertex2f(op.f[0], op.f[1]);
+                else                             glVertex3f(op.f[0], op.f[1], op.f[2]);
+                break;
+            default:
+                break;
+        }
+    }
+}
 #endif
 
 #ifndef __EMSCRIPTEN__
@@ -364,12 +419,57 @@ bool ensureContext() {
                     } catch (e) {}
                     rc += 20; // marks the vertex-buffer fallback ran
                 }
+                // GL_QUADS index buffer. glcube draws its faces with glBegin(GL_QUADS);
+                // WebGL has no GL_QUADS, so glemu's flush (library_glemu.js) triangulates
+                // a quad block by binding GL.currentContext.tempQuadIndexBuffer — a
+                // precomputed 0 1 2, 0 2 3, 4 5 6, 4 6 7, ... index buffer — and issuing
+                // drawElements(TRIANGLES). That buffer is ONLY created by
+                // generateTempBuffers(quads=TRUE), which runs from GLImmediate.init().
+                // Our bridge makes its OWN context via emscripten_webgl_create_context
+                // (NOT the SDL/Browser path), so that context was set up with
+                // generateTempBuffers(false) and has NO tempQuadIndexBuffer; and the
+                // vbuf fallback above (which DOES pass quads=true) is gated on
+                // !vertexDataU8, which an earlier partial SDL-path init may have already
+                // set — skipping quad-buffer creation entirely. With tempQuadIndexBuffer
+                // undefined, glemu binds element-array 0, so drawElements reads zeroed/
+                // garbage indices and the cube's quads come out as scrambled triangles
+                // that still transform (rotate) correctly. Build it UNCONDITIONALLY on
+                // THIS context, independent of the vertexDataU8 guard. ASSERTIONS=0 in
+                // the wasm64-mt link means glemu's own quad asserts are compiled out, so
+                // the missing buffer fails silently — hence no error in the console.
+                if (typeof GL !== 'undefined' && GL.currentContext &&
+                    !GL.currentContext.tempQuadIndexBuffer && GL.MAX_TEMP_BUFFER_SIZE &&
+                    typeof GLctx !== 'undefined' && GLctx.createBuffer) {
+                    try {
+                        var qb = GLctx.createBuffer();
+                        var savedEab = GLctx.getParameter(GLctx.ELEMENT_ARRAY_BUFFER_BINDING);
+                        GLctx.bindBuffer(GLctx.ELEMENT_ARRAY_BUFFER, qb);
+                        var numIndexes = GL.MAX_TEMP_BUFFER_SIZE >> 1;
+                        var quadIndexes = new Uint16Array(numIndexes);
+                        var qi = 0;
+                        var qv = 0;
+                        while (1) {
+                            quadIndexes[qi++] = qv;     if (qi >= numIndexes) break;
+                            quadIndexes[qi++] = qv + 1; if (qi >= numIndexes) break;
+                            quadIndexes[qi++] = qv + 2; if (qi >= numIndexes) break;
+                            quadIndexes[qi++] = qv;     if (qi >= numIndexes) break;
+                            quadIndexes[qi++] = qv + 2; if (qi >= numIndexes) break;
+                            quadIndexes[qi++] = qv + 3; if (qi >= numIndexes) break;
+                            qv += 4;
+                        }
+                        GLctx.bufferData(GLctx.ELEMENT_ARRAY_BUFFER, quadIndexes, GLctx.STATIC_DRAW);
+                        GLctx.bindBuffer(GLctx.ELEMENT_ARRAY_BUFFER, savedEab || null);
+                        GL.currentContext.tempQuadIndexBuffer = qb;
+                        rc += 4; // marks the quad-index-buffer fallback ran
+                    } catch (e) {}
+                }
                 return rc + (GLImmediate.matrix ? GLImmediate.matrix.length * 100 : 0);
             } catch (e) { return 99; }
         });
         if (getenv("BW64_GLTRACE"))
             klog_fmt("gl64: GLImmediate init rc=%d (rc%%100: 2=init-ok 3=init-threw "
-                     "+10=matrix +20=vbuf +40=rendererCache fallback; rc/100=matrix.length)", gli);
+                     "+4=quadIndexBuf +10=matrix +20=vbuf +40=rendererCache fallback; "
+                     "rc/100=matrix.length)", gli);
         klog_fmt("gl64: host GL up (WebGL2) — vendor='%s' renderer='%s' version='%s'",
                  (const char*)glGetString(GL_VENDOR),
                  (const char*)glGetString(GL_RENDERER),
@@ -797,8 +897,46 @@ U64 gl64Bridge(CPU64* cpu, U64 fnId, U64 argsAddr) {
                     // block or the depth test runs against the wrong target and
                     // the cube loses hidden-surface removal.
                     if (g_emFbo) glBindFramebuffer(GL_FRAMEBUFFER, g_emFbo);
+                    // GL_QUADS needs an index buffer at the point of consumption.
+                    // glemu's flush triangulates a GL_QUADS (mode 7) block by binding
+                    // GL.currentContext.tempQuadIndexBuffer (a precomputed
+                    // 0 1 2, 0 2 3, 4 5 6,… index buffer) and drawElements(TRIANGLES).
+                    // Our bridge's context was created via emscripten_webgl_create_context
+                    // (generateTempBuffers(false) path), so that buffer is NOT created at
+                    // init (confirmed: the init rc never set the quad-buffer bit). Without
+                    // it glemu binds element-array 0 → garbage indices. Build it once here,
+                    // on the exact GL.currentContext glemu reads, the first time we draw.
+                    if (mode == GL_QUADS) {
+                        EM_ASM({
+                            try {
+                                if (typeof GL === 'undefined' || !GL.currentContext) return;
+                                if (GL.currentContext.tempQuadIndexBuffer) return;
+                                if (typeof GLctx === 'undefined' || !GLctx.createBuffer ||
+                                    !GL.MAX_TEMP_BUFFER_SIZE) return;
+                                var qb = GLctx.createBuffer();
+                                var saved = GLctx.getParameter(GLctx.ELEMENT_ARRAY_BUFFER_BINDING);
+                                GLctx.bindBuffer(GLctx.ELEMENT_ARRAY_BUFFER, qb);
+                                var n = GL.MAX_TEMP_BUFFER_SIZE >> 1;
+                                var qa = new Uint16Array(n);
+                                var qi = 0;
+                                var qv = 0;
+                                while (1) {
+                                    qa[qi++] = qv;     if (qi >= n) break;
+                                    qa[qi++] = qv + 1; if (qi >= n) break;
+                                    qa[qi++] = qv + 2; if (qi >= n) break;
+                                    qa[qi++] = qv;     if (qi >= n) break;
+                                    qa[qi++] = qv + 2; if (qi >= n) break;
+                                    qa[qi++] = qv + 3; if (qi >= n) break;
+                                    qv += 4;
+                                }
+                                GLctx.bufferData(GLctx.ELEMENT_ARRAY_BUFFER, qa, GLctx.STATIC_DRAW);
+                                GLctx.bindBuffer(GLctx.ELEMENT_ARRAY_BUFFER, saved || null);
+                                GL.currentContext.tempQuadIndexBuffer = qb;
+                            } catch (e) {}
+                        });
+                    }
                     glBegin(mode);
-                    for (const ImmOp& op : g_immOps) replayImmOp(op);
+                    replayImmBlock(g_immOps);
                     glEnd();
                     // TEMP one-shot depth diagnostic (gated on BW64_GLTRACE): report
                     // the actual depth state on the bound FBO at draw time so we can
@@ -839,6 +977,14 @@ U64 gl64Bridge(CPU64* cpu, U64 fnId, U64 argsAddr) {
                             // inside (), and one declaration per statement.
                             EM_ASM({
                                 try {
+                                    // GL_QUADS triangulation buffer check: if this is
+                                    // undefined while glcube draws GL_QUADS (mode 7),
+                                    // glemu binds element-array 0 and the cube comes out
+                                    // as scrambled rotating triangles.
+                                    if (typeof GL !== 'undefined' && GL.currentContext)
+                                        console.log('gl64 QUADDBG: tempQuadIndexBuffer=' +
+                                            (GL.currentContext.tempQuadIndexBuffer ? 'present' : 'MISSING') +
+                                            ' immMode=' + (typeof GLImmediate !== 'undefined' ? GLImmediate.mode : 'NA'));
                                     if (typeof GLImmediate === 'undefined') { console.log('gl64 MTXDBG: no GLImmediate'); return; }
                                     var m = GLImmediate.matrix;
                                     var mm = GLImmediate.currentMatrix;
