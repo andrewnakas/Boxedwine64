@@ -189,18 +189,43 @@
         });
     }
 
+    // Wait until the Emscripten runtime's FS is actually available. preRun runs
+    // before main(), but with -pthread/PROXY_TO_PTHREAD the FS object isn't always
+    // populated on window.Module the instant a zip fetch resolves — so a fast
+    // fetch (cache hit) can reach createDataFile before Module.FS exists, giving
+    // "undefined is not an object (evaluating 'Module.FS.createDataFile')". Poll
+    // briefly for FS (or the FS_createDataFile helper export) before writing.
+    function whenFsReady() {
+        return new Promise(function (resolve, reject) {
+            var waited = 0, STEP = 30, LIMIT = 30000;
+            (function poll() {
+                var M = window.Module;
+                if (M && M.FS && typeof M.FS.createDataFile === "function") return resolve(M.FS);
+                // Some builds only expose the FS_createDataFile helper, not FS.* —
+                // accept that too (we wrap it to the same call shape below).
+                if (M && typeof M.FS_createDataFile === "function") return resolve(null);
+                waited += STEP;
+                if (waited >= LIMIT) return reject(new Error("Module.FS never became ready (" + LIMIT + "ms)"));
+                setTimeout(poll, STEP);
+            })();
+        });
+    }
+
     function dropBytesIntoVfs(name, bytes) {
-        try {
-            Module.FS.createDataFile("/", name, bytes, true, true);
-        } catch (e) {
-            console.log("createDataFile " + name + " failed: " + e);
-            throw e;
-        }
-        // Cache the bytes so a later in-page relaunch (launchApp) can skip the
-        // network entirely and just re-drop them into the fresh instance's VFS.
-        zipCache[name] = bytes;
-        console.log("loaded " + name + " (" + bytes.length + " bytes) into VFS");
-        return bytes.length;
+        return whenFsReady().then(function (FS) {
+            try {
+                if (FS) FS.createDataFile("/", name, bytes, true, true);
+                else window.Module.FS_createDataFile("/", name, bytes, true, true);
+            } catch (e) {
+                console.log("createDataFile " + name + " failed: " + e);
+                throw e;
+            }
+            // Cache the bytes so a later in-page relaunch (launchApp) can skip the
+            // network entirely and just re-drop them into the fresh instance's VFS.
+            zipCache[name] = bytes;
+            console.log("loaded " + name + " (" + bytes.length + " bytes) into VFS");
+            return bytes.length;
+        });
     }
 
     // --- fetch a zip into the Emscripten VFS with progress -------------------
@@ -218,8 +243,7 @@
         if (zipCache[name]) {
             var cached = zipCache[name];
             if (onProgress) onProgress(name, cached.length, cached.length);
-            dropBytesIntoVfs(name, cached);
-            return Promise.resolve(cached.length);
+            return dropBytesIntoVfs(name, cached);
         }
         // Whole-file path. If it 404s (e.g. on GitHub Pages, where wine64.zip is
         // shipped only as split parts), transparently fall back to chunked — so
