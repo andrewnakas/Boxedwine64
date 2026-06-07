@@ -221,12 +221,25 @@
             dropBytesIntoVfs(name, cached);
             return Promise.resolve(cached.length);
         }
+        // Whole-file path. If it 404s (e.g. on GitHub Pages, where wine64.zip is
+        // shipped only as split parts), transparently fall back to chunked — so
+        // the page works regardless of whether ?chunked=1 was on the URL. Explicit
+        // ?chunked=1 skips straight to the chunked path.
         if (!CHUNKED) {
             return fetchBytes(BASE + name, name, onProgress).then(function (bytes) {
                 return dropBytesIntoVfs(name, bytes);
+            }).catch(function (err) {
+                var msg = "" + (err && err.message ? err.message : err);
+                if (msg.indexOf("HTTP 404") === -1) throw err; // a real error, not "missing whole zip"
+                console.log(name + ": whole zip not found (404) — falling back to chunked parts");
+                return fetchChunked(name, onProgress);
             });
         }
-        // Chunked: read the manifest, then pull and stitch the parts.
+        return fetchChunked(name, onProgress);
+    }
+
+    // Chunked: read the manifest, then pull and stitch the parts into <name>.
+    function fetchChunked(name, onProgress) {
         return fetch(BASE + name + ".manifest.json").then(function (resp) {
             if (!resp.ok) throw new Error("fetch " + name + ".manifest.json -> HTTP " + resp.status);
             return resp.json();
@@ -670,9 +683,21 @@
     // --- first boot from the page load --------------------------------------
     setStatusText("Loading wine64 (WASM)...");
     window.onerror = function (msg, file, line, col, error) {
-        setStatusText("Exception — see console");
-        console.error(msg, file, line, col, error);
+        // Surface as much as the browser gives us. Cross-origin / opaque errors
+        // arrive as the bare string "Script error." with a null error object —
+        // when that happens, say so explicitly instead of a blank console line.
+        var detail = (error && error.stack) ? error.stack
+                   : (msg && msg !== "Script error.") ? (msg + (file ? " @ " + file + ":" + line + ":" + col : ""))
+                   : "opaque error (no detail available — usually a cross-origin script error or a wasm abort logged separately above)";
+        setStatusText("Exception: " + (typeof msg === "string" ? msg : "see console"));
+        console.error("wine64-launcher window.onerror:", detail, { msg: msg, file: file, line: line, col: col, error: error });
     };
+    window.addEventListener("unhandledrejection", function (ev) {
+        // A rejected promise in the boot chain (e.g. the rootfs fetch) otherwise
+        // shows up only as the vague onerror. Log the real reason.
+        console.error("wine64-launcher unhandledrejection:", ev.reason);
+        setStatusText("Boot failed: " + (ev.reason && ev.reason.message ? ev.reason.message : ev.reason));
+    });
     if (window.setActiveApp) try { window.setActiveApp(PROG || "--version"); } catch (e) {}
     bootWine();
 })();
