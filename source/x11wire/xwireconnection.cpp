@@ -525,6 +525,20 @@ void XWireConnection::processOneRequest(const uint8_t* req, uint32_t len) {
                     ew = it->second.width  ? it->second.width  : screenWidth;
                     eh = it->second.height ? it->second.height : screenHeight;
                     found = true;
+                    // Persistent-session app switch: adopt the NEW app's window as
+                    // the canvas base at MAP time. (Doing this only in the PutImage
+                    // path misses GL apps like glcube, which render via OpenGL/
+                    // glReadPixels and never PutImage their window — so the cube
+                    // stayed composited beside Notepad.) The just-assigned serial
+                    // is > adoptArmSerial, so this is the new app, not the still-
+                    // running previous app. One-shot.
+                    if (srv.adoptNextWindowAsBase && !it->second.overrideRedirect &&
+                        it->second.mapSerial > srv.adoptArmSerial) {
+                        srv.presentWindow = wid;
+                        srv.adoptNextWindowAsBase = false;
+                        klog_fmt("XWire: adopted window 0x%x (serial %llu) as new base (app switch, on map)",
+                                 wid, (unsigned long long)it->second.mapSerial);
+                    }
                 }
             }
             if (found) {
@@ -1593,8 +1607,25 @@ void XWireConnection::blitPutImage(uint32_t drawable, uint8_t format, uint8_t de
     // The first window an app draws into becomes the base; thereafter the LARGEST
     // non-override-redirect window wins (the main client area, not a tiny menu/
     // tooltip popup that also PutImages). Overlays go on top via composeAndPresent.
-    if (srv.presentWindow == 0) {
+    if (srv.adoptNextWindowAsBase && !win.overrideRedirect &&
+        win.mapSerial > srv.adoptArmSerial) {
+        // Persistent-session app switch: the NEW app's first real window (mapped
+        // after the switch was armed, so its serial is newer than the still-
+        // running previous app's window) forcibly becomes the base, regardless of
+        // size, so the canvas switches to the newly launched app without killing
+        // the previous one. One-shot.
         srv.presentWindow = drawable;
+        srv.adoptNextWindowAsBase = false;
+        // This is the PutImage path — only GDI apps reach it (GL apps render via
+        // the gl64 bridge and never PutImage their window). So a GDI app is now the
+        // base: drop any foreground-GL claim so a still-running background glcube
+        // can't paint over it.
+        srv.glPresentDrawable = 0;
+        klog_fmt("XWire: adopted window 0x%x (serial %llu) as new base (app switch)",
+                 drawable, (unsigned long long)win.mapSerial);
+    } else if (srv.presentWindow == 0) {
+        srv.presentWindow = drawable;
+        srv.glPresentDrawable = 0;  // GDI app taking the base (PutImage path)
     } else if (drawable != srv.presentWindow && !win.overrideRedirect) {
         auto pit = srv.windows.find(srv.presentWindow);
         uint32_t curArea = (pit != srv.windows.end())

@@ -64,12 +64,17 @@
 
 // --- captured session context -------------------------------------------------
 // StartUpArgs::apply() (the boot path) fills these once, so later spawns reuse
-// the exact working dir / uids the first process booted with. The env for each
-// spawned app is passed fresh from JS (HOME / WINEPREFIX / WINESERVER / ...),
-// because that's what the launcher already computes per app.
+// the EXACT working dir / uids / env the first (booted) process ran with. Reusing
+// the captured boot env is important: a spawned app must get the identical wine
+// environment (HOME, WINEPREFIX, WINESERVER, WINEDLLPATH, PATH, USER, …) the boot
+// app got, or wine inside it can't find the prefix / wineserver socket and hangs
+// after connecting to X11 (observed: glcube stalled with only envc=6 vs the boot
+// app's envc=16). So the bridge ignores any env passed from JS and always uses
+// g_sessionCtx.env.
 struct Wine64SessionCtx {
     std::atomic<bool> valid{false};
     BString workingDir;
+    std::vector<BString> env;
     int userId = 0;
     int groupId = 0;
     int effectiveUserId = 0;
@@ -102,10 +107,12 @@ static void pendingLockAcquire() { while (g_pendingLock.test_and_set(std::memory
 static void pendingLockRelease() { g_pendingLock.clear(std::memory_order_release); }
 
 // Called from StartUpArgs::apply() right before doMainLoop so the spawn bridge
-// has the same launch parameters the boot process used.
-void bw64SessionRememberContext(const BString& workingDir, int userId, int groupId,
+// has the same launch parameters (incl. the FULL env) the boot process used.
+void bw64SessionRememberContext(const BString& workingDir, const std::vector<BString>& env,
+                                int userId, int groupId,
                                 int effectiveUserId, int effectiveGroupId, U32 bootPid) {
     g_sessionCtx.workingDir = workingDir;
+    g_sessionCtx.env = env;
     g_sessionCtx.userId = userId;
     g_sessionCtx.groupId = groupId;
     g_sessionCtx.effectiveUserId = effectiveUserId;
@@ -156,7 +163,9 @@ static void doSpawn(const Wine64Req& req) {
     KThread* saved = KThread::currentThread();
     {
         KProcessPtr process = KProcess::create();
-        KThread* thread = process->startProcess(g_sessionCtx.workingDir, req.argv, req.env,
+        // Always use the captured BOOT env (not req.env) so a spawned app gets
+        // the identical wine environment the boot app had — see Wine64SessionCtx.
+        KThread* thread = process->startProcess(g_sessionCtx.workingDir, req.argv, g_sessionCtx.env,
                                                 g_sessionCtx.userId, g_sessionCtx.groupId,
                                                 g_sessionCtx.effectiveUserId,
                                                 g_sessionCtx.effectiveGroupId);

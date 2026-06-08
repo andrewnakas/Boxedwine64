@@ -101,13 +101,20 @@ void XWireServer::composeAndPresent() {
         // at host (0,0), so an overlay at root (ox,oy) lands at host (ox-baseX,
         // oy-baseY).
         int baseX = base.x, baseY = base.y;
+        uint64_t baseSerial = base.mapSerial;
 
         // Gather mapped overlay windows (anything mapped + drawn that isn't the
         // base or the root), oldest-mapped first so newer menus land on top.
+        // EXCLUDE windows mapped BEFORE the base (older serial): those belong to a
+        // previously-launched app that's still running in the persistent session.
+        // Compositing them would draw the old app (e.g. Notepad) on top of/beside
+        // the new base (e.g. glcube). The current app's own popups/menus map
+        // after its main window, so serial >= baseSerial keeps them.
         for (auto& kv : windows) {
             XWireWindow& w = kv.second;
             if (kv.first == baseId || w.isRoot) continue;
             if (!w.mapped || w.fb.empty() || !w.fbW || !w.fbH) continue;
+            if (w.mapSerial < baseSerial) continue; // window from an older app
             overlays.push_back({ (int)w.x - baseX, (int)w.y - baseY,
                                  w.fbW, w.fbH, w.fb, w.textFb, w.mapSerial });
         }
@@ -154,15 +161,23 @@ void XWireServer::composeAndPresent() {
 
 void XWireServer::resetForAppSwitch() {
     std::lock_guard<std::mutex> lk(regMutex);
-    // Only clear the base selection — do NOT wipe the window registry. The
-    // previous app's windows are removed when its X11 connection closes (after we
-    // SIGTERM it); the NEW app's window must survive. With presentWindow=0 the
-    // next composeAndPresent re-elects the base from whatever windows remain
-    // (the new app's), so the canvas switches to it. (Wiping all windows here
-    // would also delete the new app's just-mapped window, leaving a blank canvas
-    // since the app won't re-map it.)
-    presentWindow = 0;
-    klog("XWire: reset for app switch (presentWindow=0; re-elect base)");
+    // Arm "adopt the next app window as the base". We do NOT kill the previous
+    // app and do NOT wipe windows — a wine client's mid-session teardown crashes
+    // the WASM runtime (observed: WebAssembly.Exception + wineserver "Transport
+    // endpoint is not connected"). Instead the previous app keeps running
+    // (invisible) and the next REAL window the new app draws becomes the canvas.
+    adoptNextWindowAsBase = true;
+    // Only adopt a window mapped AFTER now, so the new app's fresh window wins
+    // over the still-running previous app's existing window (older serial).
+    adoptArmSerial = mapSerialCounter;
+    // Drop any foreground-GL claim: the app being switched away from may be a
+    // still-running GL app (glcube) that keeps swapping buffers. Clearing this
+    // means its frames are filtered out until/unless the NEW app is itself GL and
+    // re-claims via glXMakeCurrent. Prevents a background cube painting over the
+    // GDI app the user just switched to.
+    glPresentDrawable = 0;
+    klog_fmt("XWire: app switch armed (adopt next window mapped after serial %llu; previous app left running)",
+             (unsigned long long)adoptArmSerial);
 }
 
 // Free-function shim so the persistent-session bridge (wine64session.cpp) can

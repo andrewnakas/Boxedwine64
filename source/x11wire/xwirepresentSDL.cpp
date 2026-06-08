@@ -200,6 +200,21 @@ class XWirePresentSinkSDL : public XWirePresentSink {
 public:
     void submitFrame(uint32_t window, uint16_t width, uint16_t height,
                      const uint8_t* pixels, uint32_t pitch) override {
+        // Only present frames for the app the user switched to. In a persistent
+        // session multiple apps run at once and each calls submitFrame with its own
+        // window id; without this filter the host screen flips between them every
+        // frame (size oscillation + both apps visible). Accept a frame whose window
+        // matches the current base (GDI apps, via composeAndPresent) OR the
+        // foreground GL app's drawable (GL apps render via the gl64 bridge and
+        // submit under their GLX drawable id, which is a DIFFERENT X resource id
+        // than the window they mapped — see XWireServer::glPresentDrawable). Drop
+        // everything else so a background app can't paint over the foreground one.
+        // (presentWindow==0 only before the first app maps — accept then so the
+        // very first frame isn't dropped.)
+        XWireServer& srv = XWireServer::instance();
+        uint32_t base = srv.presentWindow;
+        uint32_t gl = srv.glPresentDrawable;
+        if (window && base && window != base && (!gl || window != gl)) return;
         std::lock_guard<std::mutex> lk(mtx);
         if (pendingW != width || pendingH != height) {
             pending.assign((size_t)width * height * 4, 0);
@@ -216,6 +231,13 @@ public:
     }
 
     void onWindowMapped(uint32_t window, uint16_t width, uint16_t height) override {
+        // Same base-window filter as submitFrame (incl. the GL drawable): only
+        // resize the host screen for the current app, or the two apps' sizes thrash
+        // (721x519 <-> 480x360).
+        XWireServer& srv = XWireServer::instance();
+        uint32_t base = srv.presentWindow;
+        uint32_t gl = srv.glPresentDrawable;
+        if (window && base && window != base && (!gl || window != gl)) return;
         std::lock_guard<std::mutex> lk(mtx);
         wantW = width;
         wantH = height;
@@ -300,6 +322,28 @@ public:
         if (!frame.empty() && fw && fh) {
             // First real guest frame — retire the loading screen.
             KSystem::bootProgressPercent = -1;
+
+            // App-switch stale-pixel fix: when switching apps the new frame is a
+            // different size/window than the previous app's last frame, and the
+            // present sink blits everything through window id 0 (putBitsOnWnd
+            // RenderCopy's into the renderer backbuffer without clearing it). The
+            // new app (e.g. glcube at 480x360) only overwrites its own region, so
+            // the previous app's larger frame (e.g. notepad 721x519) survives in
+            // the margins → split-screen look. When the presented frame's size
+            // changes, arm a few clears: SDL double-buffers RenderPresent, so we
+            // must SDL_RenderClear BOTH backbuffers (hence a small countdown, not
+            // a single clear) before blitting so no stale margin survives.
+            uint32_t base = XWireServer::instance().presentWindow;
+            if (fw != lastPresentW || fh != lastPresentH || base != lastPresentWindow) {
+                clearFrames = 3;            // flush both swap buffers (+1 slack)
+                lastPresentW = fw;
+                lastPresentH = fh;
+                lastPresentWindow = base;
+            }
+            if (clearFrames > 0) {
+                screen->clear();            // SDL_RenderClear the backbuffer
+                clearFrames--;
+            }
             screen->putBitsOnWnd(0, frame.data(), 32, (U32)fw * 4, 0, 0, fw, fh, nullptr, true);
             screen->present();
             if (getenv("BW64_XWIRE")) {
@@ -379,6 +423,9 @@ private:
     std::deque<XWireInputEvent> inputQ;
     int lastX = 0, lastY = 0;
     uint16_t shownW = 0, shownH = 0;     // last size pushed to the host screen
+    uint16_t lastPresentW = 0, lastPresentH = 0; // last frame size actually blitted
+    uint32_t lastPresentWindow = 0;      // present window at last blit (app-switch detect)
+    int clearFrames = 0;                 // remaining backbuffer clears after a size/app change
     bool loadingShown = false;           // loading-screen window sized/shown once
     int lastShownPct = -1, creep = 0;    // loading-bar anti-freeze jitter
     std::atomic<bool> inputPending{false}; // lock-free "queue non-empty" flag

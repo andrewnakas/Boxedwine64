@@ -108,6 +108,32 @@ public:
     std::mutex regMutex;
     std::unordered_map<uint32_t, XWireWindow> windows;
     uint32_t presentWindow = 0;     // base window composited under any overlays
+    // Persistent-session app switch: when set, the next real (non-override-
+    // redirect) window whose mapSerial is NEWER than adoptArmSerial is forcibly
+    // adopted as the base presentWindow, regardless of size. Gating on mapSerial
+    // ensures we adopt the NEW app's freshly-mapped window — not the still-running
+    // previous app's existing window repainting (which has an older serial). This
+    // switches the canvas to a newly launched app WITHOUT killing the previous one
+    // (whose mid-session teardown crashes the runtime). Cleared once a window is
+    // adopted. Guarded by regMutex.
+    bool adoptNextWindowAsBase = false;
+    uint64_t adoptArmSerial = 0;
+
+    // GL foreground drawable. A GL app (e.g. glcube) renders via the gl64 bridge
+    // and presents readback frames tagged with its GLX *drawable* id, which is a
+    // DIFFERENT X resource id than the X11 *window* the same app maps (winex11
+    // opens a separate X connection per thread; the drawable resolves on one, the
+    // MapWindow arrives on another). So the present-sink's "window == presentWindow"
+    // filter would drop every GL frame (the "stale Notepad / no cube" bug). The
+    // gl64 bridge publishes its current drawable here on glXMakeCurrent; the sink
+    // accepts a frame whose window matches EITHER presentWindow (GDI apps) OR this
+    // (the foreground GL app). Cleared when a GDI window is adopted as the base or
+    // on app-switch arm, so a still-running background GL app can't paint over the
+    // GDI app the user switched to. 0 = no GL app is foreground. Guarded by regMutex
+    // for writes from connection threads; the gl64 bridge sets it directly (single
+    // writer at MakeCurrent time) and the sink reads it racily (benign: worst case
+    // one stale frame).
+    uint32_t glPresentDrawable = 0;
 
     // GC id -> graphics context (foreground/background/font for core-text). Font
     // id -> name (all map to the single builtin 5x7 font for now). Both guarded

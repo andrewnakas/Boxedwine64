@@ -721,46 +721,18 @@
         console.warn("session: spawn of " + (label || argvArray.join(" ")) + " did not schedule (r=" + r + ")");
         return false;
     }
-    // Switch to `prog` IN-SESSION. Order matters: SPAWN the new app FIRST and let
-    // it come up, THEN reset the present window + kill the old app. Killing the
-    // old app *while* the new one connects to the shared wineserver raced the
-    // wineserver teardown against the new client's startup and wedged the new app
-    // before it ever created its X11 window (observed: glcube stalled after
-    // fontconfig, no X11 connect). Spawn-first also keeps a live frame on the
-    // canvas the whole time (no blank gap).
+    // Switch to `prog` IN-SESSION, the SAFE way: arm "adopt the next app window
+    // as the canvas base", then spawn the new app. We do NOT kill the previous
+    // app — a wine client's mid-session teardown crashes the whole WASM runtime
+    // (observed: WebAssembly.Exception in a worker + wineserver "Transport
+    // endpoint is not connected" right after SIGTERM). Instead the previous app
+    // keeps running invisibly; when the new app draws its first real window the
+    // XWire server makes that window the base, so the canvas switches to it.
     function spawnIntoSession(prog) {
-        var oldPid = currentAppPid;
-        // 1. Spawn the new app into the running wine.
-        var pidBefore = lastSpawnedPid();
+        // Arm the adopt-next-window switch BEFORE spawning, so the new app's very
+        // first window is the one adopted (not some late repaint of the old app).
+        try { callExport("bw64_reset_present", [], []); } catch (e) {}
         if (!spawnArgv(wineProgArgv(prog), prog)) return false;
-        // 2. Wait for the new app's pid, then give it time to create + map its
-        //    window before tearing the old one down.
-        var waited = 0, STEP = 80, LIMIT = 8000;
-        (function pollPid() {
-            var pid = lastSpawnedPid();
-            if (pid && pid !== pidBefore) {
-                currentAppPid = pid;
-                // The new app is scheduled. Let it boot + map its window (so the
-                // canvas keeps showing the old app until the new one is ready),
-                // THEN close the old app, and once its X11 windows are gone clear
-                // the base so composeAndPresent re-elects the new app's window.
-                // Sequencing kill before reset (with a gap) keeps the new client's
-                // wineserver startup clear of the old client's teardown.
-                setTimeout(function () {
-                    if (oldPid && oldPid !== pid) {
-                        callExport("bw64_kill", ["number"], [oldPid]);
-                    }
-                    // After the old app's connection tears down its windows,
-                    // re-elect the base from the remaining (new app's) windows.
-                    setTimeout(function () {
-                        try { callExport("bw64_reset_present", [], []); } catch (e) {}
-                    }, 800);
-                }, 4000);
-                return;
-            }
-            waited += STEP;
-            if (waited < LIMIT) setTimeout(pollPid, STEP);
-        })();
         return true;
     }
     // Once the kernel is up: remember the boot app as the current app, then pin

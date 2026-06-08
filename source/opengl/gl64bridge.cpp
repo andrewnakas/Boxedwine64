@@ -32,6 +32,7 @@
 #include "cpu64.h"
 #include "kmemory64.h"
 #include "../x11wire/xwirepresent.h"
+#include "../x11wire/xwireserver.h"
 
 #include <SDL.h>
 #ifdef __EMSCRIPTEN__
@@ -679,6 +680,14 @@ U64 gl64Bridge(CPU64* cpu, U64 fnId, U64 argsAddr) {
             // glXMakeContextCurrent(draw, read, ctx)   -> a[0]=draw
             if (!ensureContext()) return 0;
             g_currentDrawable = (U32)args.a[0];
+            // Claim the present slot for this GL app. Its readback frames are
+            // tagged with this drawable id (not the X11 window it maps), so the
+            // present sink's window filter needs to know the drawable belongs to
+            // the foreground app — otherwise every cube frame is dropped and the
+            // canvas stays stuck on the previous (GDI) app. A fresh glcube is
+            // spawned on each switch-to-GL, so this re-claims correctly; switching
+            // to a GDI app clears it again (see XWireServer GDI-adopt paths).
+            XWireServer::instance().glPresentDrawable = g_currentDrawable;
 #ifndef __EMSCRIPTEN__
             SDL_GL_MakeCurrent(g_hiddenWindow, g_glContext);
 #endif

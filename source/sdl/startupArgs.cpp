@@ -22,7 +22,8 @@
 #if defined(__EMSCRIPTEN__) && defined(BOXEDWINE_MULTI_THREADED) && defined(BOXEDWINE_GUEST_X64)
 // Persistent in-browser wine session (source/sdl/emscripten/wine64session.cpp):
 // remember the boot launch params so later in-session app spawns reuse them.
-void bw64SessionRememberContext(const BString& workingDir, int userId, int groupId,
+void bw64SessionRememberContext(const BString& workingDir, const std::vector<BString>& env,
+                                int userId, int groupId,
                                 int effectiveUserId, int effectiveGroupId, U32 bootPid);
 #endif
 
@@ -624,7 +625,7 @@ bool StartUpArgs::apply() {
         // can spawn further apps into THIS running kernel (persistent wine
         // session) without reloading, and close the boot app on the first switch.
         // See wine64session.cpp.
-        bw64SessionRememberContext(this->workingDir, this->userId, this->groupId,
+        bw64SessionRememberContext(this->workingDir, this->envValues, this->userId, this->groupId,
                                    this->effectiveUserId, this->effectiveGroupId, bootPid);
 #endif
         if (result) {
