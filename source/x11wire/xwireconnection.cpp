@@ -469,6 +469,10 @@ void XWireConnection::processOneRequest(const uint8_t* req, uint32_t len) {
             w.width = rd16(req + 16);
             w.height = rd16(req + 18);
             applyWindowValues(w, rd32(req + 28), req + 32);
+            // Stamp the creating connection's resource-id base so the app-switch
+            // adopt logic can tell the freshly spawned app's windows apart from a
+            // still-running previous app's (whose base was allocated earlier).
+            w.ownerClientBase = clientIdBase;
             {
                 XWireServer& srv = XWireServer::instance();
                 std::lock_guard<std::mutex> lk(srv.regMutex);
@@ -532,12 +536,22 @@ void XWireConnection::processOneRequest(const uint8_t* req, uint32_t len) {
                     // stayed composited beside Notepad.) The just-assigned serial
                     // is > adoptArmSerial, so this is the new app, not the still-
                     // running previous app. One-shot.
+                    // Adopt as the new canvas base ONLY if this window belongs to
+                    // a connection opened AFTER the switch was armed (the freshly
+                    // spawned app). The still-running previous app keeps mapping
+                    // and repainting its own windows — they get fresh mapSerials
+                    // too, so a serial gate alone let the OLD app re-win the base
+                    // (observed: launching Snake showed Minesweeper). Its
+                    // connections were all allocated before the arm, so their
+                    // ownerClientBase < adoptArmClientBase and they're skipped.
                     if (srv.adoptNextWindowAsBase && !it->second.overrideRedirect &&
+                        it->second.ownerClientBase >= srv.adoptArmClientBase &&
                         it->second.mapSerial > srv.adoptArmSerial) {
                         srv.presentWindow = wid;
                         srv.adoptNextWindowAsBase = false;
-                        klog_fmt("XWire: adopted window 0x%x (serial %llu) as new base (app switch, on map)",
-                                 wid, (unsigned long long)it->second.mapSerial);
+                        klog_fmt("XWire: adopted window 0x%x (owner base 0x%x >= arm 0x%x, serial %llu) as new base (app switch, on map)",
+                                 wid, it->second.ownerClientBase, srv.adoptArmClientBase,
+                                 (unsigned long long)it->second.mapSerial);
                     }
                 }
             }
@@ -1608,12 +1622,14 @@ void XWireConnection::blitPutImage(uint32_t drawable, uint8_t format, uint8_t de
     // non-override-redirect window wins (the main client area, not a tiny menu/
     // tooltip popup that also PutImages). Overlays go on top via composeAndPresent.
     if (srv.adoptNextWindowAsBase && !win.overrideRedirect &&
+        win.ownerClientBase >= srv.adoptArmClientBase &&
         win.mapSerial > srv.adoptArmSerial) {
-        // Persistent-session app switch: the NEW app's first real window (mapped
-        // after the switch was armed, so its serial is newer than the still-
-        // running previous app's window) forcibly becomes the base, regardless of
-        // size, so the canvas switches to the newly launched app without killing
-        // the previous one. One-shot.
+        // Persistent-session app switch: the NEW app's first real window (created
+        // by a connection opened after the switch was armed, so ownerClientBase is
+        // at/above the arm watermark — NOT the still-running previous app, whose
+        // connections were all allocated earlier) forcibly becomes the base,
+        // regardless of size, so the canvas switches to the newly launched app
+        // without killing the previous one. One-shot.
         srv.presentWindow = drawable;
         srv.adoptNextWindowAsBase = false;
         // This is the PutImage path — only GDI apps reach it (GL apps render via

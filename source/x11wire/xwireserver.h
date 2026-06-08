@@ -64,6 +64,15 @@ struct XWireWindow {
     // Monotonic map order so the compositor stacks later-mapped windows on top
     // (a freshly-opened menu draws over everything below it).
     uint64_t mapSerial = 0;
+    // Resource-id base of the X connection that CREATED this window. Connection
+    // bases are allocated monotonically (allocClientIdBase), so a window's owner
+    // base uniquely identifies which app/connection-generation it belongs to.
+    // The app-switch adopt logic uses this to adopt ONLY a window owned by a
+    // connection opened AFTER the switch was armed (i.e. the newly spawned app) —
+    // a mapSerial gate alone is not enough, because the still-running previous app
+    // keeps mapping/repainting windows that also get fresh serials and could
+    // otherwise re-win the base. 0 = unknown/server-owned (e.g. the root).
+    uint32_t ownerClientBase = 0;
     // X cursor associated with this window via CWCursor (0 = none/inherit). The
     // host shows this shape while the pointer is over the window.
     uint32_t cursor = 0;
@@ -109,15 +118,26 @@ public:
     std::unordered_map<uint32_t, XWireWindow> windows;
     uint32_t presentWindow = 0;     // base window composited under any overlays
     // Persistent-session app switch: when set, the next real (non-override-
-    // redirect) window whose mapSerial is NEWER than adoptArmSerial is forcibly
-    // adopted as the base presentWindow, regardless of size. Gating on mapSerial
-    // ensures we adopt the NEW app's freshly-mapped window — not the still-running
-    // previous app's existing window repainting (which has an older serial). This
-    // switches the canvas to a newly launched app WITHOUT killing the previous one
-    // (whose mid-session teardown crashes the runtime). Cleared once a window is
-    // adopted. Guarded by regMutex.
+    // redirect) window OWNED BY A CONNECTION OPENED AFTER THE ARM (ownerClientBase
+    // >= adoptArmClientBase) is forcibly adopted as the base presentWindow,
+    // regardless of size. The owner-base gate is what ensures we adopt the NEWLY
+    // SPAWNED app's window — not the still-running previous app's window
+    // repainting. (A mapSerial-only gate was not enough: the old app keeps
+    // mapping/repainting its own windows, which get fresh serials too, and so it
+    // could re-win the base — observed as "launching Snake showed Minesweeper".)
+    // This switches the canvas to a newly launched app WITHOUT killing the
+    // previous one (whose mid-session teardown crashes the runtime). Cleared once
+    // a window is adopted. Guarded by regMutex.
     bool adoptNextWindowAsBase = false;
     uint64_t adoptArmSerial = 0;
+    // Resource-id base watermark captured when the switch was armed (== the
+    // server's nextClientBase at arm time). A window is adopted as the new base
+    // ONLY if its ownerClientBase >= this watermark, i.e. it was created by a
+    // connection opened AFTER the arm (the freshly spawned app). This is the real
+    // discriminator that stops the still-running previous app — whose connections
+    // were all allocated BEFORE the arm — from re-winning the base via a late
+    // repaint or popup map. adoptArmSerial is kept only as a tiebreaker/log aid.
+    uint32_t adoptArmClientBase = 0;
 
     // GL foreground drawable. A GL app (e.g. glcube) renders via the gl64 bridge
     // and presents readback frames tagged with its GLX *drawable* id, which is a

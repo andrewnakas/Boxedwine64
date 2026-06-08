@@ -30,6 +30,19 @@ echo "=== done (snake.exe, tetris.exe) ==="
 # --- doom.exe (run once, from a doomgeneric checkout) -----------------------
 # git clone --depth 1 https://github.com/ozkl/doomgeneric
 # cd doomgeneric/doomgeneric
+#
+# REQUIRED PATCH to doomgeneric_win.c DG_Init() before building, or doom.exe
+# dies at startup with "Window Creation Failed!" under Boxedwine's wine64 + the
+# WM-less XWire X server (CreateWindowExA returns NULL). Upstream registers the
+# class and creates the window with hInstance=0 and CW_USEDEFAULT position; wine
+# rejects that here. Two edits (matching the working snake/tetris pattern):
+#   1. add `HINSTANCE hInst = GetModuleHandle(NULL);` and set `wc.hInstance = hInst;`
+#   2. in CreateWindowExA: use position (0, 0) instead of (CW_USEDEFAULT,
+#      CW_USEDEFAULT), and pass hInst for the hInstance arg (9th-from-last).
+# i.e. CreateWindowExA(0, windowClassName, windowTitle, WS_OVERLAPPEDWINDOW,
+#                      0, 0, rect.right-rect.left, rect.bottom-rect.top,
+#                      0, 0, hInst, 0);
+# (Verify: the built doom.exe must import GetModuleHandleA — objdump -p.)
 # SRC="dummy.c am_map.c doomdef.c doomstat.c dstrings.c d_event.c d_items.c \
 #   d_iwad.c d_loop.c d_main.c d_mode.c d_net.c f_finale.c f_wipe.c g_game.c \
 #   hu_lib.c hu_stuff.c info.c i_cdmus.c i_endoom.c i_joystick.c i_scale.c \

@@ -170,6 +170,13 @@ void XWireServer::resetForAppSwitch() {
     // Only adopt a window mapped AFTER now, so the new app's fresh window wins
     // over the still-running previous app's existing window (older serial).
     adoptArmSerial = mapSerialCounter;
+    // The real discriminator: capture the current client-base watermark. Every
+    // connection the newly spawned app opens gets a base >= this; every still-
+    // running previous app's connection has a base < this. So a window is the new
+    // app's iff ownerClientBase >= adoptArmClientBase — independent of how much
+    // the old app keeps remapping/repainting. (nextClientBase is guarded by the
+    // same regMutex we hold here.)
+    adoptArmClientBase = nextClientBase;
     // Drop any foreground-GL claim: the app being switched away from may be a
     // still-running GL app (glcube) that keeps swapping buffers. Clearing this
     // means its frames are filtered out until/unless the NEW app is itself GL and
