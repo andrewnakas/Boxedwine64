@@ -722,14 +722,56 @@ void XWireConnection::processOneRequest(const uint8_t* req, uint32_t len) {
             srv.fonts.erase(fid);
             break;
         }
+        case X_CreatePixmap: {
+            // CreatePixmap(depth, pid, drawable, width, height):
+            //   req[1]=depth, @4 pid (new pixmap id), @8 drawable (parent),
+            //   @12 width, @14 height. Model it as an ARGB8888 fb so a later
+            //   PutImage-into-pixmap + CopyArea-pixmap->window works (DOOM's
+            //   StretchDIBits path). Zero-size pixmaps are tracked but unallocated.
+            uint8_t depth = req[1];
+            uint32_t pid = rd32(req + 4);
+            uint16_t pw = rd16(req + 12);
+            uint16_t ph = rd16(req + 14);
+            XWireServer& srv = XWireServer::instance();
+            std::lock_guard<std::mutex> lk(srv.regMutex);
+            XWirePixmap pm;
+            pm.w = pw; pm.h = ph; pm.depth = depth;
+            if (pw && ph) pm.fb.assign((size_t)pw * ph * 4, 0);
+            srv.pixmaps[pid] = std::move(pm);
+            break;
+        }
+        case X_FreePixmap: {
+            uint32_t pid = rd32(req + 4);
+            XWireServer& srv = XWireServer::instance();
+            std::lock_guard<std::mutex> lk(srv.regMutex);
+            srv.pixmaps.erase(pid);
+            break;
+        }
+        case X_CopyArea: {
+            // CopyArea(src-drawable, dst-drawable, gc, src-x, src-y, dst-x,
+            //          dst-y, width, height):
+            //   @4 src, @8 dst, @12 gc, @16 src-x, @18 src-y, @20 dst-x,
+            //   @22 dst-y, @24 width, @26 height. The case we must handle is
+            //   pixmap -> window (winex11's StretchDIBits/blit-via-pixmap path):
+            //   copy the rect out of the pixmap fb into the destination window's
+            //   fb, then present. Other combinations (win->win, win->pixmap) are
+            //   not produced by the GDI apps we host, so they stay no-ops.
+            uint32_t srcId = rd32(req + 4);
+            uint32_t dstId = rd32(req + 8);
+            int16_t srcX = (int16_t)rd16(req + 16);
+            int16_t srcY = (int16_t)rd16(req + 18);
+            int16_t dstX = (int16_t)rd16(req + 20);
+            int16_t dstY = (int16_t)rd16(req + 22);
+            uint16_t cw = rd16(req + 24);
+            uint16_t ch = rd16(req + 26);
+            copyAreaPixmapToWindow(srcId, dstId, srcX, srcY, dstX, dstY, cw, ch);
+            break;
+        }
         case X_ClearArea:
-        case X_FreePixmap:
         case X_DeleteProperty:
-        case X_CreatePixmap:
         case X_CreateColormap:
         case X_FreeColormap:
         case X_PolyFillRectangle:
-        case X_CopyArea:
         case X_ChangeProperty:
         case X_SetClipRectangles:
         case X_CreateGlyphCursor: {
@@ -1477,32 +1519,37 @@ void XWireConnection::deliverInputEvents() {
             default: continue;
         }
 
-        // Hit-test: route the event to the TOPMOST mapped window under the
-        // cursor, not the global presentWindow. The old code always delivered to
-        // presentWindow (chosen by largest area = the main window), so when a
-        // modal dialog (Save As) opened as a separate, smaller top-level window,
-        // clicks kept going to the main window behind it — the dialog's buttons
-        // never saw the press (keyboard still worked because the dialog grabs
-        // input focus, which is what carries keystrokes). Now an overlay window
-        // whose host rect contains the pointer wins, and the event is translated
-        // into that window's coordinates.
+        // KEYBOARD events follow the FOCUS window (the presented app), not the
+        // pointer. POINTER events (button/motion) hit-test to the topmost mapped
+        // window under the cursor. Mixing the two was the Tetris "no input" bug:
+        // a keyboard-only game got its keys hit-tested to whatever window was
+        // under the (possibly elsewhere) cursor — often nothing or the wrong
+        // window — so KeyPress never reached the game. X semantics: keys go to the
+        // focus window; only pointer events use the cursor position. (The pointer
+        // hit-test still routes a modal dialog's clicks to the dialog, the case it
+        // was added for; keyboard already worked there because the dialog grabs
+        // focus, which is exactly what we now honor for keys.)
+        const bool isKey = (ev.type == XWireInputEvent::EvKeyDown ||
+                            ev.type == XWireInputEvent::EvKeyUp);
         uint32_t target = presentWindow;
         int16_t tgtX = baseX, tgtY = baseY;   // target window root origin
         uint32_t mask = 0;
         {
             std::lock_guard<std::mutex> lk(srv.regMutex);
-            uint64_t bestSerial = 0;
-            for (auto& kv : srv.windows) {
-                XWireWindow& w = kv.second;
-                if (kv.first == presentWindow || w.isRoot) continue;
-                if (!w.mapped || !w.fbW || !w.fbH) continue;
-                int hx0 = (int)w.x - baseX, hy0 = (int)w.y - baseY;   // host rect
-                if (ev.x >= hx0 && ev.x < hx0 + (int)w.fbW &&
-                    ev.y >= hy0 && ev.y < hy0 + (int)w.fbH &&
-                    w.mapSerial >= bestSerial) {
-                    bestSerial = w.mapSerial;
-                    target = kv.first;
-                    tgtX = w.x; tgtY = w.y;
+            if (!isKey) {
+                uint64_t bestSerial = 0;
+                for (auto& kv : srv.windows) {
+                    XWireWindow& w = kv.second;
+                    if (kv.first == presentWindow || w.isRoot) continue;
+                    if (!w.mapped || !w.fbW || !w.fbH) continue;
+                    int hx0 = (int)w.x - baseX, hy0 = (int)w.y - baseY;   // host rect
+                    if (ev.x >= hx0 && ev.x < hx0 + (int)w.fbW &&
+                        ev.y >= hy0 && ev.y < hy0 + (int)w.fbH &&
+                        w.mapSerial >= bestSerial) {
+                        bestSerial = w.mapSerial;
+                        target = kv.first;
+                        tgtX = w.x; tgtY = w.y;
+                    }
                 }
             }
             auto it = srv.windows.find(target);
@@ -1625,9 +1672,45 @@ void XWireConnection::blitPutImage(uint32_t drawable, uint8_t format, uint8_t de
     }
     auto it = srv.windows.find(drawable);
     if (it == srv.windows.end()) {
-        // A pixmap (off-screen drawable) we don't model as a window; ignore for
-        // now — winex11 normally CopyAreas it to the window, which is the path we
-        // present. (CopyArea compositing is a later refinement.)
+        // Not a window — it may be an off-screen PIXMAP. winex11 renders some GDI
+        // ops (StretchDIBits, used by DOOM every frame) by PutImage-ing into a
+        // pixmap and then CopyArea-ing the pixmap onto the window. Store the bits
+        // into the pixmap fb here so the later CopyArea (copyAreaPixmapToWindow)
+        // can blit them to the window. Only ZPixmap (format 2) at depth 24/32 is
+        // the BGRX byte order we present 1:1.
+        auto pit = srv.pixmaps.find(drawable);
+        if (pit != srv.pixmaps.end() && format == 2 && (depth == 24 || depth == 32)) {
+            XWirePixmap& pm = pit->second;
+            // Grow the pixmap fb if this blit reaches past its current extent
+            // (winex11 may create a 0x0 pixmap then size it via the first blit).
+            uint16_t needW = (uint16_t)((dstX > 0 ? dstX : 0) + w);
+            uint16_t needH = (uint16_t)((dstY > 0 ? dstY : 0) + h);
+            if (needW > pm.w || needH > pm.h) {
+                uint16_t nw = needW > pm.w ? needW : pm.w;
+                uint16_t nh = needH > pm.h ? needH : pm.h;
+                std::vector<uint8_t> grown((size_t)nw * nh * 4, 0);
+                for (uint16_t y = 0; y < pm.h; y++)
+                    if (!pm.fb.empty())
+                        memcpy(grown.data() + (size_t)y * nw * 4,
+                               pm.fb.data() + (size_t)y * pm.w * 4,
+                               (size_t)pm.w * 4);
+                pm.fb.swap(grown); pm.w = nw; pm.h = nh;
+            }
+            // Copy each source row (ZPixmap is already BGRX == our fb order) into
+            // the pixmap fb at (dstX,dstY), clipping to the pixmap bounds.
+            const uint32_t srcPitch = (uint32_t)w * 4;
+            for (uint16_t row = 0; row < h; row++) {
+                int py = dstY + row;
+                if (py < 0 || py >= pm.h) continue;
+                int px = dstX; uint16_t copyW = w; uint32_t srcOff = 0;
+                if (px < 0) { srcOff = (uint32_t)(-px) * 4; copyW = (uint16_t)(copyW + px); px = 0; }
+                if (px >= pm.w || copyW == 0) continue;
+                if (px + copyW > pm.w) copyW = (uint16_t)(pm.w - px);
+                if ((size_t)row * srcPitch + srcOff + (size_t)copyW * 4 > dataBytes) break;
+                memcpy(pm.fb.data() + ((size_t)py * pm.w + px) * 4,
+                       data + (size_t)row * srcPitch + srcOff, (size_t)copyW * 4);
+            }
+        }
         return;
     }
     XWireWindow& win = it->second;
@@ -1752,6 +1835,87 @@ void XWireConnection::blitPutImage(uint32_t drawable, uint8_t format, uint8_t de
     }
     // Recompose base + overlays whenever any window draws, so a menu/popup that
     // PutImages into its own (non-base) window still appears on the host.
+    srv.composeAndPresent();
+}
+
+void XWireConnection::copyAreaPixmapToWindow(uint32_t srcId, uint32_t dstId,
+                                             int16_t srcX, int16_t srcY,
+                                             int16_t dstX, int16_t dstY,
+                                             uint16_t w, uint16_t h) {
+    XWireServer& srv = XWireServer::instance();
+    {
+        std::unique_lock<std::mutex> lk(srv.regMutex);
+        auto pit = srv.pixmaps.find(srcId);
+        if (pit == srv.pixmaps.end()) return;          // src not a pixmap we model
+        auto wit = srv.windows.find(dstId);
+        if (wit == srv.windows.end() || wit->second.isRoot) return; // dst not a window
+        XWirePixmap& pm = pit->second;
+        XWireWindow& win = wit->second;
+        if (pm.fb.empty() || !pm.w || !pm.h) return;
+
+        // Ensure the destination window fb is at least big enough for the blit.
+        uint16_t needW = (uint16_t)((dstX > 0 ? dstX : 0) + w);
+        uint16_t needH = (uint16_t)((dstY > 0 ? dstY : 0) + h);
+        uint16_t winW = win.fbW > needW ? win.fbW : needW;
+        uint16_t winH = win.fbH > needH ? win.fbH : needH;
+        if (winW > win.width)  win.width = winW;
+        if (winH > win.height) win.height = winH;
+        if (win.fbW != winW || win.fbH != winH || win.fb.empty()) {
+            std::vector<uint8_t> grown((size_t)winW * winH * 4, 0);
+            for (uint16_t y = 0; y < win.fbH; y++)
+                if (!win.fb.empty())
+                    memcpy(grown.data() + (size_t)y * winW * 4,
+                           win.fb.data() + (size_t)y * win.fbW * 4,
+                           (size_t)win.fbW * 4);
+            win.fb.swap(grown);
+            win.fbW = winW; win.fbH = winH;
+        }
+
+        // Blit the rect from pixmap (srcX,srcY) -> window (dstX,dstY), clipping to
+        // both. Both fbs are ARGB8888 (BGRX byte order) so it's a straight memcpy.
+        for (uint16_t row = 0; row < h; row++) {
+            int sy = srcY + row, dy = dstY + row;
+            if (sy < 0 || sy >= pm.h || dy < 0 || dy >= win.fbH) continue;
+            int sx = srcX, dx = dstX; uint16_t copyW = w;
+            if (sx < 0) { copyW = (uint16_t)(copyW + sx); dx -= sx; sx = 0; }
+            if (dx < 0) { copyW = (uint16_t)(copyW + dx); sx -= dx; dx = 0; }
+            if (copyW == 0 || sx >= pm.w || dx >= win.fbW) continue;
+            if (sx + copyW > pm.w)     copyW = (uint16_t)(pm.w - sx);
+            if (dx + copyW > win.fbW)  copyW = (uint16_t)(win.fbW - dx);
+            if (copyW == 0) continue;
+            memcpy(win.fb.data() + ((size_t)dy * win.fbW + dx) * 4,
+                   pm.fb.data()  + ((size_t)sy * pm.w   + sx) * 4,
+                   (size_t)copyW * 4);
+        }
+
+        // First content into this window: if no base is presented yet (or this is
+        // the app being switched to), adopt it so the present sink shows it. The
+        // PutImage path normally does this, but DOOM only ever CopyAreas, so its
+        // adoption must happen here. Reuse the same gate as the PutImage path.
+        if (srv.adoptNextWindowAsBase && !win.overrideRedirect &&
+            win.ownerClientBase >= srv.adoptArmClientBase &&
+            win.mapSerial > srv.adoptArmSerial) {
+            uint32_t outgoingOwnerBase = 0;
+            auto ob = srv.windows.find(srv.presentWindow);
+            if (ob != srv.windows.end() &&
+                ob->second.ownerClientBase != win.ownerClientBase)
+                outgoingOwnerBase = ob->second.ownerClientBase;
+            srv.presentWindow = dstId;
+            srv.adoptNextWindowAsBase = false;
+            srv.glPresentDrawable = 0;
+            klog_fmt("XWire: adopted window 0x%x as new base (app switch, CopyArea)", dstId);
+            lk.unlock();
+            if (outgoingOwnerBase && srv.unmapAppWindows(outgoingOwnerBase) &&
+                g_xwirePresentSink) {
+                g_xwirePresentSink->requestClear();
+            }
+            srv.composeAndPresent();
+            return;
+        } else if (srv.presentWindow == 0) {
+            srv.presentWindow = dstId;
+            srv.glPresentDrawable = 0;
+        }
+    }
     srv.composeAndPresent();
 }
 

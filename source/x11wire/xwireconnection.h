@@ -127,6 +127,15 @@ private:
                       int16_t dstX, int16_t dstY, uint16_t w, uint16_t h,
                       const uint8_t* data, uint32_t dataBytes);
 
+    // X_CopyArea pixmap->window: copy the (srcX,srcY,w,h) rect out of the source
+    // pixmap's fb into the destination window's fb at (dstX,dstY), then present.
+    // This is winex11's StretchDIBits/blit-via-pixmap path (DOOM renders every
+    // frame this way). No-op if src isn't a known pixmap or dst isn't a window.
+    void copyAreaPixmapToWindow(uint32_t srcId, uint32_t dstId,
+                                int16_t srcX, int16_t srcY,
+                                int16_t dstX, int16_t dstY,
+                                uint16_t w, uint16_t h);
+
     // Render X core text (PolyText/ImageText) into a window's text-overlay buffer
     // using the GC's foreground (and background, for ImageText). y is the X text
     // BASELINE. blitTextItems draws a whole PolyText item list with one lock +

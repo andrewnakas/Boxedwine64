@@ -98,6 +98,19 @@ struct XWireGC {
     uint32_t font = 0;
 };
 
+// An off-screen drawable (X pixmap). winex11 renders some GDI ops (notably
+// StretchDIBits, which DOOM's doomgeneric backend uses every frame) by PutImage-
+// ing the bits into a pixmap and then CopyArea-ing the pixmap onto the window.
+// We model the pixmap as a plain ARGB8888 framebuffer so that PutImage-into-
+// pixmap + CopyArea-pixmap->window reproduces the on-window result. Without this
+// DOOM's frames land in a pixmap we used to throw away (the canvas stayed on the
+// boot splash). Guarded by XWireServer::regMutex like windows.
+struct XWirePixmap {
+    uint16_t w = 0, h = 0;
+    uint8_t depth = 24;
+    std::vector<uint8_t> fb;            // w*h*4 ARGB8888 (0x00RRGGBB)
+};
+
 class XWireServer {
 public:
     static XWireServer& instance();
@@ -160,6 +173,10 @@ public:
     // by regMutex like the window registry.
     std::unordered_map<uint32_t, XWireGC> gcs;
     std::unordered_map<uint32_t, std::string> fonts;
+    // Off-screen drawables (pixmap id -> backing fb). See XWirePixmap. Created by
+    // X_CreatePixmap, filled by X_PutImage when the target is a pixmap, and read
+    // by X_CopyArea pixmap->window. Guarded by regMutex.
+    std::unordered_map<uint32_t, XWirePixmap> pixmaps;
 
     // Monotonic counter handed to XWireWindow.mapSerial on each MapWindow, so the
     // compositor can stack overlays in map order (newest on top).
