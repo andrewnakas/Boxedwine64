@@ -738,6 +738,10 @@ void XWireConnection::processOneRequest(const uint8_t* req, uint32_t len) {
             pm.w = pw; pm.h = ph; pm.depth = depth;
             if (pw && ph) pm.fb.assign((size_t)pw * ph * 4, 0);
             srv.pixmaps[pid] = std::move(pm);
+            // DIAG (ungated, one-shot): confirm DOOM creates pixmaps.
+            static int s_cpDiag = 0;
+            if (s_cpDiag < 4) { s_cpDiag++;
+                klog_fmt("XWire DIAG: CreatePixmap id=0x%x %dx%d depth=%d", (int)pid, (int)pw, (int)ph, (int)depth); }
             break;
         }
         case X_FreePixmap: {
@@ -1679,6 +1683,14 @@ void XWireConnection::blitPutImage(uint32_t drawable, uint8_t format, uint8_t de
         // can blit them to the window. Only ZPixmap (format 2) at depth 24/32 is
         // the BGRX byte order we present 1:1.
         auto pit = srv.pixmaps.find(drawable);
+        // DIAG (ungated, one-shot): is DOOM PutImaging into a pixmap at all?
+        static int s_pmDiag = 0;
+        if (s_pmDiag < 4) {
+            s_pmDiag++;
+            klog_fmt("XWire DIAG: PutImage to non-window drawable=0x%x %dx%d fmt=%d depth=%d isPixmap=%d",
+                     (int)drawable, (int)w, (int)h, (int)format, (int)depth,
+                     (int)(pit != srv.pixmaps.end()));
+        }
         if (pit != srv.pixmaps.end() && format == 2 && (depth == 24 || depth == 32)) {
             XWirePixmap& pm = pit->second;
             // Grow the pixmap fb if this blit reaches past its current extent
@@ -1715,6 +1727,11 @@ void XWireConnection::blitPutImage(uint32_t drawable, uint8_t format, uint8_t de
     }
     XWireWindow& win = it->second;
     if (win.isRoot) return;     // never present the root/desktop background
+
+    // DIAG (ungated, one-shot): is DOOM PutImaging directly to its WINDOW?
+    static int s_winPiDiag = 0;
+    if (s_winPiDiag < 4) { s_winPiDiag++;
+        klog_fmt("XWire DIAG: PutImage to WINDOW=0x%x %dx%d at(%d,%d)", (int)drawable, (int)w, (int)h, (int)dstX, (int)dstY); }
 
     // Track the window's full extent from the blit reach. winex11 tiles the
     // client area in horizontal bands, so the max (dstX+w, dstY+h) across blits
@@ -1845,6 +1862,15 @@ void XWireConnection::copyAreaPixmapToWindow(uint32_t srcId, uint32_t dstId,
     XWireServer& srv = XWireServer::instance();
     {
         std::unique_lock<std::mutex> lk(srv.regMutex);
+        // DIAG (ungated, one-shot): is DOOM's CopyArea firing, and is src a pixmap
+        // we modeled / dst a window we know?
+        static int s_caDiag = 0;
+        if (s_caDiag < 6) {
+            s_caDiag++;
+            klog_fmt("XWire DIAG: CopyArea src=0x%x(pm=%d) dst=0x%x(win=%d) %dx%d",
+                     (int)srcId, (int)(srv.pixmaps.count(srcId)),
+                     (int)dstId, (int)(srv.windows.count(dstId)), (int)w, (int)h);
+        }
         auto pit = srv.pixmaps.find(srcId);
         if (pit == srv.pixmaps.end()) return;          // src not a pixmap we model
         auto wit = srv.windows.find(dstId);
