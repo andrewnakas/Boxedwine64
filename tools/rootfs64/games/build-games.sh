@@ -43,6 +43,30 @@ echo "=== done (snake.exe, tetris.exe) ==="
 #                      0, 0, rect.right-rect.left, rect.bottom-rect.top,
 #                      0, 0, hInst, 0);
 # (Verify: the built doom.exe must import GetModuleHandleA — objdump -p.)
+#
+# REQUIRED PATCH #2 — TIMER/DRAW, or DOOM stalls right after the
+# "I_InitGraphics: Auto-scaling factor: 2" console line and NEVER draws a frame
+# (canvas stuck on the boot splash). DOOM spins in TryRunTics() (d_loop.c)
+# waiting for the ms clock to advance a tic via I_Sleep(1); under wine64 the
+# blocking Sleep + a clock that doesn't advance during the spin = infinite wait,
+# never reaching DG_DrawFrame. Four edits:
+#   a) doomgeneric_win.c DG_GetTicksMs(): force a MONOTONIC floor so it can never
+#      stall:  static uint32_t f=0; uint32_t t=GetTickCount(); if(t<=f)t=f+1; f=t; return t;
+#      (NOTE: this currently advances every call → game runs UNPACED/too fast →
+#       menu input feels off. Next-session refinement: track ~real wall-clock,
+#       advancing by min(realDelta, smallFloor) so it never stalls but paces ~35fps.)
+#   b) doomgeneric_win.c DG_SleepMs(uint32_t ms): make it a NO-OP `(void)ms;`
+#      (don't block the TryRunTics spin). (Refine with the pacing fix above.)
+#   c) doomgeneric_win.c DG_DrawFrame(): REMOVE the `SwapBuffers(s_Hdc);` line.
+#      This build has no GL pixel format (no -lopengl32); SwapBuffers drags the
+#      window into the GLX path ("emscripten GL immediate mode emulation") so the
+#      StretchDIBits blit no longer surfaces as a GDI PutImage/CopyArea the XWire
+#      server presents.
+#   d) d_main.c D_DoomLoop(): move the I_SetWindowTitle/I_GraphicsCheckCommandLine/
+#      I_SetGrabMouseCallback/I_InitGraphics/I_EnableLoadingDisk block to BEFORE the
+#      first TryRunTics(); and in doomgeneric_Tick() force `screenvisible = true;`
+#      then call `D_Display();` unconditionally (drop the `if (screenvisible)` gate).
+# (Patched checkout was at /tmp/doomgeneric_build — may be gone; reclone + reapply.)
 # SRC="dummy.c am_map.c doomdef.c doomstat.c dstrings.c d_event.c d_items.c \
 #   d_iwad.c d_loop.c d_main.c d_mode.c d_net.c f_finale.c f_wipe.c g_game.c \
 #   hu_lib.c hu_stuff.c info.c i_cdmus.c i_endoom.c i_joystick.c i_scale.c \
