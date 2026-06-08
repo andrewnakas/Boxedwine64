@@ -74,6 +74,13 @@ public:
     // Main-thread (doMainLoop): present the most recent submitted frame and pump
     // the host event queue into the input queue. No-op when nothing changed.
     virtual void tickMainThread() = 0;
+
+    // Any thread: wipe the canvas to black on the next present, even if no new
+    // frame arrives and the size is unchanged. Used on a persistent-session app
+    // switch so the OUTGOING app's last frame (e.g. Notepad) doesn't linger on
+    // the host canvas after its windows are unmapped, until the incoming app
+    // paints its first frame. Default no-op for sinks that don't buffer frames.
+    virtual void requestClear() {}
 };
 
 // The single active sink (nullptr when running headless / -novideo). Set by the

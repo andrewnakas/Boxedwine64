@@ -263,6 +263,14 @@ public:
         state = sdlModState();
     }
 
+    void requestClear() override {
+        // Arm an unconditional canvas wipe (a few frames to flush SDL's double
+        // buffer). Consumed on the main-thread present tick below. atomic so it's
+        // safe to call from a connection thread on app switch.
+        pendingClearFrames.store(3, std::memory_order_release);
+        frameDirty = true;     // ensure the tick does a present even if no new frame
+    }
+
     void tickMainThread() override {
         // Present + input pump (main thread only). We render through BoxedWine's
         // OWN screen (KNativeSystem::getScreen()), not a private SDL window: the
@@ -307,6 +315,19 @@ public:
                                pct, log);
             screen->putBitsOnWnd(0, lf.data(), 32, (U32)LW * 4, 0, 0, LW, LH, nullptr, true);
             screen->present();
+        }
+
+        // App-switch canvas wipe: if requestClear() armed a clear, blank the
+        // host canvas NOW, independent of whether the incoming app has produced
+        // a frame yet. Without this the outgoing app's last frame (e.g. Notepad)
+        // lingers on the canvas until the new app paints — and an app that never
+        // PutImages its window (or whose first frame is delayed) would leave the
+        // old pixels up indefinitely. Counts down a few frames for SDL's double
+        // buffer. Runs before the frame blit so a same-tick new frame still wins.
+        if (pendingClearFrames.load(std::memory_order_acquire) > 0) {
+            screen->clear();
+            screen->present();
+            pendingClearFrames.fetch_sub(1, std::memory_order_acq_rel);
         }
 
         // Blit the latest frame and present.
@@ -429,6 +450,11 @@ private:
     bool loadingShown = false;           // loading-screen window sized/shown once
     int lastShownPct = -1, creep = 0;    // loading-bar anti-freeze jitter
     std::atomic<bool> inputPending{false}; // lock-free "queue non-empty" flag
+    // App-switch: set by requestClear() (any thread), consumed on the main
+    // thread's present tick. Wipes the canvas to black even when no new frame
+    // arrives, so the outgoing app's last frame doesn't linger until the
+    // incoming app paints. Counts down a few frames to flush SDL's double buffer.
+    std::atomic<int> pendingClearFrames{0};
 };
 
 XWirePresentSinkSDL g_sink;

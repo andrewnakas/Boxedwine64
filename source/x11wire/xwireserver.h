@@ -175,6 +175,19 @@ public:
     // NOT held (it locks internally). Cheap no-op when nothing is dirty.
     void composeAndPresent();
 
+    // Persistent-session app switch: mark every window owned by `ownerBase`
+    // (a connection's resource-id base) as un-mapped, so the previous app's
+    // windows vanish from BOTH the compositor (composeAndPresent skips
+    // !mapped windows) and the input hit-test (deliverInputEvents skips
+    // !mapped). The previous app stays RUNNING (no kill — that crashes the
+    // runtime) but becomes invisible and inert: the canvas shows only the new
+    // app and keyboard/mouse go to it. Call with `ownerBase` = the OUTGOING
+    // base window's ownerClientBase, captured before presentWindow is moved to
+    // the new app. No-op for ownerBase==0. Locks regMutex internally; safe to
+    // call from a connection thread holding NO lock. Returns true if it changed
+    // anything (caller then arms a present-sink clear to wipe stale pixels).
+    bool unmapAppWindows(uint32_t ownerBase);
+
     // Persistent-session app switch: drop every non-root window and clear the
     // base (presentWindow=0) so the NEXT app's first-mapped window is adopted as
     // the base instead of compositing the new app onto the closed app's larger

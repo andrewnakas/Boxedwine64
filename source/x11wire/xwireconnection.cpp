@@ -519,6 +519,10 @@ void XWireConnection::processOneRequest(const uint8_t* req, uint32_t len) {
             uint32_t wid = rd32(req + 4);
             uint16_t ew = 0, eh = 0;
             bool found = false;
+            // When this map adopts a NEW base (app switch), the outgoing base's
+            // owner-client-base is captured here so we can hide that app's windows
+            // (unmapAppWindows) + wipe the canvas AFTER dropping the registry lock.
+            uint32_t outgoingOwnerBase = 0;
             {
                 XWireServer& srv = XWireServer::instance();
                 std::lock_guard<std::mutex> lk(srv.regMutex);
@@ -547,12 +551,32 @@ void XWireConnection::processOneRequest(const uint8_t* req, uint32_t len) {
                     if (srv.adoptNextWindowAsBase && !it->second.overrideRedirect &&
                         it->second.ownerClientBase >= srv.adoptArmClientBase &&
                         it->second.mapSerial > srv.adoptArmSerial) {
+                        // Capture the app we're switching AWAY from (the old base's
+                        // owner) before moving the base, so we can hide its windows
+                        // below. Skip if the old base belongs to the same app (a
+                        // multi-window app re-adopting its own window).
+                        auto ob = srv.windows.find(srv.presentWindow);
+                        if (ob != srv.windows.end() &&
+                            ob->second.ownerClientBase != it->second.ownerClientBase) {
+                            outgoingOwnerBase = ob->second.ownerClientBase;
+                        }
                         srv.presentWindow = wid;
                         srv.adoptNextWindowAsBase = false;
                         klog_fmt("XWire: adopted window 0x%x (owner base 0x%x >= arm 0x%x, serial %llu) as new base (app switch, on map)",
                                  wid, it->second.ownerClientBase, srv.adoptArmClientBase,
                                  (unsigned long long)it->second.mapSerial);
                     }
+                }
+            }
+            // App switch: hide the outgoing app's windows (compositor + hit-test
+            // skip !mapped) and wipe the canvas so its last frame doesn't linger
+            // until the new app paints. Done OUTSIDE the lock (unmapAppWindows
+            // takes regMutex itself). The new window gets sendFocusIn below, so
+            // keyboard/mouse follow to the app the user switched to.
+            if (outgoingOwnerBase) {
+                if (XWireServer::instance().unmapAppWindows(outgoingOwnerBase) &&
+                    g_xwirePresentSink) {
+                    g_xwirePresentSink->requestClear();
                 }
             }
             if (found) {
@@ -1621,6 +1645,10 @@ void XWireConnection::blitPutImage(uint32_t drawable, uint8_t format, uint8_t de
     // The first window an app draws into becomes the base; thereafter the LARGEST
     // non-override-redirect window wins (the main client area, not a tiny menu/
     // tooltip popup that also PutImages). Overlays go on top via composeAndPresent.
+    // Capture the app being switched away from (old base owner) when this blit
+    // adopts a new base, so its windows can be hidden + the canvas wiped after
+    // the lock drops. 0 = no switch happened in this call.
+    uint32_t outgoingOwnerBase = 0;
     if (srv.adoptNextWindowAsBase && !win.overrideRedirect &&
         win.ownerClientBase >= srv.adoptArmClientBase &&
         win.mapSerial > srv.adoptArmSerial) {
@@ -1630,6 +1658,11 @@ void XWireConnection::blitPutImage(uint32_t drawable, uint8_t format, uint8_t de
         // connections were all allocated earlier) forcibly becomes the base,
         // regardless of size, so the canvas switches to the newly launched app
         // without killing the previous one. One-shot.
+        auto ob = srv.windows.find(srv.presentWindow);
+        if (ob != srv.windows.end() &&
+            ob->second.ownerClientBase != win.ownerClientBase) {
+            outgoingOwnerBase = ob->second.ownerClientBase;
+        }
         srv.presentWindow = drawable;
         srv.adoptNextWindowAsBase = false;
         // This is the PutImage path — only GDI apps reach it (GL apps render via
@@ -1709,6 +1742,14 @@ void XWireConnection::blitPutImage(uint32_t drawable, uint8_t format, uint8_t de
 
     // Done mutating the registry — drop the lock before composing (it re-locks).
     lk.unlock();
+    // App switch (PutImage path): hide the outgoing app's windows + wipe the
+    // canvas so its last frame doesn't linger behind the new app. unmapAppWindows
+    // re-locks regMutex, so this must run after the unlock above.
+    if (outgoingOwnerBase) {
+        if (srv.unmapAppWindows(outgoingOwnerBase) && g_xwirePresentSink) {
+            g_xwirePresentSink->requestClear();
+        }
+    }
     // Recompose base + overlays whenever any window draws, so a menu/popup that
     // PutImages into its own (non-base) window still appears on the host.
     srv.composeAndPresent();

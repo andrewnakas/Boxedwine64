@@ -187,6 +187,35 @@ void XWireServer::resetForAppSwitch() {
              (unsigned long long)adoptArmSerial);
 }
 
+bool XWireServer::unmapAppWindows(uint32_t ownerBase) {
+    if (!ownerBase) return false;
+    std::lock_guard<std::mutex> lk(regMutex);
+    bool changed = false;
+    int n = 0;
+    for (auto& kv : windows) {
+        XWireWindow& w = kv.second;
+        if (w.isRoot) continue;
+        if (w.ownerClientBase == ownerBase && w.mapped) {
+            // Mark the outgoing app's window un-mapped so the compositor
+            // (composeAndPresent skips !mapped) and the input hit-test
+            // (deliverInputEvents skips !mapped) both ignore it. The window
+            // record + its framebuffer are kept intact; the app keeps running
+            // and could be re-presented later. We do NOT send the client an
+            // UnmapNotify — that would make wine think the WM withdrew its
+            // window and could perturb its message loop; this is a host-side
+            // presentation hide only.
+            w.mapped = false;
+            changed = true;
+            n++;
+        }
+    }
+    if (changed) {
+        klog_fmt("XWire: unmapped %d window(s) of outgoing app (owner base 0x%x) on switch",
+                 n, ownerBase);
+    }
+    return changed;
+}
+
 // Free-function shim so the persistent-session bridge (wine64session.cpp) can
 // trigger an app-switch reset without including the XWire header.
 void bw64ResetPresentForSwitch() {
