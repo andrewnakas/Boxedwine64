@@ -50,13 +50,21 @@ echo "=== done (snake.exe, tetris.exe) ==="
 # waiting for the ms clock to advance a tic via I_Sleep(1); under wine64 the
 # blocking Sleep + a clock that doesn't advance during the spin = infinite wait,
 # never reaching DG_DrawFrame. Four edits:
-#   a) doomgeneric_win.c DG_GetTicksMs(): force a MONOTONIC floor so it can never
-#      stall:  static uint32_t f=0; uint32_t t=GetTickCount(); if(t<=f)t=f+1; f=t; return t;
-#      (NOTE: this currently advances every call → game runs UNPACED/too fast →
-#       menu input feels off. Next-session refinement: track ~real wall-clock,
-#       advancing by min(realDelta, smallFloor) so it never stalls but paces ~35fps.)
+#   a) doomgeneric_win.c DG_GetTicksMs(): return REAL wall-clock ms backed by
+#      QueryPerformanceCounter/QueryPerformanceFrequency (NOT GetTickCount, which
+#      was stuck under the emulator), with a monotonic floor so it can never go
+#      backwards or stall. See dg_realMs() in doomgeneric_win.c. (SUPERSEDES the
+#      old +1-per-call floor, which advanced every call → game ran UNPACED/too
+#      fast → menu/movement uncontrollable.)
+#   a2) doomgeneric_win.c add DG_PaceFrame() (declared in doomgeneric.h) and call
+#      it at the TOP of doomgeneric_Tick() in d_main.c. It busy-polls dg_realMs()
+#      (the REAL clock — never a blocking Sleep) until ~1000/35 ms have elapsed
+#      since the previous frame, capping the loop to ~35 fps. This restores input
+#      pacing WITHOUT re-introducing the TryRunTics stall (pacing is per-frame in
+#      the outer loop, not inside the spin). Also `#include "doomgeneric.h"` in
+#      d_main.c for the DG_PaceFrame declaration.
 #   b) doomgeneric_win.c DG_SleepMs(uint32_t ms): make it a NO-OP `(void)ms;`
-#      (don't block the TryRunTics spin). (Refine with the pacing fix above.)
+#      (don't block the TryRunTics spin; the QPC clock advances on its own).
 #   c) doomgeneric_win.c DG_DrawFrame(): REMOVE the `SwapBuffers(s_Hdc);` line.
 #      This build has no GL pixel format (no -lopengl32); SwapBuffers drags the
 #      window into the GLX path ("emscripten GL immediate mode emulation") so the

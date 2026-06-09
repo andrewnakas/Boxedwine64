@@ -6,7 +6,7 @@ This fork is a **work in progress**, but a substantial one: real Debian `wine64`
 
 > ### ▶ [**Try the live demo: real `wine64` in your browser**](https://andrewnakas.github.io/Boxedwine64/)
 >
-> Open <https://andrewnakas.github.io/Boxedwine64/> in a recent Chrome/Edge/Safari. After the one-time rootfs download, use the **app bar** at the top to switch between the **spinning OpenGL cube** (`glcube`) and interactive **Notepad**. A **persistent in-browser `wineserver64`** stays resident, so launching an app **spawns it into the SAME running wine** — no page reload, the prefix and GL context stay warm between apps (this is the "load a new app into the same wine" item that was long on the roadmap; `?session=0` falls back to reload-per-app). First load is ~196 MB and takes a minute; give the cube ~20–30 s to boot.
+> Open <https://andrewnakas.github.io/Boxedwine64/> in a recent Chrome/Edge/Safari. After the one-time rootfs download, use the **app bar** at the top to switch between the **spinning OpenGL cube** (`glcube`), interactive **Notepad/WordPad**, **Minesweeper**, **Snake/Tetris**, and a playable **DOOM** — or **bring your own** Windows `.exe` with the *"⬆ Run my own .exe"* button (see [App compatibility](#app-compatibility-in-browser-wasm64-mt) for what fits). A **persistent in-browser `wineserver64`** stays resident, so launching an app **spawns it into the SAME running wine** — no page reload, the prefix and GL context stay warm between apps (this is the "load a new app into the same wine" item that was long on the roadmap; `?session=0` falls back to reload-per-app). First load is ~196 MB and takes a minute; give the cube ~20–30 s to boot.
 
 ![wine64 OpenGL glcube.exe rendering a spinning 3D cube in Boxedwine64 on macOS](docs/images/glcube-gui.png)
 
@@ -334,6 +334,48 @@ the immutable HTTP cache) — kept as a fallback since a true in-page *reboot* i
 impossible (this build isn't `MODULARIZE`'d, so re-running `boxedwine64.js` throws
 "duplicate variable", and the `#gl64canvas` `OffscreenCanvas` can't be transferred
 to a pthread twice).
+
+### App compatibility (in-browser, `wasm64-mt`)
+
+What runs today in the browser build, why the sweet spot is shaped the way it is,
+and how to bring your own app. The hard limits that decide feasibility: the x86-64
+CPU is **interpreted (no JIT)** so CPU-bound code is ~10×+ slower; rendering only
+works through the **GDI/USER32** path (`BitBlt`/`StretchDIBits`/`PutImage`) or the
+basic **OpenGL→WebGL2** bridge — **no Direct3D/Direct2D/DirectWrite, no GPU
+compute**; there is **no audio backend yet**; there is **no network** inside the
+guest; and the whole rootfs is downloaded up front (no lazy loading), so **small
+matters**. The bullseye is classic **Win32/GDI** apps — the 2000s–early-2010s
+freeware era.
+
+| App | Path | Status | Notes |
+|---|---|---|---|
+| **Notepad** | GDI/USER32 | ✅ Works | Interactive; File ▸ Save As writes a downloadable file |
+| **WordPad** | GDI/USER32 | ✅ Works | Rich-edit control renders |
+| **winecfg** | GDI/USER32 | ✅ Works | Wine's own config dialog |
+| **winefile** | GDI/USER32 | ✅ Works | File manager |
+| **Clock** | GDI/USER32 | ✅ Works | |
+| **Minesweeper** (`winemine`) | GDI/USER32 | ✅ Works | |
+| **Snake / Tetris** | GDI/USER32 | ✅ Works | Self-contained Win32, built with mingw-w64 (`tools/rootfs64/games`) |
+| **glcube / gltri** | OpenGL → WebGL2 | ✅ Works | Spinning shaded cube via the `gl64` WGL→WebGL2 bridge |
+| **DOOM** (`doomgeneric`) | GDI/USER32 | ✅ Playable | Shareware WAD; renders + keyboard/menu/movement work. Fire = **Ctrl / F / X** (browsers intercept Ctrl). No mouse/turn or sound yet |
+| **Your own `.exe`** | depends on the app | ✅ via "Run my own .exe" | Drag in a **portable Win32/GDI** exe; see below |
+| Task Mgr / regedit / control / explorer / IE / oleview | mixed | 🧪 Experimental | May not come up — depend on heavier shell/COM/X11 surface |
+| .NET (WinForms) utilities | wine-mono + GDI+ | ⚠️ Poor fit | The CLR JITs IL at runtime — brutal under a non-JIT interpreter, plus a large wine-mono payload. WPF is Direct3D-backed → unsupported |
+| System-info tools (CPU-Z, HWiNFO, Speccy…) | kernel driver + WMI | ❌ Won't run | No kernel driver / real hardware / WMI to read |
+| Direct3D / GPU games & media players | D3D/DXVA | ❌ Unsupported | No D3D/Direct2D/DirectWrite backend |
+
+**Run your own `.exe`** — the **"⬆ Run my own .exe"** toolbar button lets you pick
+a Windows executable from your machine; it's written into the in-browser sandbox
+(`Z:\home\username`) and launched in-session like any bundled app. This sidesteps
+bundling/licensing (many useful utilities are free but not redistributable, so you
+supply your own copy). Best results come from a **single, portable Win32/GDI exe**
+— *not* installers, *not* apps that need sibling DLLs, *not* .NET, D3D, or anything
+that wants the network. Mechanically, a raw `Module.FS.writeFile` would be
+invisible to wine (Boxedwine caches each directory's contents the first time it's
+scanned, which happens for the prefix at boot), so the launcher calls a small
+`bw64_register_file()` bridge that injects the freshly-written file's node into the
+VFS before the spawn — a general mechanism for any file the page hands the guest
+after boot.
 
 ```sh
 cd project/emscripten

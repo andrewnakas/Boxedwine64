@@ -108,6 +108,23 @@ for f in snake.exe tetris.exe doom.exe doom1.wad; do
     echo "  NOTE: $GAMES/$f missing — app-bar button for it will ENOENT." >&2
   fi
 done
+# Bundle larger third-party utility apps from tools/rootfs64/apps/<Name>/ as WHOLE
+# packages (the app bar launches one exe from inside). HxD (hex editor) is a
+# native Win32/GDI app whose license REQUIRES redistributing the ORIGINAL PACKAGE
+# INTACT — no file removed or modified — so we copy the entire extracted folder
+# (HxD64.exe + HxD32.exe + HxD.exe + license.txt/readme/changelog), not just the
+# exe. Launched via `HxD\HxD64.exe` (the 64-bit build) from the HOME root.
+APPS="$HERE/apps"
+for pkg in HxD; do
+  if [ -d "$APPS/$pkg" ]; then
+    cp -R "$APPS/$pkg" "$STAGE/home/username/$pkg"
+    cp -R "$APPS/$pkg" "$STAGE/$DRIVE_C/$pkg"
+    echo "  + bundled $pkg package ($(ls "$APPS/$pkg" | wc -l | tr -d ' ') files, intact per license)"
+  else
+    echo "  NOTE: $APPS/$pkg missing — app-bar button for it will ENOENT." >&2
+  fi
+done
+
 # Drop a .keep in each leaf so the dir survives any tooling that prunes empties,
 # and so Save As shows a non-empty, browsable target. (zip stores empty dirs, but
 # the marker also makes the populated tree visible when debugging the VFS.)

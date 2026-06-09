@@ -153,6 +153,10 @@
             "WINESERVER=" + WINESERVER64,
             "WINEDLLPATH=/usr/lib/x86_64-linux-gnu/wine"
         ];
+        // NOTE: WINEDEBUG added here does NOT reach in-session app spawns — those
+        // use the CAPTURED BOOT env (g_sessionCtx.env in wine64session.cpp), not
+        // this JS env. To trace a spawned app, WINEDEBUG must be set at BOOT time
+        // (the ?session=0 reload path / the boot env), not on prefixEnv().
     }
 
     // argv for running a Windows/guest program under wine64: [wine64, tok, ...].
@@ -535,6 +539,66 @@
     }
     // Expose so the HTML button's onclick can reach it.
     window.downloadSavedFiles = downloadSavedFiles;
+
+    // --- upload-your-own .exe ----------------------------------------------
+    // Let the user run a Windows .exe they bring themselves (sidesteps the
+    // bundling/licensing problem — IrfanView/Sysinternals/etc are free but not
+    // redistributable, so users supply their own copy). We write the uploaded
+    // bytes into the SAME writable MEMFS the prefix lives in (Z:\home\username,
+    // i.e. HOME_IN_MEMFS), then spawn it in-session like any app-bar button.
+    // Caveats users should know (shown in the UI): only a SINGLE PORTABLE Win32/
+    // GDI exe works — not installers, not apps needing sibling DLLs, not .NET,
+    // not D3D/GPU apps, not anything needing network. Best results: classic
+    // small Win32 utilities (e.g. a portable HxD.exe, IrfanView i_view64.exe).
+    function uploadAndRunExe(file) {
+        if (!file) return;
+        if (!window.Module || !getFS()) {
+            alert("Not ready yet — wait for the prefix to finish booting (the " +
+                  "first app you launch downloads the rootfs), then try again.");
+            return;
+        }
+        var name = (file.name || "uploaded.exe").replace(/[\\/]/g, "_");
+        if (!/\.exe$/i.test(name)) {
+            if (!confirm('"' + name + '" is not a .exe — try to run it anyway?')) return;
+        }
+        // Guard against absurd sizes (the heap is ~4GB and the exe is copied a few
+        // times through the spawn path); a portable utility is a few MB.
+        if (file.size > 256 * 1024 * 1024) {
+            alert("That file is " + Math.round(file.size / 1048576) + " MB — too big " +
+                  "for the in-browser sandbox. Use a small portable .exe (a few MB).");
+            return;
+        }
+        var reader = new FileReader();
+        reader.onerror = function () { alert("Could not read " + name + "."); };
+        reader.onload = function () {
+            var bytes = new Uint8Array(reader.result);
+            var dest = HOME_IN_MEMFS + "/" + name;       // Z:\home\username\<name>
+            try {
+                // Overwrite any prior upload of the same name.
+                try { getFS().unlink(dest); } catch (e) {}
+                getFS().writeFile(dest, bytes);
+            } catch (e) {
+                console.log("uploadAndRunExe: writeFile " + dest + " failed: " + e);
+                alert("Failed to place " + name + " into the sandbox: " + e);
+                return;
+            }
+            console.log("uploadAndRunExe: wrote " + bytes.length + " bytes to " + dest +
+                        " — registering in VFS + launching");
+            // Register the freshly-written file in Boxedwine's VFS, or a spawned
+            // wine process can't see it: the prefix dir was scanned (and cached)
+            // at boot, so a raw MEMFS write is invisible to the path resolver
+            // (wine returns c0000135). bw64_register_file injects the node; it's
+            // QUEUED and drained on the main-loop thread BEFORE the spawn below
+            // (same queue, FIFO), so the file exists in the VFS when wine looks.
+            var guestPath = "/home/username/" + name;     // VFS local path (Z: == guest /)
+            callExport("bw64_register_file", ["string"], [guestPath]);
+            var prog = "Z:\\home\\username\\" + name;      // explicit Z: path, like DOOM/HxD
+            if (window.launchApp) window.launchApp(prog);
+            else window.location.search = "?p=" + encodeURIComponent(prog);
+        };
+        reader.readAsArrayBuffer(file);
+    }
+    window.uploadAndRunExe = uploadAndRunExe;
 
     // --- orchestration ------------------------------------------------------
     // The zips are large (wine64.zip ~205MB) on the FIRST boot; fetch them, drop

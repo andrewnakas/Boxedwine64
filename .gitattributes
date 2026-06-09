@@ -61,3 +61,11 @@
 #*.PDF   diff=astextplain
 #*.rtf   diff=astextplain
 #*.RTF   diff=astextplain
+
+###############################################################################
+# Bundled third-party app packages (tools/rootfs64/apps/) must be byte-exact.
+# HxD's license requires the package be redistributed INTACT — no file removed
+# or modified — so disable all line-ending normalization for it (the included
+# .txt files are CRLF and must stay CRLF).
+###############################################################################
+tools/rootfs64/apps/** -text

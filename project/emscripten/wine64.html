@@ -58,6 +58,10 @@
         <span class="applbl">Apps</span>
         <button type="button" class="appbtn" data-prog="notepad.exe"><span class="ico">📝</span>Notepad</button>
         <button type="button" class="appbtn" data-prog="wordpad.exe"><span class="ico">📄</span>WordPad</button>
+        <!-- HxD hex editor (freeware, native Win32/GDI; redistributed as the full
+             intact package per its license — see tools/rootfs64/apps/HxD). The
+             64-bit build launched from the HOME root subfolder. -->
+        <button type="button" class="appbtn" data-prog="Z:\home\username\HxD\HxD64.exe"><span class="ico">🔣</span>HxD (hex)</button>
         <button type="button" class="appbtn" data-prog="clock.exe"><span class="ico">🕑</span>Clock</button>
         <button type="button" class="appbtn" data-prog="winecfg.exe"><span class="ico">⚙️</span>winecfg</button>
         <button type="button" class="appbtn" data-prog="winefile.exe"><span class="ico">🗂️</span>Files</button>
@@ -90,6 +94,13 @@
     <div id="toolbar">
       <button type="button" onclick="window.downloadSavedFiles && window.downloadSavedFiles()">⤓ Download my files</button>
       <span class="tbhint">zips your saved files (Z:\home\username + Documents/Desktop) — save from the app first</span>
+      <!-- Upload-your-own .exe: write the picked file into the sandbox and run it.
+           The hidden file input is triggered by the button; on change we hand the
+           File to window.uploadAndRunExe (wine64-launcher.js). -->
+      <input type="file" id="exeUpload" accept=".exe,application/x-msdownload,application/octet-stream" style="display:none"
+             onchange="if (this.files[0] && window.uploadAndRunExe) { window.uploadAndRunExe(this.files[0]); this.value=''; }">
+      <button type="button" onclick="document.getElementById('exeUpload').click()">⬆ Run my own .exe</button>
+      <span class="tbhint">runs a Windows .exe you choose — best with a single <b>portable</b> Win32 app (not installers, .NET, or D3D games)</span>
     </div>
     <div id="dropzone">
       <div class="emscripten_border">

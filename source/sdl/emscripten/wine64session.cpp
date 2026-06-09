@@ -57,6 +57,8 @@
 #include "ksystem.h"
 #include "kthread.h"
 #include "ksignal.h" // K_SIGTERM
+#include "../../io/fs.h"      // Fs::getNodeFromLocalPath / addFileNode (VFS registration)
+#include "../../io/fsnode.h"
 
 #include <atomic>
 #include <vector>
@@ -86,10 +88,11 @@ static Wine64SessionCtx g_sessionCtx;
 // on the main-loop thread, in order, so a "kill old app then spawn new app"
 // switch is sequenced correctly.
 struct Wine64Req {
-    enum Kind { Spawn, Kill } kind = Spawn;
+    enum Kind { Spawn, Kill, RegisterFile } kind = Spawn;
     std::vector<BString> argv;   // Spawn
     std::vector<BString> env;    // Spawn
     U32 pid = 0;                 // Kill
+    BString path;                // RegisterFile (guest local path, e.g. /home/username/foo.exe)
 };
 
 // Pending requests, guarded by an atomic_flag spinlock. A spinlock (busy CAS, no
@@ -189,6 +192,46 @@ static void doKill(U32 pid) {
     KSystem::kill((S32)pid, K_SIGTERM);
 }
 
+// Register a file that JS just wrote directly into the Emscripten MEMFS (e.g. an
+// uploaded .exe) into Boxedwine's VFS, so newly-spawned wine processes can find
+// it. WHY THIS IS NEEDED: FsNode::loadChildren() scans a directory's native
+// contents exactly ONCE (gated by hasLoadedChildrenFromFileSystem) and caches the
+// child nodes; the prefix dir /home/username is scanned at boot. A later
+// Module.FS.writeFile() lands in MEMFS but is invisible to that cache, so wine's
+// path resolver returns c0000135 ("cannot find binary"). Here we look up the
+// parent dir node and, if the child isn't already registered, add a node for it
+// (its native path = parent's native path + the remote-encoded name), matching
+// what loadChildren() would have done. Runs on the main-loop thread.
+static void doRegisterFile(const BString& guestPath) {
+    if (guestPath.isEmpty()) return;
+    // Split into parent dir + leaf name.
+    int slash = guestPath.lastIndexOf('/');
+    if (slash < 0) { klog_fmt("wine64session: registerFile bad path '%s'", guestPath.c_str()); return; }
+    BString parentPath = (slash == 0) ? B("/") : guestPath.substr(0, slash);
+    BString name = guestPath.substr(slash + 1);
+    if (name.isEmpty()) return;
+
+    std::shared_ptr<FsNode> parent = Fs::getNodeFromLocalPath(B(""), parentPath, false);
+    if (!parent) {
+        klog_fmt("wine64session: registerFile parent '%s' not in VFS", parentPath.c_str());
+        return;
+    }
+    // Force the parent's children to be loaded first (so getChildByName is valid
+    // and we don't double-register what loadChildren already saw).
+    if (parent->getChildByName(name)) {
+        klog_fmt("wine64session: registerFile '%s' already present — ok", guestPath.c_str());
+        return;
+    }
+    // Native path = parent's native path + the remote-encoded leaf name (mirrors
+    // FsNode::loadChildren's localName->remoteName mapping for on-disk names).
+    BString remoteName = name;
+    Fs::localNameToRemote(remoteName);
+    BString nativePath = parent->nativePath.stringByApppendingPath(remoteName);
+    Fs::addFileNode(guestPath, B(""), nativePath, false, parent);
+    klog_fmt("wine64session: registerFile '%s' -> native '%s' (registered)",
+             guestPath.c_str(), nativePath.c_str());
+}
+
 // Drain queued requests. MUST be called from the main-loop thread (mainloop.cpp
 // calls it once per tick). Swaps the queue out under the spinlock, then runs the
 // requests outside the lock so kernel ops can take their own locks freely.
@@ -200,6 +243,7 @@ void bw64SessionDrainSpawns() {
     pendingLockRelease();
     for (auto& req : todo) {
         if (req.kind == Wine64Req::Kill) doKill(req.pid);
+        else if (req.kind == Wine64Req::RegisterFile) doRegisterFile(req.path);
         else doSpawn(req);
     }
 }
@@ -216,6 +260,22 @@ extern "C" EMSCRIPTEN_KEEPALIVE int bw64_spawn(const char* argvJoined, const cha
     req.argv = splitLines(argvJoined);
     req.env = splitLines(envJoined);
     if (req.argv.empty()) return 0;
+    pendingLockAcquire();
+    g_pending.push_back(std::move(req));
+    pendingLockRelease();
+    return 1;
+}
+
+// bw64_register_file: register a file JS already wrote into MEMFS (e.g. an
+// uploaded .exe at guest path /home/username/foo.exe) into Boxedwine's VFS, so the
+// app spawned right after can find it. Queue it (drained on the main-loop thread,
+// in order) so it runs BEFORE the spawn JS queues next. NON-blocking; returns 1 if
+// queued. Called via Module.ccall("bw64_register_file","number",["string"],[path]).
+extern "C" EMSCRIPTEN_KEEPALIVE int bw64_register_file(const char* guestPath) {
+    if (!g_sessionCtx.valid.load(std::memory_order_acquire) || !guestPath || !guestPath[0]) return 0;
+    Wine64Req req;
+    req.kind = Wine64Req::RegisterFile;
+    req.path = BString::copy(guestPath);
     pendingLockAcquire();
     g_pending.push_back(std::move(req));
     pendingLockRelease();
