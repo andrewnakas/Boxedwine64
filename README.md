@@ -6,7 +6,7 @@ This fork is a **work in progress**, but a substantial one: real Debian `wine64`
 
 > ### ▶ [**Try the live demo: real `wine64` in your browser**](https://andrewnakas.github.io/Boxedwine64/)
 >
-> Open <https://andrewnakas.github.io/Boxedwine64/> in a recent Chrome/Edge/Safari. After the one-time rootfs download, use the **app bar** at the top to switch between the **spinning OpenGL cube** (`glcube`), interactive **Notepad/WordPad**, **Minesweeper**, **Snake/Tetris**, and a playable **DOOM** — or **bring your own** Windows `.exe` with the *"⬆ Run my own .exe"* button (see [App compatibility](#app-compatibility-in-browser-wasm64-mt) for what fits). A **persistent in-browser `wineserver64`** stays resident, so launching an app **spawns it into the SAME running wine** — no page reload, the prefix and GL context stay warm between apps (this is the "load a new app into the same wine" item that was long on the roadmap; `?session=0` falls back to reload-per-app). First load is ~196 MB and takes a minute; give the cube ~20–30 s to boot.
+> Open <https://andrewnakas.github.io/Boxedwine64/> in a recent Chrome/Edge/Safari. After the one-time rootfs download, use the **app bar** at the top to switch between the **spinning OpenGL cube** (`glcube`), interactive **Notepad/WordPad**, the **HxD** hex editor, **Minesweeper**, **Snake/Tetris**, and a playable **DOOM** — or **bring your own** Windows `.exe` with the *"⬆ Run my own .exe"* button (see [App compatibility](#app-compatibility-in-browser-wasm64-mt) for what fits). A **persistent in-browser `wineserver64`** stays resident, so launching an app **spawns it into the SAME running wine** — no page reload, the prefix and GL context stay warm between apps (this is the "load a new app into the same wine" item that was long on the roadmap; `?session=0` falls back to reload-per-app). First load is ~196 MB and takes a minute; give the cube ~20–30 s to boot.
 
 ![wine64 OpenGL glcube.exe rendering a spinning 3D cube in Boxedwine64 on macOS](docs/images/glcube-gui.png)
 
@@ -358,6 +358,7 @@ freeware era.
 | **Snake / Tetris** | GDI/USER32 | ✅ Works | Self-contained Win32, built with mingw-w64 (`tools/rootfs64/games`) |
 | **glcube / gltri** | OpenGL → WebGL2 | ✅ Works | Spinning shaded cube via the `gl64` WGL→WebGL2 bridge |
 | **DOOM** (`doomgeneric`) | GDI/USER32 | ✅ Playable | Shareware WAD; renders + keyboard/menu/movement work. Fire = **Ctrl / F / X** (browsers intercept Ctrl). No mouse/turn or sound yet |
+| **HxD** (hex editor) | GDI/USER32 | ✅ Works | Real third-party Delphi app (WineHQ Platinum); renders the full editor — menu bar, toolbar, data-type inspector. Bundled byte-exact per its license. Give it ~60–80 s to come up |
 | **Your own `.exe`** | depends on the app | ✅ via "Run my own .exe" | Drag in a **portable Win32/GDI** exe; see below |
 | Task Mgr / regedit / control / explorer / IE / oleview | mixed | 🧪 Experimental | May not come up — depend on heavier shell/COM/X11 surface |
 | .NET (WinForms) utilities | wine-mono + GDI+ | ⚠️ Poor fit | The CLR JITs IL at runtime — brutal under a non-JIT interpreter, plus a large wine-mono payload. WPF is Direct3D-backed → unsupported |
