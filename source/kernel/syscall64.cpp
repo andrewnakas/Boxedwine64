@@ -349,7 +349,10 @@ static void crashRingDump(const char* why) {
 
 static U64 sys_write64(CPU64* cpu, U64 fd, U64 buf, U64 count) {
     if (count == 0) return 0;
-    if (count > (1ULL << 20)) count = 1ULL << 20;
+    // Ceiling only (was a 1MB cap that silently truncated large writes for any
+    // caller that doesn't loop on a short return). 256MB is plenty for the temp
+    // buffer while still bounding a pathological count.
+    if (count > (256ULL << 20)) count = 256ULL << 20;
     std::vector<U8> buffer((size_t)count + 1);
     cpu->memory->memcpyFromGuest(buffer.data(), buf, count);
     buffer[count] = 0;
@@ -854,8 +857,10 @@ static U64 sys_read64(CPU64* cpu, U64 fd, U64 buf, U64 count) {
     if (!fdesc) return (U64)-9; // -EBADF
     if (!fdesc->canRead()) return (U64)-K_EINVAL;
     if (count == 0) return 0;
-    // Cap to a reasonable per-call size — ld-linux reads in 4KB-64KB chunks.
-    if (count > (1ULL << 20)) count = 1ULL << 20;
+    // Clamp only to a sane ceiling (was a 1MB cap — too small: wine's PE loader
+    // reads whole multi-MB sections in one read() and doesn't loop on a short
+    // return, so capping left section tails zero-filled -> the HxD 0x937b30 crash).
+    if (count > (256ULL << 20)) count = 256ULL << 20;
     std::vector<U8> tmp((size_t)count);
     // BW64_WSREAD witness: for a wineserver (record-oriented, non-XWire) unix
     // socket, capture the recv-buffer fill before/after the read so the dump can
@@ -897,8 +902,21 @@ static U64 sys_read64(CPU64* cpu, U64 fd, U64 buf, U64 count) {
         std::shared_ptr<KFile> rkfile = std::dynamic_pointer_cast<KFile>(fdesc->kobject);
         if (rkfile) {
             std::lock_guard<std::mutex> lk(g_fileReadMutex);
-            got = fdesc->kobject->readNative(tmp.data(), (U32)count);
+            // Loop to satisfy the full request: a single zip-backed readNative
+            // (unzReadCurrentFile) may return fewer bytes than asked, and the PE
+            // loader that issues a whole-section read() does not loop itself.
+            // KFiles are seekable regular files, so looping until EOF is correct.
+            U64 total = 0;
+            got = 0;
+            while (total < count) {
+                U32 n = fdesc->kobject->readNative(tmp.data() + total, (U32)(count - total));
+                if ((S32)n < 0) { got = n; break; }       // propagate error
+                if (n == 0) break;                          // EOF
+                total += n;
+            }
+            if ((S32)got >= 0) got = (U32)total;
         } else {
+            // Socket/pipe: a short read is correct (blocking semantics) — single shot.
             got = fdesc->kobject->readNative(tmp.data(), (U32)count);
         }
     }
@@ -1158,9 +1176,30 @@ static U64 sys_pread64(CPU64* cpu, U64 fd, U64 buf, U64 count, U64 offset) {
     if (!fdesc) return (U64)-9; // -EBADF
     if (!fdesc->canRead()) return (U64)-K_EINVAL;
     if (count == 0) return 0;
-    if (count > (1ULL << 20)) count = 1ULL << 20;
+    // Do NOT cap `count`: wine's PE loader preads an ENTIRE section in one call
+    // (HxD's .text is ~5.3MB) and does NOT loop on a short return, so a small cap
+    // left the section tail zero-filled — a function/thread-proc whose code lives
+    // past the cap then executed zeros and crashed (the HxD "jump into 0x937b30"
+    // bug: the proc was 4.3MB into a .text formerly capped at 1MB). Clamp only to
+    // a sane ceiling to avoid a pathological allocation from a bogus count.
+    if (count > (256ULL << 20)) count = 256ULL << 20;
     std::vector<U8> tmp((size_t)count);
-    U32 got;
+    // Loop readNative until we've satisfied `count` or hit EOF: a single zip-backed
+    // readNative (unzReadCurrentFile) can legally return FEWER bytes than asked,
+    // and our single-shot callers (the PE loader) don't loop themselves.
+    auto readFully = [&](void) -> S64 {
+        S64 savedPos = fdesc->kobject->getPos();
+        fdesc->kobject->seek((S64)offset);
+        U64 total = 0;
+        while (total < count) {
+            U32 got = fdesc->kobject->readNative(tmp.data() + total, (U32)(count - total));
+            if ((S32)got < 0) { fdesc->kobject->seek(savedPos); return (S64)(S32)got; }
+            if (got == 0) break; // EOF
+            total += got;
+        }
+        fdesc->kobject->seek(savedPos);
+        return (S64)total;
+    };
     // Same zip-stream hazard as sys_mmap64_file / sys_read64: this seek+read+seek
     // is unsynchronized, and wine's PE loader + glibc ld.so pread DLL/DSO headers
     // from the SHARED per-zip stream. Serialize file reads (KFile only — a
@@ -1169,20 +1208,15 @@ static U64 sys_pread64(CPU64* cpu, U64 fd, U64 buf, U64 count, U64 offset) {
     // wrong bytes (the residual "could not load kernel32.dll" path after the
     // mmap/read serialization fixed the segment-map corruption).
     std::shared_ptr<KFile> pkfile = std::dynamic_pointer_cast<KFile>(fdesc->kobject);
+    S64 got;
     if (pkfile) {
         std::lock_guard<std::mutex> lk(g_fileReadMutex);
-        S64 savedPos = fdesc->kobject->getPos();
-        fdesc->kobject->seek((S64)offset);
-        got = fdesc->kobject->readNative(tmp.data(), (U32)count);
-        fdesc->kobject->seek(savedPos);
+        got = readFully();
     } else {
-        S64 savedPos = fdesc->kobject->getPos();
-        fdesc->kobject->seek((S64)offset);
-        got = fdesc->kobject->readNative(tmp.data(), (U32)count);
-        fdesc->kobject->seek(savedPos);
+        got = readFully();
     }
-    if ((S32)got < 0) return (U64)(S64)(S32)got;
-    if (got > 0) cpu->memory->memcpyToGuest(buf, tmp.data(), got);
+    if (got < 0) return (U64)got;
+    if (got > 0) cpu->memory->memcpyToGuest(buf, tmp.data(), (U64)got);
     return (U64)got;
 }
 
@@ -1196,7 +1230,8 @@ static U64 sys_pwrite64(CPU64* cpu, U64 fd, U64 buf, U64 count, U64 offset) {
     if (!fdesc) return (U64)-9; // -EBADF
     if (!fdesc->canWrite()) return (U64)-K_EINVAL;
     if (count == 0) return 0;
-    if (count > (1ULL << 20)) count = 1ULL << 20;
+    // Ceiling only (was a 1MB cap that silently truncated large pwrites).
+    if (count > (256ULL << 20)) count = 256ULL << 20;
     std::vector<U8> tmp((size_t)count);
     cpu->memory->memcpyFromGuest(tmp.data(), buf, (U32)count);
     S64 savedPos = fdesc->kobject->getPos();
@@ -1462,7 +1497,17 @@ static U64 sys_mmap64_file(CPU64* cpu, U64 addr, U64 length, U64 prot,
         std::lock_guard<std::mutex> lk(g_fileReadMutex);
         S64 saved = kfile->openFile->getFilePointer();
         kfile->openFile->seek((S64)offset);
-        got = kfile->openFile->readNative(buf.data(), (U32)length);
+        // Loop: a single zip-backed readNative (unzReadCurrentFile) can return
+        // fewer bytes than `length`. A single-shot read here would leave the tail
+        // of a large section (e.g. a multi-MB .text) zero-filled — the same class
+        // of bug as the capped pread64 that produced the HxD 0x937b30 crash.
+        U64 total = 0;
+        while (total < length) {
+            U32 n = kfile->openFile->readNative(buf.data() + total, (U32)(length - total));
+            if (n == 0) break; // EOF / no progress
+            total += n;
+        }
+        got = (U32)total;
         kfile->openFile->seek(saved);
     }
     // BW64_MAPWATCH=0xADDR: log every file-mmap that lands in [ADDR, ADDR+0x20000)
@@ -2738,8 +2783,18 @@ void ksyscall64(CPU64* cpu) {
     {
         static const char* tracePidEnv = getenv("BW64_TRACEPID");
         static int tracePid = tracePidEnv ? atoi(tracePidEnv) : -1;
+        // BW64_TRACE_EXE=<substr> traces every process whose commandLine contains
+        // <substr> — pid-independent, so it survives wine's loader pid churn (the
+        // wine64 wrapper exits under one pid while the app runs under another).
+        // Used to find which Win32 startup syscall precedes a GUI app's silent exit.
+        static const char* traceExe = getenv("BW64_TRACE_EXE");
         int myPid = (int)(cpu->thread ? cpu->thread->process->id : -1);
-        if (getenv("BW64_SYSTRACE") || (tracePid >= 0 && myPid == tracePid)) {
+        bool exeMatch = false;
+        if (traceExe && cpu->thread && cpu->thread->process &&
+            cpu->thread->process->commandLine.contains(traceExe)) {
+            exeMatch = true;
+        }
+        if (getenv("BW64_SYSTRACE") || (tracePid >= 0 && myPid == tracePid) || exeMatch) {
             klog_fmt("SYS64 [pid=%d] #%llu %s (a1=0x%llx a2=0x%llx a3=0x%llx)",
                      myPid, (unsigned long long)nr, x64SyscallName(nr),
                      (unsigned long long)a1, (unsigned long long)a2,
