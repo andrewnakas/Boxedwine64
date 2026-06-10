@@ -498,6 +498,11 @@ void tickXWirePresent() {
     // with no sink) so a headless-but-GL path still drains.
     drainMainThreadWork();
     if (g_xwirePresentSink) {
+        // Coalesced present: the wire server's draw handlers (PutImage bands,
+        // CopyArea, text, map/unmap) only mark the scene dirty; the one full
+        // composite per tick happens here. Lock-free no-op when nothing drew,
+        // so the boot storm stays uncontended (same reasoning as hasInput()).
+        XWireServer::instance().flushPendingPresent();
         g_xwirePresentSink->tickMainThread();
         // Flush queued host input to the guest only when there IS input — a
         // lock-free check, so during the boot storm (no input) we take zero

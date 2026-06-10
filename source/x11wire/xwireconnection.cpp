@@ -612,7 +612,7 @@ void XWireConnection::processOneRequest(const uint8_t* req, uint32_t len) {
                 }
             }
             // A menu/popup just closed — recompose so it disappears from the host.
-            if (wasOverlay) srv.composeAndPresent();
+            if (wasOverlay) srv.schedulePresent();
             break;
         }
         case X_DestroyWindow: {
@@ -1852,7 +1852,7 @@ void XWireConnection::blitPutImage(uint32_t drawable, uint8_t format, uint8_t de
     }
     // Recompose base + overlays whenever any window draws, so a menu/popup that
     // PutImages into its own (non-base) window still appears on the host.
-    srv.composeAndPresent();
+    srv.schedulePresent();
 }
 
 void XWireConnection::copyAreaPixmapToWindow(uint32_t srcId, uint32_t dstId,
@@ -1935,14 +1935,14 @@ void XWireConnection::copyAreaPixmapToWindow(uint32_t srcId, uint32_t dstId,
                 g_xwirePresentSink) {
                 g_xwirePresentSink->requestClear();
             }
-            srv.composeAndPresent();
+            srv.schedulePresent();
             return;
         } else if (srv.presentWindow == 0) {
             srv.presentWindow = dstId;
             srv.glPresentDrawable = 0;
         }
     }
-    srv.composeAndPresent();
+    srv.schedulePresent();
 }
 
 // ---------------------------------------------------------------------------
@@ -2010,7 +2010,7 @@ void XWireConnection::blitText(uint32_t drawable, uint32_t gcId, int16_t x, int1
     if (it == srv.windows.end() || it->second.isRoot) return;  // pixmap/root -> skip
     drawTextOverlay(it->second, x, y, chars, fg, bg, imageText);
     lk.unlock();
-    srv.composeAndPresent();
+    srv.schedulePresent();
 }
 
 void XWireConnection::blitTextItems(uint32_t drawable, uint32_t gcId, int16_t y,
@@ -2026,7 +2026,7 @@ void XWireConnection::blitTextItems(uint32_t drawable, uint32_t gcId, int16_t y,
     for (const auto& item : items)
         drawTextOverlay(it->second, item.first, y, item.second, fg, bg, /*imageText=*/false);
     lk.unlock();
-    srv.composeAndPresent();   // one present for the whole item list
+    srv.schedulePresent();   // one present for the whole item list
 }
 
 // ---------------------------------------------------------------------------

@@ -35,6 +35,7 @@
 #include <string>
 #include <cstdint>
 #include <mutex>
+#include <atomic>
 
 class KUnixSocketObject;
 class XWireConnection;
@@ -191,6 +192,20 @@ public:
     // one host-sized image and hand it to the present sink. Call with regMutex
     // NOT held (it locks internally). Cheap no-op when nothing is dirty.
     void composeAndPresent();
+
+    // Deferred-present path used by the per-request draw handlers (PutImage /
+    // CopyArea / text / map-unmap). composeAndPresent() copies the full
+    // host-sized framebuffer, and GDI apps repaint in many small bands — calling
+    // it inline per request composited the same frame dozens of times. Instead
+    // the handlers mark the scene dirty here, and tickXWirePresent() (every
+    // frame, on the present thread) flushes at most ONE composite per tick.
+    void schedulePresent() { presentPending.store(true, std::memory_order_release); }
+    void flushPendingPresent() {
+        if (presentPending.exchange(false, std::memory_order_acq_rel)) {
+            composeAndPresent();
+        }
+    }
+    std::atomic<bool> presentPending{false};
 
     // Persistent-session app switch: mark every window owned by `ownerBase`
     // (a connection's resource-id base) as un-mapped, so the previous app's

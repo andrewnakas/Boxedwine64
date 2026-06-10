@@ -7,14 +7,14 @@ ZIP_ASSET_FILES := $(wildcard *.zip)
 default all: release
 
 release: export BUILD_DIR := Build/Release
-release: export EXTRA_CPP_FLAGS := $(RELEASE_FLAGS)
+release: export EXTRA_CPP_FLAGS := $(RELEASE_FLAGS) -DNDEBUG
 release: export SHELL_FILE := shell.html
 release: export ASSET_FILES := boxedwine.css boxedwine-shell.js $(ZIP_ASSET_FILES)
 test: export BUILD_DIR := Build/Test
 test: export EXTRA_CPP_FLAGS := -D__TEST -DASMJIT_STATIC
 test: export SHELL_FILE := shelltest.html
 test: export EXTRA_LD_FLAGS := --emrun
-multiThreaded: export EXTRA_CPP_FLAGS := -DBOXEDWINE_MULTI_THREADED -pthread
+multiThreaded: export EXTRA_CPP_FLAGS := -DBOXEDWINE_MULTI_THREADED -pthread -DNDEBUG
 multiThreaded: export BUILD_DIR := Build/MultiThreaded
 multiThreaded: export SHELL_FILE := shell.html
 multiThreaded: export EXTRA_LD_FLAGS := -pthread -sPTHREAD_POOL_SIZE=32 -sPROXY_TO_PTHREAD=1 -sOFFSCREENCANVAS_SUPPORT=0 --js-library=boxedwine-multithreaded-audio.js
@@ -78,7 +78,7 @@ wasm64-selftest-mem64: export EXTRA_LD_FLAGS := -sMEMORY64=1 -sENVIRONMENT=node 
 # the BOXEDWINE_OPENGL build fails with "unknown type name 'GLenum'" on a CLEAN
 # tree (a stale .o hid it locally). DISABLE_GL_EXTENSIONS empties the large legacy
 # 32-bit glfunctions_ext* marshaling (unused by the 64-bit gl64 bridge).
-wasm64-mt: export EXTRA_CPP_FLAGS := -DBOXEDWINE_GUEST_X64=1 -DBOXEDWINE_MULTI_THREADED -DBOXEDWINE_OPENGL '-DGLH=<SDL_opengl.h>' -DDISABLE_GL_EXTENSIONS -pthread
+wasm64-mt: export EXTRA_CPP_FLAGS := -DBOXEDWINE_GUEST_X64=1 -DBOXEDWINE_MULTI_THREADED -DBOXEDWINE_OPENGL '-DGLH=<SDL_opengl.h>' -DDISABLE_GL_EXTENSIONS -pthread -DNDEBUG
 wasm64-mt: export BUILD_DIR := Build/Wasm64Mt
 wasm64-mt: export SHELL_FILE := shell.html
 wasm64-mt: export TARGET_EXEC := boxedwine64.html
@@ -217,7 +217,11 @@ SHELL_LDFLAGS := $(if $(filter %.html,$(TARGET_EXEC)),--shell-file $(SHELL_FILE)
 # guest's loader can fopen() a real x86_64 ELF straight off the host disk
 # (NODERAWFS replaces the whole VFS and is mutually exclusive with idbfs).
 FS_LDFLAGS ?= -s FORCE_FILESYSTEM -lidbfs.js
-LDFLAGS = $(FS_LDFLAGS) -s USE_SDL=2 -s USE_ZLIB=1 -fwasm-exceptions -s INITIAL_MEMORY=536870912 $(SHELL_LDFLAGS) -s EXPORTED_RUNTIME_METHODS='["addRunDependency", "removeRunDependency","ERRNO_CODES","ccall","FS","abort","wasmMemory"]' -mtail-call $(EXTRA_LD_FLAGS)
+# -O3 on the LINK matters independently of the per-file -O3 in CPPFLAGS: emcc
+# treats link-time -O as its own setting (default -O0), and it is what enables
+# the binaryen/wasm-opt passes over the final module + optimized JS glue. Without
+# it the shipped .wasm is the unoptimized LTO-less concatenation of the objects.
+LDFLAGS = -O3 $(FS_LDFLAGS) -s USE_SDL=2 -s USE_ZLIB=1 -fwasm-exceptions -s INITIAL_MEMORY=536870912 $(SHELL_LDFLAGS) -s EXPORTED_RUNTIME_METHODS='["addRunDependency", "removeRunDependency","ERRNO_CODES","ccall","FS","abort","wasmMemory"]' -mtail-call $(EXTRA_LD_FLAGS)
 
 #$(TEST_BUILD_DIR)/boxedwineTest: $(TEST_OBJS)
 #	$(CC) $(TEST_OBJS) -o $@ $(LDFLAGS)

@@ -22,6 +22,9 @@
 #include "knativesocket.h"
 #include "knativesystem.h"
 #include "knativethread.h"
+#ifdef BOXEDWINE_GUEST_X64
+#include "../../x11wire/xwirepresent.h"
+#endif
 
 #if !defined(BOXEDWINE_DISABLE_UI) && !defined(__TEST)
 #include "../../ui/mainui.h"
@@ -57,6 +60,12 @@ bool doMainLoop() {
             break;
         }
         KNativeSystem::tick();
+#ifdef BOXEDWINE_GUEST_X64
+        // Flush any deferred X11-wire present (the draw handlers only mark the
+        // scene dirty; see XWireServer::schedulePresent) + drain main-thread GL
+        // work + pump host input. Lock-free no-op when nothing drew.
+        tickXWirePresent();
+#endif
 #if !defined(BOXEDWINE_DISABLE_UI) && !defined(__TEST)
         if (uiIsRunning()) {
             uiLoop();

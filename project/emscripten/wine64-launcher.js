@@ -301,61 +301,111 @@
         });
     }
 
-    // --- fetch a zip into the Emscripten VFS with progress -------------------
+    // --- fetch a zip's bytes with progress -----------------------------------
     // Two paths, selected by the ?chunked flag:
     //   * whole-file: fetch BASE/<name> directly (local `node server.mjs`).
     //   * chunked: fetch BASE/<name>.manifest.json, then each listed part, and
-    //     concatenate them into the original <name> bytes. This is how GitHub
+    //     stitch them into the original <name> bytes. This is how GitHub
     //     Pages serves wine64.zip (split <100 MB, same-origin) — see
     //     tools/rootfs64/split-rootfs.sh and ?chunked above.
-    // Both end by createDataFile()ing the *original* zip name into the VFS, so the
-    // wine64 argv (`-zip <name>`) is identical regardless of how it was fetched.
-    function fetchZipToVfs(name, onProgress) {
+    // Both resolve with the *original* zip's bytes; the caller createDataFile()s
+    // them under the zip's own name, so the wine64 argv (`-zip <name>`) is
+    // identical regardless of how it was fetched.
+    function fetchZipBytes(name, onProgress) {
         // Whole-file path. If it 404s (e.g. on GitHub Pages, where wine64.zip is
         // shipped only as split parts), transparently fall back to chunked — so
         // the page works regardless of whether ?chunked=1 was on the URL. Explicit
         // ?chunked=1 skips straight to the chunked path.
         if (!CHUNKED) {
-            return fetchBytes(BASE + name, name, onProgress).then(function (bytes) {
-                return dropBytesIntoVfs(name, bytes);
-            }).catch(function (err) {
+            return fetchBytes(BASE + name, name, onProgress).catch(function (err) {
                 var msg = "" + (err && err.message ? err.message : err);
                 if (msg.indexOf("HTTP 404") === -1) throw err; // a real error, not "missing whole zip"
                 console.log(name + ": whole zip not found (404) — falling back to chunked parts");
-                return fetchChunked(name, onProgress);
+                return fetchChunkedBytes(name, onProgress);
             });
         }
-        return fetchChunked(name, onProgress);
+        return fetchChunkedBytes(name, onProgress);
     }
 
-    // Chunked: read the manifest, then pull and stitch the parts into <name>.
-    function fetchChunked(name, onProgress) {
+    // Chunked: read the manifest, then pull the parts IN PARALLEL and stitch them
+    // into <name>. split(1) emits fixed-size parts (manifest chunkBytes) with only
+    // the last one short, so part i's bytes belong at exactly i*chunkBytes — each
+    // fetch writes straight into the preallocated buffer, no concatenation copy,
+    // and the parts ride the network concurrently instead of back-to-back.
+    function fetchChunkedBytes(name, onProgress) {
         return fetch(BASE + name + ".manifest.json").then(function (resp) {
             if (!resp.ok) throw new Error("fetch " + name + ".manifest.json -> HTTP " + resp.status);
             return resp.json();
         }).then(function (manifest) {
             var parts = manifest.parts || [name];
             var total = Number(manifest.totalBytes) || 0;
+            var chunk = Number(manifest.chunkBytes) || 0;
+            if (!chunk && parts.length > 1) {
+                throw new Error(name + ".manifest.json: multi-part manifest without chunkBytes");
+            }
             var out = new Uint8Array(total);
-            var offset = 0;
-            // Fetch parts sequentially (keeps peak memory to ~one part + the
-            // assembled buffer, and reports monotonic cumulative progress).
-            return parts.reduce(function (chain, part) {
-                return chain.then(function () {
-                    var atStart = offset;
-                    return fetchBytes(BASE + part, name, onProgress, atStart, total)
-                        .then(function (bytes) {
-                            out.set(bytes, offset);
-                            offset += bytes.length;
-                        });
+            var assembled = 0;
+            return Promise.all(parts.map(function (part, i) {
+                return fetchBytes(BASE + part, part, onProgress).then(function (bytes) {
+                    var offset = i * chunk;
+                    if (offset + bytes.length > total) {
+                        throw new Error(name + ": part " + part + " overflows manifest totalBytes");
+                    }
+                    out.set(bytes, offset);
+                    assembled += bytes.length;
                 });
-            }, Promise.resolve()).then(function () {
-                if (total && offset !== total) {
-                    throw new Error(name + ": assembled " + offset + " bytes, manifest said " + total);
+            })).then(function () {
+                if (total && assembled !== total) {
+                    throw new Error(name + ": assembled " + assembled + " bytes, manifest said " + total);
                 }
-                return dropBytesIntoVfs(name, out);
+                return out;
             });
         });
+    }
+
+    // --- start the rootfs downloads ------------------------------------------
+    // Kicked off from bootWine() the moment we decide to boot — BEFORE the
+    // emscripten script is appended — so the big zip downloads overlap the wasm
+    // fetch + compile + pthread-pool spawn instead of waiting for preRun. All
+    // needed zips (and their split parts) download in parallel; loadFilesystem()
+    // just awaits the bytes. The resolved promises double as an in-memory cache,
+    // so an in-page relaunch reuses the bytes without touching the network.
+    var zipDownloads = null; // name -> Promise<Uint8Array>
+    function neededZips() {
+        var names = [GLIBC_ZIP, WINE_ZIP];
+        if (USE_PREFIX) names.push(PREFIX_ZIP);
+        return names;
+    }
+    // One progress line for the whole concurrent download set: sum the per-URL
+    // byte counts (each zip/part reports under its own label) into a single
+    // monotonic-ish "Loading rootfs NN%". Totals register as each response's
+    // Content-Length / manifest arrives, so the percentage firms up as fetches
+    // start — cosmetic, and far better than three sequential 0-100% sweeps.
+    var dlReceived = {}, dlTotals = {};
+    function aggregateProgress(label, recv, total) {
+        dlReceived[label] = recv;
+        if (total) dlTotals[label] = total;
+        var r = 0, t = 0;
+        Object.keys(dlReceived).forEach(function (k) { r += dlReceived[k]; });
+        Object.keys(dlTotals).forEach(function (k) { t += dlTotals[k]; });
+        var pct = t ? Math.round((r / t) * 100) : 0;
+        setStatusText("Loading rootfs " + pct + "%");
+        if (progressElement) {
+            progressElement.hidden = false;
+            progressElement.value = r;
+            progressElement.max = t || 1;
+        }
+    }
+    function startZipDownloads() {
+        if (!zipDownloads) zipDownloads = {};
+        neededZips().forEach(function (name) {
+            if (zipDownloads[name]) return; // already in flight / cached
+            zipDownloads[name] = fetchZipBytes(name, aggregateProgress);
+            // Swallow here only to avoid unhandled-rejection console noise before
+            // loadFilesystem chains on; IT surfaces the error to the user.
+            zipDownloads[name].catch(function () {});
+        });
+        return zipDownloads;
     }
 
     // --- writable WINEPREFIX -----------------------------------------------
@@ -601,33 +651,21 @@
     window.uploadAndRunExe = uploadAndRunExe;
 
     // --- orchestration ------------------------------------------------------
-    // The zips are large (wine64.zip ~205MB) on the FIRST boot; fetch them, drop
-    // them in the VFS, push the argv, then release the run dependency so main()
-    // proceeds. App switches reload the page, so on a switch the zips come from
-    // the browser's HTTP cache (immutable assets) rather than the network.
+    // The zips are large (wine64.zip ~205MB) on the FIRST boot. Their downloads
+    // were already started by bootWine() (overlapping the wasm compile); here we
+    // await the bytes, drop them in the VFS, push the argv, then release the run
+    // dependency so main() proceeds. On an in-page relaunch the resolved
+    // promises hand the bytes back instantly.
     function loadFilesystem(els) {
         console.log("wine64-launcher: loading 64-bit rootfs from " + (BASE || "./"));
-        function report(name, recv, total) {
-            var pct = total ? Math.round((recv / total) * 100) : 0;
-            setStatusText("Loading " + name + " " + pct + "%");
-            if (els.progress) {
-                els.progress.hidden = false;
-                els.progress.value = recv;
-                els.progress.max = total;
-            }
-        }
-        // report(label, recv, total) matches fetchBytes's onProgress(label, …)
-        // signature, so it can be passed straight through.
-        fetchZipToVfs(GLIBC_ZIP, report)
-            .then(function () {
-                return fetchZipToVfs(WINE_ZIP, report);
-            })
-            .then(function () {
-                // Third overlay: the tiny pre-booted prefix (+glcube.exe), only
-                // when we'll actually run a program against it.
-                if (USE_PREFIX) {
-                    return fetchZipToVfs(PREFIX_ZIP, report);
-                }
+        var downloads = startZipDownloads(); // no-op if already in flight
+        var names = neededZips();
+        Promise.all(names.map(function (name) { return downloads[name]; }))
+            .then(function (allBytes) {
+                // createDataFile is synchronous-cheap; do them in order.
+                return names.reduce(function (chain, name, i) {
+                    return chain.then(function () { return dropBytesIntoVfs(name, allBytes[i]); });
+                }, Promise.resolve());
             })
             .then(function () {
                 if (els.progress) els.progress.hidden = true;
@@ -720,6 +758,11 @@
         // makes emscripten_webgl_create_context fail ("ensureContext FAILED") so
         // the cube never renders. So: only append the script once isolated.
         function appendModuleScript() {
+            // Boot is going ahead: start the rootfs downloads NOW so they ride
+            // the network while the browser fetches + compiles boxedwine64.wasm
+            // and spawns the pthread worker pool. preRun's loadFilesystem awaits
+            // these same promises.
+            startZipDownloads();
             var s = document.createElement("script");
             s.id = "boxedwine64-module-script";
             s.async = true;
