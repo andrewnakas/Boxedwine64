@@ -58,10 +58,10 @@ self-contained sessions. Each iteration:
 | M7 | Lazy / streamable rootfs | Don't download ~196MB before first paint: HTTP-Range-backed zip reads (or progressive mount), unlocks bigger bundled apps (Quake 2 deferral) | First app reaches first paint with materially less than the full rootfs downloaded (measure bytes-before-first-paint before/after) | DEFERRED (2026-06-11) — needs a custom minizip Range-fetch I/O backend + synchronous-fetch-on-guest-thread under PROXY_TO_PTHREAD; multi-session architectural lift (assessment in Log). Revisit with M6's block cache as companion perf work |
 | M8 | Memory usage reduction | Parity with upstream 26R1 (-20%): measure wasm heap after boot, free what's recoverable (e.g. post-mount zip buffers, duplicate framebuffers) | Peak/total heap after notepad boot reduced ≥15% vs. measured baseline, recorded in the Log | DONE — browser-verified 2026-06-11: JS heap 651MB peak → 235MB post-boot (~416MB / 64% freed) by releasing the JS-side zip buffers after MEMFS mount |
 | M9 | App breadth: experimental row | The taskmgr/regedit/control/explorer/oleview row: each either works or has a root-caused triage note (X opcodes, missing dlls, …) | Each app: renders+takes input in-browser, or a Log entry naming the first fatal marker and the missing feature | DONE — browser-verified 2026-06-11: regedit/control/explorer/IE/oleview RENDER (5/6); taskmgr triaged (clean-exit after PolyText X-text opcodes 65/66) |
-| M10 | Joystick/gamepad | Upstream roadmap item: SDL gamepad → browser Gamepad API → wine dinput | A game or joy.cpl-style test reacts to a connected (or emulated CDP) gamepad in-browser; else documented evaluation | TODO |
-| M11 | ISO mounting (evaluate) | Upstream "distant future" item: mount an ISO as a drive (ISO9660 reader over the existing zip-mount machinery, or pre-extract path) | Either a demo ISO browses as a drive letter in winefile, or a written go/no-go with effort estimate | TODO |
-| M12 | DOSBox launching (evaluate) | Upstream item: launching DOSBox for DOS-installer games — likely impractical under the interpreter; decide honestly | Working demo, or a written descope rationale with the technical blocker | TODO |
-| M13 | Gecko / .NET (evaluate) | Upstream item: wine-gecko (HTML dialogs) and wine-mono (.NET apps) payloads — weigh ~50–80MB payloads + JIT-under-interpreter cost | A trivial .NET WinForms exe runs, or a written descope rationale (payload/perf numbers) | TODO |
+| M10 | Joystick/gamepad | Upstream roadmap item: SDL gamepad → browser Gamepad API → wine dinput | A game or joy.cpl-style test reacts to a connected (or emulated CDP) gamepad in-browser; else documented evaluation | DESCOPED (2026-06-11, evaluation) — entirely unbuilt: SDL inits VIDEO|TIMER only (no joystick subsystem), no Gamepad-API bridge, no /dev/input/js* device feeding wine's HID stack. Multi-layer effort + blocked headless verification. Assessment in Log |
+| M11 | ISO mounting (evaluate) | Upstream "distant future" item: mount an ISO as a drive (ISO9660 reader over the existing zip-mount machinery, or pre-extract path) | Either a demo ISO browses as a drive letter in winefile, or a written go/no-go with effort estimate | EVALUATED → NO-GO for now (2026-06-11): no ISO9660 reader exists; the pre-extract-to-a-drive path is the pragmatic route. Assessment in Log |
+| M12 | DOSBox launching (evaluate) | Upstream item: launching DOSBox for DOS-installer games — likely impractical under the interpreter; decide honestly | Working demo, or a written descope rationale with the technical blocker | EVALUATED → NO-GO (2026-06-11): impractical — DOSBox-under-wine-under-interpreter, no integration exists. Rationale in Log |
+| M13 | Gecko / .NET (evaluate) | Upstream item: wine-gecko (HTML dialogs) and wine-mono (.NET apps) payloads — weigh ~50–80MB payloads + JIT-under-interpreter cost | A trivial .NET WinForms exe runs, or a written descope rationale (payload/perf numbers) | EVALUATED → NO-GO (2026-06-11): no mono/gecko in rootfs; ~50-80MB payload + JIT-in-interpreter cold-start. Rationale in Log |
 
 Suggested order = table order. M1 early on purpose: it protects every later
 milestone. M11–M13 are evaluation milestones — a rigorous written no-go closes
@@ -71,6 +71,47 @@ them.
 
 ## Log
 
+- **2026-06-11 — M11/M12/M13 EVALUATED (the evaluation milestones), all
+  written no-go for the autonomous loop, each with a rationale + a resume
+  pointer.**
+  - **M11 ISO mounting → NO-GO now, clear resume path.** No ISO9660 reader in
+    the tree (grep: none). Two routes: (a) a real ISO9660 FsNode mounting an
+    .iso as a drive letter — net-new filesystem code; (b) the PRAGMATIC route —
+    pre-extract the ISO's contents (host-side, like the rootfs zips) and expose
+    them as a drive via the existing FsZip/mount machinery, which already maps a
+    zip to a drive. (b) needs no new in-guest code and is the recommended path
+    if/when a real use case (a CD-based installer) appears. Deferred, not hard-
+    blocked — just no current demand to justify the work.
+  - **M12 DOSBox → NO-GO (impractical).** No DOSBox integration exists (grep:
+    only an unrelated MMX file matched). The concept is DOSBox.exe running as a
+    Windows app under wine under the Boxedwine x86 interpreter — an emulator
+    inside an emulator inside an interpreter; the perf and complexity make it a
+    non-starter for the browser build. DOS-installer games are better served by
+    a separate native-DOSBox or js-dos path entirely outside this project.
+    Genuine descope.
+  - **M13 Gecko/.NET → NO-GO (payload + JIT cost).** No wine-mono or wine-gecko
+    in the rootfs (grep: none). Adding .NET needs the ~50-80MB wine-mono payload
+    (already 215MB rootfs), and .NET's JIT running inside a non-JIT x86
+    INTERPRETER means brutal cold-start; WPF (D3D) is dead here anyway and only
+    .NET4.x WinForms-over-GDI+ could even theoretically run. wine-gecko (HTML
+    rendering for IE/mshtml dialogs) is a similar heavy payload for narrow
+    benefit. Both are documented as AVOID in [[wasm-app-compatibility]]'s
+    sweet-spot research. Ship native Win32 equivalents instead. Genuine descope.
+- **2026-06-11 — M10 DESCOPED (joystick/gamepad), evaluation with evidence.**
+  Found it's entirely unbuilt, top to bottom: (1) the wasm build inits SDL with
+  only `SDL_INIT_VIDEO | SDL_INIT_TIMER` (mainui.cpp:470; and the emscripten
+  loop is source/sdl/emscripten/mainloop.cpp anyway) — no joystick/
+  gamecontroller subsystem; (2) no Gamepad-API code anywhere in
+  project/emscripten/*.js; (3) Boxedwine registers /dev/input/event* but wired
+  to keyboard/mouse/touch (openDevInputKeyboard/Touch), NO /dev/input/js* or a
+  joystick evdev device; (4) wine's HID stack IS in the rootfs (winebus.sys/.so,
+  hidclass.sys, dinput8.dll) but has nothing to read from. Building M10 =
+  SDL joystick subsystem init + an emscripten SDL↔browser-Gamepad-API bridge +
+  a Boxedwine joystick device feeding winebus + wine dinput config — a
+  multi-layer effort. PLUS headless verification is blocked: no real gamepad,
+  and CDP can't easily inject Gamepad-API state. A future session with a real
+  controller + a manual test plan is the right venue. Descoped (evaluation
+  milestone — a documented no-go closes it).
 - **2026-06-11 — M9 DONE (experimental-app breadth, browser-verified).**
   Probed all six experimental-row apps directly (?p=<app>), each in a fresh
   Chrome, classifying render-vs-first-fatal-marker:
