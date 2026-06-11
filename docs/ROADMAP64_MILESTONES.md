@@ -49,7 +49,7 @@ self-contained sessions. Each iteration:
 | ID | Title | Goal | Acceptance check (browser-verified) | Status |
 |----|-------|------|-------------------------------------|--------|
 | M0 | Kill-on-switch app switching | Switching apps in the app bar kills the old app (CPU/RAM freed, wineserver client reaped) and routes canvas+input to the new app, no page reload | notepad→DOOM→notepad cycle: each switch logs the kill, old app visually gone, typing/keys reach the new app, no runtime crash | DONE — browser-verified 2026-06-11 (both directions + boot-app relay-pid case), shipped |
-| M1 | CI browser smoke test | Headless-Chrome boot test wired into GitHub Actions so later milestones can't silently break boot | CI job boots `?p=notepad.exe`, asserts `XWire: first window mapped` + non-blank canvas, fails the deploy on regression; a green run on master | IN PROGRESS — harness validated locally (63s boot, lit=99.9); gated deploy run pending |
+| M1 | CI browser smoke test | Headless-Chrome boot test wired into GitHub Actions so later milestones can't silently break boot | CI job boots `?p=notepad.exe`, asserts `XWire: first window mapped` + non-blank canvas, fails the deploy on regression; a green run on master | DONE — gated deploy f9e97941 green 2026-06-11; CI smoke PASS first attempt (78s, lit=99.9) |
 | M2 | Clipboard copy/paste (host↔guest) | Parity with 32-bit 25R1 copy/paste: guest X selections bridge to the browser clipboard | Copy text in guest Notepad → readable via the page (button or navigator.clipboard); paste host text into Notepad; round-trip verified | TODO |
 | M3 | Persistence across reloads | Guest home/prefix writes survive a page reload (32-bit web build has INDEXED_DB storage) | Save a file in Notepad, hard-reload the page, relaunch Notepad: the file is still there (IndexedDB-backed) | TODO |
 | M4 | Mouse capture for games | Pointer events for game-style apps: DOOM mouse turn/fire (doomgeneric wndProc has no mouse path today), canvas pointer-lock toggle | In DOOM, mouse movement turns the player and mouse button fires, browser-verified | TODO |
@@ -71,6 +71,15 @@ them.
 
 ## Log
 
+- **2026-06-11 — M0 verified on the LIVE Pages site** (the exact environment
+  the original bug was reported in): cold chunked load → notepad booted →
+  switch to DOOM killed both the relay pid and the real notepad GUI
+  (`pid 38, C:\windows\system32\notepad.exe, [X window owner]`), X state
+  dropped, DOOM title art rendered, Enter opened DOOM's menu (red pixels
+  18%→27%). No fatal markers. Live-testing gotchas: direct wine64.html URLs
+  on Pages need `?chunked=1` (the rootfs is split); live boot is flaky —
+  attempt 2 died with notepad exit status=1 before any switch (boot
+  reliability, tracked for a future milestone; M1's CI retry absorbs it).
 - **2026-06-11 — M0 DONE + browser-verified.** Two full local browser runs:
   (1) notepad→DOOM→notepad: kills logged both ways, DOOM adopted in 8s, fresh
   notepad took typing ("ok" at Ln 1 Col 3), zero fatal markers; (2) the
