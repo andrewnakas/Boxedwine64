@@ -126,6 +126,31 @@ jobs:
           touch "$site/.nojekyll"
           echo "Assembled site:"; ls -la "$site"
 
+      - name: Browser smoke test (boot notepad to first paint)
+        # Gate the deploy on the assembled site actually BOOTING in a real
+        # browser: serve _site exactly as Pages will (chunked rootfs parts +
+        # the same launcher), launch headless Chrome (preinstalled on
+        # ubuntu-latest), and require the wine boot to reach "XWire: first
+        # window mapped" AND a lit canvas (smoke-test.mjs, no npm deps). Two
+        # attempts — the wine boot has a known intermittent wineserver
+        # startup race that can lose a boot (~1 in 3 seen locally); one retry
+        # keeps that from blocking good deploys while a genuine regression
+        # still fails both.
+        run: |
+          set -euo pipefail
+          cp project/emscripten/server.mjs _site/server.mjs
+          node _site/server.mjs 8077 &
+          SERVER_PID=$!
+          trap 'kill $SERVER_PID 2>/dev/null || true' EXIT
+          for i in $(seq 1 50); do
+            curl -fs -o /dev/null http://127.0.0.1:8077/wine64.html && break
+            sleep 0.2
+          done
+          node project/emscripten/smoke-test.mjs \
+            "http://127.0.0.1:8077/wine64.html?chunked=1&p=notepad.exe" \
+            --timeout=420000 --attempts=2
+          rm -f _site/server.mjs
+
       - name: Upload Pages artifact
         uses: actions/upload-pages-artifact@v3
         with:
