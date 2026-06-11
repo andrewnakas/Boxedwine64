@@ -668,6 +668,12 @@
                 }, Promise.resolve());
             })
             .then(function () {
+                // Restore persisted user files into the writable MEMFS layer
+                // BEFORE main() runs (we still hold the loadWine64Fs run
+                // dependency), so the guest's very first VFS scan sees them.
+                return restorePersistedFiles();
+            })
+            .then(function () {
                 if (els.progress) els.progress.hidden = true;
                 if (els.spinner) els.spinner.hidden = true;
                 setStatusText(DO_BOOT ? "Booting wine prefix..." :
@@ -690,6 +696,7 @@
                 // emulator's main loop won't quit when the app later exits — that
                 // resident server is what makes this a persistent session.
                 if (SESSION) pinSessionServerWhenReady();
+                startPersistLoop();
             })
             .catch(function (err) {
                 console.error("wine64-launcher failed: " + err);
@@ -1022,6 +1029,142 @@
     }
     window.bw64CopyFromApp = copyFromApp;
     window.bw64PasteToApp = pasteToApp;
+
+    // --- persistence across reloads (M3) -------------------------------------
+    // Guest writes land in the writable MEMFS layer under ROOT; the rootfs zips
+    // are read-only layers below it. Persist the user-visible writable tree
+    // (HOME: Z:\home\username — includes the .wine prefix, so app settings and
+    // registry changes survive too) into IndexedDB on an interval, and restore
+    // it during preRun BEFORE wine boots — restored files are then part of the
+    // very first VFS scan (no post-boot cache registration needed) and shadow
+    // the zip contents naturally. ?persist=0 disables both halves.
+    var PERSIST = param("persist") !== "0";
+    var PERSIST_DB = "bw64persist", PERSIST_STORE = "files";
+    var PERSIST_FILE_CAP = 16 * 1024 * 1024;       // skip single files above this
+    var PERSIST_SKIP = { ".bw64clip.txt": 1, ".bw64clip.out": 1, ".bw64clip.tmp": 1 };
+    var persistManifest = {};                      // path -> mtimeMs:size signature
+
+    function persistOpenDb() {
+        return new Promise(function (resolve, reject) {
+            var req = indexedDB.open(PERSIST_DB, 1);
+            req.onupgradeneeded = function () { req.result.createObjectStore(PERSIST_STORE); };
+            req.onsuccess = function () { resolve(req.result); };
+            req.onerror = function () { reject(req.error); };
+        });
+    }
+    function mkdirTreeHost(FS, dir) {
+        var parts = dir.split("/").filter(Boolean);
+        var p = "";
+        for (var i = 0; i < parts.length; i++) {
+            p += "/" + parts[i];
+            try { FS.mkdir(p); } catch (e) { /* EEXIST is fine */ }
+        }
+    }
+    // Restore every persisted file into MEMFS. Runs inside preRun (FS ready,
+    // main() held by the loadWine64Fs run dependency). Never rejects — a broken
+    // store must not block boot.
+    function restorePersistedFiles() {
+        if (!PERSIST || typeof indexedDB === "undefined") return Promise.resolve();
+        var FS = getFS();
+        if (!FS) return Promise.resolve();
+        return persistOpenDb().then(function (db) {
+            return new Promise(function (resolve) {
+                var n = 0, bytes = 0;
+                var tx = db.transaction(PERSIST_STORE, "readonly");
+                var cur = tx.objectStore(PERSIST_STORE).openCursor();
+                cur.onsuccess = function () {
+                    var c = cur.result;
+                    if (!c) return;
+                    var path = String(c.key);
+                    var rec = c.value;
+                    try {
+                        mkdirTreeHost(FS, path.slice(0, path.lastIndexOf("/")));
+                        FS.writeFile(path, rec.data);
+                        persistManifest[path] = rec.sig;
+                        n++; bytes += rec.data.length;
+                    } catch (e) {
+                        console.warn("persist: restore of " + path + " failed: " + e);
+                    }
+                    c.continue();
+                };
+                tx.oncomplete = function () {
+                    if (n) console.log("persist: restored " + n + " file(s), " + bytes + " bytes");
+                    db.close(); resolve();
+                };
+                tx.onerror = function () { db.close(); resolve(); };
+            });
+        }).catch(function (e) { console.warn("persist: restore skipped: " + e); });
+    }
+    function persistWalk(FS, dir, out) {
+        var names;
+        try { names = FS.readdir(dir); } catch (e) { return; }
+        for (var i = 0; i < names.length; i++) {
+            var name = names[i];
+            if (name === "." || name === "..") continue;
+            if (PERSIST_SKIP[name]) continue;
+            var p = dir + "/" + name;
+            var st;
+            try { st = FS.stat(p); } catch (e) { continue; }
+            if (FS.isDir(st.mode)) persistWalk(FS, p, out);
+            else if (FS.isFile(st.mode) && st.size <= PERSIST_FILE_CAP) {
+                out[p] = (st.mtime && st.mtime.getTime ? st.mtime.getTime() : Number(st.mtime) || 0) + ":" + st.size;
+            }
+        }
+    }
+    // One incremental sync of HOME into IndexedDB (changed/new files written,
+    // deleted files removed). Cheap when nothing changed: a stat walk + map diff.
+    var persistBusy = false;
+    function persistTick() {
+        if (persistBusy || !PERSIST) return;
+        var FS = getFS();
+        if (!FS) return;
+        var now = {};
+        try { persistWalk(FS, HOME_IN_MEMFS, now); } catch (e) { return; }
+        var puts = [], dels = [];
+        for (var p in now) if (now[p] !== persistManifest[p]) puts.push(p);
+        for (var q2 in persistManifest) if (!(q2 in now)) dels.push(q2);
+        if (!puts.length && !dels.length) return;
+        persistBusy = true;
+        persistOpenDb().then(function (db) {
+            var tx = db.transaction(PERSIST_STORE, "readwrite");
+            var store = tx.objectStore(PERSIST_STORE);
+            puts.forEach(function (p) {
+                var data = readFileSafe(p);
+                if (data === null) return;
+                store.put({ data: data, sig: now[p] }, p);
+            });
+            dels.forEach(function (p) { store.delete(p); });
+            tx.oncomplete = function () {
+                puts.forEach(function (p) { persistManifest[p] = now[p]; });
+                dels.forEach(function (p) { delete persistManifest[p]; });
+                console.log("persist: synced " + puts.length + " changed, " + dels.length + " removed");
+                db.close(); persistBusy = false;
+            };
+            tx.onerror = function () { db.close(); persistBusy = false; };
+        }).catch(function () { persistBusy = false; });
+    }
+    function startPersistLoop() {
+        if (!PERSIST || typeof indexedDB === "undefined") return;
+        // Wait for the session (boot done, guest writing possible), then sync
+        // every 5s. A final flush on pagehide is racy (IndexedDB is async), so
+        // the interval is the real mechanism; visibilitychange gives one extra
+        // early chance when the user switches tabs before closing.
+        var armed = false;
+        (function poll() {
+            if (sessionReady()) {
+                if (!armed) {
+                    armed = true;
+                    setInterval(persistTick, 5000);
+                    document.addEventListener("visibilitychange", function () {
+                        if (document.visibilityState === "hidden") persistTick();
+                    });
+                    console.log("persist: sync loop armed (every 5s; ?persist=0 to disable)");
+                }
+                return;
+            }
+            setTimeout(poll, 1000);
+        })();
+    }
 
     // --- first boot from the page load --------------------------------------
     setStatusText("Loading wine64 (WASM)...");

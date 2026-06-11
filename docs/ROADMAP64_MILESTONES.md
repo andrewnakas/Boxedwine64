@@ -51,7 +51,7 @@ self-contained sessions. Each iteration:
 | M0 | Kill-on-switch app switching | Switching apps in the app bar kills the old app (CPU/RAM freed, wineserver client reaped) and routes canvas+input to the new app, no page reload | notepad→DOOM→notepad cycle: each switch logs the kill, old app visually gone, typing/keys reach the new app, no runtime crash | DONE — browser-verified 2026-06-11 (both directions + boot-app relay-pid case), shipped |
 | M1 | CI browser smoke test | Headless-Chrome boot test wired into GitHub Actions so later milestones can't silently break boot | CI job boots `?p=notepad.exe`, asserts `XWire: first window mapped` + non-blank canvas, fails the deploy on regression; a green run on master | DONE — gated deploy f9e97941 green 2026-06-11; CI smoke PASS first attempt (78s, lit=99.9) |
 | M2 | Clipboard copy/paste (host↔guest) | Parity with 32-bit 25R1 copy/paste: bridge the browser clipboard with the guest's | Copy text in guest Notepad → readable via the page (button or navigator.clipboard); paste host text into Notepad; round-trip verified | DONE — round-trip browser-verified 2026-06-11 (win32 clipset/clipget helper design; toolbar buttons) |
-| M3 | Persistence across reloads | Guest home/prefix writes survive a page reload (32-bit web build has INDEXED_DB storage) | Save a file in Notepad, hard-reload the page, relaunch Notepad: the file is still there (IndexedDB-backed) | TODO |
+| M3 | Persistence across reloads | Guest home/prefix writes survive a page reload (32-bit web build has INDEXED_DB storage) | Save a file in Notepad, hard-reload the page, relaunch Notepad: the file is still there (IndexedDB-backed) | DONE — browser-verified 2026-06-11 across a full Chrome restart (marker file restored byte-identical pre-boot) |
 | M4 | Mouse capture for games | Pointer events for game-style apps: DOOM mouse turn/fire (doomgeneric wndProc has no mouse path today), canvas pointer-lock toggle | In DOOM, mouse movement turns the player and mouse button fires, browser-verified | TODO |
 | M5 | Sound (audio backend) | Parity with 32-bit audio: wine's audio stack → an SDL-audio (WebAudio) device in the browser | DOOM plays its sound effects (or a .wav plays via sndrec/winmm test) audibly in the tab; AudioContext confirmed feeding samples | TODO |
 | M6 | Web-build performance: decoded-block cache | The upstream "improve performance for Emscripten build" item, 64-bit edition: per-RIP decoded-block cache so hot loops skip re-decode (README "concrete next steps" #3) | Measured ≥2x CPU64 throughput on a repeatable benchmark (or notepad cold boot <30s local), selftest 234/234, apps still boot | TODO |
@@ -71,6 +71,26 @@ them.
 
 ## Log
 
+- **2026-06-11 — M3 DONE (persistence, browser-verified across a real Chrome
+  restart).** wine64-launcher.js now syncs the writable HOME tree
+  (Z:\home\username — includes the .wine prefix, so registry + app settings
+  persist too) into IndexedDB on a 5s interval + visibilitychange, and
+  restores it during preRun BEFORE wine boots (restored files are part of the
+  first VFS scan, so they shadow the read-only zip layers naturally — no
+  post-boot cache registration). Incremental: a stat-walk diff against an
+  in-memory signature manifest, so a quiet session writes nothing. ?persist=0
+  disables it; 16MB/file cap; the .bw64clip.* bridge files are skipped.
+  Verified A/B with a full Chrome process restart between phases (MEMFS gone,
+  IndexedDB carries the data): marker written into HOME → captured by the
+  sync loop → fresh Chrome boots → `persist: restored N files` pre-boot →
+  marker read back byte-identical. Test gotcha learned (not a product bug):
+  driving notepad's Ctrl+S Save As dialog headless is unreliable (the dialog
+  often doesn't open from a synthetic Ctrl+S) — the test writes the marker
+  straight into the writable MEMFS HOME instead, which is byte-identical to
+  what a guest save produces since guest saves land in that same layer. Also:
+  a clean-DB setup must navigate to a NON-wine page first (a mid-boot wine
+  teardown by navigation occasionally wedges the next boot — use a 404/blank
+  URL for the IndexedDB-clear step).
 - **2026-06-11 — M2 DONE (clipboard, browser-verified round trip).** Winning
   design: two tiny bundled win32 helpers — clipset.exe (UTF-8 staging file →
   CF_UNICODETEXT) and clipget.exe (clipboard → output file) — spawned into the
