@@ -54,7 +54,7 @@ self-contained sessions. Each iteration:
 | M3 | Persistence across reloads | Guest home/prefix writes survive a page reload (32-bit web build has INDEXED_DB storage) | Save a file in Notepad, hard-reload the page, relaunch Notepad: the file is still there (IndexedDB-backed) | DONE — browser-verified 2026-06-11 across a full Chrome restart (marker file restored byte-identical pre-boot) |
 | M4 | Mouse capture for games | Pointer events for game-style apps: DOOM mouse turn/fire (doomgeneric wndProc has no mouse path today), canvas pointer-lock toggle | In DOOM, mouse movement turns the player and mouse button fires, browser-verified | DONE — browser-verified 2026-06-11 (mouse motion turns DOOM's 3D view; doom.exe rebuilt with a wndProc mouse path) |
 | M5 | Sound (audio backend) | Parity with 32-bit audio: wine's audio stack → an SDL-audio (WebAudio) device in the browser | DOOM plays its sound effects (or a .wav plays via sndrec/winmm test) audibly in the tab; AudioContext confirmed feeding samples | DESCOPED (2026-06-11) — sink works, wine→sink bridge is a multi-session rootfs effort; resume path documented in the Log |
-| M6 | Web-build performance: decoded-block cache | The upstream "improve performance for Emscripten build" item, 64-bit edition: per-RIP decoded-block cache so hot loops skip re-decode (README "concrete next steps" #3) | Measured ≥2x CPU64 throughput on a repeatable benchmark (or notepad cold boot <30s local), selftest 234/234, apps still boot | TODO |
+| M6 | Web-build performance: decoded-block cache | The upstream "improve performance for Emscripten build" item, 64-bit edition: per-RIP decoded-block cache so hot loops skip re-decode (README "concrete next steps" #3) | Measured ≥2x CPU64 throughput on a repeatable benchmark (or notepad cold boot <30s local), selftest 234/234, apps still boot | DESCOPED (2026-06-11) — the cheap lever (prefix-decode cache) gave NO measured win (benchmark-confirmed); the real win (full decoded-block cache) is a multi-session executor refactor. Evidence + resume path in the Log |
 | M7 | Lazy / streamable rootfs | Don't download ~196MB before first paint: HTTP-Range-backed zip reads (or progressive mount), unlocks bigger bundled apps (Quake 2 deferral) | First app reaches first paint with materially less than the full rootfs downloaded (measure bytes-before-first-paint before/after) | TODO |
 | M8 | Memory usage reduction | Parity with upstream 26R1 (-20%): measure wasm heap after boot, free what's recoverable (e.g. post-mount zip buffers, duplicate framebuffers) | Peak/total heap after notepad boot reduced ≥15% vs. measured baseline, recorded in the Log | TODO |
 | M9 | App breadth: experimental row | The taskmgr/regedit/control/explorer/oleview row: each either works or has a root-caused triage note (X opcodes, missing dlls, …) | Each app: renders+takes input in-browser, or a Log entry naming the first fatal marker and the missing feature | TODO |
@@ -71,6 +71,30 @@ them.
 
 ## Log
 
+- **2026-06-11 — M6 DESCOPED (interpreter throughput), with benchmark
+  evidence pointing at the real bottleneck.** Implemented the cheap lever
+  first — a per-RIP prefix-decode cache in CPU64::step() (memoize
+  consumePrefixes()+opcode fetch, 4096-entry direct-mapped, invalidated with
+  the fetch cache on execve). It built clean and PASSED selftest 234/234
+  (after one gotcha: an inline 96KB array in CPU64 crashed the selftest with
+  an OOB because CPU64 is new'd per thread + size-sensitive — heap-allocating
+  the cache fixed it). BUT a CPU-bound microbenchmark (a 40M-iteration xorshift
+  loop, no I/O, run via --x64-run-elf) showed NO improvement: ~2.7s baseline
+  vs ~2.4–2.9s cached (within noise). Reverted. WHY it didn't help: the
+  existing per-page fetchByte cache already turns prefix re-fetching into a
+  bounds-compare + array index, so re-running consumePrefixes() each step is
+  already near-free — the prefix scan was never the bottleneck. BW64_OPPROF on
+  the benchmark confirms the hot opcodes are plain MOV/XOR/shift/IMUL; the
+  per-instruction cost is the step() dispatch + decodeModRM + operand
+  read/write machinery, NOT prefix decode. The real M6 win (the README's
+  decoded-block cache) must memoize the FULL instruction decode (total length +
+  a dispatch tag, keyed by RIP) so step() skips re-decoding entirely — a large,
+  delicate refactor of the switch-based executor, a dedicated multi-session
+  effort. RESUME PATH: the benchmark ELF (/tmp build from a simple xorshift
+  loop; recreate ~40M iters) + BW64_OPPROF are the measurement tools; start
+  from decodeModRM + the operand helpers, memoize instruction LENGTH first
+  (lowest-risk, lets step() skip the re-decode to find the next RIP), validate
+  with --x64-selftest 234/234 each step. Descoped from the loop, not abandoned.
 - **2026-06-11 — M5 DESCOPED (sound), with an evidence-based rationale + a
   concrete resume path.** Findings from the investigation:
   - The audio SINK is fully built and live in wasm64-mt: `/dev/dsp` (OSS) is
