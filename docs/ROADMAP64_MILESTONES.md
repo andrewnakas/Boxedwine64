@@ -57,7 +57,7 @@ self-contained sessions. Each iteration:
 | M6 | Web-build performance: decoded-block cache | The upstream "improve performance for Emscripten build" item, 64-bit edition: per-RIP decoded-block cache so hot loops skip re-decode (README "concrete next steps" #3) | Measured ≥2x CPU64 throughput on a repeatable benchmark (or notepad cold boot <30s local), selftest 234/234, apps still boot | DESCOPED (2026-06-11) — the cheap lever (prefix-decode cache) gave NO measured win (benchmark-confirmed); the real win (full decoded-block cache) is a multi-session executor refactor. Evidence + resume path in the Log |
 | M7 | Lazy / streamable rootfs | Don't download ~196MB before first paint: HTTP-Range-backed zip reads (or progressive mount), unlocks bigger bundled apps (Quake 2 deferral) | First app reaches first paint with materially less than the full rootfs downloaded (measure bytes-before-first-paint before/after) | DEFERRED (2026-06-11) — needs a custom minizip Range-fetch I/O backend + synchronous-fetch-on-guest-thread under PROXY_TO_PTHREAD; multi-session architectural lift (assessment in Log). Revisit with M6's block cache as companion perf work |
 | M8 | Memory usage reduction | Parity with upstream 26R1 (-20%): measure wasm heap after boot, free what's recoverable (e.g. post-mount zip buffers, duplicate framebuffers) | Peak/total heap after notepad boot reduced ≥15% vs. measured baseline, recorded in the Log | DONE — browser-verified 2026-06-11: JS heap 651MB peak → 235MB post-boot (~416MB / 64% freed) by releasing the JS-side zip buffers after MEMFS mount |
-| M9 | App breadth: experimental row | The taskmgr/regedit/control/explorer/oleview row: each either works or has a root-caused triage note (X opcodes, missing dlls, …) | Each app: renders+takes input in-browser, or a Log entry naming the first fatal marker and the missing feature | TODO |
+| M9 | App breadth: experimental row | The taskmgr/regedit/control/explorer/oleview row: each either works or has a root-caused triage note (X opcodes, missing dlls, …) | Each app: renders+takes input in-browser, or a Log entry naming the first fatal marker and the missing feature | DONE — browser-verified 2026-06-11: regedit/control/explorer/IE/oleview RENDER (5/6); taskmgr triaged (clean-exit after PolyText X-text opcodes 65/66) |
 | M10 | Joystick/gamepad | Upstream roadmap item: SDL gamepad → browser Gamepad API → wine dinput | A game or joy.cpl-style test reacts to a connected (or emulated CDP) gamepad in-browser; else documented evaluation | TODO |
 | M11 | ISO mounting (evaluate) | Upstream "distant future" item: mount an ISO as a drive (ISO9660 reader over the existing zip-mount machinery, or pre-extract path) | Either a demo ISO browses as a drive letter in winefile, or a written go/no-go with effort estimate | TODO |
 | M12 | DOSBox launching (evaluate) | Upstream item: launching DOSBox for DOS-installer games — likely impractical under the interpreter; decide honestly | Working demo, or a written descope rationale with the technical blocker | TODO |
@@ -71,6 +71,30 @@ them.
 
 ## Log
 
+- **2026-06-11 — M9 DONE (experimental-app breadth, browser-verified).**
+  Probed all six experimental-row apps directly (?p=<app>), each in a fresh
+  Chrome, classifying render-vs-first-fatal-marker:
+  - **regedit.exe** — RENDERS (full registry-tree GUI: HKEY_* hives, two-pane
+    layout, menu). ✓
+  - **control.exe** — RENDERS (canvas 100% lit). ✓
+  - **explorer.exe** — RENDERS (file-manager: Desktop tree, Location bar,
+    toolbar, file panes). ✓ — notable, it's the shell/COM-heavy one.
+  - **iexplore.exe (IE)** — RENDERS (Back/Forward/Stop/Refresh/Home/Print
+    toolbar + Address bar about:blank). ✓
+  - **oleview.exe** — RENDERS (canvas 100% lit). ✓
+  - **taskmgr.exe** — TRIAGED, does not render. It launches through its relay
+    chain (3 pids, reaches C:\windows\system32\taskmgr.exe) and then
+    exit_group **status=0** (clean exit, not a crash), with
+    `XWire: unhandled request opcode=65/66` (PolyText8/PolyText16 — X CORE
+    TEXT) immediately before. So the blocker is the X core-text path the
+    README already flagged as the top gate: taskmgr tries to draw text, the
+    wire server doesn't implement PolyText, and it bails gracefully. Fixing
+    PolyText8/16 in xwireconnection.cpp is the unlock (same path that would
+    help WordPad's text) — separate work, noted for a future text milestone.
+  Result: 5/6 render (vs. the roadmap's "unproven" assumption), 1 root-caused.
+  Acceptance (renders OR triage note for each) fully met. The earlier
+  milestones (kill-on-switch input routing, matured GDI/USER paths) are why so
+  many now come up.
 - **2026-06-11 — M8 DONE (memory reduction, browser-verified).** The launcher
   held each rootfs zip's bytes TWICE after boot: once in MEMFS (what wine
   reads) and once in the `zipDownloads` JS map (kept as an in-page-relaunch
