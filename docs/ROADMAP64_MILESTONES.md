@@ -53,7 +53,7 @@ self-contained sessions. Each iteration:
 | M2 | Clipboard copy/paste (host↔guest) | Parity with 32-bit 25R1 copy/paste: bridge the browser clipboard with the guest's | Copy text in guest Notepad → readable via the page (button or navigator.clipboard); paste host text into Notepad; round-trip verified | DONE — round-trip browser-verified 2026-06-11 (win32 clipset/clipget helper design; toolbar buttons) |
 | M3 | Persistence across reloads | Guest home/prefix writes survive a page reload (32-bit web build has INDEXED_DB storage) | Save a file in Notepad, hard-reload the page, relaunch Notepad: the file is still there (IndexedDB-backed) | DONE — browser-verified 2026-06-11 across a full Chrome restart (marker file restored byte-identical pre-boot) |
 | M4 | Mouse capture for games | Pointer events for game-style apps: DOOM mouse turn/fire (doomgeneric wndProc has no mouse path today), canvas pointer-lock toggle | In DOOM, mouse movement turns the player and mouse button fires, browser-verified | DONE — browser-verified 2026-06-11 (mouse motion turns DOOM's 3D view; doom.exe rebuilt with a wndProc mouse path) |
-| M5 | Sound (audio backend) | Parity with 32-bit audio: wine's audio stack → an SDL-audio (WebAudio) device in the browser | DOOM plays its sound effects (or a .wav plays via sndrec/winmm test) audibly in the tab; AudioContext confirmed feeding samples | TODO |
+| M5 | Sound (audio backend) | Parity with 32-bit audio: wine's audio stack → an SDL-audio (WebAudio) device in the browser | DOOM plays its sound effects (or a .wav plays via sndrec/winmm test) audibly in the tab; AudioContext confirmed feeding samples | DESCOPED (2026-06-11) — sink works, wine→sink bridge is a multi-session rootfs effort; resume path documented in the Log |
 | M6 | Web-build performance: decoded-block cache | The upstream "improve performance for Emscripten build" item, 64-bit edition: per-RIP decoded-block cache so hot loops skip re-decode (README "concrete next steps" #3) | Measured ≥2x CPU64 throughput on a repeatable benchmark (or notepad cold boot <30s local), selftest 234/234, apps still boot | TODO |
 | M7 | Lazy / streamable rootfs | Don't download ~196MB before first paint: HTTP-Range-backed zip reads (or progressive mount), unlocks bigger bundled apps (Quake 2 deferral) | First app reaches first paint with materially less than the full rootfs downloaded (measure bytes-before-first-paint before/after) | TODO |
 | M8 | Memory usage reduction | Parity with upstream 26R1 (-20%): measure wasm heap after boot, free what's recoverable (e.g. post-mount zip buffers, duplicate framebuffers) | Peak/total heap after notepad boot reduced ≥15% vs. measured baseline, recorded in the Log | TODO |
@@ -71,6 +71,37 @@ them.
 
 ## Log
 
+- **2026-06-11 — M5 DESCOPED (sound), with an evidence-based rationale + a
+  concrete resume path.** Findings from the investigation:
+  - The audio SINK is fully built and live in wasm64-mt: `/dev/dsp` (OSS) is
+    registered at boot (startupArgs.cpp:155), `KNativeAudio::init()` runs, and
+    platform/sdl/kdspaudio.cpp implements the emscripten SDL→WebAudio backend
+    (SDL_OpenAudioDevice + the boxedwine-multithreaded-audio.js main-thread
+    proxy already linked via EXTRA_LD_FLAGS). devdsp.cpp routes guest OSS
+    writes into it.
+  - The GAP is the wine→sink bridge. The Debian wine64 package in the rootfs
+    ships only **winealsa** (ALSA): wine64.zip has winealsa.so/.drv, winmm,
+    dsound, mmdevapi, and glibc-rootfs64.zip has libasound.so.2 — but
+    Boxedwine emulates **OSS /dev/dsp**, NOT ALSA /dev/snd, and there is NO
+    wineoss.drv and NO libasound OSS plugin/asound.conf in the rootfs. So
+    wine→winealsa→libasound→/dev/snd dead-ends (no /dev/snd), and nothing
+    routes to the working /dev/dsp sink.
+  - Bridging it is a multi-session rootfs effort with real uncertainty:
+    either (a) add wine's wineoss.drv built for wine 8.0 (PE+unix split driver)
+    and set wine's audio driver to oss, or (b) ship the alsa-lib OSS plugin
+    (libasound_module_pcm_oss) + an asound.conf routing default→oss:/dev/dsp.
+    Plus DOOM itself ships the DUMMY i_sound (would also need a rebuild with
+    real audio). And headless audio verification is a second open problem
+    (no "did the speaker play" probe — would assert via an AudioContext
+    sample-callback counter exposed to JS).
+  - RESUME PATH: a native /dev/dsp tone generator is saved at
+    tools/rootfs64/work/dsp_tone.c (build: `zig cc -target x86_64-linux-musl
+    -static -O2 dsp_tone.c -o tone`). Running it through --x64-run-elf is the
+    cleanest way to prove the SINK is audible independent of wine; do that
+    first (and add an AudioContext sample-count export for headless assertion),
+    THEN tackle the wine bridge (option b is likely lighter than building
+    wineoss). This is the right next audio session — descoped from the loop,
+    not abandoned.
 - **2026-06-11 — M4 DONE (DOOM mouse, browser-verified).** Rebuilt doom.exe
   from doomgeneric with a new mouse patch (on top of the existing window/timer
   patches): wndProc now handles WM_MOUSEMOVE (relative-from-center) +
