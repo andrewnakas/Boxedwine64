@@ -22,7 +22,9 @@
 #include "knativescreen.h"
 
 #include <cstring>
+#include <cstdlib>
 #include <string>
+#include <algorithm>
 #include <vector>
 #include <utility>
 
@@ -143,6 +145,11 @@ namespace {
         X_FreeGC                = 60,
         X_ClearArea             = 61,
         X_CopyArea              = 62,
+        X_PolyPoint             = 63,
+        X_PolyLine              = 64,
+        X_PolySegment           = 65,
+        X_PolyRectangle         = 66,
+        X_FillPoly              = 69,
         X_PolyFillRectangle     = 70,
         X_PutImage              = 72,
         X_OpenFont              = 45,
@@ -811,7 +818,86 @@ void XWireConnection::processOneRequest(const uint8_t* req, uint32_t len) {
         case X_DeleteProperty:
         case X_CreateColormap:
         case X_FreeColormap:
-        case X_PolyFillRectangle:
+        case X_PolyFillRectangle: {
+            // PolyFillRectangle(drawable, gc, [x,y,w,h]...): filled rects in the
+            // GC foreground. taskmgr/many GDI apps draw control backgrounds and
+            // bar-graph bars this way. (Previously this opcode fell THROUGH into
+            // X_ChangeProperty and was silently dropped — a latent no-op.)
+            uint32_t drawable = rd32(req + 4);
+            uint32_t gcId     = rd32(req + 8);
+            std::vector<std::array<int16_t,4>> rects;   // x,y,w,h
+            for (uint32_t pos = 12; pos + 8 <= len; pos += 8) {
+                rects.push_back({ (int16_t)rd16(req+pos), (int16_t)rd16(req+pos+2),
+                                  (int16_t)rd16(req+pos+4), (int16_t)rd16(req+pos+6) });
+            }
+            drawFillRectangles(drawable, gcId, rects);
+            break;
+        }
+        case X_PolyRectangle: {
+            // PolyRectangle(drawable, gc, [x,y,w,h]...): rectangle OUTLINES in
+            // the GC foreground (4 line segments each). Window/control borders.
+            uint32_t drawable = rd32(req + 4);
+            uint32_t gcId     = rd32(req + 8);
+            std::vector<std::array<int16_t,4>> rects;
+            for (uint32_t pos = 12; pos + 8 <= len; pos += 8) {
+                rects.push_back({ (int16_t)rd16(req+pos), (int16_t)rd16(req+pos+2),
+                                  (int16_t)rd16(req+pos+4), (int16_t)rd16(req+pos+6) });
+            }
+            drawRectangleOutlines(drawable, gcId, rects);
+            break;
+        }
+        case X_PolySegment: {
+            // PolySegment(drawable, gc, [x1,y1,x2,y2]...): independent line
+            // segments in the GC foreground. taskmgr's graph grid + traces.
+            uint32_t drawable = rd32(req + 4);
+            uint32_t gcId     = rd32(req + 8);
+            std::vector<std::array<int16_t,4>> segs;    // x1,y1,x2,y2
+            for (uint32_t pos = 12; pos + 8 <= len; pos += 8) {
+                segs.push_back({ (int16_t)rd16(req+pos), (int16_t)rd16(req+pos+2),
+                                 (int16_t)rd16(req+pos+4), (int16_t)rd16(req+pos+6) });
+            }
+            drawSegments(drawable, gcId, segs);
+            break;
+        }
+        case X_PolyLine:
+        case X_PolyPoint: {
+            // PolyLine(drawable, gc, mode, [x,y]...): a connected polyline (each
+            // point to the next) in the GC foreground. PolyPoint plots the points
+            // themselves. coordinate-mode @1 (0=Origin absolute, 1=Previous
+            // relative). We treat points as a vertex list and, for PolyLine,
+            // connect consecutive vertices.
+            uint32_t drawable = rd32(req + 4);
+            uint32_t gcId     = rd32(req + 8);
+            uint8_t  coordMode = req[1];
+            std::vector<std::pair<int16_t,int16_t>> pts;
+            int16_t cx = 0, cy = 0;
+            for (uint32_t pos = 12; pos + 4 <= len; pos += 4) {
+                int16_t px = (int16_t)rd16(req+pos), py = (int16_t)rd16(req+pos+2);
+                if (coordMode == 1 && !pts.empty()) { px = (int16_t)(cx + px); py = (int16_t)(cy + py); }
+                cx = px; cy = py;
+                pts.push_back({px, py});
+            }
+            drawPolyline(drawable, gcId, pts, /*connect=*/opcode == X_PolyLine);
+            break;
+        }
+        case X_FillPoly: {
+            // FillPoly(drawable, gc, shape, coord-mode, [x,y]...): a filled
+            // polygon in the GC foreground. shape @ data, coord-mode @ data+1.
+            // We scanline-fill the vertex polygon (even-odd).
+            uint32_t drawable = rd32(req + 4);
+            uint32_t gcId     = rd32(req + 8);
+            uint8_t  coordMode = (len > 13) ? req[13] : 0;
+            std::vector<std::pair<int16_t,int16_t>> pts;
+            int16_t cx = 0, cy = 0;
+            for (uint32_t pos = 16; pos + 4 <= len; pos += 4) {
+                int16_t px = (int16_t)rd16(req+pos), py = (int16_t)rd16(req+pos+2);
+                if (coordMode == 1 && !pts.empty()) { px = (int16_t)(cx + px); py = (int16_t)(cy + py); }
+                cx = px; cy = py;
+                pts.push_back({px, py});
+            }
+            fillPolygon(drawable, gcId, pts);
+            break;
+        }
         case X_ChangeProperty: {
             // ChangeProperty(mode, window, property, type, format, data-len,
             // data). Stored keyed by (window, property NAME) so a different
@@ -2276,6 +2362,142 @@ void XWireConnection::blitTextItems(uint32_t drawable, uint32_t gcId, int16_t y,
         drawTextOverlay(it->second, item.first, y, item.second, fg, bg, /*imageText=*/false);
     lk.unlock();
     srv.schedulePresent();   // one present for the whole item list
+}
+
+// ---------------------------------------------------------------------------
+// X core drawing primitives (M14). All draw opaque GC-foreground pixels into a
+// window's ARGB framebuffer. Helpers below operate on a live XWireWindow under
+// the caller's regMutex; the public methods lock, resolve the GC, and present.
+// ---------------------------------------------------------------------------
+namespace {
+    // Plot one pixel into win.fb at (x,y), clipped. fb is ARGB8888 row-major.
+    inline void plotPixel(XWireWindow& win, int x, int y, uint32_t argb) {
+        if (x < 0 || y < 0 || x >= win.fbW || y >= win.fbH) return;
+        if (win.fb.size() < (size_t)win.fbW * win.fbH * 4) return;
+        ((uint32_t*)win.fb.data())[(size_t)y * win.fbW + x] = argb;
+    }
+    // Bresenham line from (x0,y0) to (x1,y1).
+    void drawLine(XWireWindow& win, int x0, int y0, int x1, int y1, uint32_t argb) {
+        int dx = std::abs(x1 - x0), dy = -std::abs(y1 - y0);
+        int sx = x0 < x1 ? 1 : -1, sy = y0 < y1 ? 1 : -1;
+        int err = dx + dy;
+        for (;;) {
+            plotPixel(win, x0, y0, argb);
+            if (x0 == x1 && y0 == y1) break;
+            int e2 = 2 * err;
+            if (e2 >= dy) { err += dy; x0 += sx; }
+            if (e2 <= dx) { err += dx; y0 += sy; }
+        }
+    }
+    // True if this drawable is a paintable (non-root) window; resolves fg.
+    XWireWindow* paintTarget(XWireServer& srv, uint32_t drawable) {
+        auto it = srv.windows.find(drawable);
+        if (it == srv.windows.end() || it->second.isRoot) return nullptr;
+        // The fb must be sized (a PutImage/CopyArea created it). If the app
+        // draws primitives before any blit, fb is empty and there is nothing to
+        // paint onto yet — skip (rare; the first Expose drives a blit first).
+        if (it->second.fb.empty() || !it->second.fbW || !it->second.fbH) return nullptr;
+        return &it->second;
+    }
+    uint32_t gcForeground(XWireServer& srv, uint32_t gcId) {
+        auto git = srv.gcs.find(gcId);
+        return (git != srv.gcs.end()) ? git->second.foreground : 0xff000000;
+    }
+}
+
+void XWireConnection::drawFillRectangles(uint32_t drawable, uint32_t gcId,
+                                         const std::vector<std::array<int16_t,4>>& rects) {
+    if (rects.empty()) return;
+    XWireServer& srv = XWireServer::instance();
+    { std::lock_guard<std::mutex> lk(srv.regMutex);
+      XWireWindow* w = paintTarget(srv, drawable); if (!w) return;
+      uint32_t fg = gcForeground(srv, gcId);
+      for (auto& r : rects)
+        for (int yy = r[1]; yy < r[1] + r[3]; yy++)
+            for (int xx = r[0]; xx < r[0] + r[2]; xx++)
+                plotPixel(*w, xx, yy, fg);
+    }
+    srv.schedulePresent();
+}
+
+void XWireConnection::drawRectangleOutlines(uint32_t drawable, uint32_t gcId,
+                                            const std::vector<std::array<int16_t,4>>& rects) {
+    if (rects.empty()) return;
+    XWireServer& srv = XWireServer::instance();
+    { std::lock_guard<std::mutex> lk(srv.regMutex);
+      XWireWindow* w = paintTarget(srv, drawable); if (!w) return;
+      uint32_t fg = gcForeground(srv, gcId);
+      for (auto& r : rects) {
+        int x0 = r[0], y0 = r[1], x1 = r[0] + r[2], y1 = r[1] + r[3];
+        drawLine(*w, x0, y0, x1, y0, fg);   // top
+        drawLine(*w, x0, y1, x1, y1, fg);   // bottom
+        drawLine(*w, x0, y0, x0, y1, fg);   // left
+        drawLine(*w, x1, y0, x1, y1, fg);   // right
+      }
+    }
+    srv.schedulePresent();
+}
+
+void XWireConnection::drawSegments(uint32_t drawable, uint32_t gcId,
+                                   const std::vector<std::array<int16_t,4>>& segs) {
+    if (segs.empty()) return;
+    XWireServer& srv = XWireServer::instance();
+    { std::lock_guard<std::mutex> lk(srv.regMutex);
+      XWireWindow* w = paintTarget(srv, drawable); if (!w) return;
+      uint32_t fg = gcForeground(srv, gcId);
+      for (auto& s : segs) drawLine(*w, s[0], s[1], s[2], s[3], fg);
+    }
+    srv.schedulePresent();
+}
+
+void XWireConnection::drawPolyline(uint32_t drawable, uint32_t gcId,
+                                   const std::vector<std::pair<int16_t,int16_t>>& pts, bool connect) {
+    if (pts.empty()) return;
+    XWireServer& srv = XWireServer::instance();
+    { std::lock_guard<std::mutex> lk(srv.regMutex);
+      XWireWindow* w = paintTarget(srv, drawable); if (!w) return;
+      uint32_t fg = gcForeground(srv, gcId);
+      if (connect && pts.size() >= 2) {
+        for (size_t i = 1; i < pts.size(); i++)
+            drawLine(*w, pts[i-1].first, pts[i-1].second, pts[i].first, pts[i].second, fg);
+      } else {
+        for (auto& p : pts) plotPixel(*w, p.first, p.second, fg);
+      }
+    }
+    srv.schedulePresent();
+}
+
+void XWireConnection::fillPolygon(uint32_t drawable, uint32_t gcId,
+                                  const std::vector<std::pair<int16_t,int16_t>>& pts) {
+    if (pts.size() < 3) return;
+    XWireServer& srv = XWireServer::instance();
+    { std::lock_guard<std::mutex> lk(srv.regMutex);
+      XWireWindow* w = paintTarget(srv, drawable); if (!w) return;
+      uint32_t fg = gcForeground(srv, gcId);
+      // Even-odd scanline fill. Find the y-extent, then for each scanline collect
+      // edge crossings, sort, and fill between pairs.
+      int minY = pts[0].second, maxY = pts[0].second;
+      for (auto& p : pts) { minY = std::min<int>(minY, p.second); maxY = std::max<int>(maxY, p.second); }
+      if (minY < 0) minY = 0;
+      if (maxY >= w->fbH) maxY = w->fbH - 1;
+      std::vector<int> xs;
+      for (int y = minY; y <= maxY; y++) {
+        xs.clear();
+        for (size_t i = 0, n = pts.size(); i < n; i++) {
+            int x0 = pts[i].first, y0 = pts[i].second;
+            int x1 = pts[(i+1)%n].first, y1 = pts[(i+1)%n].second;
+            if (y0 == y1) continue;
+            if ((y >= y0 && y < y1) || (y >= y1 && y < y0)) {
+                int xc = x0 + (int)((long)(y - y0) * (x1 - x0) / (y1 - y0));
+                xs.push_back(xc);
+            }
+        }
+        std::sort(xs.begin(), xs.end());
+        for (size_t i = 0; i + 1 < xs.size(); i += 2)
+            for (int x = xs[i]; x <= xs[i+1]; x++) plotPixel(*w, x, y, fg);
+      }
+    }
+    srv.schedulePresent();
 }
 
 // ---------------------------------------------------------------------------

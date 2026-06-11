@@ -22,6 +22,7 @@
 #include <memory>
 #include <unordered_map>
 #include <vector>
+#include <array>
 #include <string>
 #include <utility>
 
@@ -161,6 +162,23 @@ private:
                   const std::string& chars, bool imageText);
     void blitTextItems(uint32_t drawable, uint32_t gc, int16_t y,
                        const std::vector<std::pair<int16_t, std::string>>& items);
+
+    // X core DRAWING primitives (M14) — line/rect/poly into the window
+    // framebuffer in the GC's foreground colour. taskmgr and many GDI apps
+    // draw control borders, graph grids, and bar-graph bars with these; without
+    // them the app's paint fails and it exits. All no-op for an unknown/pixmap/
+    // root drawable, take regMutex internally, and schedulePresent() once.
+    // Rects are {x,y,w,h}; segments are {x1,y1,x2,y2}.
+    void drawFillRectangles(uint32_t drawable, uint32_t gc,
+                            const std::vector<std::array<int16_t,4>>& rects);
+    void drawRectangleOutlines(uint32_t drawable, uint32_t gc,
+                               const std::vector<std::array<int16_t,4>>& rects);
+    void drawSegments(uint32_t drawable, uint32_t gc,
+                      const std::vector<std::array<int16_t,4>>& segs);
+    void drawPolyline(uint32_t drawable, uint32_t gc,
+                      const std::vector<std::pair<int16_t,int16_t>>& pts, bool connect);
+    void fillPolygon(uint32_t drawable, uint32_t gc,
+                     const std::vector<std::pair<int16_t,int16_t>>& pts);
 
     // Host input -> X11 wire events (Phase 2c input path).
     void deliverInputEvents();

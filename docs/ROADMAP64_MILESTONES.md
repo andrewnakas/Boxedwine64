@@ -61,6 +61,7 @@ self-contained sessions. Each iteration:
 | M10 | Joystick/gamepad | Upstream roadmap item: SDL gamepad → browser Gamepad API → wine dinput | A game or joy.cpl-style test reacts to a connected (or emulated CDP) gamepad in-browser; else documented evaluation | DESCOPED (2026-06-11, evaluation) — entirely unbuilt: SDL inits VIDEO|TIMER only (no joystick subsystem), no Gamepad-API bridge, no /dev/input/js* device feeding wine's HID stack. Multi-layer effort + blocked headless verification. Assessment in Log |
 | M11 | ISO mounting (evaluate) | Upstream "distant future" item: mount an ISO as a drive (ISO9660 reader over the existing zip-mount machinery, or pre-extract path) | Either a demo ISO browses as a drive letter in winefile, or a written go/no-go with effort estimate | EVALUATED → NO-GO for now (2026-06-11): no ISO9660 reader exists; the pre-extract-to-a-drive path is the pragmatic route. Assessment in Log |
 | M12 | DOSBox launching (evaluate) | Upstream item: launching DOSBox for DOS-installer games — likely impractical under the interpreter; decide honestly | Working demo, or a written descope rationale with the technical blocker | EVALUATED → NO-GO (2026-06-11): impractical — DOSBox-under-wine-under-interpreter, no integration exists. Rationale in Log |
+| M14 | X drawing primitives | Implement the core X line/rect drawing requests (PolySegment 65, PolyRectangle 66, PolyLine 64, PolyPoint 63, FillPoly 69) into the window framebuffer — the gap behind graph/border-drawing apps | Draw-primitive app shows lines/borders in-browser, no regression, selftest unaffected | DONE — implemented + browser-verified 2026-06-11 (regedit's tree/border lines render crisp via the new primitives, no regression; selftest 234/234). Also fixed a latent PolyFillRectangle no-op. taskmgr re-triaged: its blocker is a deeper wine null-function stub, NOT drawing |
 | M13 | Gecko / .NET (evaluate) | Upstream item: wine-gecko (HTML dialogs) and wine-mono (.NET apps) payloads — weigh ~50–80MB payloads + JIT-under-interpreter cost | A trivial .NET WinForms exe runs, or a written descope rationale (payload/perf numbers) | EVALUATED → NO-GO (2026-06-11): no mono/gecko in rootfs; ~50-80MB payload + JIT-in-interpreter cold-start. Rationale in Log |
 
 Suggested order = table order. M1 early on purpose: it protects every later
@@ -71,6 +72,26 @@ them.
 
 ## Log
 
+- **2026-06-11 — M14 DONE (X drawing primitives) + taskmgr root cause
+  CORRECTED.** Added the core X core drawing requests to xwireconnection.cpp:
+  PolyFillRectangle(70, filled rects), PolyRectangle(66, outlines),
+  PolySegment(65, line segments), PolyLine(64)/PolyPoint(63), FillPoly(69,
+  even-odd scanline polygon fill) — five helpers rasterizing into the window
+  ARGB framebuffer in the GC foreground (Bresenham lines + clipped plot). Also
+  fixed a LATENT BUG: X_PolyFillRectangle was grouped with X_ChangeProperty and
+  silently dropped (a no-op) — now it actually fills. selftest 234/234,
+  wasm64-mt clean. Browser-verified: regedit RENDERS with crisp tree/panel/
+  column lines (drawn via these primitives) and NO regression vs. before.
+  IMPORTANT CORRECTION to the M9 log: taskmgr's blocker is NOT the X opcodes —
+  I'd mis-read 65/66 as PolyText (they're PolySegment/PolyRectangle). With the
+  primitives implemented, taskmgr STILL fails, now with a hard wasm
+  `RuntimeError: null function` (an indirect call to an unimplemented wine API,
+  likely its perf-counter/NtQuerySystemInformation path) — a deeper wine stub
+  gap, separate work, NOT a drawing problem. So M14 shipped its real value (the
+  drawing primitives, which border/graph-drawing apps need broadly) even though
+  taskmgr needs more. The X core-TEXT path (PolyText8/16, opcodes 74/75) is
+  ALREADY implemented (blitTextItems) — that earlier "top gate" note was also
+  based on the opcode mis-attribution; text already works.
 - **2026-06-11 — M11/M12/M13 EVALUATED (the evaluation milestones), all
   written no-go for the autonomous loop, each with a rationale + a resume
   pointer.**
