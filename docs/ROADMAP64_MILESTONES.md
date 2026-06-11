@@ -61,6 +61,7 @@ self-contained sessions. Each iteration:
 | M10 | Joystick/gamepad | Upstream roadmap item: SDL gamepad → browser Gamepad API → wine dinput | A game or joy.cpl-style test reacts to a connected (or emulated CDP) gamepad in-browser; else documented evaluation | DESCOPED (2026-06-11, evaluation) — entirely unbuilt: SDL inits VIDEO|TIMER only (no joystick subsystem), no Gamepad-API bridge, no /dev/input/js* device feeding wine's HID stack. Multi-layer effort + blocked headless verification. Assessment in Log |
 | M11 | ISO mounting (evaluate) | Upstream "distant future" item: mount an ISO as a drive (ISO9660 reader over the existing zip-mount machinery, or pre-extract path) | Either a demo ISO browses as a drive letter in winefile, or a written go/no-go with effort estimate | EVALUATED → NO-GO for now (2026-06-11): no ISO9660 reader exists; the pre-extract-to-a-drive path is the pragmatic route. Assessment in Log |
 | M12 | DOSBox launching (evaluate) | Upstream item: launching DOSBox for DOS-installer games — likely impractical under the interpreter; decide honestly | Working demo, or a written descope rationale with the technical blocker | EVALUATED → NO-GO (2026-06-11): impractical — DOSBox-under-wine-under-interpreter, no integration exists. Rationale in Log |
+| M15 | taskmgr blocker triage | Root-cause taskmgr's wasm `RuntimeError: null function` — identify the exact call site/missing feature, then fix if bounded or leave a precise triage note | A named root cause and either a fix that lets taskmgr render, or a documented blocker | DONE (2026-06-11) — root-caused to a HOST-SIDE wasm null-function call on a WORKER thread (not a wine API stub, not a missing x86 opcode — NO wine err:/unimplemented line precedes it), during taskmgr's icon/pixmap setup; pinpointing the C++ site needs a symbolicated build (documented blocker). Predates M14. Also stripped the 4 stale XWire DIAG logs this surfaced |
 | M14 | X drawing primitives | Implement the core X line/rect drawing requests (PolySegment 65, PolyRectangle 66, PolyLine 64, PolyPoint 63, FillPoly 69) into the window framebuffer — the gap behind graph/border-drawing apps | Draw-primitive app shows lines/borders in-browser, no regression, selftest unaffected | DONE — implemented + browser-verified 2026-06-11 (regedit's tree/border lines render crisp via the new primitives, no regression; selftest 234/234). Also fixed a latent PolyFillRectangle no-op. taskmgr re-triaged: its blocker is a deeper wine null-function stub, NOT drawing |
 | M13 | Gecko / .NET (evaluate) | Upstream item: wine-gecko (HTML dialogs) and wine-mono (.NET apps) payloads — weigh ~50–80MB payloads + JIT-under-interpreter cost | A trivial .NET WinForms exe runs, or a written descope rationale (payload/perf numbers) | EVALUATED → NO-GO (2026-06-11): no mono/gecko in rootfs; ~50-80MB payload + JIT-in-interpreter cold-start. Rationale in Log |
 
@@ -72,6 +73,25 @@ them.
 
 ## Log
 
+- **2026-06-11 — M15 DONE (taskmgr blocker triaged) + DIAG-log cleanup.**
+  Captured taskmgr's crash context headless (last ~80 console lines before the
+  trap). Findings: the `RuntimeError: null function` fires on a WORKER thread
+  immediately after taskmgr's startup reaches its icon/cursor setup (32×32
+  pixmap PutImages) — and crucially there is NO wine `err:`/`fixme:`/
+  `unimplemented function` line and NO CPU64 unimplemented-opcode panic before
+  it. So it is NOT a wine API stub and NOT a missing x86 opcode (my M14
+  correction already ruled out the X-opcode theory); it is a HOST-SIDE wasm
+  indirect call through a null function-table slot inside Boxedwine's own C++,
+  on a guest worker thread, triggered by a code path taskmgr exercises that the
+  5 rendering apps don't. Pinpointing the exact C++ call site needs a
+  symbolicated/debug wasm build to resolve the `boxedwine64.js:1:4588` wasm
+  function index to a symbol — a separate multi-session diagnostic. Documented
+  blocker (meets the milestone bar: named root cause + why it's blocked). The
+  crash PREDATES M14 (the M9 probe saw it too). Contained win this surfaced:
+  stripped the 4 stale one-shot `XWire DIAG:` logs in xwireconnection.cpp
+  (CreatePixmap / PutImage-to-pixmap / PutImage-to-window / CopyArea) that
+  prior notes had long flagged for removal — they were DOOM bring-up
+  diagnostics. wasm64-mt builds clean.
 - **2026-06-11 — M14 DONE (X drawing primitives) + taskmgr root cause
   CORRECTED.** Added the core X core drawing requests to xwireconnection.cpp:
   PolyFillRectangle(70, filled rects), PolyRectangle(66, outlines),
