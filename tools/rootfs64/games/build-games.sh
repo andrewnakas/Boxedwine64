@@ -20,12 +20,12 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 CC=x86_64-w64-mingw32-gcc
 command -v "$CC" >/dev/null || { echo "ERROR: $CC not found (brew install mingw-w64)" >&2; exit 1; }
 
-for g in snake tetris; do
+for g in snake tetris clipset clipget; do
   echo "=== building $g.exe ==="
   "$CC" -O2 -std=gnu11 -mwindows "$HERE/src/$g.c" -o "$HERE/$g.exe" -lgdi32 -luser32
   file "$HERE/$g.exe"
 done
-echo "=== done (snake.exe, tetris.exe) ==="
+echo "=== done (snake.exe, tetris.exe, clipset.exe, clipget.exe) ==="
 
 # --- doom.exe (run once, from a doomgeneric checkout) -----------------------
 # git clone --depth 1 https://github.com/ozkl/doomgeneric

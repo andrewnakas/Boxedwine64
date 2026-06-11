@@ -306,6 +306,9 @@ bool XWireServer::dropAppByPid(uint32_t pid) {
         for (auto it = selectionOwners.begin(); it != selectionOwners.end();) {
             if (owned(it->second)) { it = selectionOwners.erase(it); } else { ++it; }
         }
+        for (auto it = windowProps.begin(); it != windowProps.end();) {
+            if (owned(it->first.first)) { it = windowProps.erase(it); } else { ++it; }
+        }
         if (presentWindow && owned(presentWindow)) {
             presentWindow = 0;
             changed = true;
@@ -341,10 +344,58 @@ void bw64DropAppPresenceByPid(uint32_t pid) {
 // Flush queued host input to every connection from the main thread's present
 // tick, so an idle app (not sending requests) still gets keystrokes/clicks.
 void XWireServer::pumpInput() {
+    // Host took the clipboard (bw64_clipboard_set): notify the previous guest
+    // owner it lost the selection. Without the SelectionClear wine keeps
+    // believing it owns CLIPBOARD and pastes its own stale internal content
+    // instead of importing the host text. Done here (main-thread tick) because
+    // the setter runs on the browser main thread, which must not write to
+    // connections directly.
+    std::vector<std::pair<std::string, uint32_t>> clears;   // (selection, owner)
+    {
+        std::lock_guard<std::mutex> lk(regMutex);
+        for (auto& name : pendingSelectionClears) {
+            auto it = selectionOwners.find(name);
+            if (it != selectionOwners.end()) {
+                clears.push_back({ name, it->second });
+                selectionOwners.erase(it);
+            }
+        }
+        pendingSelectionClears.clear();
+    }
     std::vector<std::shared_ptr<XWireConnection>> snapshot;
     {
         std::lock_guard<std::mutex> lk(connMutex);
         snapshot = connections;
     }
+    for (auto& nc : clears) {
+        for (auto& c : snapshot) {
+            if (c->idBase() && (nc.second & ~0x001fffffu) == c->idBase()) {
+                c->sendSelectionClear(nc.second, nc.first);
+                break;
+            }
+        }
+    }
     for (auto& c : snapshot) c->pumpInputAndFlush();
+}
+
+// --- clipboard bridge shims (called from wine64session.cpp exports) ---------
+// Host -> guest: stage the host clipboard text and queue SelectionClear for
+// the guest owners so the next guest paste imports it.
+void bw64ClipboardSetHost(const char* text) {
+    XWireServer& srv = XWireServer::instance();
+    std::lock_guard<std::mutex> lk(srv.regMutex);
+    srv.clipboardText = text ? text : "";
+    srv.pendingSelectionClears.push_back("CLIPBOARD");
+    srv.pendingSelectionClears.push_back("PRIMARY");
+    klog_fmt("XWire: host clipboard set (%d bytes)", (int)srv.clipboardText.size());
+}
+// Guest -> host: the latest harvested guest copy (or whatever the host last
+// staged). Returns a pointer that stays valid until the next call (single
+// caller: the browser main thread's ccall).
+const char* bw64ClipboardGetHost() {
+    static std::string out;
+    XWireServer& srv = XWireServer::instance();
+    std::lock_guard<std::mutex> lk(srv.regMutex);
+    out = srv.clipboardText;
+    return out.c_str();
 }

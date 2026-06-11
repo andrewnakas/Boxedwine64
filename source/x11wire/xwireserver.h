@@ -31,6 +31,8 @@
 
 #include <memory>
 #include <unordered_map>
+#include <map>
+#include <utility>
 #include <vector>
 #include <string>
 #include <cstdint>
@@ -249,12 +251,43 @@ public:
     // Locks regMutex internally.
     void resetForAppSwitch();
 
-    // Selection (clipboard) ownership: selection-atom -> owner window. wine's
+    // Selection (clipboard) ownership: selection NAME -> owner window. wine's
     // clipboard manager does SetSelectionOwner then polls GetSelectionOwner to
     // confirm it owns CLIPBOARD/PRIMARY; if we never record the owner the poll
-    // never sees itself win and spins forever (the boot wedge). Guarded by
-    // regMutex like the other registries.
-    std::unordered_map<uint32_t, uint32_t> selectionOwners;
+    // never sees itself win and spins forever (the boot wedge). Keyed by the
+    // selection atom's NAME (not its id) because atom ids are PER-CONNECTION —
+    // the same "CLIPBOARD" interns to different ids on different connections,
+    // and the clipboard logic must compare selections across connections.
+    // Guarded by regMutex like the other registries.
+    std::unordered_map<std::string, uint32_t> selectionOwners;
+
+    // ---- clipboard bridge (M2) ----
+    // The host-side clipboard text, bridged to the browser via the session
+    // exports (bw64_clipboard_get/set in wine64session.cpp). Guest paste reads
+    // it (ConvertSelection -> property + SelectionNotify); guest copy fills it
+    // (SetSelectionOwner triggers a synthesized SelectionRequest back at the
+    // owner; the owner's ChangeProperty reply is harvested). Guarded by
+    // regMutex.
+    std::string clipboardText;
+    // Selections the HOST took over (host clipboard newly set) whose previous
+    // guest owner must be told it lost ownership (SelectionClear) — otherwise
+    // wine keeps preferring its own internal clipboard and ignores the host
+    // text. Drained on the main-thread pumpInput tick (the synthesizing caller
+    // is the browser main thread, which must not write to connections
+    // directly). Guarded by regMutex.
+    std::vector<std::string> pendingSelectionClears;
+
+    // A window property (ChangeProperty/GetProperty), used by the selection
+    // data transfer. Keyed by (window id, property NAME) — names, not atom
+    // ids, because the writer and reader may be different connections with
+    // different atom numbering. `type` is likewise an atom NAME. Guarded by
+    // regMutex.
+    struct XWireProp {
+        std::string type;            // e.g. "UTF8_STRING", "ATOM"
+        uint8_t format = 8;          // 8/16/32
+        std::vector<uint8_t> data;
+    };
+    std::map<std::pair<uint32_t, std::string>, XWireProp> windowProps;
 
     // Allocate the next distinct client resource-id base (so ids never collide
     // across connections).

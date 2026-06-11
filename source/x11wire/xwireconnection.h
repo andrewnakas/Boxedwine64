@@ -96,6 +96,13 @@ public:
     // path is the thread-safe client-wakeup (same as onPeerWrote).
     void pumpInputAndFlush() { deliverInputEvents(); flushReplies(); }
 
+    // Tell this connection's client it lost a selection (SelectionClear, code
+    // 29) — sent when the HOST clipboard takes over so wine stops preferring
+    // its own internal clipboard. `selectionName` is interned into this
+    // connection's atom table (atom ids are per-connection). Called from the
+    // main-thread pump (XWireServer::pumpInput) and flushes immediately.
+    void sendSelectionClear(uint32_t ownerWindow, const std::string& selectionName);
+
 private:
     // ---- wire helpers ----
     void writeToClient(const void* data, uint32_t len);
@@ -200,6 +207,12 @@ private:
     std::shared_ptr<XWireServerSocket> serverPeer;
 
     uint32_t internAtom(const std::string& name, bool onlyIfExists);
+    // Atom id -> name for THIS connection ("" if unknown). Predefined X atoms
+    // (PRIMARY=1, ATOM=4, STRING=31, ...) are seeded in the constructor.
+    std::string atomName(uint32_t atom) const;
+    // Stable cross-connection key for a selection atom: its name, or a
+    // connection-qualified fallback for atoms we can't name.
+    std::string selectionKey(uint32_t atom) const;
     void processOneRequest(const uint8_t* req, uint32_t len);
     void doHandshake();
     void ensureWindow();

@@ -99,7 +99,9 @@ done
 # Same placement: HOME root + drive_c. doom.exe needs doom1.wad next to it AND is
 # launched with `-iwad Z:\home\username\doom1.wad` (see the app bar in wine64.html).
 GAMES="$HERE/games"
-for f in snake.exe tetris.exe doom.exe doom1.wad; do
+# clipset/clipget are not games — they're the browser<->guest clipboard bridge
+# helpers (games/src/clipset.c, clipget.c) — but they ride the same staging.
+for f in snake.exe tetris.exe doom.exe doom1.wad clipset.exe clipget.exe; do
   if [ -f "$GAMES/$f" ]; then
     cp "$GAMES/$f" "$STAGE/home/username/$f"
     cp "$GAMES/$f" "$STAGE/$DRIVE_C/$f"
@@ -117,6 +119,11 @@ done
 APPS="$HERE/apps"
 for pkg in HxD; do
   if [ -d "$APPS/$pkg" ]; then
+    # REPLACE, don't merge: the stage starts from the PREVIOUS prefix64.zip
+    # (idempotent-by-rebuild), so the package dir already exists there — and
+    # `cp -R src dst` with an existing dst copies INTO it, nesting HxD/HxD/...
+    # one level deeper per rebuild (observed: the zip grew 18MB -> 30MB).
+    rm -rf "$STAGE/home/username/$pkg" "$STAGE/$DRIVE_C/$pkg"
     cp -R "$APPS/$pkg" "$STAGE/home/username/$pkg"
     cp -R "$APPS/$pkg" "$STAGE/$DRIVE_C/$pkg"
     echo "  + bundled $pkg package ($(ls "$APPS/$pkg" | wc -l | tr -d ' ') files, intact per license)"

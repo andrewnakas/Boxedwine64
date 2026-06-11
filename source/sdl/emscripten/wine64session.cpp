@@ -154,6 +154,11 @@ void bw64DropAppPresenceByPid(uint32_t pid);
 // Defined in source/x11wire/xwireserver.cpp: the guest pid that owns the window
 // being switched away from (captured when the switch armed), one-shot consume.
 uint32_t bw64TakeOutgoingAppPid();
+// Defined in source/x11wire/xwireserver.cpp: clipboard bridge (M2). Set stages
+// host text for guest paste (+ queues SelectionClear to the guest owner); get
+// returns the latest harvested guest copy (pointer valid until the next call).
+void bw64ClipboardSetHost(const char* text);
+const char* bw64ClipboardGetHost();
 
 // The actual spawn — runs on the main-loop thread (see THREADING note).
 static void doSpawn(const Wine64Req& req) {
@@ -381,6 +386,22 @@ extern "C" EMSCRIPTEN_KEEPALIVE void bw64_reset_present() {
 // Whether the persistent session is up (context captured == boot completed).
 extern "C" EMSCRIPTEN_KEEPALIVE int bw64_session_ready() {
     return g_sessionCtx.valid.load(std::memory_order_acquire) ? 1 : 0;
+}
+
+// bw64_clipboard_set: stage host clipboard text for the guest (paste path).
+// Safe from the browser main thread — only takes the XWire registry mutex and
+// queues the SelectionClear for the main-loop pump. Called via
+// Module.ccall("bw64_clipboard_set", null, ["string"], [text]).
+extern "C" EMSCRIPTEN_KEEPALIVE void bw64_clipboard_set(const char* text) {
+    bw64ClipboardSetHost(text);
+}
+
+// bw64_clipboard_get: the latest guest copy (harvested on SetSelectionOwner)
+// or whatever the host last staged. Called via
+// Module.ccall("bw64_clipboard_get", "string", [], []) — ccall copies the
+// returned C string immediately, so the static buffer lifetime is fine.
+extern "C" EMSCRIPTEN_KEEPALIVE const char* bw64_clipboard_get() {
+    return bw64ClipboardGetHost();
 }
 
 #endif

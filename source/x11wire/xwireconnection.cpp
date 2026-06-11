@@ -111,6 +111,7 @@ namespace {
         X_GetProperty           = 20,
         X_SetSelectionOwner     = 22,
         X_GetSelectionOwner     = 23,
+        X_ConvertSelection      = 24,
         X_SendEvent             = 25,
         X_GrabPointer           = 26,
         X_UngrabPointer         = 27,
@@ -255,6 +256,34 @@ XWireConnection::XWireConnection(const std::shared_ptr<KUnixSocketObject>& clien
     if (thread && thread->process) {
         ownerPid = thread->process->id;
     }
+    // Seed the X11 PREDEFINED atoms the clipboard path must recognize, and
+    // start interned ids above the predefined range (1..68). Historically
+    // interned ids started at 1, colliding with the predefined numbering —
+    // harmless while the server never INTERPRETED atoms, but the selection
+    // logic compares atoms by name (XA_STRING=31 arrives without ever being
+    // interned), so the numbering must be authentic now.
+    static const struct { uint32_t id; const char* name; } predef[] = {
+        { 1, "PRIMARY" }, { 2, "SECONDARY" }, { 4, "ATOM" }, { 6, "CARDINAL" },
+        { 31, "STRING" }, { 33, "WINDOW" },
+    };
+    for (auto& p : predef) {
+        atoms[p.name] = p.id;
+        atomNames[p.id] = p.name;
+    }
+    nextAtom = 0x100;
+}
+
+std::string XWireConnection::atomName(uint32_t atom) const {
+    auto it = atomNames.find(atom);
+    return it != atomNames.end() ? it->second : std::string();
+}
+
+std::string XWireConnection::selectionKey(uint32_t atom) const {
+    std::string name = atomName(atom);
+    if (!name.empty()) return name;
+    // Unknown atom — key it uniquely to this connection so two connections'
+    // unrelated unknown atoms can't alias each other.
+    return "#" + std::to_string(clientIdBase) + ":" + std::to_string(atom);
 }
 
 U32 XWireServerSocket::readNativeNonBlocking(U8* buffer, U32 len) {
@@ -783,7 +812,49 @@ void XWireConnection::processOneRequest(const uint8_t* req, uint32_t len) {
         case X_CreateColormap:
         case X_FreeColormap:
         case X_PolyFillRectangle:
-        case X_ChangeProperty:
+        case X_ChangeProperty: {
+            // ChangeProperty(mode, window, property, type, format, data-len,
+            // data). Stored keyed by (window, property NAME) so a different
+            // connection can read it back (GetProperty) — that's how selection
+            // data transfers. Special case: a write to the BW64_CLIP property
+            // is wine's clipboard thread answering our synthesized
+            // SelectionRequest (see X_SetSelectionOwner) — harvest the text
+            // into the host clipboard buffer.
+            if (len < 24) break;
+            uint8_t mode = req[1];                  // 0=Replace 1=Prepend 2=Append
+            uint32_t window   = rd32(req + 4);
+            uint32_t property = rd32(req + 8);
+            uint32_t type     = rd32(req + 12);
+            uint8_t format    = req[16];
+            uint32_t units    = rd32(req + 20);
+            uint32_t bytes = units * (format == 32 ? 4 : format == 16 ? 2 : 1);
+            if ((uint64_t)24 + bytes > len) bytes = (len > 24) ? (uint32_t)(len - 24) : 0;
+            std::string propName = selectionKey(property);
+            std::string typeName = atomName(type);
+            XWireServer& srv = XWireServer::instance();
+            bool harvested = false;
+            {
+                std::lock_guard<std::mutex> lk(srv.regMutex);
+                XWireServer::XWireProp& p = srv.windowProps[{window, propName}];
+                if (mode == 2 && p.format == format) {          // Append
+                    p.data.insert(p.data.end(), req + 24, req + 24 + bytes);
+                } else if (mode == 1 && p.format == format) {   // Prepend
+                    p.data.insert(p.data.begin(), req + 24, req + 24 + bytes);
+                } else {                                        // Replace
+                    p.type = typeName;
+                    p.format = format;
+                    p.data.assign(req + 24, req + 24 + bytes);
+                }
+                if (propName == "BW64_CLIP" && format == 8) {
+                    srv.clipboardText.assign((const char*)p.data.data(), p.data.size());
+                    harvested = true;
+                }
+            }
+            if (harvested) {
+                klog_fmt("XWire: harvested guest clipboard (%d bytes)", (int)bytes);
+            }
+            break;
+        }
         case X_SetClipRectangles:
         case X_CreateGlyphCursor: {
             // This block is a catch-all for reply-less drawing/property ops we
@@ -811,17 +882,28 @@ void XWireConnection::processOneRequest(const uint8_t* req, uint32_t len) {
             break;
 
         case X_GetSelectionOwner: {
-            // Return the recorded owner for this selection atom. wine's clipboard
+            // Return the recorded owner for this selection. wine's clipboard
             // manager SetSelectionOwner's CLIPBOARD/PRIMARY then polls here to
             // confirm it won ownership; without an owner registry we'd always
             // answer None and wine would re-poll forever (the boot wedge).
+            // When NO guest owns it but the HOST has clipboard text, report the
+            // root window as a stand-in owner — wine then takes the import path
+            // (ConvertSelection) on paste instead of deciding the clipboard is
+            // empty.
             uint32_t selection = rd32(req + 4);
+            std::string sel = selectionKey(selection);
             uint32_t owner = 0;
             {
                 XWireServer& srv = XWireServer::instance();
                 std::lock_guard<std::mutex> lk(srv.regMutex);
-                auto it = srv.selectionOwners.find(selection);
-                if (it != srv.selectionOwners.end()) owner = it->second;
+                auto it = srv.selectionOwners.find(sel);
+                if (it != srv.selectionOwners.end()) {
+                    owner = it->second;
+                } else if ((sel == "CLIPBOARD" || sel == "PRIMARY") &&
+                           !srv.clipboardText.empty()) {
+                    owner = rootWindow;        // host-owned stand-in
+                    klog_fmt("XWire: GetSelectionOwner(%s) -> host sentinel", sel.c_str());
+                }
             }
             uint8_t r[32] = {0};
             r[0] = 1;
@@ -832,15 +914,119 @@ void XWireConnection::processOneRequest(const uint8_t* req, uint32_t len) {
             break;
         }
         case X_SetSelectionOwner: {
-            // SetSelectionOwner(owner, selection, time): record owner so the
-            // subsequent GetSelectionOwner poll sees it and stops spinning. No
-            // reply (this is a reply-less request).
+            // SetSelectionOwner(owner, selection, time): record owner (by
+            // selection NAME — ids are per-connection) so the subsequent
+            // GetSelectionOwner poll sees it. No reply.
+            //
+            // CLIPBOARD harvest: a guest app just copied. There is no other X
+            // client to ask for the data, and the browser can't pull it on
+            // demand (clipboard writes need a user gesture with fresh data) —
+            // so harvest EAGERLY: synthesize the SelectionRequest a paste-ing
+            // client would have sent. wine's clipboard thread (this very
+            // connection) answers with ChangeProperty(requestor, BW64_CLIP,
+            // UTF8_STRING, <text>) + SendEvent(SelectionNotify); the
+            // ChangeProperty handler below spots BW64_CLIP and copies the text
+            // into XWireServer::clipboardText for the JS side to read.
             uint32_t owner     = rd32(req + 4);
             uint32_t selection = rd32(req + 8);
-            XWireServer& srv = XWireServer::instance();
-            std::lock_guard<std::mutex> lk(srv.regMutex);
-            if (owner) srv.selectionOwners[selection] = owner;
-            else       srv.selectionOwners.erase(selection);
+            std::string sel = selectionKey(selection);
+            bool harvest = false;
+            {
+                XWireServer& srv = XWireServer::instance();
+                std::lock_guard<std::mutex> lk(srv.regMutex);
+                if (owner) srv.selectionOwners[sel] = owner;
+                else       srv.selectionOwners.erase(sel);
+                harvest = owner && sel == "CLIPBOARD";
+            }
+            klog_fmt("XWire: SetSelectionOwner %s owner=0x%x", sel.c_str(), owner);
+            if (harvest) {
+                uint8_t e[32] = {0};
+                e[0] = 30;                                  // SelectionRequest
+                e[2] = (uint8_t)(sequence & 0xff);
+                e[3] = (uint8_t)(sequence >> 8);
+                uint32_t t = (uint32_t)KSystem::getMilliesSinceStart();
+                memcpy(e + 4, &t, 4);                       // time
+                memcpy(e + 8, &owner, 4);                   // owner
+                // Requestor: a never-allocated id at the top of THIS client's
+                // own resource range (clients allocate from the bottom), so the
+                // owner's ChangeProperty lands on a window id we can recognize
+                // without colliding with a real window.
+                uint32_t requestor = clientIdBase | clientIdMask;
+                memcpy(e + 12, &requestor, 4);
+                memcpy(e + 16, &selection, 4);              // selection (their id)
+                uint32_t target = internAtom("UTF8_STRING", false);
+                memcpy(e + 20, &target, 4);
+                uint32_t property = internAtom("BW64_CLIP", false);
+                memcpy(e + 24, &property, 4);
+                writeToClient(e, sizeof(e));
+                klog_fmt("XWire: clipboard harvest armed (owner=0x%x sel=%s)", owner, sel.c_str());
+            }
+            break;
+        }
+        case X_ConvertSelection: {
+            // A guest app is PASTING: ConvertSelection(requestor, selection,
+            // target, property, time). Serve the HOST clipboard text directly
+            // (the host is the only "other side" — guest-to-guest clipboard
+            // never reaches X, wine handles it internally via wineserver):
+            // store the data as a property on the requestor window and send
+            // SelectionNotify. TARGETS gets the format list; text-ish targets
+            // get UTF-8 bytes; anything else gets property=None ("can't
+            // convert").
+            uint32_t requestor = rd32(req + 4);
+            uint32_t selection = rd32(req + 8);
+            uint32_t target    = rd32(req + 12);
+            uint32_t property  = rd32(req + 16);
+            uint32_t time      = rd32(req + 20);
+            std::string tgtName = atomName(target);
+            if (!property) property = target;   // ICCCM: obsolete clients
+            std::string propName = atomName(property);
+            std::string text;
+            {
+                XWireServer& srv = XWireServer::instance();
+                std::lock_guard<std::mutex> lk(srv.regMutex);
+                text = srv.clipboardText;
+            }
+            bool ok = false;
+            if (tgtName == "TARGETS") {
+                // Reply with the supported conversion targets (type ATOM,
+                // format 32) — ids interned in THIS connection's numbering.
+                uint32_t list[4] = {
+                    internAtom("TARGETS", false),
+                    internAtom("UTF8_STRING", false),
+                    internAtom("STRING", false),
+                    internAtom("TEXT", false),
+                };
+                XWireServer& srv = XWireServer::instance();
+                std::lock_guard<std::mutex> lk(srv.regMutex);
+                XWireServer::XWireProp& p = srv.windowProps[{requestor, propName}];
+                p.type = "ATOM";
+                p.format = 32;
+                p.data.assign((uint8_t*)list, (uint8_t*)list + sizeof(list));
+                ok = true;
+            } else if (tgtName == "UTF8_STRING" || tgtName == "STRING" ||
+                       tgtName == "TEXT" || tgtName == "COMPOUND_TEXT") {
+                XWireServer& srv = XWireServer::instance();
+                std::lock_guard<std::mutex> lk(srv.regMutex);
+                XWireServer::XWireProp& p = srv.windowProps[{requestor, propName}];
+                p.type = (tgtName == "STRING") ? "STRING" : "UTF8_STRING";
+                p.format = 8;
+                p.data.assign(text.begin(), text.end());
+                ok = true;
+            }
+            uint8_t e[32] = {0};
+            e[0] = 31;                                      // SelectionNotify
+            e[2] = (uint8_t)(sequence & 0xff);
+            e[3] = (uint8_t)(sequence >> 8);
+            memcpy(e + 4, &time, 4);
+            memcpy(e + 8, &requestor, 4);
+            memcpy(e + 12, &selection, 4);
+            memcpy(e + 16, &target, 4);
+            uint32_t prop = ok ? property : 0;              // None = no conversion
+            memcpy(e + 20, &prop, 4);
+            writeToClient(e, sizeof(e));
+            klog_fmt("XWire: ConvertSelection sel=%s target=%s prop=%s -> %s (%d bytes staged)",
+                     selectionKey(selection).c_str(), tgtName.c_str(), propName.c_str(),
+                     ok ? "served" : "none", (int)text.size());
             break;
         }
         case X_AllocColor: {
@@ -936,15 +1122,64 @@ void XWireConnection::processOneRequest(const uint8_t* req, uint32_t len) {
             break;
         }
         case X_GetProperty: {
-            // Always report "property does not exist": type=None, len=0.
-            uint8_t r[32] = {0};
+            // GetProperty(delete, window, property, type, long-offset,
+            // long-length). Serves the windowProps store (selection data
+            // transfer); unknown properties still report "does not exist".
+            uint8_t del       = req[1];
+            uint32_t window   = rd32(req + 4);
+            uint32_t property = rd32(req + 8);
+            uint32_t offset   = rd32(req + 16) * 4;     // long-offset in 32-bit units
+            uint32_t maxBytes = rd32(req + 20) * 4;     // long-length in 32-bit units
+            std::string propName = selectionKey(property);
+
+            XWireServer::XWireProp prop;
+            bool found = false;
+            uint32_t bytesAfter = 0;
+            std::vector<uint8_t> slice;
+            {
+                XWireServer& srv = XWireServer::instance();
+                std::lock_guard<std::mutex> lk(srv.regMutex);
+                auto it = srv.windowProps.find({window, propName});
+                if (it != srv.windowProps.end()) {
+                    found = true;
+                    prop = it->second;
+                    if (offset > prop.data.size()) offset = (uint32_t)prop.data.size();
+                    uint32_t avail = (uint32_t)prop.data.size() - offset;
+                    uint32_t take = avail < maxBytes ? avail : maxBytes;
+                    slice.assign(prop.data.begin() + offset,
+                                 prop.data.begin() + offset + take);
+                    bytesAfter = avail - take;
+                    if (del && bytesAfter == 0) srv.windowProps.erase(it);
+                }
+            }
+            if (!found) {
+                uint8_t r[32] = {0};
+                r[0] = 1;
+                r[2] = (uint8_t)(sequence & 0xff);
+                r[3] = (uint8_t)(sequence >> 8);
+                writeToClient(r, sizeof(r));
+                break;
+            }
+            klog_fmt("XWire: GetProperty win=0x%x %s -> %d bytes (type=%s, after=%d)",
+                     window, propName.c_str(), (int)slice.size(), prop.type.c_str(),
+                     (int)bytesAfter);
+            // The reply's type atom must be in THIS connection's numbering.
+            uint32_t typeAtom = prop.type.empty() ? 0 : internAtom(prop.type, false);
+            uint32_t unitBytes = prop.format == 32 ? 4 : prop.format == 16 ? 2 : 1;
+            uint32_t valueUnits = unitBytes ? (uint32_t)slice.size() / unitBytes : 0;
+            uint32_t padded = ((uint32_t)slice.size() + 3) & ~3u;
+            std::vector<uint8_t> r(32 + padded, 0);
             r[0] = 1;
-            r[1] = 0;                          // format
+            r[1] = prop.format;
             r[2] = (uint8_t)(sequence & 0xff);
             r[3] = (uint8_t)(sequence >> 8);
-            // reply-length(4)@4 = 0, type@8 = None(0), bytes-after@12 = 0,
-            // length-of-value@16 = 0
-            writeToClient(r, sizeof(r));
+            uint32_t replyLen = padded / 4;
+            memcpy(r.data() + 4, &replyLen, 4);
+            memcpy(r.data() + 8, &typeAtom, 4);
+            memcpy(r.data() + 12, &bytesAfter, 4);
+            memcpy(r.data() + 16, &valueUnits, 4);
+            if (!slice.empty()) memcpy(r.data() + 32, slice.data(), slice.size());
+            writeToClient(r.data(), (uint32_t)r.size());
             break;
         }
         case X_GetWindowAttributes: {
@@ -2059,6 +2294,21 @@ void XWireConnection::sendExpose(uint32_t window, uint16_t x, uint16_t y, uint16
     memcpy(e + 14, &h, 2);
     // count @16 = 0 (last expose)
     writeToClient(e, sizeof(e));
+}
+
+void XWireConnection::sendSelectionClear(uint32_t ownerWindow, const std::string& selectionName) {
+    uint8_t e[32] = {0};
+    e[0] = 29;                                  // SelectionClear
+    e[2] = (uint8_t)(sequence & 0xff);
+    e[3] = (uint8_t)(sequence >> 8);
+    uint32_t t = (uint32_t)KSystem::getMilliesSinceStart();
+    memcpy(e + 4, &t, 4);
+    memcpy(e + 8, &ownerWindow, 4);
+    uint32_t sel = internAtom(selectionName, false);
+    memcpy(e + 12, &sel, 4);
+    writeToClient(e, sizeof(e));
+    flushReplies();
+    klog_fmt("XWire: SelectionClear -> owner 0x%x (%s)", ownerWindow, selectionName.c_str());
 }
 
 void XWireConnection::sendFocusIn(uint32_t window) {

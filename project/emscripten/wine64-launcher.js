@@ -937,6 +937,92 @@
     // Expose so the HTML button's onclick can reach it.
     window.downloadSavedFiles = downloadSavedFiles;
 
+    // --- clipboard bridge (M2): host <-> guest copy/paste --------------------
+    // Implemented with two tiny bundled win32 helpers (clipset.exe/clipget.exe
+    // in the prefix HOME) that talk to the wineserver-managed WIN32 clipboard
+    // directly — the X-selection clipboard manager (explorer's clipboard
+    // thread) is not functional under the minimal XWire server, but every wine
+    // app's OpenClipboard/GetClipboardData against wineserver works.
+    //   Paste to app: browser clipboard -> MEMFS .bw64clip.txt ->
+    //     bw64_register_file -> spawn clipset.exe (SetClipboardData) -> the
+    //     user pastes inside the app (Ctrl+V / Edit▸Paste).
+    //   Copy from app: spawn clipget.exe (GetClipboardData -> .bw64clip.out)
+    //     -> poll MEMFS for the file -> navigator.clipboard.writeText.
+    // Buttons (not automatic) because navigator.clipboard needs a user gesture.
+    // The X-selection path (bw64_clipboard_get/set + ConvertSelection in the
+    // XWire server) stays as substrate; these helpers are the working route.
+    var CLIP_IN_MEMFS = HOME_IN_MEMFS + "/.bw64clip.txt";    // host -> guest
+    var CLIP_OUT_MEMFS = HOME_IN_MEMFS + "/.bw64clip.out";   // guest -> host
+    var clipInRegistered = false;
+    function copyFromApp() {
+        var FS = getFS();
+        if (!FS || !sessionReady()) { setStatusText("Clipboard: wine session not ready yet"); return; }
+        try { FS.unlink(CLIP_OUT_MEMFS); } catch (e) {}
+        if (!spawnArgv(wineProgArgv("Z:\\home\\username\\clipget.exe"), "clipget")) {
+            setStatusText("Clipboard helper failed to start");
+            return;
+        }
+        setStatusText("Reading the app's clipboard…");
+        var waited = 0, STEP = 500, LIMIT = 30000;
+        (function poll() {
+            var bytes = null;
+            try { bytes = FS.readFile(CLIP_OUT_MEMFS); } catch (e) {}
+            if (bytes !== null) {
+                var text = new TextDecoder().decode(bytes);
+                if (!text) { setStatusText("App clipboard is empty (copy something in the app first)"); return; }
+                var done = function () { setStatusText("Copied " + text.length + " chars from the app → your clipboard"); };
+                if (navigator.clipboard && navigator.clipboard.writeText) {
+                    navigator.clipboard.writeText(text).then(done, function (err) {
+                        setStatusText("Browser blocked the clipboard write (" + err + ") — text: " + text.slice(0, 120));
+                    });
+                } else {
+                    var ta = document.createElement("textarea");
+                    ta.value = text; document.body.appendChild(ta); ta.select();
+                    try { document.execCommand("copy"); done(); }
+                    catch (e) { setStatusText("Clipboard write failed: " + e); }
+                    document.body.removeChild(ta);
+                }
+                return;
+            }
+            waited += STEP;
+            if (waited >= LIMIT) { setStatusText("Clipboard read timed out (helper didn't finish)"); return; }
+            setTimeout(poll, STEP);
+        })();
+    }
+    function pasteToApp() {
+        var FS = getFS();
+        if (!FS || !sessionReady()) { setStatusText("Clipboard: wine session not ready yet"); return; }
+        var stage = function (text) {
+            if (!text) { setStatusText("Your clipboard is empty"); return; }
+            try {
+                FS.writeFile(CLIP_IN_MEMFS, new TextEncoder().encode(text));
+            } catch (e) { setStatusText("Could not stage clipboard file: " + e); return; }
+            if (!clipInRegistered) {
+                // Make the freshly written MEMFS file visible to the guest VFS
+                // (same mechanism as the .exe upload — see uploadAndRunExe).
+                callExport("bw64_register_file", ["string"], ["/home/username/.bw64clip.txt"]);
+                clipInRegistered = true;
+            }
+            if (!spawnArgv(wineProgArgv("Z:\\home\\username\\clipset.exe"), "clipset")) {
+                setStatusText("Clipboard helper failed to start");
+                return;
+            }
+            setStatusText("Sending " + text.length + " chars to the app… paste inside the app in a few seconds (Ctrl+V)");
+        };
+        if (navigator.clipboard && navigator.clipboard.readText) {
+            navigator.clipboard.readText().then(stage, function () {
+                // Permission denied or unsupported — fall back to a prompt.
+                var t = window.prompt("Paste the text to send to the app:", "");
+                if (t !== null) stage(t);
+            });
+        } else {
+            var t = window.prompt("Paste the text to send to the app:", "");
+            if (t !== null) stage(t);
+        }
+    }
+    window.bw64CopyFromApp = copyFromApp;
+    window.bw64PasteToApp = pasteToApp;
+
     // --- first boot from the page load --------------------------------------
     setStatusText("Loading wine64 (WASM)...");
     window.onerror = function (msg, file, line, col, error) {

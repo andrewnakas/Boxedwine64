@@ -50,7 +50,7 @@ self-contained sessions. Each iteration:
 |----|-------|------|-------------------------------------|--------|
 | M0 | Kill-on-switch app switching | Switching apps in the app bar kills the old app (CPU/RAM freed, wineserver client reaped) and routes canvas+input to the new app, no page reload | notepad→DOOM→notepad cycle: each switch logs the kill, old app visually gone, typing/keys reach the new app, no runtime crash | DONE — browser-verified 2026-06-11 (both directions + boot-app relay-pid case), shipped |
 | M1 | CI browser smoke test | Headless-Chrome boot test wired into GitHub Actions so later milestones can't silently break boot | CI job boots `?p=notepad.exe`, asserts `XWire: first window mapped` + non-blank canvas, fails the deploy on regression; a green run on master | DONE — gated deploy f9e97941 green 2026-06-11; CI smoke PASS first attempt (78s, lit=99.9) |
-| M2 | Clipboard copy/paste (host↔guest) | Parity with 32-bit 25R1 copy/paste: guest X selections bridge to the browser clipboard | Copy text in guest Notepad → readable via the page (button or navigator.clipboard); paste host text into Notepad; round-trip verified | TODO |
+| M2 | Clipboard copy/paste (host↔guest) | Parity with 32-bit 25R1 copy/paste: bridge the browser clipboard with the guest's | Copy text in guest Notepad → readable via the page (button or navigator.clipboard); paste host text into Notepad; round-trip verified | DONE — round-trip browser-verified 2026-06-11 (win32 clipset/clipget helper design; toolbar buttons) |
 | M3 | Persistence across reloads | Guest home/prefix writes survive a page reload (32-bit web build has INDEXED_DB storage) | Save a file in Notepad, hard-reload the page, relaunch Notepad: the file is still there (IndexedDB-backed) | TODO |
 | M4 | Mouse capture for games | Pointer events for game-style apps: DOOM mouse turn/fire (doomgeneric wndProc has no mouse path today), canvas pointer-lock toggle | In DOOM, mouse movement turns the player and mouse button fires, browser-verified | TODO |
 | M5 | Sound (audio backend) | Parity with 32-bit audio: wine's audio stack → an SDL-audio (WebAudio) device in the browser | DOOM plays its sound effects (or a .wav plays via sndrec/winmm test) audibly in the tab; AudioContext confirmed feeding samples | TODO |
@@ -71,6 +71,26 @@ them.
 
 ## Log
 
+- **2026-06-11 — M2 DONE (clipboard, browser-verified round trip).** Winning
+  design: two tiny bundled win32 helpers — clipset.exe (UTF-8 staging file →
+  CF_UNICODETEXT) and clipget.exe (clipboard → output file) — spawned into the
+  running session by toolbar buttons ("⧉ Copy from app" / "⧉ Paste to app").
+  They talk to the wineserver-managed win32 clipboard directly, which works
+  under the minimal XWire server; verified: host text → clipset → Ctrl+V
+  pasted into notepad (screenshot, Ln1 Col31) → Ctrl+A/C → clipget → exact
+  payload back. The X-selection route was implemented first (per-connection
+  atom table seeded with predefined atoms + ids rebased past them,
+  ConvertSelection/SelectionNotify, real ChangeProperty/GetProperty with a
+  (window, property-name)-keyed store, SetSelectionOwner harvest via
+  synthesized SelectionRequest, host-owner sentinel, SelectionClear on host
+  set) and is KEPT as substrate with diagnostics — but wine 8.0's X↔win32
+  clipboard manager (explorer's clipboard thread, programs/explorer/desktop.c
+  + winex11 clipboard.c) never polls selections in our session (no
+  GetSelectionOwner traffic ever; root cause inside wine not chased further
+  since the win32 path is strictly better here). Also fixed: build-prefix64.sh
+  accumulated nested app dirs (HxD/HxD/…) on every rebuild because the stage
+  starts from the previous zip and `cp -R` merges into existing dirs — now
+  replaced; prefix64.zip back to 17MB clean, re-uploaded to rootfs-pages.
 - **2026-06-11 — M0 verified on the LIVE Pages site** (the exact environment
   the original bug was reported in): cold chunked load → notepad booted →
   switch to DOOM killed both the relay pid and the real notepad GUI
