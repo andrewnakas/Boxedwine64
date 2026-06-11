@@ -74,6 +74,20 @@ echo "=== done (snake.exe, tetris.exe, clipset.exe, clipget.exe) ==="
 #      I_SetGrabMouseCallback/I_InitGraphics/I_EnableLoadingDisk block to BEFORE the
 #      first TryRunTics(); and in doomgeneric_Tick() force `screenvisible = true;`
 #      then call `D_Display();` unconditionally (drop the `if (screenvisible)` gate).
+#
+# REQUIRED PATCH #3 — MOUSE (M4): the doomgeneric WIN32 backend had NO mouse
+# handling, so mouse look/fire didn't work. Added:
+#   - doomgeneric_win.c: a mouse accumulator (s_MouseButtons/DX/DY) fed by
+#     wndProc cases WM_MOUSEMOVE (relative-from-center) + WM_{L,R,M}BUTTON{DOWN,UP}
+#     (button bits: 1=left/fire, 2=right, 4=middle), and an exported
+#     DG_GetMouse(buttons,dx,dy) that hands DOOM one sample/frame.
+#   - doomgeneric.h: declare DG_GetMouse (and DG_PaceFrame from patch #2).
+#   - i_video.c: set `usemouse = 1` (was 0).
+#   - i_input.c: after the key drain, call DG_GetMouse and D_PostEvent an
+#     ev_mouse (data1=buttons, data2=+dx*4, data3=-dy*4 — DOOM's convention).
+# Verified in-browser: DOOM's 3D view turns when the mouse moves. The whole
+# patch set is scripted in apply_patches.py (kept beside this note in the
+# doomgeneric checkout — recreate from the diffs above if the checkout is gone).
 # (Patched checkout was at /tmp/doomgeneric_build — may be gone; reclone + reapply.)
 # SRC="dummy.c am_map.c doomdef.c doomstat.c dstrings.c d_event.c d_items.c \
 #   d_iwad.c d_loop.c d_main.c d_mode.c d_net.c f_finale.c f_wipe.c g_game.c \
