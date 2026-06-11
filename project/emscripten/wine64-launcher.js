@@ -662,9 +662,23 @@
         var names = neededZips();
         Promise.all(names.map(function (name) { return downloads[name]; }))
             .then(function (allBytes) {
-                // createDataFile is synchronous-cheap; do them in order.
+                // createDataFile is synchronous-cheap; do them in order. After a
+                // zip's bytes are copied into MEMFS (what wine actually reads),
+                // DROP the JS-side Uint8Array (M8): startZipDownloads kept it as
+                // an in-page-relaunch cache, but that doubled peak memory — each
+                // ~50-196MB zip was resident BOTH in MEMFS and in zipDownloads.
+                // The reload-fallback relaunch path re-fetches from the HTTP
+                // cache anyway (and the in-session relaunch doesn't re-mount), so
+                // nothing needs the JS copy after the mount. Replacing the cached
+                // promise with a tombstone frees the buffer to GC while still
+                // de-duping any concurrent in-flight request for the same name.
                 return names.reduce(function (chain, name, i) {
-                    return chain.then(function () { return dropBytesIntoVfs(name, allBytes[i]); });
+                    return chain.then(function () {
+                        return dropBytesIntoVfs(name, allBytes[i]);
+                    }).then(function () {
+                        allBytes[i] = null;
+                        if (zipDownloads) zipDownloads[name] = Promise.resolve(null);
+                    });
                 }, Promise.resolve());
             })
             .then(function () {

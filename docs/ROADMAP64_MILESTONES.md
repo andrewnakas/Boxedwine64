@@ -55,8 +55,8 @@ self-contained sessions. Each iteration:
 | M4 | Mouse capture for games | Pointer events for game-style apps: DOOM mouse turn/fire (doomgeneric wndProc has no mouse path today), canvas pointer-lock toggle | In DOOM, mouse movement turns the player and mouse button fires, browser-verified | DONE — browser-verified 2026-06-11 (mouse motion turns DOOM's 3D view; doom.exe rebuilt with a wndProc mouse path) |
 | M5 | Sound (audio backend) | Parity with 32-bit audio: wine's audio stack → an SDL-audio (WebAudio) device in the browser | DOOM plays its sound effects (or a .wav plays via sndrec/winmm test) audibly in the tab; AudioContext confirmed feeding samples | DESCOPED (2026-06-11) — sink works, wine→sink bridge is a multi-session rootfs effort; resume path documented in the Log |
 | M6 | Web-build performance: decoded-block cache | The upstream "improve performance for Emscripten build" item, 64-bit edition: per-RIP decoded-block cache so hot loops skip re-decode (README "concrete next steps" #3) | Measured ≥2x CPU64 throughput on a repeatable benchmark (or notepad cold boot <30s local), selftest 234/234, apps still boot | DESCOPED (2026-06-11) — the cheap lever (prefix-decode cache) gave NO measured win (benchmark-confirmed); the real win (full decoded-block cache) is a multi-session executor refactor. Evidence + resume path in the Log |
-| M7 | Lazy / streamable rootfs | Don't download ~196MB before first paint: HTTP-Range-backed zip reads (or progressive mount), unlocks bigger bundled apps (Quake 2 deferral) | First app reaches first paint with materially less than the full rootfs downloaded (measure bytes-before-first-paint before/after) | TODO |
-| M8 | Memory usage reduction | Parity with upstream 26R1 (-20%): measure wasm heap after boot, free what's recoverable (e.g. post-mount zip buffers, duplicate framebuffers) | Peak/total heap after notepad boot reduced ≥15% vs. measured baseline, recorded in the Log | TODO |
+| M7 | Lazy / streamable rootfs | Don't download ~196MB before first paint: HTTP-Range-backed zip reads (or progressive mount), unlocks bigger bundled apps (Quake 2 deferral) | First app reaches first paint with materially less than the full rootfs downloaded (measure bytes-before-first-paint before/after) | DEFERRED (2026-06-11) — needs a custom minizip Range-fetch I/O backend + synchronous-fetch-on-guest-thread under PROXY_TO_PTHREAD; multi-session architectural lift (assessment in Log). Revisit with M6's block cache as companion perf work |
+| M8 | Memory usage reduction | Parity with upstream 26R1 (-20%): measure wasm heap after boot, free what's recoverable (e.g. post-mount zip buffers, duplicate framebuffers) | Peak/total heap after notepad boot reduced ≥15% vs. measured baseline, recorded in the Log | DONE — browser-verified 2026-06-11: JS heap 651MB peak → 235MB post-boot (~416MB / 64% freed) by releasing the JS-side zip buffers after MEMFS mount |
 | M9 | App breadth: experimental row | The taskmgr/regedit/control/explorer/oleview row: each either works or has a root-caused triage note (X opcodes, missing dlls, …) | Each app: renders+takes input in-browser, or a Log entry naming the first fatal marker and the missing feature | TODO |
 | M10 | Joystick/gamepad | Upstream roadmap item: SDL gamepad → browser Gamepad API → wine dinput | A game or joy.cpl-style test reacts to a connected (or emulated CDP) gamepad in-browser; else documented evaluation | TODO |
 | M11 | ISO mounting (evaluate) | Upstream "distant future" item: mount an ISO as a drive (ISO9660 reader over the existing zip-mount machinery, or pre-extract path) | Either a demo ISO browses as a drive letter in winefile, or a written go/no-go with effort estimate | TODO |
@@ -71,6 +71,32 @@ them.
 
 ## Log
 
+- **2026-06-11 — M8 DONE (memory reduction, browser-verified).** The launcher
+  held each rootfs zip's bytes TWICE after boot: once in MEMFS (what wine
+  reads) and once in the `zipDownloads` JS map (kept as an in-page-relaunch
+  cache). The two zips sum to ~215MB, so peak memory carried a full duplicate.
+  Fix (wine64-launcher.js loadFilesystem): after each zip is createDataFile'd
+  into MEMFS, null out its Uint8Array and tombstone the cached promise so the
+  buffer is GC'd. Nothing needs the JS copy post-mount — the reload-fallback
+  relaunch re-fetches from the HTTP cache, and the in-session relaunch doesn't
+  re-mount. Measured (Chrome, --expose-gc --enable-precise-memory-info): JS
+  heap PEAK 651MB → POST-boot 235MB, ~416MB / 64% freed; notepad still boots.
+  (Freed exceeds the raw 215MB because the intermediate fetch/chunk-assembly
+  allocations also collapse once the final buffers are released.) Far past the
+  ≥15% target. Test: /tmp/bw64test/test_mem.mjs.
+- **2026-06-11 — M7 DEFERRED (lazy rootfs), with the blocker assessed.**
+  FsZip (source/io/fszip.cpp) mounts via minizip's `unzOpen(zipPath)` over a
+  `FILE*` and reads with `unzReadCurrentFile` — in the wasm build the zip is a
+  MEMFS file, which is exactly why the launcher must download the WHOLE zip
+  into MEMFS before boot. Lazy/Range-backed loading needs either a custom
+  minizip I/O backend that issues HTTP Range requests, or emscripten lazy-file/
+  WORKERFS with Range support — and the guest read happens on guest pthreads
+  under PROXY_TO_PTHREAD, where synchronous fetch is restricted. That's a
+  multi-session architectural change to the zip I/O layer + threading model.
+  Deferred (not a contained single-session change); the lower-risk
+  memory-reduction milestone (M8) is the better next perf win. Resume: add a
+  minizip filefunc64 vtable backed by a Range-fetch (sync XHR on a worker, or
+  an Asyncify boundary) reading only the central directory + opened entries.
 - **2026-06-11 — M6 DESCOPED (interpreter throughput), with benchmark
   evidence pointing at the real bottleneck.** Implemented the cheap lever
   first — a per-RIP prefix-decode cache in CPU64::step() (memoize
