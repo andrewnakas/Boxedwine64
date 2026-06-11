@@ -152,6 +152,16 @@ public:
     // were all allocated BEFORE the arm — from re-winning the base via a late
     // repaint or popup map. adoptArmSerial is kept only as a tiebreaker/log aid.
     uint32_t adoptArmClientBase = 0;
+    // Guest pid of the app being switched AWAY from, captured at arm time from
+    // the outgoing presentWindow's owning connection. This — not the pid JS
+    // tracked from the spawn — is the authoritative kill target: wine starts a
+    // boot app through a relay chain (wine64 → start/relay processes that fork
+    // and EXIT), so the pid the launcher remembers is often a long-dead
+    // ancestor of the process that actually owns the window. The kill path
+    // (wine64session doKill) consumes this with exchange(0). Atomic because it
+    // is written at arm (browser-main-thread ccall) and read on the main-loop
+    // thread.
+    std::atomic<uint32_t> outgoingAppPid{0};
 
     // GL foreground drawable. A GL app (e.g. glcube) renders via the gl64 bridge
     // and presents readback frames tagged with its GLX *drawable* id, which is a
@@ -219,6 +229,18 @@ public:
     // call from a connection thread holding NO lock. Returns true if it changed
     // anything (caller then arms a present-sink clear to wipe stale pixels).
     bool unmapAppWindows(uint32_t ownerBase);
+
+    // Persistent-session app switch, kill path: the app with guest pid `pid`
+    // was just terminated (wine64session doKill marks its threads terminating;
+    // the dying process never tells the X server anything), so tear down its
+    // host-side presence deterministically: drop its connections from the pump
+    // list and erase every window/pixmap/GC/font/cursor created by any of its
+    // connections (X "DestroyAll close-down" semantics, keyed by process). If
+    // the presented base belonged to it, presentWindow is cleared so the next
+    // app's first window is adopted cleanly. Returns true if anything was
+    // dropped (caller then wipes the canvas + reschedules a present). Locks
+    // connMutex then regMutex internally; call with neither held.
+    bool dropAppByPid(uint32_t pid);
 
     // Persistent-session app switch: drop every non-root window and clear the
     // base (presentWindow=0) so the NEXT app's first-mapped window is adopted as

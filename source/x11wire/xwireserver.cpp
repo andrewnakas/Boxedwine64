@@ -160,12 +160,19 @@ void XWireServer::composeAndPresent() {
 }
 
 void XWireServer::resetForAppSwitch() {
+    uint32_t outgoingBase = 0;
+    {
     std::lock_guard<std::mutex> lk(regMutex);
-    // Arm "adopt the next app window as the base". We do NOT kill the previous
-    // app and do NOT wipe windows — a wine client's mid-session teardown crashes
-    // the WASM runtime (observed: WebAssembly.Exception + wineserver "Transport
-    // endpoint is not connected"). Instead the previous app keeps running
-    // (invisible) and the next REAL window the new app draws becomes the canvas.
+    // The connection base that owns the CURRENT base window — resolved to its
+    // guest pid below (outside regMutex) so the kill path can terminate the
+    // process that really owns the window, not just the relay pid JS tracked.
+    auto ow = windows.find(presentWindow);
+    if (ow != windows.end()) outgoingBase = ow->second.ownerClientBase;
+    // Arm "adopt the next app window as the base". Windows are NOT wiped here —
+    // the launcher kills the outgoing app right after queueing the new spawn,
+    // and that kill path (dropAppByPid) erases the old app's windows; until it
+    // runs, the owner-base watermark below keeps the old app from re-winning
+    // the base.
     adoptNextWindowAsBase = true;
     // Only adopt a window mapped AFTER now, so the new app's fresh window wins
     // over the still-running previous app's existing window (older serial).
@@ -183,8 +190,31 @@ void XWireServer::resetForAppSwitch() {
     // re-claims via glXMakeCurrent. Prevents a background cube painting over the
     // GDI app the user just switched to.
     glPresentDrawable = 0;
-    klog_fmt("XWire: app switch armed (adopt next window mapped after serial %llu; previous app left running)",
+    klog_fmt("XWire: app switch armed (adopt next window mapped after serial %llu)",
              (unsigned long long)adoptArmSerial);
+    }
+    // Resolve the outgoing window's owning connection to its guest pid (the
+    // app the user is switching away from). connMutex and regMutex are never
+    // held together anywhere, so taking connMutex after dropping regMutex
+    // keeps that invariant.
+    uint32_t pid = 0;
+    if (outgoingBase) {
+        std::lock_guard<std::mutex> lk(connMutex);
+        for (auto& c : connections) {
+            if (c->idBase() == outgoingBase) { pid = c->ownerPid; break; }
+        }
+    }
+    outgoingAppPid.store(pid, std::memory_order_release);
+    if (pid) {
+        klog_fmt("XWire: outgoing app on switch = pid %d (window owner base 0x%x)",
+                 (int)pid, outgoingBase);
+    }
+}
+
+// Consumed by the session bridge's kill path: the guest pid that owns the
+// window being switched away from (captured at arm time), one-shot.
+uint32_t bw64TakeOutgoingAppPid() {
+    return XWireServer::instance().outgoingAppPid.exchange(0);
 }
 
 bool XWireServer::unmapAppWindows(uint32_t ownerBase) {
@@ -216,10 +246,96 @@ bool XWireServer::unmapAppWindows(uint32_t ownerBase) {
     return changed;
 }
 
+bool XWireServer::dropAppByPid(uint32_t pid) {
+    if (!pid) return false;
+    // Collect the killed app's connections (one per winex11 thread) and remove
+    // them from the pump list so deliverInputEvents/flushReplies stop touching
+    // their dead sockets. Each connection's resource-id base identifies the X
+    // resources it created.
+    std::vector<uint32_t> bases;
+    size_t droppedConns = 0;
+    {
+        std::lock_guard<std::mutex> lk(connMutex);
+        for (auto it = connections.begin(); it != connections.end();) {
+            if ((*it)->ownerPid == pid) {
+                if ((*it)->idBase()) bases.push_back((*it)->idBase());
+                it = connections.erase(it);
+                droppedConns++;
+            } else {
+                ++it;
+            }
+        }
+    }
+    if (!droppedConns) return false;
+
+    // A resource id's top bits are its creating connection's base (the 21-bit
+    // client id mask below the base step). True for window/pixmap/gc/font ids
+    // and for ownerClientBase values themselves (bases are mask-aligned).
+    auto owned = [&bases](uint32_t rid) {
+        uint32_t base = rid & ~0x001fffffu;
+        for (uint32_t b : bases) {
+            if (base == b) return true;
+        }
+        return false;
+    };
+
+    bool changed = false;
+    {
+        std::lock_guard<std::mutex> lk(regMutex);
+        for (auto it = windows.begin(); it != windows.end();) {
+            if (!it->second.isRoot &&
+                (owned(it->first) || owned(it->second.ownerClientBase))) {
+                it = windows.erase(it);
+                changed = true;
+            } else {
+                ++it;
+            }
+        }
+        for (auto it = pixmaps.begin(); it != pixmaps.end();) {
+            if (owned(it->first)) { it = pixmaps.erase(it); } else { ++it; }
+        }
+        for (auto it = gcs.begin(); it != gcs.end();) {
+            if (owned(it->first)) { it = gcs.erase(it); } else { ++it; }
+        }
+        for (auto it = fonts.begin(); it != fonts.end();) {
+            if (owned(it->first)) { it = fonts.erase(it); } else { ++it; }
+        }
+        for (auto it = cursorShapes.begin(); it != cursorShapes.end();) {
+            if (owned(it->first)) { it = cursorShapes.erase(it); } else { ++it; }
+        }
+        for (auto it = selectionOwners.begin(); it != selectionOwners.end();) {
+            if (owned(it->second)) { it = selectionOwners.erase(it); } else { ++it; }
+        }
+        if (presentWindow && owned(presentWindow)) {
+            presentWindow = 0;
+            changed = true;
+        }
+        if (glPresentDrawable && owned(glPresentDrawable)) {
+            glPresentDrawable = 0;
+        }
+    }
+    klog_fmt("XWire: dropped killed app pid=%d (%d connection(s), %d resource base(s))",
+             (int)pid, (int)droppedConns, (int)bases.size());
+    return changed;
+}
+
 // Free-function shim so the persistent-session bridge (wine64session.cpp) can
 // trigger an app-switch reset without including the XWire header.
 void bw64ResetPresentForSwitch() {
     XWireServer::instance().resetForAppSwitch();
+}
+
+// Shim for the session bridge's kill path: erase the killed app's host-side X
+// presence and, if it owned the canvas, wipe to black so its last frame doesn't
+// linger while the next app boots.
+void bw64DropAppPresenceByPid(uint32_t pid) {
+    XWireServer& srv = XWireServer::instance();
+    if (srv.dropAppByPid(pid)) {
+        if (g_xwirePresentSink) {
+            g_xwirePresentSink->requestClear();
+        }
+        srv.schedulePresent();
+    }
 }
 
 // Flush queued host input to every connection from the main thread's present

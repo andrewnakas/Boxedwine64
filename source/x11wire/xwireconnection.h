@@ -55,6 +55,16 @@ public:
     XWireConnection(const std::shared_ptr<KUnixSocketObject>& client,
                     const std::shared_ptr<XWireServerSocket>& serverPeer);
 
+    // Guest process that opened this connection (KProcess id captured at
+    // connect time — acceptConnection runs on the connecting guest's thread).
+    // XWireServer::dropAppByPid uses it to tear down ALL of a killed app's
+    // connections/windows at once: one app opens several X connections (winex11
+    // opens one per thread), each with its own resource-id base, so a single
+    // base does not identify the whole app. 0 = unknown.
+    uint32_t ownerPid = 0;
+    // This connection's resource-id base (0 until the handshake assigns it).
+    uint32_t idBase() const { return clientIdBase; }
+
     // Drain the server peer's recvBuffer and process as many complete requests
     // as are available. Called from XWireServerSocket::onPeerWrote.
     void onData();

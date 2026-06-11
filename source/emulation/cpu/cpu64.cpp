@@ -5183,6 +5183,15 @@ void CPU64::run() {
         U32 n = step();
         if (n == 0) break;
         instructionCount++;
+        // A thread killed from outside (persistent-session app switch kills the
+        // previous app) is only MARKED terminating — nothing interrupts a
+        // CPU-bound guest loop that never blocks in a syscall (DOOM busy-spins
+        // by design), so without this check run() never returns and the killed
+        // process can never finish dying. One flag test every 64k instructions
+        // is noise next to step()'s cost.
+        if ((instructionCount & 0xFFFF) == 0 && thread && thread->terminating) {
+            break;
+        }
     }
 }
 

@@ -828,18 +828,47 @@
         console.warn("session: spawn of " + (label || argvArray.join(" ")) + " did not schedule (r=" + r + ")");
         return false;
     }
-    // Switch to `prog` IN-SESSION, the SAFE way: arm "adopt the next app window
-    // as the canvas base", then spawn the new app. We do NOT kill the previous
-    // app — a wine client's mid-session teardown crashes the whole WASM runtime
-    // (observed: WebAssembly.Exception in a worker + wineserver "Transport
-    // endpoint is not connected" right after SIGTERM). Instead the previous app
-    // keeps running invisibly; when the new app draws its first real window the
-    // XWire server makes that window the base, so the canvas switches to it.
+    // Switch to `prog` IN-SESSION: arm "adopt the next app window as the canvas
+    // base", spawn the new app, then KILL the previous app. Leaving the old app
+    // running invisibly (the earlier design) didn't hold up: wine never learns
+    // its window is hidden, so a background notepad kept repainting (caret
+    // blink), could steal the canvas + keyboard back from the new app, and a
+    // background DOOM busy-spins a whole core. The kill is kernel-side (no
+    // guest SIGTERM — that's what crashed the runtime when kill was first
+    // tried); the C side also erases the dead app's windows from the X server,
+    // so input + canvas can only belong to the new app.
     function spawnIntoSession(prog) {
         // Arm the adopt-next-window switch BEFORE spawning, so the new app's very
         // first window is the one adopted (not some late repaint of the old app).
         try { callExport("bw64_reset_present", [], []); } catch (e) {}
+        var prevPid = currentAppPid;
+        var pidBeforeSpawn = lastSpawnedPid();
         if (!spawnArgv(wineProgArgv(prog), prog)) return false;
+        // Kill the outgoing app AFTER the new spawn is queued (the C-side FIFO
+        // runs them in order). prevPid is only ever an APP pid (boot app or a
+        // prior in-session app) — never the wineserver/pin, which JS tracks
+        // separately — so the session itself can't be killed here.
+        if (prevPid > 0) {
+            console.log("session: closing previous app pid=" + prevPid);
+            callExport("bw64_kill", ["number"], [prevPid]);
+        }
+        // The spawn is queued (drained on the next main-loop tick), so the new
+        // pid isn't known yet — poll it for the NEXT switch's kill.
+        var waited = 0, STEP = 200, LIMIT = 30000;
+        (function pollPid() {
+            var p = lastSpawnedPid();
+            if (p && p !== pidBeforeSpawn) {
+                currentAppPid = p;
+                console.log("session: current app pid=" + p);
+                return;
+            }
+            waited += STEP;
+            if (waited >= LIMIT) {
+                console.warn("session: never saw the new app's pid (spawn failed?)");
+                return;
+            }
+            setTimeout(pollPid, STEP);
+        })();
         return true;
     }
     // Once the kernel is up: remember the boot app as the current app, then pin

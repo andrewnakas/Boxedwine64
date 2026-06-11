@@ -148,6 +148,12 @@ static std::vector<BString> splitLines(const char* joined) {
 // Defined in source/x11wire/xwireserver.cpp (calls XWireServer::resetForAppSwitch);
 // forward-declared here to avoid pulling the whole XWire header into this bridge.
 void bw64ResetPresentForSwitch();
+// Defined in source/x11wire/xwireserver.cpp: erase a killed app's host-side X
+// presence (connections, windows, pixmaps) + wipe the canvas if it owned it.
+void bw64DropAppPresenceByPid(uint32_t pid);
+// Defined in source/x11wire/xwireserver.cpp: the guest pid that owns the window
+// being switched away from (captured when the switch armed), one-shot consume.
+uint32_t bw64TakeOutgoingAppPid();
 
 // The actual spawn — runs on the main-loop thread (see THREADING note).
 static void doSpawn(const Wine64Req& req) {
@@ -182,14 +188,75 @@ static void doSpawn(const Wine64Req& req) {
     KThread::setCurrentThread(saved);
 }
 
-// Kill a previously-spawned app (close-previous-on-switch). SIGTERM lets wine
-// shut the app's windows + wineserver client down cleanly; the wineserver itself
-// stays (it was pinned persistent), so the session survives. Runs on the
+// Kill a previously-spawned app (close-previous-on-switch). Runs on the
 // main-loop thread.
+//
+// HOW (and why not a signal): delivering a guest SIGTERM means running wine's
+// guest signal handler mid-session — the path that crashed the runtime
+// (WebAssembly.Exception + wineserver protocol errors) when kill-on-switch was
+// first attempted. Instead this terminates the process KERNEL-SIDE, the same
+// way exit_group does: mark every thread `terminating` and wake any wait it's
+// parked in. Each thread's own platform pthread then unwinds and the LAST one
+// runs the full process cleanup in KProcess::deleteThread (fds close — so the
+// persistent wineserver sees its client die, like any crashed Windows app —
+// RAM released, process erased). CPU-bound threads that never block notice the
+// flag via the periodic check in CPU64::run(). Deliberately NON-blocking: we
+// don't wait for the threads to finish dying (terminateOtherThread's wait loop
+// would wedge the main loop if a thread were stuck), we just flag + wake and
+// let them exit on their own pthreads.
+//
+// The host-side X presence (its connections/windows on our wire server) is
+// dropped immediately — the dying process never tells the X server anything.
+static bool terminatePid(U32 pid, const char* why) {
+    if (!pid) return false;
+    KProcessPtr process = KSystem::getProcess(pid);
+    if (!process || process->terminated) {
+        klog_fmt("wine64session: kill pid=%d (%s) — already gone", (int)pid, why);
+        bw64DropAppPresenceByPid(pid);  // in case its X state still lingers
+        return false;
+    }
+    // Never kill the session's plumbing, whatever pid bookkeeping claims: the
+    // wineserver (pinned persistent — killing it ends the session) or wine's
+    // service processes. The X-derived pid below SHOULD always be a real app,
+    // but a guard here is cheap and the failure mode without it is fatal.
+    BString cmd = process->commandLine;
+    if (cmd.contains("wineserver") || cmd.contains("services.exe") ||
+        cmd.contains("winedevice") || cmd.contains("plugplay") ||
+        cmd.contains("rpcss") || cmd.contains("explorer.exe")) {
+        klog_fmt("wine64session: REFUSING to kill pid=%d (%s) — system process (%s)",
+                 (int)pid, cmd.c_str(), why);
+        return false;
+    }
+    klog_fmt("wine64session: killing previous app pid=%d (%s) [%s]", (int)pid,
+             cmd.c_str(), why);
+    process->iterateThreads([](KThread* thread) {
+        thread->terminating = true;
+        // Wake the thread if it's parked in a guest wait so it sees the flag
+        // (same wake terminateOtherThread uses, minus the blocking wait).
+        const std::shared_ptr<BoxedWineCondition> cond = thread->waitingCond;
+        if (cond) {
+            cond->lock();
+            cond->signal();
+            cond->unlock();
+        }
+        return true;
+    });
+    bw64DropAppPresenceByPid(pid);
+    return true;
+}
+
 static void doKill(U32 pid) {
-    if (!pid) return;
-    klog_fmt("wine64session: killing previous app pid=%d", (int)pid);
-    KSystem::kill((S32)pid, K_SIGTERM);
+    // The pid JS tracked (the spawn root). For an in-session spawn this IS the
+    // app; for the boot app it's usually a relay ancestor that already exited.
+    terminatePid(pid, "launcher-tracked pid");
+    // The pid that owns the window being switched away from, per the X server —
+    // authoritative even when wine relayed the app through intermediate
+    // processes (observed: the BOOT notepad's GUI lived in a different pid than
+    // the boot spawn, so killing only the tracked pid left it running hidden).
+    U32 xpid = bw64TakeOutgoingAppPid();
+    if (xpid && xpid != pid) {
+        terminatePid(xpid, "X window owner");
+    }
 }
 
 // Register a file that JS just wrote directly into the Emscripten MEMFS (e.g. an
@@ -282,9 +349,10 @@ extern "C" EMSCRIPTEN_KEEPALIVE int bw64_register_file(const char* guestPath) {
     return 1;
 }
 
-// bw64_kill: queue a SIGTERM for a previously-spawned app pid (switch = close the
-// old app first). Queued ahead of the new app's spawn so they're ordered. NON-
-// blocking. Returns 1 if queued.
+// bw64_kill: queue a kernel-side terminate of a previously-spawned app pid
+// (app switch kills the outgoing app). The launcher queues the NEW app's spawn
+// first, then this — the FIFO drain keeps them ordered, so a failed spawn can
+// still be retried against a live old app. NON-blocking. Returns 1 if queued.
 extern "C" EMSCRIPTEN_KEEPALIVE int bw64_kill(int pid) {
     if (!g_sessionCtx.valid.load(std::memory_order_acquire) || pid <= 0) return 0;
     Wine64Req req;

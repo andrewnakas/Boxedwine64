@@ -248,6 +248,13 @@ namespace {
 XWireConnection::XWireConnection(const std::shared_ptr<KUnixSocketObject>& client,
                                  const std::shared_ptr<XWireServerSocket>& serverPeer)
     : client(client), serverPeer(serverPeer) {
+    // Constructed inside the guest's connect() (acceptConnection), so the
+    // current thread IS the connecting app's thread — record which process this
+    // connection belongs to for app-switch teardown (dropAppByPid).
+    KThread* thread = KThread::currentThread();
+    if (thread && thread->process) {
+        ownerPid = thread->process->id;
+    }
 }
 
 U32 XWireServerSocket::readNativeNonBlocking(U8* buffer, U32 len) {
@@ -1775,7 +1782,14 @@ void XWireConnection::blitPutImage(uint32_t drawable, uint8_t format, uint8_t de
     } else if (srv.presentWindow == 0) {
         srv.presentWindow = drawable;
         srv.glPresentDrawable = 0;  // GDI app taking the base (PutImage path)
-    } else if (drawable != srv.presentWindow && !win.overrideRedirect) {
+    } else if (drawable != srv.presentWindow && !win.overrideRedirect && win.mapped) {
+        // Largest-window re-election. The `mapped` gate matters: a window hidden
+        // host-side on app switch (unmapAppWindows) belongs to the OUTGOING app —
+        // if it keeps repainting (notepad's caret blink) and is bigger than the
+        // new app's window, it would steal back the base, putting the old app
+        // back on screen AND taking the keyboard with it (keys follow
+        // presentWindow). Observed live as: switch notepad->DOOM, DOOM renders
+        // but notepad stays behind it and eats all input.
         auto pit = srv.windows.find(srv.presentWindow);
         uint32_t curArea = (pit != srv.windows.end())
                            ? (uint32_t)pit->second.width * pit->second.height : 0;
