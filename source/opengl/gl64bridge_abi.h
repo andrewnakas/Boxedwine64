@@ -133,6 +133,114 @@ enum {
     GL64_fn_glVertex2f,                 // (x,y : float)
     GL64_fn_glVertex3f,                 // (x,y,z : float)
 
+    // === programmable pipeline (GL2/GLES3, for wined3d / Direct3D) =====
+    // These are the modern-GL entry points wined3d resolves through
+    // glXGetProcAddressARB. They marshal 1:1 onto WebGL2 (GLES3) on the host.
+    // Guest pointer args are GUEST virtual addresses; the host reads/writes
+    // them via KMemory64. Buffer-relative pointers (VertexAttribPointer
+    // `pointer`, DrawElements `indices`) are plain integer OFFSETS into the
+    // bound buffer when a VBO/IBO is bound — passed through as u64, no guest
+    // read. Handles returned by CreateShader/CreateProgram are real host GL
+    // names handed straight back to the guest.
+
+    // --- diagnostics ---
+    GL64_fn_traceProc = 400,            // (name* , hit) -> log a glXGetProcAddress resolution
+
+    // --- shaders / programs ---
+    GL64_fn_glCreateShader = 410,       // (type) -> GLuint
+    GL64_fn_glShaderSource,             // (shader, count, string** , length*) reads guest strings
+    GL64_fn_glCompileShader,            // (shader)
+    GL64_fn_glGetShaderiv,              // (shader, pname, out params*)
+    GL64_fn_glGetShaderInfoLog,         // (shader, bufSize, out length*, out infoLog*)
+    GL64_fn_glDeleteShader,             // (shader)
+    GL64_fn_glCreateProgram,            // () -> GLuint
+    GL64_fn_glAttachShader,             // (program, shader)
+    GL64_fn_glDetachShader,             // (program, shader)
+    GL64_fn_glBindAttribLocation,       // (program, index, name*)
+    GL64_fn_glLinkProgram,              // (program)
+    GL64_fn_glGetProgramiv,             // (program, pname, out params*)
+    GL64_fn_glGetProgramInfoLog,        // (program, bufSize, out length*, out infoLog*)
+    GL64_fn_glUseProgram,               // (program)
+    GL64_fn_glDeleteProgram,            // (program)
+    GL64_fn_glGetUniformLocation,       // (program, name*) -> GLint
+    GL64_fn_glGetAttribLocation,        // (program, name*) -> GLint
+    GL64_fn_glValidateProgram,          // (program)
+
+    // --- uniforms ---
+    GL64_fn_glUniform1i = 440,          // (loc, v0)
+    GL64_fn_glUniform1f,                // (loc, v0:float)
+    GL64_fn_glUniform2f,                // (loc, v0,v1:float)
+    GL64_fn_glUniform3f,                // (loc, v0,v1,v2:float)
+    GL64_fn_glUniform4f,                // (loc, v0,v1,v2,v3:float)
+    GL64_fn_glUniform1fv,               // (loc, count, value*)
+    GL64_fn_glUniform2fv,               // (loc, count, value*)
+    GL64_fn_glUniform3fv,               // (loc, count, value*)
+    GL64_fn_glUniform4fv,               // (loc, count, value*)
+    GL64_fn_glUniform1iv,               // (loc, count, value*)
+    GL64_fn_glUniformMatrix2fv,         // (loc, count, transpose, value*)
+    GL64_fn_glUniformMatrix3fv,         // (loc, count, transpose, value*)
+    GL64_fn_glUniformMatrix4fv,         // (loc, count, transpose, value*)
+
+    // --- buffers (VBO / IBO) ---
+    GL64_fn_glGenBuffers = 470,         // (n, out buffers*)
+    GL64_fn_glBindBuffer,               // (target, buffer)
+    GL64_fn_glBufferData,               // (target, size, data*, usage) reads guest data
+    GL64_fn_glBufferSubData,            // (target, offset, size, data*) reads guest data
+    GL64_fn_glDeleteBuffers,            // (n, buffers*)
+    GL64_fn_glMapBufferRange,           // unsupported in WebGL2; returns 0 (guest falls back)
+
+    // --- vertex attrib arrays / VAO ---
+    GL64_fn_glEnableVertexAttribArray = 490,  // (index)
+    GL64_fn_glDisableVertexAttribArray,       // (index)
+    GL64_fn_glVertexAttribPointer,            // (index, size, type, normalized, stride, offset)
+    GL64_fn_glGenVertexArrays,                // (n, out arrays*)
+    GL64_fn_glBindVertexArray,                // (array)
+    GL64_fn_glDeleteVertexArrays,             // (n, arrays*)
+    GL64_fn_glVertexAttrib4f,                 // (index, x,y,z,w:float)
+
+    // --- draws ---
+    GL64_fn_glDrawArrays = 510,         // (mode, first, count)
+    GL64_fn_glDrawElements,             // (mode, count, type, indices-offset)
+    GL64_fn_glDrawRangeElements,        // (mode, start, end, count, type, offset)
+
+    // --- modern state ---
+    GL64_fn_glBlendFunc = 530,          // (sfactor, dfactor)
+    GL64_fn_glBlendFuncSeparate,        // (srcRGB, dstRGB, srcA, dstA)
+    GL64_fn_glBlendEquation,            // (mode)
+    GL64_fn_glBlendEquationSeparate,    // (modeRGB, modeAlpha)
+    GL64_fn_glBlendColor,               // (r,g,b,a:float)
+    GL64_fn_glColorMask,                // (r,g,b,a:bool)
+    GL64_fn_glDepthMask,                // (flag)
+    GL64_fn_glStencilFunc,              // (func, ref, mask)
+    GL64_fn_glStencilOp,                // (fail, zfail, zpass)
+    GL64_fn_glStencilMask,              // (mask)
+    GL64_fn_glStencilFuncSeparate,      // (face, func, ref, mask)
+    GL64_fn_glStencilOpSeparate,        // (face, fail, zfail, zpass)
+    GL64_fn_glStencilMaskSeparate,      // (face, mask)
+    GL64_fn_glScissor,                  // (x,y,w,h)
+    GL64_fn_glPolygonOffset,            // (factor, units : float)
+    GL64_fn_glPolygonMode,              // (face, mode) — no-op on GLES
+    GL64_fn_glDepthRange,               // (near, far : double)
+    GL64_fn_glLineWidth,                // (width : float)
+    GL64_fn_glPixelStorei,              // (pname, param)
+    GL64_fn_glSampleCoverage,           // (value:float, invert)
+
+    // --- textures (modern) ---
+    GL64_fn_glActiveTexture = 560,      // (texture)
+    GL64_fn_glGenTextures,              // (n, out textures*)
+    GL64_fn_glBindTexture,              // (target, texture)
+    GL64_fn_glDeleteTextures,           // (n, textures*)
+    GL64_fn_glTexParameteri,            // (target, pname, param)
+    GL64_fn_glTexParameterf,            // (target, pname, param:float)
+    GL64_fn_glTexImage2D,               // (target, level, ifmt, w, h, border, fmt, type, pixels*) reads guest pixels
+    GL64_fn_glTexSubImage2D,            // (target, level, x, y, w, h, fmt, type, pixels*) reads guest pixels
+    GL64_fn_glGenerateMipmap,           // (target)
+    GL64_fn_glCompressedTexImage2D,     // (target, level, ifmt, w, h, border, imageSize, data*)
+
+    // --- queries / strings ---
+    GL64_fn_glGetStringi = 590,         // (name, index) -> const char* (returns 0; guest stub)
+    GL64_fn_glGetShaderSource,          // (shader, bufSize, out length*, out source*) — rarely used
+
     GL64_fn__MAX
 };
 

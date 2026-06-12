@@ -111,7 +111,97 @@ enum {
     GL64_fn_glBegin = 320,
     GL64_fn_glEnd,
     GL64_fn_glVertex2f,
-    GL64_fn_glVertex3f
+    GL64_fn_glVertex3f,
+
+    // === programmable pipeline (must match source/opengl/gl64bridge_abi.h) ===
+    GL64_fn_traceProc = 400,
+
+    GL64_fn_glCreateShader = 410,
+    GL64_fn_glShaderSource,
+    GL64_fn_glCompileShader,
+    GL64_fn_glGetShaderiv,
+    GL64_fn_glGetShaderInfoLog,
+    GL64_fn_glDeleteShader,
+    GL64_fn_glCreateProgram,
+    GL64_fn_glAttachShader,
+    GL64_fn_glDetachShader,
+    GL64_fn_glBindAttribLocation,
+    GL64_fn_glLinkProgram,
+    GL64_fn_glGetProgramiv,
+    GL64_fn_glGetProgramInfoLog,
+    GL64_fn_glUseProgram,
+    GL64_fn_glDeleteProgram,
+    GL64_fn_glGetUniformLocation,
+    GL64_fn_glGetAttribLocation,
+    GL64_fn_glValidateProgram,
+
+    GL64_fn_glUniform1i = 440,
+    GL64_fn_glUniform1f,
+    GL64_fn_glUniform2f,
+    GL64_fn_glUniform3f,
+    GL64_fn_glUniform4f,
+    GL64_fn_glUniform1fv,
+    GL64_fn_glUniform2fv,
+    GL64_fn_glUniform3fv,
+    GL64_fn_glUniform4fv,
+    GL64_fn_glUniform1iv,
+    GL64_fn_glUniformMatrix2fv,
+    GL64_fn_glUniformMatrix3fv,
+    GL64_fn_glUniformMatrix4fv,
+
+    GL64_fn_glGenBuffers = 470,
+    GL64_fn_glBindBuffer,
+    GL64_fn_glBufferData,
+    GL64_fn_glBufferSubData,
+    GL64_fn_glDeleteBuffers,
+    GL64_fn_glMapBufferRange,
+
+    GL64_fn_glEnableVertexAttribArray = 490,
+    GL64_fn_glDisableVertexAttribArray,
+    GL64_fn_glVertexAttribPointer,
+    GL64_fn_glGenVertexArrays,
+    GL64_fn_glBindVertexArray,
+    GL64_fn_glDeleteVertexArrays,
+    GL64_fn_glVertexAttrib4f,
+
+    GL64_fn_glDrawArrays = 510,
+    GL64_fn_glDrawElements,
+    GL64_fn_glDrawRangeElements,
+
+    GL64_fn_glBlendFunc = 530,
+    GL64_fn_glBlendFuncSeparate,
+    GL64_fn_glBlendEquation,
+    GL64_fn_glBlendEquationSeparate,
+    GL64_fn_glBlendColor,
+    GL64_fn_glColorMask,
+    GL64_fn_glDepthMask,
+    GL64_fn_glStencilFunc,
+    GL64_fn_glStencilOp,
+    GL64_fn_glStencilMask,
+    GL64_fn_glStencilFuncSeparate,
+    GL64_fn_glStencilOpSeparate,
+    GL64_fn_glStencilMaskSeparate,
+    GL64_fn_glScissor,
+    GL64_fn_glPolygonOffset,
+    GL64_fn_glPolygonMode,
+    GL64_fn_glDepthRange,
+    GL64_fn_glLineWidth,
+    GL64_fn_glPixelStorei,
+    GL64_fn_glSampleCoverage,
+
+    GL64_fn_glActiveTexture = 560,
+    GL64_fn_glGenTextures,
+    GL64_fn_glBindTexture,
+    GL64_fn_glDeleteTextures,
+    GL64_fn_glTexParameteri,
+    GL64_fn_glTexParameterf,
+    GL64_fn_glTexImage2D,
+    GL64_fn_glTexSubImage2D,
+    GL64_fn_glGenerateMipmap,
+    GL64_fn_glCompressedTexImage2D,
+
+    GL64_fn_glGetStringi = 590,
+    GL64_fn_glGetShaderSource
 };
 
 // ---- the trap ---------------------------------------------------------------
@@ -323,13 +413,35 @@ API void glFinish(void){ (void)gl64_trap(GL64_fn_glFinish,0); }
 API GLenum glGetError(void){ return (GLenum)gl64_trap(GL64_fn_glGetError,0); }
 API const GLubyte* glGetString(GLenum name) {
     // Host returns the real string only as a host pointer (unusable in-guest),
-    // so it returns 0 and we hand back our own stable strings. Good enough for
-    // wined3d/version probes during first light.
+    // so it returns 0 and we hand back our own stable strings.
     static const GLubyte* vendor   = (const GLubyte*)"Boxedwine64";
-    static const GLubyte* renderer = (const GLubyte*)"Boxedwine64 GL (host passthrough)";
+    static const GLubyte* renderer = (const GLubyte*)"Boxedwine64 GL (WebGL2)";
+    // GL 2.1 + a rich ARB extension list so wined3d's GLSL renderer backend
+    // activates (it picks GLSL when ARB_shader_objects + GLSL 1.20 are present)
+    // and so it sees the VBO / FBO / multitexture / NPOT / depth-texture caps it
+    // needs to emit a draw. With an EMPTY extension string wined3d concluded the
+    // driver had no usable feature set and never issued DrawPrimitive (the clear
+    // showed, the triangle never did). These all map onto WebGL2/GLES3 features.
     static const GLubyte* version  = (const GLubyte*)"2.1 Boxedwine64";
     static const GLubyte* slv      = (const GLubyte*)"1.20";
-    static const GLubyte* exts     = (const GLubyte*)"";
+    // The monolithic GL_EXTENSIONS string (legacy/compat path). Must list the same
+    // extensions as g_extList[] below (the core-profile glGetStringi path) so both
+    // wined3d code paths see the same feature set.
+    static const GLubyte* exts     = (const GLubyte*)
+        "GL_ARB_multitexture GL_ARB_texture_env_combine GL_ARB_texture_env_dot3 "
+        "GL_ARB_vertex_buffer_object GL_ARB_pixel_buffer_object "
+        "GL_ARB_vertex_program GL_ARB_fragment_program "
+        "GL_ARB_shader_objects GL_ARB_shading_language_100 "
+        "GL_ARB_vertex_shader GL_ARB_fragment_shader "
+        "GL_ARB_framebuffer_object GL_EXT_framebuffer_object GL_EXT_framebuffer_blit "
+        "GL_ARB_depth_texture GL_ARB_shadow GL_ARB_texture_non_power_of_two "
+        "GL_ARB_texture_rectangle GL_ARB_texture_cube_map GL_ARB_texture_float "
+        "GL_ARB_half_float_pixel GL_ARB_occlusion_query GL_ARB_point_sprite "
+        "GL_ARB_draw_buffers GL_EXT_blend_minmax GL_EXT_blend_color "
+        "GL_EXT_blend_func_separate GL_EXT_blend_equation_separate "
+        "GL_EXT_stencil_two_side GL_ARB_stencil_two_side "
+        "GL_EXT_texture_sRGB GL_ARB_texture_compression GL_EXT_texture_compression_s3tc "
+        "GL_NV_texture_shader GL_ARB_map_buffer_range";
     (void)gl64_trap(GL64_fn_glGetString, 0);
     switch (name) {
         case 0x1F00: return vendor;    // GL_VENDOR
@@ -340,7 +452,37 @@ API const GLubyte* glGetString(GLenum name) {
         default:     return exts;
     }
 }
+
+// The SAME extension set as the monolithic string above, as an indexable array
+// for the GL 3.0+ core-profile enumeration path: glGetIntegerv(GL_NUM_EXTENSIONS)
+// + glGetStringi(GL_EXTENSIONS, i). wined3d uses THIS path (it queries
+// GL_NUM_EXTENSIONS), so an empty glGetStringi made it find no usable extensions
+// and never issue a draw, even though the monolithic string was populated.
+static const char* const g_extList[] = {
+    "GL_ARB_multitexture","GL_ARB_texture_env_combine","GL_ARB_texture_env_dot3",
+    "GL_ARB_vertex_buffer_object","GL_ARB_pixel_buffer_object",
+    "GL_ARB_vertex_program","GL_ARB_fragment_program",
+    "GL_ARB_shader_objects","GL_ARB_shading_language_100",
+    "GL_ARB_vertex_shader","GL_ARB_fragment_shader",
+    "GL_ARB_framebuffer_object","GL_EXT_framebuffer_object","GL_EXT_framebuffer_blit",
+    "GL_ARB_depth_texture","GL_ARB_shadow","GL_ARB_texture_non_power_of_two",
+    "GL_ARB_texture_rectangle","GL_ARB_texture_cube_map","GL_ARB_texture_float",
+    "GL_ARB_half_float_pixel","GL_ARB_occlusion_query","GL_ARB_point_sprite",
+    "GL_ARB_draw_buffers","GL_EXT_blend_minmax","GL_EXT_blend_color",
+    "GL_EXT_blend_func_separate","GL_EXT_blend_equation_separate",
+    "GL_EXT_stencil_two_side","GL_ARB_stencil_two_side",
+    "GL_EXT_texture_sRGB","GL_ARB_texture_compression","GL_EXT_texture_compression_s3tc",
+    "GL_NV_texture_shader","GL_ARB_map_buffer_range",
+};
+#define G_EXT_COUNT ((int)(sizeof(g_extList)/sizeof(g_extList[0])))
+
 API void glGetIntegerv(GLenum pname, GLint* params) {
+    // GL_NUM_EXTENSIONS: answer with OUR curated count guest-side. If we forwarded
+    // to the host it would return WebGL2's own count (54), and wined3d would then
+    // glGetStringi() through 54 host extensions that our guest can't name — so it
+    // would see none of the features it needs. Keeping the count + the names in
+    // sync (both from g_extList) is what lets wined3d's GLSL renderer come up.
+    if (pname == 0x821D /*GL_NUM_EXTENSIONS*/) { if (params) params[0] = G_EXT_COUNT; return; }
     GL64Args a = {{0}}; a.a[0]=pname; a.a[1]=(uint64_t)(uintptr_t)params;
     (void)gl64_trap(GL64_fn_glGetIntegerv, &a);
 }
@@ -381,6 +523,137 @@ API void glVertex2f(GLfloat x,GLfloat y){ GL64Args a={{0}}; a.a[0]=F2U(x);a.a[1]
 API void glVertex3f(GLfloat x,GLfloat y,GLfloat z){ GL64Args a={{0}}; a.a[0]=F2U(x);a.a[1]=F2U(y);a.a[2]=F2U(z); (void)gl64_trap(GL64_fn_glVertex3f,&a); }
 
 // ===========================================================================
+// Programmable pipeline (GL2 / GLES3) — the modern entry points wined3d needs.
+// Extra typedefs the FFP block above didn't require.
+// ===========================================================================
+typedef unsigned int   GLuint;
+typedef char           GLchar;
+typedef long           GLsizeiptr;   // 64-bit on x86_64-linux
+typedef long           GLintptr;
+typedef unsigned int   GLuintptr;
+
+// --- shaders / programs ---
+API GLuint glCreateShader(GLenum type){ GL64Args a={{0}}; a.a[0]=type; return (GLuint)gl64_trap(GL64_fn_glCreateShader,&a); }
+API void glShaderSource(GLuint sh, GLsizei count, const GLchar* const* string, const GLint* length){
+    GL64Args a={{0}}; a.a[0]=sh; a.a[1]=(uint64_t)(uint32_t)count;
+    a.a[2]=(uint64_t)(uintptr_t)string; a.a[3]=(uint64_t)(uintptr_t)length;
+    (void)gl64_trap(GL64_fn_glShaderSource,&a);
+}
+API void glCompileShader(GLuint sh){ GL64Args a={{0}}; a.a[0]=sh; (void)gl64_trap(GL64_fn_glCompileShader,&a); }
+API void glGetShaderiv(GLuint sh, GLenum pname, GLint* params){ GL64Args a={{0}}; a.a[0]=sh; a.a[1]=pname; a.a[2]=(uint64_t)(uintptr_t)params; (void)gl64_trap(GL64_fn_glGetShaderiv,&a); }
+API void glGetShaderInfoLog(GLuint sh, GLsizei bufSize, GLsizei* length, GLchar* infoLog){
+    GL64Args a={{0}}; a.a[0]=sh; a.a[1]=(uint64_t)(uint32_t)bufSize; a.a[2]=(uint64_t)(uintptr_t)length; a.a[3]=(uint64_t)(uintptr_t)infoLog;
+    (void)gl64_trap(GL64_fn_glGetShaderInfoLog,&a);
+}
+API void glDeleteShader(GLuint sh){ GL64Args a={{0}}; a.a[0]=sh; (void)gl64_trap(GL64_fn_glDeleteShader,&a); }
+API GLuint glCreateProgram(void){ return (GLuint)gl64_trap(GL64_fn_glCreateProgram,0); }
+API void glAttachShader(GLuint p, GLuint sh){ GL64Args a={{0}}; a.a[0]=p; a.a[1]=sh; (void)gl64_trap(GL64_fn_glAttachShader,&a); }
+API void glDetachShader(GLuint p, GLuint sh){ GL64Args a={{0}}; a.a[0]=p; a.a[1]=sh; (void)gl64_trap(GL64_fn_glDetachShader,&a); }
+API void glBindAttribLocation(GLuint p, GLuint index, const GLchar* name){ GL64Args a={{0}}; a.a[0]=p; a.a[1]=index; a.a[2]=(uint64_t)(uintptr_t)name; (void)gl64_trap(GL64_fn_glBindAttribLocation,&a); }
+API void glLinkProgram(GLuint p){ GL64Args a={{0}}; a.a[0]=p; (void)gl64_trap(GL64_fn_glLinkProgram,&a); }
+API void glGetProgramiv(GLuint p, GLenum pname, GLint* params){ GL64Args a={{0}}; a.a[0]=p; a.a[1]=pname; a.a[2]=(uint64_t)(uintptr_t)params; (void)gl64_trap(GL64_fn_glGetProgramiv,&a); }
+API void glGetProgramInfoLog(GLuint p, GLsizei bufSize, GLsizei* length, GLchar* infoLog){
+    GL64Args a={{0}}; a.a[0]=p; a.a[1]=(uint64_t)(uint32_t)bufSize; a.a[2]=(uint64_t)(uintptr_t)length; a.a[3]=(uint64_t)(uintptr_t)infoLog;
+    (void)gl64_trap(GL64_fn_glGetProgramInfoLog,&a);
+}
+API void glUseProgram(GLuint p){ GL64Args a={{0}}; a.a[0]=p; (void)gl64_trap(GL64_fn_glUseProgram,&a); }
+API void glDeleteProgram(GLuint p){ GL64Args a={{0}}; a.a[0]=p; (void)gl64_trap(GL64_fn_glDeleteProgram,&a); }
+API GLint glGetUniformLocation(GLuint p, const GLchar* name){ GL64Args a={{0}}; a.a[0]=p; a.a[1]=(uint64_t)(uintptr_t)name; return (GLint)gl64_trap(GL64_fn_glGetUniformLocation,&a); }
+API GLint glGetAttribLocation(GLuint p, const GLchar* name){ GL64Args a={{0}}; a.a[0]=p; a.a[1]=(uint64_t)(uintptr_t)name; return (GLint)gl64_trap(GL64_fn_glGetAttribLocation,&a); }
+API void glValidateProgram(GLuint p){ GL64Args a={{0}}; a.a[0]=p; (void)gl64_trap(GL64_fn_glValidateProgram,&a); }
+
+// --- uniforms ---
+API void glUniform1i(GLint l, GLint v0){ GL64Args a={{0}}; a.a[0]=(uint64_t)(uint32_t)l; a.a[1]=(uint64_t)(uint32_t)v0; (void)gl64_trap(GL64_fn_glUniform1i,&a); }
+API void glUniform1f(GLint l, GLfloat v0){ GL64Args a={{0}}; a.a[0]=(uint64_t)(uint32_t)l; a.a[1]=F2U(v0); (void)gl64_trap(GL64_fn_glUniform1f,&a); }
+API void glUniform2f(GLint l, GLfloat v0, GLfloat v1){ GL64Args a={{0}}; a.a[0]=(uint64_t)(uint32_t)l; a.a[1]=F2U(v0); a.a[2]=F2U(v1); (void)gl64_trap(GL64_fn_glUniform2f,&a); }
+API void glUniform3f(GLint l, GLfloat v0, GLfloat v1, GLfloat v2){ GL64Args a={{0}}; a.a[0]=(uint64_t)(uint32_t)l; a.a[1]=F2U(v0); a.a[2]=F2U(v1); a.a[3]=F2U(v2); (void)gl64_trap(GL64_fn_glUniform3f,&a); }
+API void glUniform4f(GLint l, GLfloat v0, GLfloat v1, GLfloat v2, GLfloat v3){ GL64Args a={{0}}; a.a[0]=(uint64_t)(uint32_t)l; a.a[1]=F2U(v0); a.a[2]=F2U(v1); a.a[3]=F2U(v2); a.a[4]=F2U(v3); (void)gl64_trap(GL64_fn_glUniform4f,&a); }
+API void glUniform1fv(GLint l, GLsizei n, const GLfloat* v){ GL64Args a={{0}}; a.a[0]=(uint64_t)(uint32_t)l; a.a[1]=(uint64_t)(uint32_t)n; a.a[2]=(uint64_t)(uintptr_t)v; (void)gl64_trap(GL64_fn_glUniform1fv,&a); }
+API void glUniform2fv(GLint l, GLsizei n, const GLfloat* v){ GL64Args a={{0}}; a.a[0]=(uint64_t)(uint32_t)l; a.a[1]=(uint64_t)(uint32_t)n; a.a[2]=(uint64_t)(uintptr_t)v; (void)gl64_trap(GL64_fn_glUniform2fv,&a); }
+API void glUniform3fv(GLint l, GLsizei n, const GLfloat* v){ GL64Args a={{0}}; a.a[0]=(uint64_t)(uint32_t)l; a.a[1]=(uint64_t)(uint32_t)n; a.a[2]=(uint64_t)(uintptr_t)v; (void)gl64_trap(GL64_fn_glUniform3fv,&a); }
+API void glUniform4fv(GLint l, GLsizei n, const GLfloat* v){ GL64Args a={{0}}; a.a[0]=(uint64_t)(uint32_t)l; a.a[1]=(uint64_t)(uint32_t)n; a.a[2]=(uint64_t)(uintptr_t)v; (void)gl64_trap(GL64_fn_glUniform4fv,&a); }
+API void glUniform1iv(GLint l, GLsizei n, const GLint* v){ GL64Args a={{0}}; a.a[0]=(uint64_t)(uint32_t)l; a.a[1]=(uint64_t)(uint32_t)n; a.a[2]=(uint64_t)(uintptr_t)v; (void)gl64_trap(GL64_fn_glUniform1iv,&a); }
+API void glUniformMatrix2fv(GLint l, GLsizei n, GLboolean tr, const GLfloat* v){ GL64Args a={{0}}; a.a[0]=(uint64_t)(uint32_t)l; a.a[1]=(uint64_t)(uint32_t)n; a.a[2]=tr; a.a[3]=(uint64_t)(uintptr_t)v; (void)gl64_trap(GL64_fn_glUniformMatrix2fv,&a); }
+API void glUniformMatrix3fv(GLint l, GLsizei n, GLboolean tr, const GLfloat* v){ GL64Args a={{0}}; a.a[0]=(uint64_t)(uint32_t)l; a.a[1]=(uint64_t)(uint32_t)n; a.a[2]=tr; a.a[3]=(uint64_t)(uintptr_t)v; (void)gl64_trap(GL64_fn_glUniformMatrix3fv,&a); }
+API void glUniformMatrix4fv(GLint l, GLsizei n, GLboolean tr, const GLfloat* v){ GL64Args a={{0}}; a.a[0]=(uint64_t)(uint32_t)l; a.a[1]=(uint64_t)(uint32_t)n; a.a[2]=tr; a.a[3]=(uint64_t)(uintptr_t)v; (void)gl64_trap(GL64_fn_glUniformMatrix4fv,&a); }
+
+// --- buffers ---
+API void glGenBuffers(GLsizei n, GLuint* buffers){ GL64Args a={{0}}; a.a[0]=(uint64_t)(uint32_t)n; a.a[1]=(uint64_t)(uintptr_t)buffers; (void)gl64_trap(GL64_fn_glGenBuffers,&a); }
+API void glBindBuffer(GLenum target, GLuint buffer){ GL64Args a={{0}}; a.a[0]=target; a.a[1]=buffer; (void)gl64_trap(GL64_fn_glBindBuffer,&a); }
+API void glBufferData(GLenum target, GLsizeiptr size, const void* data, GLenum usage){ GL64Args a={{0}}; a.a[0]=target; a.a[1]=(uint64_t)size; a.a[2]=(uint64_t)(uintptr_t)data; a.a[3]=usage; (void)gl64_trap(GL64_fn_glBufferData,&a); }
+API void glBufferSubData(GLenum target, GLintptr offset, GLsizeiptr size, const void* data){ GL64Args a={{0}}; a.a[0]=target; a.a[1]=(uint64_t)offset; a.a[2]=(uint64_t)size; a.a[3]=(uint64_t)(uintptr_t)data; (void)gl64_trap(GL64_fn_glBufferSubData,&a); }
+API void glDeleteBuffers(GLsizei n, const GLuint* buffers){ GL64Args a={{0}}; a.a[0]=(uint64_t)(uint32_t)n; a.a[1]=(uint64_t)(uintptr_t)buffers; (void)gl64_trap(GL64_fn_glDeleteBuffers,&a); }
+API void* glMapBufferRange(GLenum target, GLintptr offset, GLsizeiptr length, GLbitfield access){ (void)target;(void)offset;(void)length;(void)access; return 0; }
+
+// --- vertex attrib arrays / VAO ---
+API void glEnableVertexAttribArray(GLuint index){ GL64Args a={{0}}; a.a[0]=index; (void)gl64_trap(GL64_fn_glEnableVertexAttribArray,&a); }
+API void glDisableVertexAttribArray(GLuint index){ GL64Args a={{0}}; a.a[0]=index; (void)gl64_trap(GL64_fn_glDisableVertexAttribArray,&a); }
+API void glVertexAttribPointer(GLuint index, GLint size, GLenum type, GLboolean norm, GLsizei stride, const void* ptr){
+    GL64Args a={{0}}; a.a[0]=index; a.a[1]=(uint64_t)(uint32_t)size; a.a[2]=type; a.a[3]=norm; a.a[4]=(uint64_t)(uint32_t)stride; a.a[5]=(uint64_t)(uintptr_t)ptr;
+    (void)gl64_trap(GL64_fn_glVertexAttribPointer,&a);
+}
+API void glGenVertexArrays(GLsizei n, GLuint* arrays){ GL64Args a={{0}}; a.a[0]=(uint64_t)(uint32_t)n; a.a[1]=(uint64_t)(uintptr_t)arrays; (void)gl64_trap(GL64_fn_glGenVertexArrays,&a); }
+API void glBindVertexArray(GLuint array){ GL64Args a={{0}}; a.a[0]=array; (void)gl64_trap(GL64_fn_glBindVertexArray,&a); }
+API void glDeleteVertexArrays(GLsizei n, const GLuint* arrays){ GL64Args a={{0}}; a.a[0]=(uint64_t)(uint32_t)n; a.a[1]=(uint64_t)(uintptr_t)arrays; (void)gl64_trap(GL64_fn_glDeleteVertexArrays,&a); }
+API void glVertexAttrib4f(GLuint index, GLfloat x, GLfloat y, GLfloat z, GLfloat w){ GL64Args a={{0}}; a.a[0]=index; a.a[1]=F2U(x); a.a[2]=F2U(y); a.a[3]=F2U(z); a.a[4]=F2U(w); (void)gl64_trap(GL64_fn_glVertexAttrib4f,&a); }
+
+// --- draws ---
+API void glDrawArrays(GLenum mode, GLint first, GLsizei count){ GL64Args a={{0}}; a.a[0]=mode; a.a[1]=(uint64_t)(uint32_t)first; a.a[2]=(uint64_t)(uint32_t)count; (void)gl64_trap(GL64_fn_glDrawArrays,&a); }
+API void glDrawElements(GLenum mode, GLsizei count, GLenum type, const void* indices){ GL64Args a={{0}}; a.a[0]=mode; a.a[1]=(uint64_t)(uint32_t)count; a.a[2]=type; a.a[3]=(uint64_t)(uintptr_t)indices; (void)gl64_trap(GL64_fn_glDrawElements,&a); }
+API void glDrawRangeElements(GLenum mode, GLuint start, GLuint end, GLsizei count, GLenum type, const void* indices){ GL64Args a={{0}}; a.a[0]=mode; a.a[1]=start; a.a[2]=end; a.a[3]=(uint64_t)(uint32_t)count; a.a[4]=type; a.a[5]=(uint64_t)(uintptr_t)indices; (void)gl64_trap(GL64_fn_glDrawRangeElements,&a); }
+
+// --- modern state ---
+API void glBlendFunc(GLenum s, GLenum d){ GL64Args a={{0}}; a.a[0]=s; a.a[1]=d; (void)gl64_trap(GL64_fn_glBlendFunc,&a); }
+API void glBlendFuncSeparate(GLenum sR, GLenum dR, GLenum sA, GLenum dA){ GL64Args a={{0}}; a.a[0]=sR; a.a[1]=dR; a.a[2]=sA; a.a[3]=dA; (void)gl64_trap(GL64_fn_glBlendFuncSeparate,&a); }
+API void glBlendEquation(GLenum m){ GL64Args a={{0}}; a.a[0]=m; (void)gl64_trap(GL64_fn_glBlendEquation,&a); }
+API void glBlendEquationSeparate(GLenum mR, GLenum mA){ GL64Args a={{0}}; a.a[0]=mR; a.a[1]=mA; (void)gl64_trap(GL64_fn_glBlendEquationSeparate,&a); }
+API void glBlendColor(GLfloat r, GLfloat g, GLfloat b, GLfloat al){ GL64Args a={{0}}; a.a[0]=F2U(r); a.a[1]=F2U(g); a.a[2]=F2U(b); a.a[3]=F2U(al); (void)gl64_trap(GL64_fn_glBlendColor,&a); }
+API void glColorMask(GLboolean r, GLboolean g, GLboolean b, GLboolean al){ GL64Args a={{0}}; a.a[0]=r; a.a[1]=g; a.a[2]=b; a.a[3]=al; (void)gl64_trap(GL64_fn_glColorMask,&a); }
+API void glDepthMask(GLboolean f){ GL64Args a={{0}}; a.a[0]=f; (void)gl64_trap(GL64_fn_glDepthMask,&a); }
+API void glStencilFunc(GLenum func, GLint ref, GLuint mask){ GL64Args a={{0}}; a.a[0]=func; a.a[1]=(uint64_t)(uint32_t)ref; a.a[2]=mask; (void)gl64_trap(GL64_fn_glStencilFunc,&a); }
+API void glStencilOp(GLenum f, GLenum zf, GLenum zp){ GL64Args a={{0}}; a.a[0]=f; a.a[1]=zf; a.a[2]=zp; (void)gl64_trap(GL64_fn_glStencilOp,&a); }
+API void glStencilMask(GLuint mask){ GL64Args a={{0}}; a.a[0]=mask; (void)gl64_trap(GL64_fn_glStencilMask,&a); }
+API void glStencilFuncSeparate(GLenum face, GLenum func, GLint ref, GLuint mask){ GL64Args a={{0}}; a.a[0]=face; a.a[1]=func; a.a[2]=(uint64_t)(uint32_t)ref; a.a[3]=mask; (void)gl64_trap(GL64_fn_glStencilFuncSeparate,&a); }
+API void glStencilOpSeparate(GLenum face, GLenum f, GLenum zf, GLenum zp){ GL64Args a={{0}}; a.a[0]=face; a.a[1]=f; a.a[2]=zf; a.a[3]=zp; (void)gl64_trap(GL64_fn_glStencilOpSeparate,&a); }
+API void glStencilMaskSeparate(GLenum face, GLuint mask){ GL64Args a={{0}}; a.a[0]=face; a.a[1]=mask; (void)gl64_trap(GL64_fn_glStencilMaskSeparate,&a); }
+API void glScissor(GLint x, GLint y, GLsizei w, GLsizei h){ GL64Args a={{0}}; a.a[0]=(uint64_t)(uint32_t)x; a.a[1]=(uint64_t)(uint32_t)y; a.a[2]=(uint64_t)(uint32_t)w; a.a[3]=(uint64_t)(uint32_t)h; (void)gl64_trap(GL64_fn_glScissor,&a); }
+API void glPolygonOffset(GLfloat factor, GLfloat units){ GL64Args a={{0}}; a.a[0]=F2U(factor); a.a[1]=F2U(units); (void)gl64_trap(GL64_fn_glPolygonOffset,&a); }
+API void glPolygonMode(GLenum face, GLenum mode){ GL64Args a={{0}}; a.a[0]=face; a.a[1]=mode; (void)gl64_trap(GL64_fn_glPolygonMode,&a); }
+API void glDepthRange(GLclampd n, GLclampd f){ GL64Args a={{0}}; a.a[0]=D2U(n); a.a[1]=D2U(f); (void)gl64_trap(GL64_fn_glDepthRange,&a); }
+API void glLineWidth(GLfloat w){ GL64Args a={{0}}; a.a[0]=F2U(w); (void)gl64_trap(GL64_fn_glLineWidth,&a); }
+API void glPixelStorei(GLenum pname, GLint param){ GL64Args a={{0}}; a.a[0]=pname; a.a[1]=(uint64_t)(uint32_t)param; (void)gl64_trap(GL64_fn_glPixelStorei,&a); }
+API void glSampleCoverage(GLfloat value, GLboolean invert){ GL64Args a={{0}}; a.a[0]=F2U(value); a.a[1]=invert; (void)gl64_trap(GL64_fn_glSampleCoverage,&a); }
+
+// --- textures ---
+API void glActiveTexture(GLenum texture){ GL64Args a={{0}}; a.a[0]=texture; (void)gl64_trap(GL64_fn_glActiveTexture,&a); }
+API void glGenTextures(GLsizei n, GLuint* textures){ GL64Args a={{0}}; a.a[0]=(uint64_t)(uint32_t)n; a.a[1]=(uint64_t)(uintptr_t)textures; (void)gl64_trap(GL64_fn_glGenTextures,&a); }
+API void glBindTexture(GLenum target, GLuint texture){ GL64Args a={{0}}; a.a[0]=target; a.a[1]=texture; (void)gl64_trap(GL64_fn_glBindTexture,&a); }
+API void glDeleteTextures(GLsizei n, const GLuint* textures){ GL64Args a={{0}}; a.a[0]=(uint64_t)(uint32_t)n; a.a[1]=(uint64_t)(uintptr_t)textures; (void)gl64_trap(GL64_fn_glDeleteTextures,&a); }
+API void glTexParameteri(GLenum target, GLenum pname, GLint param){ GL64Args a={{0}}; a.a[0]=target; a.a[1]=pname; a.a[2]=(uint64_t)(uint32_t)param; (void)gl64_trap(GL64_fn_glTexParameteri,&a); }
+API void glTexParameterf(GLenum target, GLenum pname, GLfloat param){ GL64Args a={{0}}; a.a[0]=target; a.a[1]=pname; a.a[2]=F2U(param); (void)gl64_trap(GL64_fn_glTexParameterf,&a); }
+API void glTexImage2D(GLenum target, GLint level, GLint ifmt, GLsizei w, GLsizei h, GLint border, GLenum fmt, GLenum type, const void* pixels){
+    GL64Args a={{0}}; a.a[0]=target; a.a[1]=(uint64_t)(uint32_t)level; a.a[2]=(uint64_t)(uint32_t)ifmt; a.a[3]=(uint64_t)(uint32_t)w; a.a[4]=(uint64_t)(uint32_t)h; a.a[5]=(uint64_t)(uint32_t)border; a.a[6]=fmt; a.a[7]=type; a.a[8]=(uint64_t)(uintptr_t)pixels;
+    (void)gl64_trap(GL64_fn_glTexImage2D,&a);
+}
+API void glTexSubImage2D(GLenum target, GLint level, GLint x, GLint y, GLsizei w, GLsizei h, GLenum fmt, GLenum type, const void* pixels){
+    GL64Args a={{0}}; a.a[0]=target; a.a[1]=(uint64_t)(uint32_t)level; a.a[2]=(uint64_t)(uint32_t)x; a.a[3]=(uint64_t)(uint32_t)y; a.a[4]=(uint64_t)(uint32_t)w; a.a[5]=(uint64_t)(uint32_t)h; a.a[6]=fmt; a.a[7]=type; a.a[8]=(uint64_t)(uintptr_t)pixels;
+    (void)gl64_trap(GL64_fn_glTexSubImage2D,&a);
+}
+API void glGenerateMipmap(GLenum target){ GL64Args a={{0}}; a.a[0]=target; (void)gl64_trap(GL64_fn_glGenerateMipmap,&a); }
+API void glCompressedTexImage2D(GLenum target, GLint level, GLenum ifmt, GLsizei w, GLsizei h, GLint border, GLsizei imageSize, const void* data){
+    GL64Args a={{0}}; a.a[0]=target; a.a[1]=(uint64_t)(uint32_t)level; a.a[2]=ifmt; a.a[3]=(uint64_t)(uint32_t)w; a.a[4]=(uint64_t)(uint32_t)h; a.a[5]=(uint64_t)(uint32_t)border; a.a[6]=(uint64_t)(uint32_t)imageSize; a.a[7]=(uint64_t)(uintptr_t)data;
+    (void)gl64_trap(GL64_fn_glCompressedTexImage2D,&a);
+}
+API const GLubyte* glGetStringi(GLenum name, GLuint index){
+    // GL 3.0+ extension enumeration: return the i-th name from our curated list
+    // (the same set as the monolithic GL_EXTENSIONS string). wined3d walks this
+    // to decide which renderer features are available.
+    if (name == 0x1F03 /*GL_EXTENSIONS*/ && (int)index < G_EXT_COUNT)
+        return (const GLubyte*)g_extList[index];
+    return (const GLubyte*)"";
+}
+
+// ===========================================================================
 // glXGetProcAddressARB — opengl32/winex11 resolve every gl*/glX* through here.
 // Return our own wrapper for names we implement, or a harmless no-op stub for
 // the rest (so an unimplemented call is silently ignored rather than crashing).
@@ -410,6 +683,29 @@ static const struct procEntry g_procs[] = {
     E(glMultMatrixf), E(glLightfv), E(glLightf), E(glMaterialfv), E(glMaterialf),
     E(glColorMaterial), E(glNormal3f), E(glBegin), E(glEnd), E(glVertex2f),
     E(glVertex3f),
+    // --- programmable pipeline (wined3d / Direct3D) ---
+    E(glCreateShader), E(glShaderSource), E(glCompileShader), E(glGetShaderiv),
+    E(glGetShaderInfoLog), E(glDeleteShader), E(glCreateProgram), E(glAttachShader),
+    E(glDetachShader), E(glBindAttribLocation), E(glLinkProgram), E(glGetProgramiv),
+    E(glGetProgramInfoLog), E(glUseProgram), E(glDeleteProgram), E(glGetUniformLocation),
+    E(glGetAttribLocation), E(glValidateProgram),
+    E(glUniform1i), E(glUniform1f), E(glUniform2f), E(glUniform3f), E(glUniform4f),
+    E(glUniform1fv), E(glUniform2fv), E(glUniform3fv), E(glUniform4fv), E(glUniform1iv),
+    E(glUniformMatrix2fv), E(glUniformMatrix3fv), E(glUniformMatrix4fv),
+    E(glGenBuffers), E(glBindBuffer), E(glBufferData), E(glBufferSubData),
+    E(glDeleteBuffers), E(glMapBufferRange),
+    E(glEnableVertexAttribArray), E(glDisableVertexAttribArray), E(glVertexAttribPointer),
+    E(glGenVertexArrays), E(glBindVertexArray), E(glDeleteVertexArrays), E(glVertexAttrib4f),
+    E(glDrawArrays), E(glDrawElements), E(glDrawRangeElements),
+    E(glBlendFunc), E(glBlendFuncSeparate), E(glBlendEquation), E(glBlendEquationSeparate),
+    E(glBlendColor), E(glColorMask), E(glDepthMask),
+    E(glStencilFunc), E(glStencilOp), E(glStencilMask),
+    E(glStencilFuncSeparate), E(glStencilOpSeparate), E(glStencilMaskSeparate),
+    E(glScissor), E(glPolygonOffset), E(glPolygonMode), E(glDepthRange),
+    E(glLineWidth), E(glPixelStorei), E(glSampleCoverage),
+    E(glActiveTexture), E(glGenTextures), E(glBindTexture), E(glDeleteTextures),
+    E(glTexParameteri), E(glTexParameterf), E(glTexImage2D), E(glTexSubImage2D),
+    E(glGenerateMipmap), E(glCompressedTexImage2D), E(glGetStringi),
 };
 #undef E
 #define NPROCS (sizeof(g_procs)/sizeof(g_procs[0]))
@@ -417,11 +713,21 @@ static const struct procEntry g_procs[] = {
 API GLproc glXGetProcAddressARB(const GLubyte* name) {
     if (!name) return 0;
     for (unsigned i = 0; i < NPROCS; i++) {
-        if (strcmp(g_procs[i].name, (const char*)name) == 0) return g_procs[i].fn;
+        if (strcmp(g_procs[i].name, (const char*)name) == 0) {
+            // hit=1: a real wrapper. Trace so BW64_GLTRACE shows wined3d's
+            // resolved-and-implemented set.
+            GL64Args a = {{0}}; a.a[0] = (uint64_t)(uintptr_t)name; a.a[1] = 1;
+            (void)gl64_trap(GL64_fn_traceProc, &a);
+            return g_procs[i].fn;
+        }
     }
-    // Unknown gl* function: hand back a no-op so opengl32's dispatch fills its
+    // Unknown gl* function: trace it (hit=0) so the host log names exactly which
+    // modern-GL entry point wined3d wanted that we don't implement yet — the
+    // worklist for D3D. Then hand back a no-op so opengl32's dispatch fills its
     // table with a callable pointer (returning 0 would make wine think the
     // driver is broken and disable OpenGL).
+    GL64Args a = {{0}}; a.a[0] = (uint64_t)(uintptr_t)name; a.a[1] = 0;
+    (void)gl64_trap(GL64_fn_traceProc, &a);
     return gl64_noop;
 }
 API GLproc glXGetProcAddress(const GLubyte* name) { return glXGetProcAddressARB(name); }

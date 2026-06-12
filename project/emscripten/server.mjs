@@ -50,7 +50,13 @@ const server = createServer(async (request, response) => {
     // rootfs from cache instead of re-downloading. The page/launcher/wasm stay
     // revalidated so code changes show up on reload.
     const ext = extname(finalPath);
-    const immutable = ext === ".zip" || ext === ".part" || /\.zip\.part\d+$/.test(finalPath);
+    // BW64_NO_IMMUTABLE=1 forces no-cache on the rootfs zips too, so local rootfs
+    // edits (e.g. re-injecting a rebuilt libGL into wine64.zip) actually refetch
+    // instead of serving the browser's year-long immutable cache. Off by default
+    // (prod wants the long-lived rootfs cache).
+    const allowImmutable = process.env.BW64_NO_IMMUTABLE !== "1";
+    const immutable = allowImmutable &&
+        (ext === ".zip" || ext === ".part" || /\.zip\.part\d+$/.test(finalPath));
     const headers = {
         "Content-Length": finalInfo.size,
         "Content-Type": mimeTypes.get(ext) || "application/octet-stream",

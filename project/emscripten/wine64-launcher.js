@@ -147,12 +147,17 @@
     // talk to the SAME server socket (derived from WINEPREFIX) — that's what
     // makes them one wine session. Returned as ["K=V", ...].
     function prefixEnv() {
-        return [
+        var e = [
             "HOME=" + PREFIX_HOME,
             "WINEPREFIX=" + PREFIX_WINE,
             "WINESERVER=" + WINESERVER64,
             "WINEDLLPATH=/usr/lib/x86_64-linux-gnu/wine"
         ];
+        // TEMP D3D bring-up: ?winedbg=<channels> sets WINEDEBUG for the reload
+        // (?session=0) path so we can see loaddll/d3d failures. Remove before ship.
+        var wd = param("winedbg");
+        if (wd) e.push("WINEDEBUG=" + wd);
+        return e;
         // NOTE: WINEDEBUG added here does NOT reach in-session app spawns — those
         // use the CAPTURED BOOT env (g_sessionCtx.env in wine64session.cpp), not
         // this JS env. To trace a spawned app, WINEDEBUG must be set at BOOT time
@@ -218,9 +223,15 @@
     // --- fetch one URL to a Uint8Array, streaming progress ------------------
     // `baseReceived` lets callers offset the progress so a multi-part download
     // reports cumulative bytes against a known grand total.
+    // ?fresh=1 forces fetch(cache:'reload') on the rootfs zips so the browser
+    // bypasses its (possibly immutable-cached) copy and re-pulls from the server.
+    // Used during local rootfs iteration; harmless in prod (off by default).
+    var FRESH_FETCH = (typeof param === "function" && param("fresh") === "1");
+    function fetchOpts() { return FRESH_FETCH ? { cache: "reload" } : undefined; }
+
     function fetchBytes(url, label, onProgress, baseReceived, grandTotal) {
         baseReceived = baseReceived || 0;
-        return fetch(url).then(function (resp) {
+        return fetch(url, fetchOpts()).then(function (resp) {
             if (!resp.ok) throw new Error("fetch " + url + " -> HTTP " + resp.status);
             var partTotal = Number(resp.headers.get("Content-Length")) || 0;
             var total = grandTotal || partTotal;
@@ -333,7 +344,7 @@
     // fetch writes straight into the preallocated buffer, no concatenation copy,
     // and the parts ride the network concurrently instead of back-to-back.
     function fetchChunkedBytes(name, onProgress) {
-        return fetch(BASE + name + ".manifest.json").then(function (resp) {
+        return fetch(BASE + name + ".manifest.json", fetchOpts()).then(function (resp) {
             if (!resp.ok) throw new Error("fetch " + name + ".manifest.json -> HTTP " + resp.status);
             return resp.json();
         }).then(function (manifest) {
@@ -750,7 +761,7 @@
                 liveModule = (typeof Module !== "undefined") ? Module : window.Module;
                 // Host-side GL trace (read via getenv in gl64bridge.cpp). Emscripten
                 // getenv() reads Module.ENV; set it before main() runs.
-                try { liveModule["ENV"] = liveModule["ENV"] || {}; liveModule["ENV"]["BW64_GLTRACE"] = "1"; } catch (e) {}
+                try { liveModule["ENV"] = liveModule["ENV"] || {}; liveModule["ENV"]["BW64_GLTRACE"] = (param("gltrace") || "1"); } catch (e) {}
                 // Hold main() until the rootfs is in the VFS.
                 liveModule["addRunDependency"]("loadWine64Fs");
                 loadFilesystem(els);

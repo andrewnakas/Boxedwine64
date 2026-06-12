@@ -64,6 +64,7 @@ self-contained sessions. Each iteration:
 | M15 | taskmgr blocker triage | Root-cause taskmgr's wasm `RuntimeError: null function` — identify the exact call site/missing feature, then fix if bounded or leave a precise triage note | A named root cause and either a fix that lets taskmgr render, or a documented blocker | DONE (2026-06-11) — root-caused to a HOST-SIDE wasm null-function call on a WORKER thread (not a wine API stub, not a missing x86 opcode — NO wine err:/unimplemented line precedes it), during taskmgr's icon/pixmap setup; pinpointing the C++ site needs a symbolicated build (documented blocker). Predates M14. Also stripped the 4 stale XWire DIAG logs this surfaced |
 | M14 | X drawing primitives | Implement the core X line/rect drawing requests (PolySegment 65, PolyRectangle 66, PolyLine 64, PolyPoint 63, FillPoly 69) into the window framebuffer — the gap behind graph/border-drawing apps | Draw-primitive app shows lines/borders in-browser, no regression, selftest unaffected | DONE — implemented + browser-verified 2026-06-11 (regedit's tree/border lines render crisp via the new primitives, no regression; selftest 234/234). Also fixed a latent PolyFillRectangle no-op. taskmgr re-triaged: its blocker is a deeper wine null-function stub, NOT drawing |
 | M13 | Gecko / .NET (evaluate) | Upstream item: wine-gecko (HTML dialogs) and wine-mono (.NET apps) payloads — weigh ~50–80MB payloads + JIT-under-interpreter cost | A trivial .NET WinForms exe runs, or a written descope rationale (payload/perf numbers) | EVALUATED → NO-GO (2026-06-11): no mono/gecko in rootfs; ~50-80MB payload + JIT-in-interpreter cold-start. Rationale in Log |
+| M16 | Direct3D (wined3d → WebGL2) | Bring up the D3D path: extend the gl64 bridge from fixed-function-only to the full programmable pipeline (shaders, VBOs, vertex attribs, modern state, textures) so wined3d can render D3D apps via WebGL2 | A D3D9 app renders its 3D output (not black) in-browser | IN PROGRESS (2026-06-11) — programmable-pipeline GL bridge + GLSL-ES transpiler built & verified (glcube unregressed, selftest 234/234, D3D9 device path reaches GL: shaders compile+link clean, full pipeline incl. glDrawArrays fires). BLOCKED on wined3d `CreateDevice` returning `D3DERR_NOTAVAILABLE` (a cap rejection; this wined3d.dll has no debug channels so the exact check is opaque). Resume path in the Log |
 
 Suggested order = table order. M1 early on purpose: it protects every later
 milestone. M11–M13 are evaluation milestones — a rigorous written no-go closes
@@ -73,6 +74,63 @@ them.
 
 ## Log
 
+- **2026-06-11 — M16 IN PROGRESS (Direct3D via wined3d → WebGL2): the
+  programmable-pipeline GL bridge is built & verified; D3D9 reaches GL and
+  compiles shaders; blocked on a wined3d `CreateDevice` cap rejection.**
+  - **What shipped (this branch, `d3d-wined3d-webgl2`, NOT on master/deployed):**
+    The gl64 bridge was fixed-function-only (glBegin/glEnd, matrix stack); wined3d
+    needs the programmable pipeline. Added ~80 modern GL entry points across all
+    three layers in lockstep: the ABI (`gl64bridge_abi.h`, new opcode block at
+    400+), the guest libGL (`libgl64.c` wrappers + `glXGetProcAddressARB` table;
+    removed the 21 colliding `GLSTUB`s now implemented for real), and the host
+    bridge (`gl64bridge.cpp`, ~800 lines): shaders (Create/Source/Compile/Attach/
+    Link/Use/Get*iv/InfoLog), uniforms (1i/1f..4fv/MatrixNfv), buffers (Gen/Bind/
+    BufferData/SubData), vertex attribs + VAOs, glDrawArrays/Elements/RangeElements,
+    modern blend/stencil/scissor/depth state, and modern textures (ActiveTexture/
+    Gen/Bind/TexParameter*/TexImage2D/SubImage/GenerateMipmap/Compressed). Plus a
+    minimal **GLSL transpiler** (`translateGlslToEs300`) — WebGL2 only accepts GLSL
+    ES 3.00, but wined3d emits desktop `#version 120` (attribute/varying/
+    gl_FragData/texture2D); the transpiler rewrites the version + keywords +
+    fragment output. Plus a built D3D9 test app (`gltest/d3dtri.c` →
+    `d3dtri.exe`, FVF triangle, staged into the prefix by `build-prefix64.sh`).
+  - **Verified working (browser, local):** glcube still renders 100% lit (no
+    regression); `--x64-selftest` 234/234; D3D9 `Direct3DCreate9` succeeds, the GL
+    context comes up (`gl64: host GL up (WebGL2)`), wined3d takes the GLSL renderer
+    path (it enumerates our advertised ARB extensions), **shaders compile + link
+    with zero errors** via the transpiler, and the full pipeline traps through the
+    bridge (histogram shows shaders/buffers/attribs/textures + `glDrawArrays
+    GL_TRIANGLE_STRIP, 4`).
+  - **THE BLOCKER:** wined3d's `CreateDevice` (HAL and REF) returns
+    **`D3DERR_NOTAVAILABLE` (0x8876086C)** — a device-capability rejection. The
+    same d3dtri created a device fine BEFORE extensions were advertised (it used a
+    minimal no-shader path then); advertising the full GLSL/VBO/FBO feature set
+    makes wined3d validate more strictly and reject. The exact failing check is
+    **opaque**: the rootfs wined3d.dll was built WITHOUT debug channels (verified:
+    `WINEDEBUG=+d3d` produces ZERO output), so wined3d's own reason can't be read.
+    GL-error logging shows GL_INVALID_ENUM/VALUE during device-init texture setup
+    (desktop-only `glTexParameter`/`glGetIntegerv` pnames) — these were filtered/
+    defaulted (texParamSupported + a glGetIntegerv desktop-pname table that
+    swallows errors), but they were NOT the cause: CreateDevice still fails
+    identically after filtering. So the rejection is a higher-level wined3d cap
+    decision, not a stray GL error.
+  - **RESUME PATH (next session):** (1) the highest-leverage move is a
+    **debug-channel wined3d** — either find/build a wine 8.0 wined3d.dll with
+    TRACE compiled in, or rebuild the rootfs wine with `--enable-debug`, so
+    `WINEDEBUG=+d3d,+d3d_caps` prints the exact `wined3d_check_device_*` that
+    fails. (2) Cheap experiments meanwhile: bisect the advertised extension list
+    (esp. drop `GL_ARB_framebuffer_object` to force wined3d's older swapchain
+    path; or trim sRGB/float/occlusion which trigger stricter format checks);
+    return larger `glGetIntegerv` caps; have `glXChooseFBConfig` advertise >1
+    config with varied attribs so wined3d finds a matching format. (3) The whole
+    programmable-GL bridge is the durable asset — it's correct and unregressing;
+    only this wined3d device-cap handshake remains. Test harness: the d3dtri probe
+    pattern in /tmp/bw64test (clearBrowserCache once, then sample canvas + grep
+    `device created OK` / `CreateDevice .* FAILED` / `gl64 GLERR`). Local-iteration
+    gotchas baked in: the dev server now honors `BW64_NO_IMMUTABLE=1` (zips served
+    no-cache) and the launcher honors `?fresh=1` (fetch cache:reload) — because the
+    rootfs zips are otherwise immutable-cached for a year; AND libGL.so.1 lives in
+    BOTH `glibc-rootfs64.zip` (mounted first, wins) and `wine64.zip`, so a rebuilt
+    libGL must be injected into BOTH or the old one shadows it.
 - **2026-06-11 — M15 DONE (taskmgr blocker triaged) + DIAG-log cleanup.**
   Captured taskmgr's crash context headless (last ~80 console lines before the
   trap). Findings: the `RuntimeError: null function` fires on a WORKER thread

@@ -68,6 +68,8 @@
 #include <thread>
 #include <atomic>
 #include <cstring>
+#include <cstdio>
+#include <string>
 #include <mutex>
 
 #ifdef __EMSCRIPTEN__
@@ -602,21 +604,219 @@ void readFloats(CPU64* cpu, U64 guestAddr, float* out, int count) {
     cpu->memory->memcpyFromGuest(out, guestAddr, (U64)count * 4);
 }
 
+#ifdef __EMSCRIPTEN__
+// True once any draw has hit our offscreen FBO this frame — lets the swap path
+// know a programmable-pipeline frame was produced (vs. the immediate-mode path).
+std::atomic<bool> g_glDrew{false};
+
+// Tiny ring of the most recent gl64 fnIds, for annotating nonzero glGetError
+// logs (which GL call likely produced the error). Guarded by g_glMutex.
+U64 g_lastFnIds[8] = {0};
+int g_lastFnIdx = 0;
+
+// Translate wined3d's desktop-GLSL (#version 120/130) shader source into the
+// GLSL ES 3.00 dialect WebGL2 requires. WebGL2 rejects `#version 120` outright,
+// and the legacy `attribute`/`varying`/`gl_FragData`/`texture2D` keywords don't
+// exist in GLSL ES 3.00. wined3d's generated shaders are regular enough that a
+// token-level rewrite suffices for the D3D fixed-function + simple-shader path.
+// `isFragment` selects the varying direction and the fragment-output handling.
+std::string translateGlslToEs300(const std::string& srcIn, bool isFragment) {
+    std::string src = srcIn;
+
+    // Replace whole-word `needle` with `repl` (so we don't corrupt identifiers
+    // like `attribute_foo`). ASCII word chars = [A-Za-z0-9_].
+    auto isWord = [](char c){ return (c>='A'&&c<='Z')||(c>='a'&&c<='z')||(c>='0'&&c<='9')||c=='_'; };
+    auto wordReplace = [&](const std::string& needle, const std::string& repl){
+        std::string out; out.reserve(src.size());
+        size_t i = 0;
+        while (i < src.size()) {
+            size_t p = src.find(needle, i);
+            if (p == std::string::npos) { out.append(src, i, std::string::npos); break; }
+            bool lb = (p == 0) || !isWord(src[p-1]);
+            bool rb = (p+needle.size() >= src.size()) || !isWord(src[p+needle.size()]);
+            out.append(src, i, p - i);
+            if (lb && rb) out += repl; else out += needle;
+            i = p + needle.size();
+        }
+        src.swap(out);
+    };
+
+    // Strip any existing #version line (we prepend our own).
+    {
+        size_t v = src.find("#version");
+        if (v != std::string::npos) {
+            size_t eol = src.find('\n', v);
+            src.erase(v, (eol == std::string::npos ? src.size() : eol + 1) - v);
+        }
+    }
+
+    // Legacy texture lookups → unified texture().
+    wordReplace("texture2DProj", "textureProj");
+    wordReplace("texture2DLod",  "textureLod");
+    wordReplace("texture2D",     "texture");
+    wordReplace("texture3D",     "texture");
+    wordReplace("textureCube",   "texture");
+    wordReplace("shadow2DProj",  "textureProj");
+    wordReplace("shadow2D",      "texture");
+
+    if (isFragment) {
+        // varying (in) + a single declared fragment output replacing gl_FragColor /
+        // gl_FragData[0]. (wined3d's simple shaders write only attachment 0.)
+        wordReplace("varying", "in");
+        bool usesFragData  = src.find("gl_FragData")  != std::string::npos;
+        bool usesFragColor = src.find("gl_FragColor") != std::string::npos;
+        // gl_FragData[0] -> bw_FragColor ; gl_FragColor -> bw_FragColor
+        for (size_t p; (p = src.find("gl_FragData[0]")) != std::string::npos; )
+            src.replace(p, std::string("gl_FragData[0]").size(), "bw_FragColor");
+        wordReplace("gl_FragColor", "bw_FragColor");
+        std::string header = "#version 300 es\nprecision highp float;\nprecision highp int;\n";
+        if (usesFragData || usesFragColor) header += "out vec4 bw_FragColor;\n";
+        src = header + src;
+    } else {
+        // vertex: attribute -> in, varying -> out.
+        wordReplace("attribute", "in");
+        wordReplace("varying", "out");
+        std::string header = "#version 300 es\nprecision highp float;\nprecision highp int;\n";
+        src = header + src;
+    }
+    return src;
+}
+
+// Is this glTexParameter pname valid in WebGL2/GLES3? wined3d also sets several
+// desktop-GL-only ones that would raise GL_INVALID_ENUM; we drop those.
+bool texParamSupported(GLenum pname) {
+    switch (pname) {
+        case 0x2800 /*GL_TEXTURE_MAG_FILTER*/:
+        case 0x2801 /*GL_TEXTURE_MIN_FILTER*/:
+        case 0x2802 /*GL_TEXTURE_WRAP_S*/:
+        case 0x2803 /*GL_TEXTURE_WRAP_T*/:
+        case 0x8072 /*GL_TEXTURE_WRAP_R*/:
+        case 0x813A /*GL_TEXTURE_MIN_LOD*/:
+        case 0x813B /*GL_TEXTURE_MAX_LOD*/:
+        case 0x813C /*GL_TEXTURE_BASE_LEVEL*/:
+        case 0x813D /*GL_TEXTURE_MAX_LEVEL*/:
+        case 0x884C /*GL_TEXTURE_COMPARE_MODE*/:
+        case 0x884D /*GL_TEXTURE_COMPARE_FUNC*/:
+            return true;
+        default:
+            return false;   // GL_TEXTURE_LOD_BIAS, GENERATE_MIPMAP, BORDER_COLOR, …
+    }
+}
+
+// Read a NUL-terminated C string from guest memory, capped at `maxLen` bytes.
+// Reads in chunks to avoid a per-byte trap; stops at the first NUL.
+std::string readGuestCStr(CPU64* cpu, U64 guestAddr, U64 maxLen) {
+    std::string out;
+    if (!guestAddr) return out;
+    char buf[256];
+    while (out.size() < maxLen) {
+        U64 chunk = sizeof(buf);
+        if (chunk > maxLen - out.size()) chunk = maxLen - out.size();
+        cpu->memory->memcpyFromGuest(buf, guestAddr + out.size(), chunk);
+        for (U64 i = 0; i < chunk; i++) {
+            if (buf[i] == 0) { out.append(buf, i); return out; }
+        }
+        out.append(buf, chunk);
+    }
+    return out;
+}
+
+// Generate/delete host GL object names and write/read the id array to/from the
+// guest. n = args.a[0], guest id array = args.a[1].
+enum class GenKind { Buffer, Texture, VertexArray };
+void genObjects(CPU64* cpu, const GL64Args& args, GenKind kind) {
+    GLsizei n = (GLsizei)args.a[0];
+    if (n <= 0 || n > 65536) return;
+    std::vector<GLuint> ids((size_t)n, 0);
+    GLuint* p = ids.data();
+    glOnMain([&]{
+        switch (kind) {
+            case GenKind::Buffer:      glGenBuffers(n, p); break;
+            case GenKind::Texture:     glGenTextures(n, p); break;
+            case GenKind::VertexArray: glGenVertexArrays(n, p); break;
+        }
+    });
+    cpu->memory->memcpyToGuest(args.a[1], ids.data(), (U64)n * 4);
+}
+void deleteObjects(CPU64* cpu, const GL64Args& args, GenKind kind) {
+    GLsizei n = (GLsizei)args.a[0];
+    if (n <= 0 || n > 65536) return;
+    std::vector<GLuint> ids((size_t)n, 0);
+    cpu->memory->memcpyFromGuest(ids.data(), args.a[1], (U64)n * 4);
+    const GLuint* p = ids.data();
+    glOnMain([&]{
+        switch (kind) {
+            case GenKind::Buffer:      glDeleteBuffers(n, p); break;
+            case GenKind::Texture:     glDeleteTextures(n, p); break;
+            case GenKind::VertexArray: glDeleteVertexArrays(n, p); break;
+        }
+    });
+}
+
+// glGetShaderInfoLog / glGetProgramInfoLog: args = (obj, bufSize, length*, infoLog*).
+void writeInfoLog(CPU64* cpu, const GL64Args& args, bool isProgram) {
+    GLuint obj = (GLuint)args.a[0];
+    GLsizei bufSize = (GLsizei)args.a[1];
+    if (bufSize <= 0 || bufSize > (1 << 20)) bufSize = 0;
+    std::vector<char> log((size_t)bufSize + 1, 0);
+    GLsizei outLen = 0;
+    char* lp = log.data();
+    glOnMain([&]{
+        if (isProgram) glGetProgramInfoLog(obj, bufSize, &outLen, lp);
+        else           glGetShaderInfoLog(obj, bufSize, &outLen, lp);
+    });
+    if (args.a[2]) cpu->memory->writed(args.a[2], (U32)outLen);
+    if (args.a[3] && bufSize > 0)
+        cpu->memory->memcpyToGuest(args.a[3], log.data(), (U64)outLen + 1);
+}
+
+// Bytes a glTexImage2D/glTexSubImage2D pixel buffer occupies for (w,h,fmt,type).
+// Covers the formats wined3d uses for texture uploads; unknown → 4 bytes/texel.
+size_t texImageBytes(GLsizei w, GLsizei h, GLenum format, GLenum type) {
+    if (w <= 0 || h <= 0) return 0;
+    int comps;
+    switch (format) {
+        case GL_RGBA: case 0x80E1 /*GL_BGRA*/: comps = 4; break;
+        case GL_RGB:  case 0x80E0 /*GL_BGR*/:  comps = 3; break;
+        case 0x1903 /*GL_RED*/: case GL_ALPHA: case GL_LUMINANCE: comps = 1; break;
+        case GL_LUMINANCE_ALPHA: case 0x8227 /*GL_RG*/: comps = 2; break;
+        case GL_DEPTH_COMPONENT: comps = 1; break;
+        default: comps = 4; break;
+    }
+    int bytesPerComp;
+    switch (type) {
+        case GL_UNSIGNED_BYTE: case GL_BYTE: bytesPerComp = 1; break;
+        case GL_UNSIGNED_SHORT: case GL_SHORT: bytesPerComp = 2; break;
+        case 0x8363 /*GL_UNSIGNED_SHORT_5_6_5*/:
+        case 0x8033 /*GL_UNSIGNED_SHORT_4_4_4_4*/:
+        case 0x8034 /*GL_UNSIGNED_SHORT_5_5_5_1*/:
+            // packed 16-bit types fold all components into 2 bytes/texel
+            return (size_t)w * h * 2;
+        case 0x8035 /*GL_UNSIGNED_INT_8_8_8_8*/:
+        case 0x8368 /*GL_UNSIGNED_INT_8_8_8_8_REV*/:
+            return (size_t)w * h * 4;
+        case GL_UNSIGNED_INT: case GL_INT: case GL_FLOAT: bytesPerComp = 4; break;
+        default: bytesPerComp = 1; break;
+    }
+    return (size_t)w * h * comps * bytesPerComp;
+}
+#endif // __EMSCRIPTEN__
+
 } // namespace
 
 U64 gl64Bridge(CPU64* cpu, U64 fnId, U64 argsAddr) {
     std::lock_guard<std::recursive_mutex> lk(g_glMutex);
 
-    // BW64_GLTRACE: confirm the guest opengl32/winex11 is actually issuing the
-    // private gl64 trap (and which fn ids). If a GL app reaches a window but no
-    // GLTRACE line ever prints, the guest-side GL dll is NOT the gl64 build —
-    // it's trying the stock GLX path the wire server doesn't implement, so it
-    // never gets here. First hit + per-id-once keeps it cheap.
+    // Track the most recent fnIds (ring) so a nonzero glGetError can be annotated
+    // with the GL call that likely produced it (see GL64_fn_glGetError). Cheap;
+    // guarded by g_glMutex (held above).
+    g_lastFnIdx = (g_lastFnIdx + 1) & 7;
+    g_lastFnIds[g_lastFnIdx] = fnId;
+    // BW64_GLTRACE=2 logs every trapped fnId (verbose). NB: getenv is unreliable on
+    // guest worker threads in this pthread build (Module.ENV isn't always wired to
+    // workers), so this can stay silent even when GL is flowing — it's a best-effort
+    // trace, not a correctness signal.
     if (const char* gt = getenv("BW64_GLTRACE")) {
-        static std::atomic<bool> announced{false};
-        if (!announced.exchange(true))
-            klog_fmt("gl64: FIRST trap — guest IS using the gl64 bridge (fnId=%llu)",
-                     (unsigned long long)fnId);
         if (gt[0] == '2')
             klog_fmt("gl64: call fnId=%llu", (unsigned long long)fnId);
     }
@@ -665,9 +865,43 @@ U64 gl64Bridge(CPU64* cpu, U64 fnId, U64 argsAddr) {
         }
         case GL64_fn_glXGetFBConfigAttrib:
         case GL64_fn_glXGetConfig: {
-            // (config_or_vis, attribute, out value*) -> write a sane default, 0
+            // (config_or_vis, attribute, out value*). Report a real 32-bit RGBA,
+            // depth-24, stencil-8, double-buffered, window+pbuffer config so
+            // wined3d accepts the pixel format and uses the GL renderer (returning
+            // a blanket 1 made it reject the format and fall back to GDI/software,
+            // so D3D frames never reached our GL bridge).
+            U32 attr = (U32)args.a[1];
             U64 valueAddr = args.a[2];
-            if (valueAddr) cpu->memory->writed(valueAddr, 1);
+            U32 v;
+            switch (attr) {
+                case 1:  v = 1; break;   // GLX_USE_GL
+                case 2:  v = 32; break;  // GLX_BUFFER_SIZE (total color bits)
+                case 3:  v = 0; break;   // GLX_LEVEL
+                case 4:  v = 1; break;   // GLX_RGBA (true)
+                case 5:  v = 1; break;   // GLX_DOUBLEBUFFER (true)
+                case 6:  v = 0; break;   // GLX_STEREO
+                case 7:  v = 0; break;   // GLX_AUX_BUFFERS
+                case 8:  v = 8; break;   // GLX_RED_SIZE
+                case 9:  v = 8; break;   // GLX_GREEN_SIZE
+                case 10: v = 8; break;   // GLX_BLUE_SIZE
+                case 11: v = 8; break;   // GLX_ALPHA_SIZE
+                case 12: v = 24; break;  // GLX_DEPTH_SIZE
+                case 13: v = 8; break;   // GLX_STENCIL_SIZE
+                case 14: case 15: case 16: case 17: v = 0; break; // GLX_ACCUM_*_SIZE
+                case 0x20: v = 0; break;     // GLX_CONFIG_CAVEAT -> GLX_NONE (0x8000? wine maps 0=none)
+                case 0x22: v = 0x8002; break;// GLX_X_VISUAL_TYPE -> GLX_TRUE_COLOR
+                case 0x23: v = 0; break;     // GLX_TRANSPARENT_TYPE -> GLX_NONE
+                case 0x800B: v = 0x21; break;// GLX_VISUAL_ID (our visual id)
+                case 0x8010: v = 1|4; break; // GLX_DRAWABLE_TYPE -> WINDOW_BIT|PBUFFER_BIT
+                case 0x8011: v = 1; break;   // GLX_RENDER_TYPE -> GLX_RGBA_BIT
+                case 0x8012: v = 1; break;   // GLX_X_RENDERABLE (true)
+                case 0x8013: v = 0x5100; break; // GLX_FBCONFIG_ID (opaque, stable)
+                case 0x8016: v = 1; break;   // GLX_MAX_PBUFFER_WIDTH-ish (sane nonzero)
+                case 0x186a3: v = 0; break;  // GLX_SAMPLE_BUFFERS_ARB
+                case 0x186a4: v = 0; break;  // GLX_SAMPLES_ARB
+                default: v = 0; break;
+            }
+            if (valueAddr) cpu->memory->writed(valueAddr, v);
             return 0; // Success
         }
         case GL64_fn_glXCreateContext:
@@ -788,6 +1022,20 @@ U64 gl64Bridge(CPU64* cpu, U64 fnId, U64 argsAddr) {
             if (!g_glContext) return 0;
             U64 err = 0;
             GL_MT(err = glGetError());
+            // Log the first handful of NONZERO GL errors with the recent fnId
+            // context, so a CreateDevice cap failure (D3DERR_NOTAVAILABLE) that
+            // stems from a GL error is visible. g_lastFnIds is a tiny ring updated
+            // at the top of gl64Bridge.
+            if (err) {
+                static std::atomic<int> nlog{0};
+                if (nlog.fetch_add(1) < 20)
+                    klog_fmt("gl64 GLERR 0x%llx after recent fnIds [%llu %llu %llu %llu]",
+                             (unsigned long long)err,
+                             (unsigned long long)g_lastFnIds[(g_lastFnIdx+1)&7],
+                             (unsigned long long)g_lastFnIds[(g_lastFnIdx+5)&7],
+                             (unsigned long long)g_lastFnIds[(g_lastFnIdx+6)&7],
+                             (unsigned long long)g_lastFnIds[(g_lastFnIdx+7)&7]);
+            }
             return err;
         }
         case GL64_fn_glGetString: {
@@ -798,9 +1046,47 @@ U64 gl64Bridge(CPU64* cpu, U64 fnId, U64 argsAddr) {
         }
         case GL64_fn_glGetIntegerv: {
             if (g_glContext && args.a[1]) {
+                GLenum pname = (GLenum)ai(args,0);
                 GLint v[16] = {0};
-                GL_MT(glGetIntegerv((GLenum)ai(args,0), v)); // read on GL thread
-                cpu->memory->memcpyToGuest(args.a[1], v, sizeof(GLint)); // 1 value (enough for first light)
+                // Some desktop-GL pnames don't exist in WebGL2/GLES3 and make
+                // glGetIntegerv raise GL_INVALID_ENUM (leaving v unchanged at 0).
+                // wined3d reads these as caps; a 0 (or a leftover GL error it then
+                // observes) can make it reject the device (D3DERR_NOTAVAILABLE).
+                // Answer the known desktop-only ones with sane fixed values and
+                // skip the GL call; for everything else, query then SWALLOW any
+                // error so it can't pollute wined3d's own glGetError checks.
+                bool handled = true;
+                switch (pname) {
+                    case 0x0D31 /*GL_MAX_LIGHTS*/:               v[0] = 8; break;
+                    case 0x0D32 /*GL_MAX_CLIP_PLANES*/:          v[0] = 6; break;
+                    case 0x0D50 /*GL_MAX_PIXEL_MAP_TABLE*/:      v[0] = 256; break;
+                    case 0x0B31 /*GL_MAX_LIST_NESTING*/:         v[0] = 64; break;
+                    case 0x8073 /*GL_MAX_3D_TEXTURE_SIZE*/:      v[0] = 2048; break;
+                    case 0x84E2 /*GL_MAX_TEXTURE_UNITS (deprecated)*/: v[0] = 8; break;
+                    case 0x80E9 /*GL_MAX_ELEMENTS_VERTICES*/:    v[0] = 65536; break;
+                    case 0x80E8 /*GL_MAX_ELEMENTS_INDICES*/:     v[0] = 65536; break;
+                    case 0x864B /*GL_TEXTURE_COMPRESSED?/desktop-only*/: v[0] = 0; break;
+                    default: handled = false; break;
+                }
+                if (handled) { cpu->memory->memcpyToGuest(args.a[1], v, sizeof(GLint)); return 0; }
+                GL_MT({ glGetError(); glGetIntegerv(pname, v); glGetError(); }); // read + swallow err
+                // Some pnames return multiple ints (GL_VIEWPORT=4, GL_MAX_VIEWPORT_DIMS=2,
+                // GL_SCISSOR_BOX=4). Write the right count so wined3d's caps reads are
+                // complete (a 1-int write left stale guest memory for the rest).
+                int count = 1;
+                switch (pname) {
+                    case 0x0BA2 /*GL_VIEWPORT*/: case 0x0C10 /*GL_SCISSOR_BOX*/:
+                    case 0x0C22 /*GL_COLOR_WRITEMASK*/: count = 4; break;
+                    case 0x0D3A /*GL_MAX_VIEWPORT_DIMS*/: case 0x846D /*GL_ALIASED_POINT_SIZE_RANGE*/:
+                    case 0x846E /*GL_ALIASED_LINE_WIDTH_RANGE*/: count = 2; break;
+                    default: count = 1; break;
+                }
+                cpu->memory->memcpyToGuest(args.a[1], v, sizeof(GLint) * count);
+                // One-shot log of the first ~40 distinct pname/value pairs so we can
+                // see what wined3d queries and whether it gets sane caps.
+                static std::atomic<int> logged{0};
+                if (logged.fetch_add(1) < 40)
+                    klog_fmt("gl64 GETINT pname=0x%04x -> %d", pname, v[0]);
             }
             return 0;
         }
@@ -1024,6 +1310,520 @@ U64 gl64Bridge(CPU64* cpu, U64 fnId, U64 argsAddr) {
             if (g_glContext) RECORD_IMM(GL64_fn_glVertex3f, af(args,0), af(args,1), af(args,2), 0,
                                         glVertex3f(af(args,0), af(args,1), af(args,2)));
             return 0;
+
+        // =================================================================
+        // Programmable pipeline (GL2/GLES3) — wined3d / Direct3D path.
+        // These map 1:1 onto WebGL2 on the host. Guest-memory reads happen on
+        // THIS (calling) thread into host buffers; only the gl* call hops to
+        // the GL-owning thread via GL_MT. Buffer-relative pointers
+        // (VertexAttribPointer/DrawElements) are integer offsets into the bound
+        // buffer — passed through, never dereferenced as guest memory.
+        // =================================================================
+#ifdef __EMSCRIPTEN__
+        case GL64_fn_traceProc: {
+            // args[0]=guest name*, args[1]=hit(1)/miss(0). Log under BW64_GLTRACE
+            // so we can see exactly which GL entry points wined3d resolves and
+            // which ones we don't implement yet (the D3D worklist).
+            if (const char* gt = getenv("BW64_GLTRACE")) {
+                char name[64] = {0};
+                if (args.a[0]) cpu->memory->memcpyFromGuest(name, args.a[0], sizeof(name)-1);
+                // gt=="3" → only log misses (the worklist); else log everything.
+                bool hit = args.a[1] != 0;
+                if (gt[0] != '3' || !hit)
+                    klog_fmt("gl64 PROC %s %s", hit ? "HIT " : "MISS", name);
+            }
+            return 0;
+        }
+
+        // --- shaders / programs ---
+        case GL64_fn_glCreateShader: {
+            if (!ensureContext()) return 0;
+            U64 ret = 0; GLenum sty = (GLenum)ai(args,0);
+            GL_MT(ret = glCreateShader(sty));
+            return ret;
+        }
+        case GL64_fn_glShaderSource: {
+            if (!ensureContext()) return 0;
+            GLsizei count = (GLsizei)ai(args,1);
+            if (count <= 0 || count > 256) return 0;
+            // Read the guest string-pointer array and optional length array, then
+            // each guest source string, into host-owned storage.
+            std::vector<U64> guestStrPtrs(count);
+            cpu->memory->memcpyFromGuest(guestStrPtrs.data(), args.a[2], (U64)count * 8);
+            std::vector<S32> guestLens;
+            bool haveLens = args.a[3] != 0;
+            if (haveLens) {
+                guestLens.resize(count);
+                cpu->memory->memcpyFromGuest(guestLens.data(), args.a[3], (U64)count * 4);
+            }
+            std::vector<std::string> srcs(count);
+            std::vector<const char*> srcPtrs(count);
+            std::vector<GLint>        srcLens(count);
+            for (GLsizei i = 0; i < count; i++) {
+                std::string& s = srcs[i];
+                if (haveLens && guestLens[i] >= 0) {
+                    s.resize(guestLens[i]);
+                    if (guestLens[i] > 0 && guestStrPtrs[i])
+                        cpu->memory->memcpyFromGuest(&s[0], guestStrPtrs[i], (U64)guestLens[i]);
+                } else {
+                    // NUL-terminated: read the guest C string.
+                    s = guestStrPtrs[i] ? readGuestCStr(cpu, guestStrPtrs[i], 1 << 20) : std::string();
+                }
+                srcPtrs[i] = s.c_str();
+                srcLens[i] = (GLint)s.size();
+            }
+            // Concatenate the source, then translate the legacy desktop-GLSL wined3d
+            // emits (#version 120, attribute/varying, gl_FragData/texture2D) into the
+            // GLSL ES 3.00 dialect WebGL2 accepts. WebGL2 rejects the raw source
+            // outright (`'120': client/version number not supported`), so without
+            // this the program never links and the D3D draw produces nothing.
+            std::string joined;
+            for (GLsizei i = 0; i < count; i++) joined += srcs[i];
+            // Detect stage from content (no per-handle state needed): a fragment
+            // shader writes gl_FragData/gl_FragColor/gl_FragDepth; a vertex shader
+            // writes gl_Position.
+            bool isFrag = joined.find("gl_FragData") != std::string::npos ||
+                          joined.find("gl_FragColor") != std::string::npos ||
+                          joined.find("gl_FragDepth") != std::string::npos ||
+                          (joined.find("gl_Position") == std::string::npos &&
+                           joined.find("gl_PointSize") == std::string::npos);
+            std::string translated = translateGlslToEs300(joined, isFrag);
+            const char* tptr = translated.c_str();
+            GLint tlen = (GLint)translated.size();
+            GLuint sh = (GLuint)ai(args,0);
+            GL_MT(glShaderSource(sh, 1, &tptr, &tlen));
+            return 0;
+        }
+        case GL64_fn_glCompileShader:
+            if (g_glContext) {
+                GLuint sh = (GLuint)ai(args,0);
+                glOnMain([&]{
+                    // Safety: never call glCompileShader on a handle Emscripten doesn't
+                    // have in GL.shaders — that throws a JS TypeError that kills the
+                    // worker. With glDeleteShader deferred this shouldn't happen, but
+                    // guard unconditionally so a stray case degrades, not crashes.
+                    int present = EM_ASM_INT({
+                        try { return (typeof GL!=='undefined' && GL.shaders && GL.shaders[$0]) ? 1 : 0; }
+                        catch(e){ return 0; }
+                    }, (int)sh);
+                    if (!present) { klog_fmt("gl64: glCompileShader(%u) — handle not in GL.shaders, skipped", sh); return; }
+                    glCompileShader(sh);
+                    GLint ok = 0; glGetShaderiv(sh, GL_COMPILE_STATUS, &ok);
+                    if (!ok) {
+                        char log[1024] = {0}; GLsizei n = 0;
+                        glGetShaderInfoLog(sh, sizeof(log)-1, &n, log);
+                        klog_fmt("gl64 SHADER COMPILE FAIL (sh=%u): %s", sh, log);
+                    }
+                });
+            }
+            return 0;
+        case GL64_fn_glGetShaderiv: {
+            if (g_glContext && args.a[2]) {
+                GLint v = 0; GLuint sh=(GLuint)ai(args,0); GLenum pn=(GLenum)ai(args,1);
+                GL_MT(glGetShaderiv(sh, pn, &v));
+                cpu->memory->writed(args.a[2], (U32)v);
+            }
+            return 0;
+        }
+        case GL64_fn_glGetShaderInfoLog: {
+            if (g_glContext) writeInfoLog(cpu, args, /*isProgram*/false);
+            return 0;
+        }
+        case GL64_fn_glDeleteShader:
+            // DEFER (no-op): wined3d does create→source→compile→attach→glDeleteShader,
+            // but its GL calls reach this bridge slightly reordered across the
+            // trap/main-thread hops, so the delete can land BEFORE the matching
+            // glCompileShader. Emscripten's glDeleteShader nulls GL.shaders[id], which
+            // then makes the deferred glCompileShader(id) throw "parameter 1 is not a
+            // WebGLShader" and the whole program fails to link (the D3D triangle never
+            // renders). A deleted-but-attached shader is retained by GL until the
+            // program links anyway, so skipping the delete is safe; the only cost is a
+            // small, bounded shader leak (wined3d creates few shaders). This is THE fix
+            // that lets wined3d's GLSL programs compile+link under our bridge.
+            return 0;
+        case GL64_fn_glCreateProgram: {
+            if (!ensureContext()) return 0;
+            U64 ret = 0; GL_MT(ret = glCreateProgram());
+            return ret;
+        }
+        case GL64_fn_glAttachShader:
+            if (g_glContext) GL_MT(glAttachShader((GLuint)ai(args,0), (GLuint)ai(args,1)));
+            return 0;
+        case GL64_fn_glDetachShader:
+            if (g_glContext) GL_MT(glDetachShader((GLuint)ai(args,0), (GLuint)ai(args,1)));
+            return 0;
+        case GL64_fn_glBindAttribLocation: {
+            if (g_glContext) {
+                std::string nm = readGuestCStr(cpu, args.a[2], 256);
+                GLuint p=(GLuint)ai(args,0); GLuint idx=(GLuint)ai(args,1);
+                const char* c = nm.c_str();
+                GL_MT(glBindAttribLocation(p, idx, c));
+            }
+            return 0;
+        }
+        case GL64_fn_glLinkProgram:
+            if (g_glContext) {
+                GLuint pr = (GLuint)ai(args,0);
+                glOnMain([&]{
+                    glLinkProgram(pr);
+                    GLint ok = 0; glGetProgramiv(pr, GL_LINK_STATUS, &ok);
+                    if (!ok) {
+                        char log[1024] = {0}; GLsizei n = 0;
+                        glGetProgramInfoLog(pr, sizeof(log)-1, &n, log);
+                        klog_fmt("gl64 PROGRAM LINK FAIL (pr=%u): %s", pr, log);
+                    }
+                });
+            }
+            return 0;
+        case GL64_fn_glGetProgramiv: {
+            if (g_glContext && args.a[2]) {
+                GLint v = 0; GLuint p=(GLuint)ai(args,0); GLenum pn=(GLenum)ai(args,1);
+                GL_MT(glGetProgramiv(p, pn, &v));
+                cpu->memory->writed(args.a[2], (U32)v);
+            }
+            return 0;
+        }
+        case GL64_fn_glGetProgramInfoLog: {
+            if (g_glContext) writeInfoLog(cpu, args, /*isProgram*/true);
+            return 0;
+        }
+        case GL64_fn_glUseProgram:
+            if (g_glContext) { GLuint p=(GLuint)ai(args,0); GL_MT(glUseProgram(p)); }
+            return 0;
+        case GL64_fn_glDeleteProgram:
+            // DEFER (no-op), same reasoning as glDeleteShader: the delete can reach
+            // this bridge before a still-pending glUseProgram/glGetUniformLocation on
+            // the same handle (reordered across trap/main-thread hops), which would
+            // then hit a nulled GL.programs[id]. Bounded leak; wined3d makes few
+            // programs. Keeps the program object alive for the whole app.
+            return 0;
+        case GL64_fn_glGetUniformLocation: {
+            if (!g_glContext) return (U64)(S64)-1;
+            std::string nm = readGuestCStr(cpu, args.a[1], 256);
+            GLuint p=(GLuint)ai(args,0); const char* c = nm.c_str();
+            S64 loc = -1; GL_MT(loc = glGetUniformLocation(p, c));
+            return (U64)loc;
+        }
+        case GL64_fn_glGetAttribLocation: {
+            if (!g_glContext) return (U64)(S64)-1;
+            std::string nm = readGuestCStr(cpu, args.a[1], 256);
+            GLuint p=(GLuint)ai(args,0); const char* c = nm.c_str();
+            S64 loc = -1; GL_MT(loc = glGetAttribLocation(p, c));
+            return (U64)loc;
+        }
+        case GL64_fn_glValidateProgram:
+            if (g_glContext) GL_MT(glValidateProgram((GLuint)ai(args,0)));
+            return 0;
+
+        // --- uniforms ---
+        case GL64_fn_glUniform1i:
+            if (g_glContext) GL_MT(glUniform1i((GLint)ai(args,0), (GLint)ai(args,1)));
+            return 0;
+        case GL64_fn_glUniform1f:
+            if (g_glContext) GL_MT(glUniform1f((GLint)ai(args,0), af(args,1)));
+            return 0;
+        case GL64_fn_glUniform2f:
+            if (g_glContext) GL_MT(glUniform2f((GLint)ai(args,0), af(args,1), af(args,2)));
+            return 0;
+        case GL64_fn_glUniform3f:
+            if (g_glContext) GL_MT(glUniform3f((GLint)ai(args,0), af(args,1), af(args,2), af(args,3)));
+            return 0;
+        case GL64_fn_glUniform4f:
+            if (g_glContext) GL_MT(glUniform4f((GLint)ai(args,0), af(args,1), af(args,2), af(args,3), af(args,4)));
+            return 0;
+        case GL64_fn_glUniform1fv: case GL64_fn_glUniform2fv:
+        case GL64_fn_glUniform3fv: case GL64_fn_glUniform4fv: {
+            if (g_glContext && args.a[2]) {
+                int comps = fnId==GL64_fn_glUniform1fv?1 : fnId==GL64_fn_glUniform2fv?2 :
+                            fnId==GL64_fn_glUniform3fv?3 : 4;
+                GLsizei n = (GLsizei)ai(args,1);
+                if (n > 0 && n <= 4096) {
+                    std::vector<float> v((size_t)n * comps);
+                    cpu->memory->memcpyFromGuest(v.data(), args.a[2], (U64)v.size()*4);
+                    GLint loc=(GLint)ai(args,0); const float* p=v.data();
+                    switch (comps) {
+                        case 1: GL_MT(glUniform1fv(loc, n, p)); break;
+                        case 2: GL_MT(glUniform2fv(loc, n, p)); break;
+                        case 3: GL_MT(glUniform3fv(loc, n, p)); break;
+                        default: GL_MT(glUniform4fv(loc, n, p)); break;
+                    }
+                }
+            }
+            return 0;
+        }
+        case GL64_fn_glUniform1iv: {
+            if (g_glContext && args.a[2]) {
+                GLsizei n = (GLsizei)ai(args,1);
+                if (n > 0 && n <= 4096) {
+                    std::vector<GLint> v(n);
+                    cpu->memory->memcpyFromGuest(v.data(), args.a[2], (U64)n*4);
+                    GLint loc=(GLint)ai(args,0); const GLint* p=v.data();
+                    GL_MT(glUniform1iv(loc, n, p));
+                }
+            }
+            return 0;
+        }
+        case GL64_fn_glUniformMatrix2fv:
+        case GL64_fn_glUniformMatrix3fv:
+        case GL64_fn_glUniformMatrix4fv: {
+            if (g_glContext && args.a[3]) {
+                int dim = fnId==GL64_fn_glUniformMatrix2fv?2 : fnId==GL64_fn_glUniformMatrix3fv?3 : 4;
+                GLsizei n = (GLsizei)ai(args,1);
+                if (n > 0 && n <= 1024) {
+                    std::vector<float> v((size_t)n * dim * dim);
+                    cpu->memory->memcpyFromGuest(v.data(), args.a[3], (U64)v.size()*4);
+                    GLint loc=(GLint)ai(args,0); GLboolean tr=(GLboolean)ai(args,2); const float* p=v.data();
+                    switch (dim) {
+                        case 2: GL_MT(glUniformMatrix2fv(loc, n, tr, p)); break;
+                        case 3: GL_MT(glUniformMatrix3fv(loc, n, tr, p)); break;
+                        default: GL_MT(glUniformMatrix4fv(loc, n, tr, p)); break;
+                    }
+                }
+            }
+            return 0;
+        }
+
+        // --- buffers ---
+        case GL64_fn_glGenBuffers: {
+            if (g_glContext && args.a[1]) genObjects(cpu, args, GenKind::Buffer);
+            return 0;
+        }
+        case GL64_fn_glBindBuffer:
+            if (g_glContext) GL_MT(glBindBuffer((GLenum)ai(args,0), (GLuint)ai(args,1)));
+            return 0;
+        case GL64_fn_glBufferData: {
+            if (g_glContext) {
+                GLsizeiptr size = (GLsizeiptr)args.a[1];
+                std::vector<U8> data;
+                const void* dp = nullptr;
+                if (args.a[2] && size > 0) {
+                    data.resize((size_t)size);
+                    cpu->memory->memcpyFromGuest(data.data(), args.a[2], (U64)size);
+                    dp = data.data();
+                }
+                GLenum tgt=(GLenum)ai(args,0); GLenum usage=(GLenum)ai(args,3);
+                GL_MT(glBufferData(tgt, size, dp, usage));
+            }
+            return 0;
+        }
+        case GL64_fn_glBufferSubData: {
+            if (g_glContext && args.a[3]) {
+                GLsizeiptr size = (GLsizeiptr)args.a[2];
+                if (size > 0) {
+                    std::vector<U8> data((size_t)size);
+                    cpu->memory->memcpyFromGuest(data.data(), args.a[3], (U64)size);
+                    GLenum tgt=(GLenum)ai(args,0); GLintptr off=(GLintptr)args.a[1]; const void* dp=data.data();
+                    GL_MT(glBufferSubData(tgt, off, size, dp));
+                }
+            }
+            return 0;
+        }
+        case GL64_fn_glDeleteBuffers:
+            if (g_glContext && args.a[1]) deleteObjects(cpu, args, GenKind::Buffer);
+            return 0;
+        case GL64_fn_glMapBufferRange:
+            return 0; // unsupported in WebGL2; guest wrapper already returns 0
+
+        // --- vertex attrib arrays / VAO ---
+        case GL64_fn_glEnableVertexAttribArray:
+            if (g_glContext) GL_MT(glEnableVertexAttribArray((GLuint)ai(args,0)));
+            return 0;
+        case GL64_fn_glDisableVertexAttribArray:
+            if (g_glContext) GL_MT(glDisableVertexAttribArray((GLuint)ai(args,0)));
+            return 0;
+        case GL64_fn_glVertexAttribPointer: {
+            // pointer (a[5]) is a byte offset into the bound ARRAY_BUFFER.
+            if (g_glContext) {
+                GLuint idx=(GLuint)ai(args,0); GLint sz=(GLint)ai(args,1); GLenum ty=(GLenum)ai(args,2);
+                GLboolean nm=(GLboolean)ai(args,3); GLsizei st=(GLsizei)ai(args,4);
+                const void* off = (const void*)(uintptr_t)args.a[5];
+                GL_MT(glVertexAttribPointer(idx, sz, ty, nm, st, off));
+            }
+            return 0;
+        }
+        case GL64_fn_glGenVertexArrays:
+            if (g_glContext && args.a[1]) genObjects(cpu, args, GenKind::VertexArray);
+            return 0;
+        case GL64_fn_glBindVertexArray:
+            if (g_glContext) GL_MT(glBindVertexArray((GLuint)ai(args,0)));
+            return 0;
+        case GL64_fn_glDeleteVertexArrays:
+            if (g_glContext && args.a[1]) deleteObjects(cpu, args, GenKind::VertexArray);
+            return 0;
+        case GL64_fn_glVertexAttrib4f:
+            if (g_glContext) GL_MT(glVertexAttrib4f((GLuint)ai(args,0), af(args,1), af(args,2), af(args,3), af(args,4)));
+            return 0;
+
+        // --- draws --- (bind our depth-equipped offscreen FBO first, like glEnd)
+        case GL64_fn_glDrawArrays:
+            if (g_glContext) {
+                GLenum mode=(GLenum)ai(args,0); GLint first=(GLint)ai(args,1); GLsizei count=(GLsizei)ai(args,2);
+                static std::atomic<bool> once{false};
+                if (!once.exchange(true)) klog_fmt("gl64 DRAW: first glDrawArrays mode=0x%x count=%d", mode, count);
+                glOnMain([&]{ if (g_emFbo) glBindFramebuffer(GL_FRAMEBUFFER, g_emFbo);
+                              glDrawArrays(mode, first, count); });
+                g_glDrew = true;
+            }
+            return 0;
+        case GL64_fn_glDrawElements:
+            if (g_glContext) {
+                GLenum mode=(GLenum)ai(args,0); GLsizei count=(GLsizei)ai(args,1); GLenum type=(GLenum)ai(args,2);
+                const void* indices = (const void*)(uintptr_t)args.a[3];
+                static std::atomic<bool> once{false};
+                if (!once.exchange(true)) klog_fmt("gl64 DRAW: first glDrawElements mode=0x%x count=%d", mode, count);
+                glOnMain([&]{ if (g_emFbo) glBindFramebuffer(GL_FRAMEBUFFER, g_emFbo);
+                              glDrawElements(mode, count, type, indices); });
+                g_glDrew = true;
+            }
+            return 0;
+        case GL64_fn_glDrawRangeElements:
+            if (g_glContext) {
+                GLenum mode=(GLenum)ai(args,0); GLuint start=(GLuint)ai(args,1); GLuint end=(GLuint)ai(args,2);
+                GLsizei count=(GLsizei)ai(args,3); GLenum type=(GLenum)ai(args,4);
+                const void* indices = (const void*)(uintptr_t)args.a[5];
+                glOnMain([&]{ if (g_emFbo) glBindFramebuffer(GL_FRAMEBUFFER, g_emFbo);
+                              glDrawRangeElements(mode, start, end, count, type, indices); });
+                g_glDrew = true;
+            }
+            return 0;
+
+        // --- modern state ---
+        case GL64_fn_glBlendFunc:
+            if (g_glContext) GL_MT(glBlendFunc((GLenum)ai(args,0), (GLenum)ai(args,1)));
+            return 0;
+        case GL64_fn_glBlendFuncSeparate:
+            if (g_glContext) GL_MT(glBlendFuncSeparate((GLenum)ai(args,0),(GLenum)ai(args,1),(GLenum)ai(args,2),(GLenum)ai(args,3)));
+            return 0;
+        case GL64_fn_glBlendEquation:
+            if (g_glContext) GL_MT(glBlendEquation((GLenum)ai(args,0)));
+            return 0;
+        case GL64_fn_glBlendEquationSeparate:
+            if (g_glContext) GL_MT(glBlendEquationSeparate((GLenum)ai(args,0),(GLenum)ai(args,1)));
+            return 0;
+        case GL64_fn_glBlendColor:
+            if (g_glContext) GL_MT(glBlendColor(af(args,0),af(args,1),af(args,2),af(args,3)));
+            return 0;
+        case GL64_fn_glColorMask:
+            if (g_glContext) GL_MT(glColorMask((GLboolean)ai(args,0),(GLboolean)ai(args,1),(GLboolean)ai(args,2),(GLboolean)ai(args,3)));
+            return 0;
+        case GL64_fn_glDepthMask:
+            if (g_glContext) GL_MT(glDepthMask((GLboolean)ai(args,0)));
+            return 0;
+        case GL64_fn_glStencilFunc:
+            if (g_glContext) GL_MT(glStencilFunc((GLenum)ai(args,0),(GLint)ai(args,1),(GLuint)ai(args,2)));
+            return 0;
+        case GL64_fn_glStencilOp:
+            if (g_glContext) GL_MT(glStencilOp((GLenum)ai(args,0),(GLenum)ai(args,1),(GLenum)ai(args,2)));
+            return 0;
+        case GL64_fn_glStencilMask:
+            if (g_glContext) GL_MT(glStencilMask((GLuint)ai(args,0)));
+            return 0;
+        case GL64_fn_glStencilFuncSeparate:
+            if (g_glContext) GL_MT(glStencilFuncSeparate((GLenum)ai(args,0),(GLenum)ai(args,1),(GLint)ai(args,2),(GLuint)ai(args,3)));
+            return 0;
+        case GL64_fn_glStencilOpSeparate:
+            if (g_glContext) GL_MT(glStencilOpSeparate((GLenum)ai(args,0),(GLenum)ai(args,1),(GLenum)ai(args,2),(GLenum)ai(args,3)));
+            return 0;
+        case GL64_fn_glStencilMaskSeparate:
+            if (g_glContext) GL_MT(glStencilMaskSeparate((GLenum)ai(args,0),(GLuint)ai(args,1)));
+            return 0;
+        case GL64_fn_glScissor:
+            if (g_glContext) GL_MT(glScissor((GLint)ai(args,0),(GLint)ai(args,1),(GLsizei)ai(args,2),(GLsizei)ai(args,3)));
+            return 0;
+        case GL64_fn_glPolygonOffset:
+            if (g_glContext) GL_MT(glPolygonOffset(af(args,0), af(args,1)));
+            return 0;
+        case GL64_fn_glPolygonMode:
+            return 0; // no glPolygonMode in GLES — wireframe not supported, ignore
+        case GL64_fn_glDepthRange:
+            if (g_glContext) { float n=(float)ad(args,0), f=(float)ad(args,1); GL_MT(glDepthRangef(n, f)); }
+            return 0;
+        case GL64_fn_glLineWidth:
+            if (g_glContext) GL_MT(glLineWidth(af(args,0)));
+            return 0;
+        case GL64_fn_glPixelStorei:
+            if (g_glContext) GL_MT(glPixelStorei((GLenum)ai(args,0), (GLint)ai(args,1)));
+            return 0;
+        case GL64_fn_glSampleCoverage:
+            if (g_glContext) GL_MT(glSampleCoverage(af(args,0), (GLboolean)ai(args,1)));
+            return 0;
+
+        // --- textures (modern) ---
+        case GL64_fn_glActiveTexture:
+            if (g_glContext) GL_MT(glActiveTexture((GLenum)ai(args,0)));
+            return 0;
+        case GL64_fn_glGenTextures:
+            if (g_glContext && args.a[1]) genObjects(cpu, args, GenKind::Texture);
+            return 0;
+        case GL64_fn_glBindTexture:
+            if (g_glContext) GL_MT(glBindTexture((GLenum)ai(args,0), (GLuint)ai(args,1)));
+            return 0;
+        case GL64_fn_glDeleteTextures:
+            if (g_glContext && args.a[1]) deleteObjects(cpu, args, GenKind::Texture);
+            return 0;
+        // glTexParameter*: WebGL2 accepts only a subset of pnames; wined3d sets
+        // several desktop-GL-only ones (GL_TEXTURE_LOD_BIAS, GL_GENERATE_MIPMAP,
+        // GL_TEXTURE_BORDER_COLOR, GL_DEPTH_TEXTURE_MODE, …) that raise
+        // GL_INVALID_ENUM. Drop those (return success) so they don't pollute the GL
+        // error state wined3d inspects during CreateDevice.
+        case GL64_fn_glTexParameteri:
+            if (g_glContext) {
+                GLenum pn = (GLenum)ai(args,1);
+                if (texParamSupported(pn)) GL_MT(glTexParameteri((GLenum)ai(args,0), pn, (GLint)ai(args,2)));
+            }
+            return 0;
+        case GL64_fn_glTexParameterf:
+            if (g_glContext) {
+                GLenum pn = (GLenum)ai(args,1);
+                if (texParamSupported(pn)) GL_MT(glTexParameterf((GLenum)ai(args,0), pn, af(args,2)));
+            }
+            return 0;
+        case GL64_fn_glTexImage2D: {
+            if (g_glContext) {
+                GLenum tgt=(GLenum)ai(args,0); GLint lvl=(GLint)ai(args,1); GLint ifmt=(GLint)ai(args,2);
+                GLsizei w=(GLsizei)ai(args,3); GLsizei h=(GLsizei)ai(args,4); GLint bd=(GLint)ai(args,5);
+                GLenum fmt=(GLenum)ai(args,6); GLenum type=(GLenum)ai(args,7);
+                std::vector<U8> pix; const void* pp=nullptr;
+                if (args.a[8]) {
+                    size_t bytes = texImageBytes(w, h, fmt, type);
+                    if (bytes) { pix.resize(bytes); cpu->memory->memcpyFromGuest(pix.data(), args.a[8], (U64)bytes); pp=pix.data(); }
+                }
+                GL_MT(glTexImage2D(tgt, lvl, ifmt, w, h, bd, fmt, type, pp));
+            }
+            return 0;
+        }
+        case GL64_fn_glTexSubImage2D: {
+            if (g_glContext && args.a[8]) {
+                GLenum tgt=(GLenum)ai(args,0); GLint lvl=(GLint)ai(args,1); GLint x=(GLint)ai(args,2); GLint y=(GLint)ai(args,3);
+                GLsizei w=(GLsizei)ai(args,4); GLsizei h=(GLsizei)ai(args,5); GLenum fmt=(GLenum)ai(args,6); GLenum type=(GLenum)ai(args,7);
+                size_t bytes = texImageBytes(w, h, fmt, type);
+                if (bytes) {
+                    std::vector<U8> pix(bytes); cpu->memory->memcpyFromGuest(pix.data(), args.a[8], (U64)bytes);
+                    const void* pp=pix.data();
+                    GL_MT(glTexSubImage2D(tgt, lvl, x, y, w, h, fmt, type, pp));
+                }
+            }
+            return 0;
+        }
+        case GL64_fn_glGenerateMipmap:
+            if (g_glContext) GL_MT(glGenerateMipmap((GLenum)ai(args,0)));
+            return 0;
+        case GL64_fn_glCompressedTexImage2D: {
+            if (g_glContext) {
+                GLenum tgt=(GLenum)ai(args,0); GLint lvl=(GLint)ai(args,1); GLenum ifmt=(GLenum)ai(args,2);
+                GLsizei w=(GLsizei)ai(args,3); GLsizei h=(GLsizei)ai(args,4); GLint bd=(GLint)ai(args,5);
+                GLsizei isz=(GLsizei)ai(args,6);
+                std::vector<U8> data; const void* dp=nullptr;
+                if (args.a[7] && isz>0) { data.resize((size_t)isz); cpu->memory->memcpyFromGuest(data.data(), args.a[7], (U64)isz); dp=data.data(); }
+                GL_MT(glCompressedTexImage2D(tgt, lvl, ifmt, w, h, bd, isz, dp));
+            }
+            return 0;
+        }
+        case GL64_fn_glGetStringi:
+            return 0; // guest wrapper returns "" itself
+        case GL64_fn_glGetShaderSource:
+            return 0; // not needed
+#endif // __EMSCRIPTEN__
 
         default:
             klog_fmt("gl64: unimplemented fn id %llu", (unsigned long long)fnId);
