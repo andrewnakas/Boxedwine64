@@ -131,22 +131,35 @@ them.
     present, so it's not blocked waiting on the dead main thread for GL either).
     Also ruled out: vsync (`D3DPRESENT_INTERVAL_IMMEDIATE` still hangs), our
     readback (no `glXSwapBuffers` trap), the glemu frame hook (guarded+try/catch).
-    => The Present thread is NOT parked on any kernel wait primitive. It is either
-    (a) **busy-spinning** on a guest memory flag that never flips (wined3d/wineserver
-    sometimes spin-waits) while pegging a core + holding contention that wedges the
-    main loop, or (b) blocked in a `BOXEDWINE_CONDITION_WAIT` site I did not
-    instrument (ksignal/kevent/kpoll/ksystem — there are ~dozen). NEXT SESSION:
-    (1) add a guest **RIP sampler** for the d3dtri Present thread (there's a
-    ripSampler.cpp) to see WHERE in wined3d/ntdll it spins/loops — that names the
-    exact poll/wait; (2) failing that, instrument the remaining
-    BOXEDWINE_CONDITION_WAIT sites (grep them) the same throttled way. Once the
-    spin/wait target is known, the fix is to make whatever should flip that flag /
-    signal that condition actually run (likely the main loop must keep servicing
-    something while the Present thread spins). The benign leftover GL_INVALID_ENUM
-    (a vertex-attrib/VAO setup enum) is worth clearing too. glcube still renders;
-    selftest 234/234. The whole front of the D3D pipeline (device, GLSL shaders,
-    draw) is SOLID — only Present remains, and it is an unusual spin/wait deadlock,
-    not a GL gap.
+    => The Present thread is NOT parked on any kernel wait primitive I instrument.
+    **RIP-SAMPLER RESULT (the decisive probe, this session):** ran the guest RIP
+    sampler (force-enabled — getenv-on-worker made BW64_RIPSAMPLE not reach it).
+    d3dtri is pid 38 (relay 16→36→38). After Present hangs, ALL d3dtri threads
+    (tid 39/40/41) sit at **dIns=0, rip=libc.so.6+0xd22ec** — i.e. genuinely
+    BLOCKED (not spinning) at the generic host thread-park point (the same libc
+    addr every idle thread parks at — a host futex/wait the emscripten pthread
+    uses). So Present is parked waiting to be WOKEN, and the wakeup never comes.
+    Meanwhile the wineserver-side pid (14) is alive and cycling through libc, but
+    isn't completing d3dtri's present request — and a MAIN-LOOP HEARTBEAT earlier
+    showed the emscripten main loop runs ONE iteration after Present then STOPS.
+    So the chain is: **main loop stalls/stops → the wineserver↔X11↔present pump it
+    drives stops → wineserver can't finish d3dtri's present → d3dtri's Present
+    thread blocks forever in a libc park.** TRIED (kept, but did NOT fix the hang):
+    wrapping the ENTIRE emscripten main-loop body in try/catch so a thrown
+    exception can't kill it (real hardening — a throw there deadlocks everything —
+    glcube unregressed, selftest 234/234); and the glemu frame-hook guard. Since
+    try/catch didn't help, the main loop isn't dying by THROW — it's BLOCKING
+    inside its own body (tickXWirePresent/drainMainThreadWork/processEvents/
+    bw64SessionDrainSpawns) on something the stalled wineserver/present interaction
+    needs. NEXT SESSION: instrument the MAIN-LOOP thread itself (it's NOT a guest
+    CPU64 so the RIP sampler can't see it) — log entry/exit around each call in
+    mainloop() (tickXWirePresent, drainMainThreadWork, processEvents) to find which
+    one blocks after Present; and/or trace the wineserver's request-dispatch to see
+    why d3dtri's present request never gets a reply. The fix is to break the
+    main-loop ↔ wineserver-present circular wait. Benign leftover GL_INVALID_ENUM
+    (a vertex-attrib/VAO setup enum) worth clearing too. The whole FRONT of the D3D
+    pipeline (device, GLSL shaders, draw) is SOLID — only Present remains, and it's
+    a main-loop ↔ wineserver present-deadlock, not a GL gap.
 - **2026-06-11 — M17 EVALUATED (winetricks): NO-GO for the script itself; the
   native verb-subset is the realistic path.** The user asked to bring up
   winetricks after D3D. Findings:

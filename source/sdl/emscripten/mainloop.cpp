@@ -61,6 +61,13 @@ static BString getSize(int pages)
 extern int allocatedRamPages;
 void mainloop() {
     isMainThread = true;
+  // The emscripten main loop MUST NOT throw: if mainloop() throws, emscripten
+  // stops scheduling it, the loop dies, and every xwireRunOnMainThread/glOnMain
+  // (and the wineserver<->X11<->present-sink pump) deadlocks forever — observed
+  // as the D3D Present() hang (one more loop iteration after Present, then the
+  // guest blocks in a libc wait for a wineserver reply that never comes because
+  // nothing pumps it). Contain any exception so the loop always survives.
+  try {
 #ifdef BOXEDWINE_GUEST_X64
         // LEGACY_GL_EMULATION registers GL.newRenderingFrameStarted() as a
         // preMainLoop hook that runs HERE, on this main-loop thread, every frame.
@@ -140,6 +147,13 @@ void mainloop() {
         if (!KNativeSystem::getCurrentInput()->processEvents()) {
             KNativeSystem::cleanup();
         }
+  } catch (const std::exception& e) {
+        static std::atomic<int> n{0};
+        if (n.fetch_add(1) < 20) klog_fmt("mainloop: caught exception (loop survives): %s", e.what());
+  } catch (...) {
+        static std::atomic<int> n{0};
+        if (n.fetch_add(1) < 20) klog_fmt("mainloop: caught non-std exception (loop survives)");
+  }
 }
 
 void waitForProcessToFinish(const std::shared_ptr<KProcess>& process, KThread* thread) {

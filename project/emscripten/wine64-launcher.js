@@ -762,6 +762,10 @@
                 // Host-side GL trace (read via getenv in gl64bridge.cpp). Emscripten
                 // getenv() reads Module.ENV; set it before main() runs.
                 try { liveModule["ENV"] = liveModule["ENV"] || {}; liveModule["ENV"]["BW64_GLTRACE"] = (param("gltrace") || "1"); } catch (e) {}
+                // ?ripsample=1 turns on the guest RIP sampler + heartbeat (every ~2s
+                // dump each live thread's instruction-delta + rip + module) — used to
+                // locate where the D3D Present() thread spins/blocks. Off by default.
+                try { if (param("ripsample") === "1") { liveModule["ENV"]["BW64_RIPSAMPLE"] = "1"; liveModule["ENV"]["BW64_RIPSAMPLE_HB"] = "1"; } } catch (e) {}
                 // Hold main() until the rootfs is in the VFS.
                 liveModule["addRunDependency"]("loadWine64Fs");
                 loadFilesystem(els);
