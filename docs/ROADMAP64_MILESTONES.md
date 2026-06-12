@@ -75,6 +75,29 @@ them.
 
 ## Log
 
+- **2026-06-11 — M16 UPDATE #5 (D3D Present hang): stack-backtrace attempt — the
+  concrete blocker is that wine PE-DLL ranges aren't registered for the sampler.**
+  Added a guest backtrace to read the 3 deadlocked d3dtri threads' call stacks:
+  - **RBP-chain walk → ret=0x0**: glibc/wine are built `-fomit-frame-pointer`, so
+    RBP is not a frame chain. Dead end.
+  - **Raw stack-scan** (resolve qwords from RSP to known modules) → found the 3
+    threads (all at the libc wait stub rip=0x7000f82ec) but printed **ZERO resolved
+    frames**. Root cause: the sampler's module ranges come only from
+    `ripSamplerNoteModule` at the **mmap-of-an-fd** path (syscall64.cpp ~L1435/1539)
+    = libc/ld + wine's x86_64-**unix** .so halves. wine's **PE DLLs** (wined3d.dll,
+    ntdll.dll PE side) are mapped by the PE image-section path (NtMapViewOfSection /
+    wine's PE loader), which is NOT hooked — so return addresses into wined3d/ntdll
+    resolve to nothing and the call chain is invisible.
+  - **RESUME (now very concrete):** (1) hook the PE image-section map so PE DLL
+    [lo,hi) ranges get `ripSamplerNoteModule`'d (the "PE image section" handling in
+    syscall64.cpp ~L1400 / kmemory64 is the spot — register the mapped PE range +
+    dll basename). (2) Then the EXISTING stack-scan backtrace names the wined3d/
+    ntdll functions on each blocked thread's stack → the wine-level wait. (3) Then
+    chase the event/APC that should wake the wined3d CS thread and why our
+    wineserver/kernel doesn't deliver it (cross-thread APC delivery is known-
+    fragile — kthread.cpp deliverPendingSignals). The whole FRONT (device, GLSL
+    shaders, draw) is SOLID; only this wined3d threading deadlock remains. glcube
+    unregressed; selftest 234/234.
 - **2026-06-11 — M16 UPDATE #4 (D3D Present hang): it's a wined3d 3-thread
   (main↔CS) deadlock; worker-pool + CSMT-disable both ruled out.** Continued from
   UPDATE #3:
