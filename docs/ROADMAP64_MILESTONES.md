@@ -75,6 +75,42 @@ them.
 
 ## Log
 
+- **2026-06-11 — M16 UPDATE #3 (D3D Present hang): MAJOR CORRECTION — the main
+  loop is ALIVE; Present blocks in a libc wait having sent NO X request / GL call
+  / socket / futex.** Continued narrowing the Present() deadlock and overturned a
+  prior wrong theory:
+  - **The emscripten main loop does NOT die.** Added per-call phase markers
+    (a:tickXWirePresent → b:drainSpawns → c:timers → d:processEvents → e:END) +
+    a whole-run iteration heartbeat. The loop completes FULL clean iterations
+    through e:END continuously DURING the Present hang (counter climbs e.g.
+    3264→3328, 20+ iterations logged after `render: Present...`). The earlier
+    "main loop dies one iteration after Present" reading was a throttle/timing
+    artifact. So Present is NOT blocked on a dead main loop. (The main-loop
+    try/catch from UPDATE #2 is KEPT — it's correct hardening, just not this fix.)
+  - **Present sends NO X request either.** Added throttled X-request logging in
+    xwireconnection.cpp::processOneRequest. The window-property burst (X_ChangeProperty
+    opcode 18, plus CreateWindow/ConfigureWindow/GetInputFocus) all happens BEFORE
+    `render: Present...` (window setup). After Present starts there are ZERO X
+    requests on the d3dtri connection, and only ONE unhandled opcode the whole run
+    (opcode 7 ReparentWindow, early, harmless). So Present is NOT waiting on an X
+    reply we fail to send.
+  - **NET (cumulative across this + prior sessions):** d3dtri's Present thread
+    (pid 38, tids 39/40/41) blocks at dIns=0 in a libc park (libc.so.6+0xd22ec,
+    the generic host thread-wait point) having issued NO X request, NO GL call, and
+    parking on NONE of: unix-socket read, 32/64-bit futex (indef or timed). The
+    main loop AND the wineserver are both alive and running. So Present waits for
+    an INTERNAL wakeup (a wine-side event/APC, or a host-emscripten pthread
+    futex below our syscall layer) that never arrives. RESUME (next session):
+    (1) resolve libc.so.6+0xd22ec precisely with a FULL-symbol glibc (the rootfs
+    libc is stripped of internal syms) to name the exact wait fn (likely
+    clock_nanosleep / pthread_cond / a wine internal); (2) check for SCHEDULER
+    starvation — are pid-38 threads runnable-but-never-picked? (instrument
+    kscheduler.cpp to log ready-but-unscheduled threads); (3) trace the wineserver
+    (pid 12/14) APC/event path that should wake a thread waiting in Present. The
+    whole FRONT of the D3D pipeline (device, GLSL shaders, draw) is SOLID — only
+    Present remains; it is now characterized as an internal/host-level wakeup that
+    never fires, with the main-loop-death and X-reply theories both DISPROVEN.
+    glcube unregressed; selftest 234/234.
 - **2026-06-11 — M16 UPDATE #2 (D3D, big progress): device-create SOLVED + FFP
   shaders compile clean; new final blocker = the Present stall.** Continuing the
   loop after the first M16 checkpoint, the `D3DERR_NOTAVAILABLE` blocker was
