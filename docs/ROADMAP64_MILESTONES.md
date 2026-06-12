@@ -75,6 +75,38 @@ them.
 
 ## Log
 
+- **2026-06-11 — M16 UPDATE #4 (D3D Present hang): it's a wined3d 3-thread
+  (main↔CS) deadlock; worker-pool + CSMT-disable both ruled out.** Continued from
+  UPDATE #3:
+  - **Web Worker pool exhaustion = NOT the cause.** Each guest thread runs on a
+    worker from PTHREAD_POOL_SIZE=32; instrumented scheduleThread() to log the live
+    count. Peak was only **13/32**, and ZERO thread spawns happen after Present —
+    so Present is not blocked on a new-thread-can't-get-a-worker.
+  - **The structure: d3dtri (pid 38) has 3 threads — 39 (render-loop main, calls
+    Present), 40 & 41 (wined3d's command-stream/worker threads).** The RIP sampler
+    showed ALL THREE parked at dIns=0 in a libc wait. So `Present()` on tid 39
+    submits to the wined3d CS thread and waits; the CS thread is ALSO blocked →
+    a **wined3d-internal main↔CS-thread deadlock**, all 3 parked waiting on each
+    other / an event, below the syscall/futex/socket/X/GL layers (all already
+    instrumented and clear).
+  - **Tried CSMT-disable (didn't work + wine-8 can't):** injected
+    `[Software\\Wine\\Direct3D] "csmt"=dword:0` into the prefix user.reg to force
+    synchronous (no-CS-thread) present. d3dtri STILL spawned 3 threads (CS thread
+    still created) — wine 8.0 made CSMT effectively mandatory; the registry knob no
+    longer disables it. Reverted the key. (NB: this DID exercise the M17 native
+    registry-verb mechanism end-to-end — the edit applied cleanly; wine just
+    ignores csmt now.)
+  - **RESUME (next session):** the deadlock is inside wined3d's CS-thread
+    synchronization — read each of the 3 d3dtri threads' EXACT wait with the
+    force-enabled RIP sampler (resolve their distinct RIPs to wined3d/ntdll
+    symbols, not just the shared libc park point) to see the main↔CS wait pair;
+    then either (a) find the wine-side event/APC that should wake the CS thread and
+    why our wineserver/kernel doesn't deliver it, or (b) check whether wined3d's CS
+    thread is itself waiting on `glOnMain`/the main thread in a way that circular-
+    waits with tid 39's Present. A full-symbol ntdll/wined3d + the per-thread RIP
+    is the key missing data. The whole FRONT (device, GLSL shaders, draw) is SOLID;
+    only this wined3d threading deadlock remains. glcube unregressed; selftest
+    234/234.
 - **2026-06-11 — M16 UPDATE #3 (D3D Present hang): MAJOR CORRECTION — the main
   loop is ALIVE; Present blocks in a libc wait having sent NO X request / GL call
   / socket / futex.** Continued narrowing the Present() deadlock and overturned a
