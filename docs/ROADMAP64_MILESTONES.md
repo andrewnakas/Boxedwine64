@@ -75,6 +75,32 @@ them.
 
 ## Log
 
+- **2026-06-12 — M16 UPDATE #6 (D3D Present hang): CONFIRMED — wined3d.dll is
+  never registered with the sampler (no pid has it); ntdll IS. Plus a process-id
+  correction.** Drilled into why the stack-scan resolved nothing:
+  - Dumped pid 38's module table → it is **explorer.exe** (ntdll.dll + libwine.so +
+    explorer.exe + libX11), NOT d3dtri. A PIDMAP of all sampled threads: pid 10 =
+    libc/win32u/**libGL.so.1** (the GL-using process), pid 38 = libc/libX11
+    (explorer/X), pid 14 = the (unmapped) spinner. So earlier "pid 38 = d3dtri's 3
+    threads" was partly an X/explorer attribution — caution: the d3dtri render +
+    GL happens via pid 10's libGL, and the D3D DLLs live in yet another pid.
+  - Scanned EVERY pid's module table for wined3d.dll/d3d9.dll/d3dtri.exe →
+    **D3DPID lines: 0 — NO pid has wined3d.dll registered.** Meanwhile ntdll.dll
+    IS registered (for pid 38). The difference: ntdll is loaded at process startup
+    via the loader path that hits the mmap/`mmapSharedFile` hook
+    (ripSamplerNoteModule), but **wined3d.dll is loaded ON DEMAND later via wine's
+    PE loader using a mapping path that does NOT call ripSamplerNoteModule** — so
+    wined3d is invisible to the module table, and any RIP/return-address in it
+    resolves to nothing. THAT is why the stack-scan named zero frames.
+  - **RESUME (next session) — the precise hook:** find where wine's ON-DEMAND PE
+    DLL load maps the image (NOT the startup loader — the later
+    LdrLoadDll/NtMapViewOfSection-driven map of wined3d.dll from wine64.zip) and
+    add a `ripSamplerNoteModule(pid, base, size, "wined3d.dll")` there. Confirm via
+    the D3DPID scan that wined3d then shows up. THEN the existing stack-scan
+    backtrace will name the wined3d functions on the blocked thread's stack →
+    finally the wine-level wait. (Then chase the event/APC that should wake the
+    wined3d CS thread.) The whole FRONT (device, GLSL shaders, draw) is SOLID; only
+    this remains. glcube unregressed; selftest 234/234.
 - **2026-06-11 — M16 UPDATE #5 (D3D Present hang): stack-backtrace attempt — the
   concrete blocker is that wine PE-DLL ranges aren't registered for the sampler.**
   Added a guest backtrace to read the 3 deadlocked d3dtri threads' call stacks:
