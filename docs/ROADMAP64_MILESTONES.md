@@ -64,7 +64,7 @@ self-contained sessions. Each iteration:
 | M15 | taskmgr blocker triage | Root-cause taskmgr's wasm `RuntimeError: null function` — identify the exact call site/missing feature, then fix if bounded or leave a precise triage note | A named root cause and either a fix that lets taskmgr render, or a documented blocker | DONE (2026-06-11) — root-caused to a HOST-SIDE wasm null-function call on a WORKER thread (not a wine API stub, not a missing x86 opcode — NO wine err:/unimplemented line precedes it), during taskmgr's icon/pixmap setup; pinpointing the C++ site needs a symbolicated build (documented blocker). Predates M14. Also stripped the 4 stale XWire DIAG logs this surfaced |
 | M14 | X drawing primitives | Implement the core X line/rect drawing requests (PolySegment 65, PolyRectangle 66, PolyLine 64, PolyPoint 63, FillPoly 69) into the window framebuffer — the gap behind graph/border-drawing apps | Draw-primitive app shows lines/borders in-browser, no regression, selftest unaffected | DONE — implemented + browser-verified 2026-06-11 (regedit's tree/border lines render crisp via the new primitives, no regression; selftest 234/234). Also fixed a latent PolyFillRectangle no-op. taskmgr re-triaged: its blocker is a deeper wine null-function stub, NOT drawing |
 | M13 | Gecko / .NET (evaluate) | Upstream item: wine-gecko (HTML dialogs) and wine-mono (.NET apps) payloads — weigh ~50–80MB payloads + JIT-under-interpreter cost | A trivial .NET WinForms exe runs, or a written descope rationale (payload/perf numbers) | EVALUATED → NO-GO (2026-06-11): no mono/gecko in rootfs; ~50-80MB payload + JIT-in-interpreter cold-start. Rationale in Log |
-| M16 | Direct3D (wined3d → WebGL2) | Bring up the D3D path: extend the gl64 bridge from fixed-function-only to the full programmable pipeline (shaders, VBOs, vertex attribs, modern state, textures) so wined3d can render D3D apps via WebGL2 | A D3D9 app renders its 3D output (not black) in-browser | IN PROGRESS (2026-06-11) — programmable-pipeline GL bridge + GLSL-ES transpiler built & verified (glcube unregressed, selftest 234/234, D3D9 device path reaches GL: shaders compile+link clean, full pipeline incl. glDrawArrays fires). BLOCKED on wined3d `CreateDevice` returning `D3DERR_NOTAVAILABLE` (a cap rejection; this wined3d.dll has no debug channels so the exact check is opaque). Resume path in the Log |
+| M16 | Direct3D (wined3d → WebGL2) | Bring up the D3D path: extend the gl64 bridge from fixed-function-only to the full programmable pipeline (shaders, VBOs, vertex attribs, modern state, textures) so wined3d can render D3D apps via WebGL2 | A D3D9 app renders its 3D output (not black) in-browser | IN PROGRESS (2026-06-11) — MUCH further now: device-create blocker SOLVED (trim advertised extensions to the minimal GLSL set → wined3d `CreateDevice` succeeds), FFP-shader transpiler done (wined3d's fixed-function GLSL compiles+links CLEAN on WebGL2), and the D3D `glDrawArrays` fires. NEW & FINAL blocker: the guest STALLS after the first draw — wined3d's `Present()` does NOT call `glXSwapBuffers` and hangs in non-GL code (a present/threading issue), so no frame ever reaches the canvas. Resume path in the Log |
 | M17 | winetricks (evaluate) | Bring up winetricks (the wine helper that installs redistributables/DLL-overrides/fonts) in the WASM build, or get a useful subset working | winetricks runs a verb in-browser, or a written go/no-go with the technical blocker + the achievable native subset | EVALUATED → NO-GO for the script; native verb-subset is the path (2026-06-11). winetricks is a ~14k-line bash script needing a POSIX shell + coreutils + wget/curl + cabextract + internet — NONE exist in the rootfs (no shell at all; no socket egress in-browser). Its USEFUL actions (DLL overrides, registry tweaks) ARE achievable natively without it. Assessment + mechanism in the Log |
 
 Suggested order = table order. M1 early on purpose: it protects every later
@@ -75,6 +75,54 @@ them.
 
 ## Log
 
+- **2026-06-11 — M16 UPDATE #2 (D3D, big progress): device-create SOLVED + FFP
+  shaders compile clean; new final blocker = the Present stall.** Continuing the
+  loop after the first M16 checkpoint, the `D3DERR_NOTAVAILABLE` blocker was
+  CRACKED and two more layers fixed:
+  - **CreateDevice blocker = OVER-ADVERTISED EXTENSIONS.** A lever test proved it:
+    with the GLSL shader extensions *un*-advertised, `CreateDevice` succeeds (the
+    old no-shader path); advertising them made wined3d reject the device. Bisected
+    it — NOT the GLSL extensions themselves (device creates fine with VBO + the 4
+    core GLSL exts), but the broader **texture-format/FBO extensions**
+    (texture_float / sRGB / s3tc / rectangle / framebuffer_object / occlusion /
+    draw_buffers) make wined3d run a strict D3D-format validation that fails
+    against WebGL2 → NOTAVAILABLE. FIX: trim `g_extList[]` / the monolithic string
+    in libgl64.c to the minimal set (multitexture, VBO, NPOT, shader_objects,
+    shading_language_100, vertex_shader, fragment_shader). All the GLSL numeric
+    caps wined3d queries (MAX_VERTEX_ATTRIBS=16, MAX_VARYING_FLOATS=120,
+    MAX_*_UNIFORM=4096, …) come back healthy; bumping GL_VERSION/GLSL version did
+    NOT matter — it was the extensions.
+  - **FFP shaders now compile+link CLEAN.** d3dtri uses D3D's fixed-function
+    pipeline, so wined3d generates FFP-replacement GLSL that uses the legacy
+    compatibility built-in varyings GLSL ES 3.00 removed: vertex writes
+    `gl_FrontColor`/`gl_FrontSecondaryColor`/`gl_TexCoord[]`, fragment reads
+    `gl_Color`/`gl_SecondaryColor`/`gl_TexCoord[]`, plus `gl_FogFragCoord`.
+    Extended `translateGlslToEs300` to rewrite them to matching user in/out
+    varyings (`bw_color`/`bw_secondary`/`bw_texcoord[8]`/`bw_fogcoord`) with the
+    right declarations per stage, AND to strip EVERY `#version` (wined3d emits a
+    second one mid-source that re-started the shader and dropped the precision
+    line). Result: shader COMPILE/LINK errors = 0; the D3D `glDrawArrays
+    GL_TRIANGLES,3` fires.
+  - **NEW FINAL BLOCKER — the Present stall.** With everything above, the guest
+    runs `device created OK` → `entering render loop` → ONE `glDrawArrays` → then
+    STALLS: no second draw, no frame, no more GL traps at all, canvas stays at the
+    window-chrome image (no triangle, not even the clear). Instrumented: the
+    draw's glOnMain RETURNS (not a draw deadlock; it does leave a benign leftover
+    GL_INVALID_ENUM). Crucially, **wined3d's `Present()` does NOT call
+    `glXSwapBuffers`** (fnId 14 never traps after the draw) — so our
+    readbackAndPresent never runs, and the guest hangs in wined3d's non-GL present
+    path (a GDI/blit or wineserver round-trip). This is the last thing between
+    here and a rendered triangle.
+  - **RESUME PATH:** find how wined3d presents this swapchain without
+    glXSwapBuffers — likely a `wined3d_texture` blit to the window via GDI
+    (BitBlt/StretchDIBits through the X11 wire) or an internal readback that
+    deadlocks against our single present-sink/main-thread. Trace the guest after
+    the draw with a non-GL probe (what syscall/wineserver call it blocks on);
+    candidate fixes: implement whatever GL/blit entry point wined3d's present uses,
+    or make `D3DSWAPEFFECT_COPY`/windowed present route through glXSwapBuffers.
+    Also try the StretchRect/`Present`-to-`glReadPixels` path. The leftover
+    GL_INVALID_ENUM (from a vertex-attrib/VAO setup enum) is worth clearing too.
+    glcube still renders (immediate-mode path unaffected); selftest 234/234.
 - **2026-06-11 — M17 EVALUATED (winetricks): NO-GO for the script itself; the
   native verb-subset is the realistic path.** The user asked to bring up
   winetricks after D3D. Findings:

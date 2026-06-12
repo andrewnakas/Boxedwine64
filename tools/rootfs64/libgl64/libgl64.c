@@ -428,20 +428,7 @@ API const GLubyte* glGetString(GLenum name) {
     // extensions as g_extList[] below (the core-profile glGetStringi path) so both
     // wined3d code paths see the same feature set.
     static const GLubyte* exts     = (const GLubyte*)
-        "GL_ARB_multitexture GL_ARB_texture_env_combine GL_ARB_texture_env_dot3 "
-        "GL_ARB_vertex_buffer_object GL_ARB_pixel_buffer_object "
-        "GL_ARB_vertex_program GL_ARB_fragment_program "
-        "GL_ARB_shader_objects GL_ARB_shading_language_100 "
-        "GL_ARB_vertex_shader GL_ARB_fragment_shader "
-        "GL_ARB_framebuffer_object GL_EXT_framebuffer_object GL_EXT_framebuffer_blit "
-        "GL_ARB_depth_texture GL_ARB_shadow GL_ARB_texture_non_power_of_two "
-        "GL_ARB_texture_rectangle GL_ARB_texture_cube_map GL_ARB_texture_float "
-        "GL_ARB_half_float_pixel GL_ARB_occlusion_query GL_ARB_point_sprite "
-        "GL_ARB_draw_buffers GL_EXT_blend_minmax GL_EXT_blend_color "
-        "GL_EXT_blend_func_separate GL_EXT_blend_equation_separate "
-        "GL_EXT_stencil_two_side GL_ARB_stencil_two_side "
-        "GL_EXT_texture_sRGB GL_ARB_texture_compression GL_EXT_texture_compression_s3tc "
-        "GL_NV_texture_shader GL_ARB_map_buffer_range";
+        "GL_ARB_multitexture GL_ARB_vertex_buffer_object GL_ARB_texture_non_power_of_two GL_ARB_shader_objects GL_ARB_shading_language_100 GL_ARB_vertex_shader GL_ARB_fragment_shader";
     (void)gl64_trap(GL64_fn_glGetString, 0);
     switch (name) {
         case 0x1F00: return vendor;    // GL_VENDOR
@@ -459,20 +446,16 @@ API const GLubyte* glGetString(GLenum name) {
 // GL_NUM_EXTENSIONS), so an empty glGetStringi made it find no usable extensions
 // and never issue a draw, even though the monolithic string was populated.
 static const char* const g_extList[] = {
-    "GL_ARB_multitexture","GL_ARB_texture_env_combine","GL_ARB_texture_env_dot3",
-    "GL_ARB_vertex_buffer_object","GL_ARB_pixel_buffer_object",
-    "GL_ARB_vertex_program","GL_ARB_fragment_program",
+    // The MINIMAL set that lets wined3d create a GLSL device AND pass CreateDevice.
+    // Bisected (M16): advertising the broader texture-format/FBO extensions
+    // (texture_float / sRGB / s3tc / rectangle / framebuffer_object / occlusion)
+    // made wined3d run a strict D3D-format validation that FAILS against WebGL2 →
+    // CreateDevice returned D3DERR_NOTAVAILABLE. With just VBO + the 4 core GLSL
+    // extensions, wined3d selects its GLSL shader backend and the device creates.
+    // Keep the monolithic GL_EXTENSIONS string (glGetString) in sync with this.
+    "GL_ARB_multitexture","GL_ARB_vertex_buffer_object","GL_ARB_texture_non_power_of_two",
     "GL_ARB_shader_objects","GL_ARB_shading_language_100",
     "GL_ARB_vertex_shader","GL_ARB_fragment_shader",
-    "GL_ARB_framebuffer_object","GL_EXT_framebuffer_object","GL_EXT_framebuffer_blit",
-    "GL_ARB_depth_texture","GL_ARB_shadow","GL_ARB_texture_non_power_of_two",
-    "GL_ARB_texture_rectangle","GL_ARB_texture_cube_map","GL_ARB_texture_float",
-    "GL_ARB_half_float_pixel","GL_ARB_occlusion_query","GL_ARB_point_sprite",
-    "GL_ARB_draw_buffers","GL_EXT_blend_minmax","GL_EXT_blend_color",
-    "GL_EXT_blend_func_separate","GL_EXT_blend_equation_separate",
-    "GL_EXT_stencil_two_side","GL_ARB_stencil_two_side",
-    "GL_EXT_texture_sRGB","GL_ARB_texture_compression","GL_EXT_texture_compression_s3tc",
-    "GL_NV_texture_shader","GL_ARB_map_buffer_range",
 };
 #define G_EXT_COUNT ((int)(sizeof(g_extList)/sizeof(g_extList[0])))
 

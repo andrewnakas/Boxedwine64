@@ -641,13 +641,13 @@ std::string translateGlslToEs300(const std::string& srcIn, bool isFragment) {
         src.swap(out);
     };
 
-    // Strip any existing #version line (we prepend our own).
-    {
-        size_t v = src.find("#version");
-        if (v != std::string::npos) {
-            size_t eol = src.find('\n', v);
-            src.erase(v, (eol == std::string::npos ? src.size() : eol + 1) - v);
-        }
+    // Strip EVERY existing #version line (we prepend our own). wined3d sometimes
+    // emits more than one #version, and a SECOND one further down re-starts the
+    // shader — discarding our prepended `precision` line ("No precision specified
+    // for float") and itself violating "#version must occur before anything else".
+    for (size_t v; (v = src.find("#version")) != std::string::npos; ) {
+        size_t eol = src.find('\n', v);
+        src.erase(v, (eol == std::string::npos ? src.size() : eol + 1) - v);
     }
 
     // Legacy texture lookups → unified texture().
@@ -659,24 +659,53 @@ std::string translateGlslToEs300(const std::string& srcIn, bool isFragment) {
     wordReplace("shadow2DProj",  "textureProj");
     wordReplace("shadow2D",      "texture");
 
+    // wined3d's fixed-function-pipeline shaders use the legacy compatibility
+    // built-in varyings (gl_FrontColor/gl_Color, gl_FrontSecondaryColor/
+    // gl_SecondaryColor, gl_TexCoord[], gl_FogFragCoord) that GLSL ES 3.00 removed.
+    // Rewrite them to user in/out varyings with matching names across stages so the
+    // program links. Order matters: do gl_FrontSecondaryColor before gl_SecondaryColor
+    // and the Front* before the bare reads.
+    auto rewriteFFPVaryings = [&](){
+        wordReplace("gl_FrontSecondaryColor", "bw_secondary");
+        wordReplace("gl_BackSecondaryColor",  "bw_secondary");
+        wordReplace("gl_SecondaryColor",      "bw_secondary");
+        wordReplace("gl_FrontColor",          "bw_color");
+        wordReplace("gl_BackColor",           "bw_color");
+        wordReplace("gl_Color",               "bw_color");
+        wordReplace("gl_TexCoord",            "bw_texcoord");
+        wordReplace("gl_FogFragCoord",        "bw_fogcoord");
+    };
+    bool usesColor     = src.find("gl_Color") != std::string::npos || src.find("gl_FrontColor") != std::string::npos || src.find("gl_BackColor") != std::string::npos;
+    bool usesSecondary = src.find("gl_SecondaryColor") != std::string::npos || src.find("gl_FrontSecondaryColor") != std::string::npos || src.find("gl_BackSecondaryColor") != std::string::npos;
+    bool usesTexCoord  = src.find("gl_TexCoord") != std::string::npos;
+    bool usesFog       = src.find("gl_FogFragCoord") != std::string::npos;
+
     if (isFragment) {
-        // varying (in) + a single declared fragment output replacing gl_FragColor /
-        // gl_FragData[0]. (wined3d's simple shaders write only attachment 0.)
+        // varying → in; legacy FFP built-ins → user `in` varyings.
         wordReplace("varying", "in");
+        rewriteFFPVaryings();
         bool usesFragData  = src.find("gl_FragData")  != std::string::npos;
         bool usesFragColor = src.find("gl_FragColor") != std::string::npos;
-        // gl_FragData[0] -> bw_FragColor ; gl_FragColor -> bw_FragColor
         for (size_t p; (p = src.find("gl_FragData[0]")) != std::string::npos; )
             src.replace(p, std::string("gl_FragData[0]").size(), "bw_FragColor");
         wordReplace("gl_FragColor", "bw_FragColor");
         std::string header = "#version 300 es\nprecision highp float;\nprecision highp int;\n";
+        if (usesColor)     header += "in vec4 bw_color;\n";
+        if (usesSecondary) header += "in vec4 bw_secondary;\n";
+        if (usesTexCoord)  header += "in vec4 bw_texcoord[8];\n";
+        if (usesFog)       header += "in float bw_fogcoord;\n";
         if (usesFragData || usesFragColor) header += "out vec4 bw_FragColor;\n";
         src = header + src;
     } else {
-        // vertex: attribute -> in, varying -> out.
+        // vertex: attribute → in, varying → out; legacy FFP built-ins → user `out`.
         wordReplace("attribute", "in");
         wordReplace("varying", "out");
+        rewriteFFPVaryings();
         std::string header = "#version 300 es\nprecision highp float;\nprecision highp int;\n";
+        if (usesColor)     header += "out vec4 bw_color;\n";
+        if (usesSecondary) header += "out vec4 bw_secondary;\n";
+        if (usesTexCoord)  header += "out vec4 bw_texcoord[8];\n";
+        if (usesFog)       header += "out float bw_fogcoord;\n";
         src = header + src;
     }
     return src;
@@ -1082,11 +1111,6 @@ U64 gl64Bridge(CPU64* cpu, U64 fnId, U64 argsAddr) {
                     default: count = 1; break;
                 }
                 cpu->memory->memcpyToGuest(args.a[1], v, sizeof(GLint) * count);
-                // One-shot log of the first ~40 distinct pname/value pairs so we can
-                // see what wined3d queries and whether it gets sane caps.
-                static std::atomic<int> logged{0};
-                if (logged.fetch_add(1) < 40)
-                    klog_fmt("gl64 GETINT pname=0x%04x -> %d", pname, v[0]);
             }
             return 0;
         }
@@ -1658,8 +1682,6 @@ U64 gl64Bridge(CPU64* cpu, U64 fnId, U64 argsAddr) {
         case GL64_fn_glDrawArrays:
             if (g_glContext) {
                 GLenum mode=(GLenum)ai(args,0); GLint first=(GLint)ai(args,1); GLsizei count=(GLsizei)ai(args,2);
-                static std::atomic<bool> once{false};
-                if (!once.exchange(true)) klog_fmt("gl64 DRAW: first glDrawArrays mode=0x%x count=%d", mode, count);
                 glOnMain([&]{ if (g_emFbo) glBindFramebuffer(GL_FRAMEBUFFER, g_emFbo);
                               glDrawArrays(mode, first, count); });
                 g_glDrew = true;
