@@ -85,7 +85,21 @@ void mainloop() {
                             if (GL.currentContextIsProxied ||
                                 !GL.currentContext ||
                                 typeof GL.currentContext !== 'object') return;
-                            return orig.apply(this, arguments);
+                            // Our gl64 WebGL2 context is created via
+                            // emscripten_webgl_create_context (NOT the SDL/Browser
+                            // path), so glemu's per-context temp-vertex-buffer arrays
+                            // don't exist on it. When a wined3d GLSL draw leaves OUR
+                            // context current, orig() then does
+                            // `currentContext.tempVertexBufferCounters1[i]=0` →
+                            // "Cannot read/set properties of undefined", which throws
+                            // out of the main loop and DEADLOCKS every later glOnMain
+                            // (the D3D Present stall: one draw, then total silence).
+                            // Bail when those arrays are absent.
+                            if (!GL.currentContext.tempVertexBufferCounters1) return;
+                            // Belt-and-suspenders: never let a throw from glemu's
+                            // frame hook escape the main loop (that would deadlock
+                            // every glOnMain forever).
+                            try { return orig.apply(this, arguments); } catch (e) {}
                         };
                         GL.newRenderingFrameStarted.__bw64Patched = true;
                     }

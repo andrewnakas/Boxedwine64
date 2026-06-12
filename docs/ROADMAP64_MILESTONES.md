@@ -103,26 +103,37 @@ them.
     second one mid-source that re-started the shader and dropped the precision
     line). Result: shader COMPILE/LINK errors = 0; the D3D `glDrawArrays
     GL_TRIANGLES,3` fires.
-  - **NEW FINAL BLOCKER — the Present stall.** With everything above, the guest
-    runs `device created OK` → `entering render loop` → ONE `glDrawArrays` → then
-    STALLS: no second draw, no frame, no more GL traps at all, canvas stays at the
-    window-chrome image (no triangle, not even the clear). Instrumented: the
-    draw's glOnMain RETURNS (not a draw deadlock; it does leave a benign leftover
-    GL_INVALID_ENUM). Crucially, **wined3d's `Present()` does NOT call
-    `glXSwapBuffers`** (fnId 14 never traps after the draw) — so our
-    readbackAndPresent never runs, and the guest hangs in wined3d's non-GL present
-    path (a GDI/blit or wineserver round-trip). This is the last thing between
-    here and a rendered triangle.
-  - **RESUME PATH:** find how wined3d presents this swapchain without
-    glXSwapBuffers — likely a `wined3d_texture` blit to the window via GDI
-    (BitBlt/StretchDIBits through the X11 wire) or an internal readback that
-    deadlocks against our single present-sink/main-thread. Trace the guest after
-    the draw with a non-GL probe (what syscall/wineserver call it blocks on);
-    candidate fixes: implement whatever GL/blit entry point wined3d's present uses,
-    or make `D3DSWAPEFFECT_COPY`/windowed present route through glXSwapBuffers.
-    Also try the StretchRect/`Present`-to-`glReadPixels` path. The leftover
-    GL_INVALID_ENUM (from a vertex-attrib/VAO setup enum) is worth clearing too.
-    glcube still renders (immediate-mode path unaffected); selftest 234/234.
+  - **NEW FINAL BLOCKER — Present() hangs (PINPOINTED).** With everything above,
+    the render loop runs and per-call d3dtri logging shows: `Clear` ✓ →
+    `BeginScene` ✓ → `DrawPrimitive` ✓ (the one `glDrawArrays` fires) → `EndScene`
+    ✓ → **`Present...` → HANGS** (the matching "Present DONE" never prints; total
+    silence after — no X11 wire, no wineserver, no GL trap of any kind). So
+    `IDirect3DDevice9_Present` blocks forever inside wined3d. Key facts: wined3d's
+    Present does NOT call our `glXSwapBuffers` (a real wrapper + in the proc table,
+    so it WOULD trap) — it presents this windowed `D3DSWAPEFFECT_DISCARD` swapchain
+    some other way and blocks BEFORE any GL/blit. The draw's glOnMain returns fine
+    and leaves only a benign leftover GL_INVALID_ENUM. Tried (didn't fix): guarding
+    + try/catch-wrapping glemu's `newRenderingFrameStarted` main-loop hook (it
+    throws on our gl64 context, a real latent deadlock source, but not THIS one).
+    So the hang is a wineserver/window-system round-trip in wined3d's present path
+    that never completes — a wine-threading deadlock, the last thing between here
+    and a rendered triangle.
+  - **RESUME PATH (Present hang):** the hang is inside `IDirect3DDevice9_Present`,
+    after EndScene, with NO GL call. Next session: attach a guest-side syscall/
+    wineserver trace (e.g. strace-style logging in syscall64.cpp gated to the
+    d3dtri pid, or BW64 logging in the wineserver IPC path) to capture WHAT the
+    Present thread blocks on — almost certainly a wineserver request waiting for a
+    reply the main thread should service but doesn't (classic main-thread-busy /
+    present-sink deadlock, same family as M0). Candidate fixes once the blocking
+    call is known: (a) ensure tickXWirePresent/the main loop keeps servicing
+    wineserver+X11 while a guest thread blocks in Present; (b) if wined3d does a
+    GDI StretchBlt/BitBlt of the backbuffer, implement that X11 path; (c) try a
+    different swapchain config (windowed `D3DSWAPEFFECT_COPY`, or
+    `D3DPRESENT_DONOTWAIT`, or no `D3DCREATE_*` vsync) to dodge a frame-wait. Also
+    clear the benign leftover GL_INVALID_ENUM (a vertex-attrib/VAO setup enum).
+    glcube still renders (immediate-mode path unaffected); selftest 234/234. The
+    whole front of the D3D pipeline (device, GLSL shaders, draw) is solid — only
+    Present remains.
 - **2026-06-11 — M17 EVALUATED (winetricks): NO-GO for the script itself; the
   native verb-subset is the realistic path.** The user asked to bring up
   winetricks after D3D. Findings:

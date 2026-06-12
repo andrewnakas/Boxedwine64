@@ -83,17 +83,26 @@ static int initD3D(HWND hwnd) {
     return 1;
 }
 
+static int g_frame = 0;
 static void render(void) {
     if (!g_dev) return;
+    int first = (g_frame < 3);
+    if (first) dbg("d3dtri: render: Clear...\n");
     IDirect3DDevice9_Clear(g_dev, 0, NULL, D3DCLEAR_TARGET | D3DCLEAR_ZBUFFER,
         D3DCOLOR_XRGB(0, 40, 100), 1.0f, 0);   // dark blue background
+    if (first) dbg("d3dtri: render: BeginScene...\n");
     if (SUCCEEDED(IDirect3DDevice9_BeginScene(g_dev))) {
         IDirect3DDevice9_SetStreamSource(g_dev, 0, g_vb, 0, sizeof(CUSTOMVERTEX));
         IDirect3DDevice9_SetFVF(g_dev, D3DFVF_CUSTOMVERTEX);
+        if (first) dbg("d3dtri: render: DrawPrimitive...\n");
         IDirect3DDevice9_DrawPrimitive(g_dev, D3DPT_TRIANGLELIST, 0, 1);
+        if (first) dbg("d3dtri: render: EndScene...\n");
         IDirect3DDevice9_EndScene(g_dev);
     }
+    if (first) dbg("d3dtri: render: Present...\n");
     IDirect3DDevice9_Present(g_dev, NULL, NULL, NULL, NULL);
+    if (first) dbg("d3dtri: render: Present DONE\n");
+    g_frame++;
 }
 
 int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR cmd, int show) {
