@@ -65,6 +65,7 @@ self-contained sessions. Each iteration:
 | M14 | X drawing primitives | Implement the core X line/rect drawing requests (PolySegment 65, PolyRectangle 66, PolyLine 64, PolyPoint 63, FillPoly 69) into the window framebuffer — the gap behind graph/border-drawing apps | Draw-primitive app shows lines/borders in-browser, no regression, selftest unaffected | DONE — implemented + browser-verified 2026-06-11 (regedit's tree/border lines render crisp via the new primitives, no regression; selftest 234/234). Also fixed a latent PolyFillRectangle no-op. taskmgr re-triaged: its blocker is a deeper wine null-function stub, NOT drawing |
 | M13 | Gecko / .NET (evaluate) | Upstream item: wine-gecko (HTML dialogs) and wine-mono (.NET apps) payloads — weigh ~50–80MB payloads + JIT-under-interpreter cost | A trivial .NET WinForms exe runs, or a written descope rationale (payload/perf numbers) | EVALUATED → NO-GO (2026-06-11): no mono/gecko in rootfs; ~50-80MB payload + JIT-in-interpreter cold-start. Rationale in Log |
 | M16 | Direct3D (wined3d → WebGL2) | Bring up the D3D path: extend the gl64 bridge from fixed-function-only to the full programmable pipeline (shaders, VBOs, vertex attribs, modern state, textures) so wined3d can render D3D apps via WebGL2 | A D3D9 app renders its 3D output (not black) in-browser | IN PROGRESS (2026-06-11) — programmable-pipeline GL bridge + GLSL-ES transpiler built & verified (glcube unregressed, selftest 234/234, D3D9 device path reaches GL: shaders compile+link clean, full pipeline incl. glDrawArrays fires). BLOCKED on wined3d `CreateDevice` returning `D3DERR_NOTAVAILABLE` (a cap rejection; this wined3d.dll has no debug channels so the exact check is opaque). Resume path in the Log |
+| M17 | winetricks (evaluate) | Bring up winetricks (the wine helper that installs redistributables/DLL-overrides/fonts) in the WASM build, or get a useful subset working | winetricks runs a verb in-browser, or a written go/no-go with the technical blocker + the achievable native subset | EVALUATED → NO-GO for the script; native verb-subset is the path (2026-06-11). winetricks is a ~14k-line bash script needing a POSIX shell + coreutils + wget/curl + cabextract + internet — NONE exist in the rootfs (no shell at all; no socket egress in-browser). Its USEFUL actions (DLL overrides, registry tweaks) ARE achievable natively without it. Assessment + mechanism in the Log |
 
 Suggested order = table order. M1 early on purpose: it protects every later
 milestone. M11–M13 are evaluation milestones — a rigorous written no-go closes
@@ -74,6 +75,38 @@ them.
 
 ## Log
 
+- **2026-06-11 — M17 EVALUATED (winetricks): NO-GO for the script itself; the
+  native verb-subset is the realistic path.** The user asked to bring up
+  winetricks after D3D. Findings:
+  - **winetricks cannot run as-is.** It's a single ~14,000-line POSIX/bash shell
+    script (github.com/Winetricks/winetricks). It needs, none of which exist in
+    this rootfs: (1) a **POSIX shell** — exhaustive grep of all three zips found NO
+    bash/sh/dash/busybox at all (the rootfs is purely wine64 + its libs; `usr/bin`
+    is empty); (2) **coreutils** (cp/mkdir/sort/sed/grep/…) — absent; (3) a
+    **downloader** (wget/curl) — absent; (4) **cabextract / 7z / unzip** to unpack
+    the redistributables it fetches — absent; (5) **internet egress** — the WASM
+    build runs in the browser sandbox with no outbound TCP (Boxedwine has socket
+    code, but there's no real network path to the redistributable mirrors).
+    Supplying all of that = adding a whole Linux userland + a network shim, far
+    beyond a bring-up task; and even then the downloads can't reach the internet.
+  - **The USEFUL subset is achievable natively, without winetricks.** What people
+    actually use winetricks for is mostly (a) **DLL overrides** (force a DLL to
+    native/builtin/disabled) and (b) **registry tweaks**, plus (c) bundling a
+    redistributable DLL/font. All three are doable here with NO shell and NO
+    network: the prefix already carries wine's text registry
+    (`home/username/.wine/system.reg` + `user.reg`), and `reg.exe` / `regedit.exe`
+    / `rundll32.exe` are in the rootfs (regedit even renders in-browser, per M9).
+    So a "winetricks-lite" is: append the verb's registry keys to `user.reg` at
+    prefix-build time (build-prefix64.sh), e.g. a DLL override under
+    `[Software\\Wine\\DllOverrides]` (`"d3dx9_43"="native,builtin"`), and stage any
+    bundled DLL/font into drive_c — exactly the pattern we already use to bundle
+    games/apps. wine reads it on boot; no script, no download, no shell.
+  - **Recommendation / resume path:** don't port the script. When a specific app
+    needs a verb, add it as a prefix-build registry edit (or ship the override +
+    DLL in the rootfs). If a generic mechanism is ever wanted, a tiny in-page
+    "apply override" button could write the `.wine/.../user.reg` key via the same
+    HOME-write path the clipboard/persistence bridges use, then relaunch. Genuine
+    descope of the script; the native subset covers the real need.
 - **2026-06-11 — M16 IN PROGRESS (Direct3D via wined3d → WebGL2): the
   programmable-pipeline GL bridge is built & verified; D3D9 reaches GL and
   compiles shaders; blocked on a wined3d `CreateDevice` cap rejection.**
