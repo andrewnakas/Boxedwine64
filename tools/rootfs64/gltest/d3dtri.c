@@ -50,6 +50,8 @@ static int initD3D(HWND hwnd) {
     pp.BackBufferFormat = D3DFMT_UNKNOWN;
     pp.EnableAutoDepthStencil = TRUE;
     pp.AutoDepthStencilFormat = D3DFMT_D16;
+    // Dodge any vsync/frame-wait in Present (the windowed-present hang probe).
+    pp.PresentationInterval = D3DPRESENT_INTERVAL_IMMEDIATE;
 
     HRESULT hr = IDirect3D9_CreateDevice(g_d3d, D3DADAPTER_DEFAULT, D3DDEVTYPE_HAL,
         hwnd, D3DCREATE_SOFTWARE_VERTEXPROCESSING, &pp, &g_dev);

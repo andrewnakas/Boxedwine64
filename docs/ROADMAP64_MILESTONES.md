@@ -118,22 +118,24 @@ them.
     So the hang is a wineserver/window-system round-trip in wined3d's present path
     that never completes — a wine-threading deadlock, the last thing between here
     and a rendered triangle.
-  - **RESUME PATH (Present hang):** the hang is inside `IDirect3DDevice9_Present`,
-    after EndScene, with NO GL call. Next session: attach a guest-side syscall/
-    wineserver trace (e.g. strace-style logging in syscall64.cpp gated to the
-    d3dtri pid, or BW64 logging in the wineserver IPC path) to capture WHAT the
-    Present thread blocks on — almost certainly a wineserver request waiting for a
-    reply the main thread should service but doesn't (classic main-thread-busy /
-    present-sink deadlock, same family as M0). Candidate fixes once the blocking
-    call is known: (a) ensure tickXWirePresent/the main loop keeps servicing
-    wineserver+X11 while a guest thread blocks in Present; (b) if wined3d does a
-    GDI StretchBlt/BitBlt of the backbuffer, implement that X11 path; (c) try a
-    different swapchain config (windowed `D3DSWAPEFFECT_COPY`, or
-    `D3DPRESENT_DONOTWAIT`, or no `D3DCREATE_*` vsync) to dodge a frame-wait. Also
-    clear the benign leftover GL_INVALID_ENUM (a vertex-attrib/VAO setup enum).
-    glcube still renders (immediate-mode path unaffected); selftest 234/234. The
-    whole front of the D3D pipeline (device, GLSL shaders, draw) is solid — only
-    Present remains.
+  - **RESUME PATH (Present hang) — narrowed hard this session:** ruled OUT, with
+    evidence: it is NOT vsync (`D3DPRESENT_INTERVAL_IMMEDIATE` still hangs); NOT
+    our readback (wined3d's Present makes NO `glXSwapBuffers` call → our
+    `readbackAndPresent` never runs — SWAP#/RBP# probes never fired); NOT (solely)
+    the glemu frame hook (guarded + try/catch, still hangs). A main-loop heartbeat
+    proved the loop runs exactly ONE more iteration after `Present...` then DIES —
+    so `IDirect3DDevice9_Present` blocks on the guest thread in wined3d's own
+    wineserver/window code (no GL at all) AND that also wedges the main loop:
+    a **lock-ordering deadlock between the guest Present thread and the main
+    loop** (the M0 family). NEXT SESSION: instrument the wineserver IPC / syscall
+    layer (syscall64.cpp futex/select/wineserver-request path, gated to the
+    d3dtri pid) to capture the exact wait both sides are stuck on, then fix the
+    lock ordering (likely: make the main loop's tickXWirePresent / processEvents
+    not hold a lock the guest Present thread needs, or vice-versa). The benign
+    leftover GL_INVALID_ENUM (a vertex-attrib/VAO setup enum) is worth clearing
+    too. glcube still renders (immediate-mode path unaffected); selftest 234/234.
+    The whole front of the D3D pipeline (device, GLSL shaders, draw) is solid —
+    only Present remains, and it is a wineserver-threading deadlock, not a GL gap.
 - **2026-06-11 — M17 EVALUATED (winetricks): NO-GO for the script itself; the
   native verb-subset is the realistic path.** The user asked to bring up
   winetricks after D3D. Findings:
