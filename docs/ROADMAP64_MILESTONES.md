@@ -118,24 +118,35 @@ them.
     So the hang is a wineserver/window-system round-trip in wined3d's present path
     that never completes — a wine-threading deadlock, the last thing between here
     and a rendered triangle.
-  - **RESUME PATH (Present hang) — narrowed hard this session:** ruled OUT, with
-    evidence: it is NOT vsync (`D3DPRESENT_INTERVAL_IMMEDIATE` still hangs); NOT
-    our readback (wined3d's Present makes NO `glXSwapBuffers` call → our
-    `readbackAndPresent` never runs — SWAP#/RBP# probes never fired); NOT (solely)
-    the glemu frame hook (guarded + try/catch, still hangs). A main-loop heartbeat
-    proved the loop runs exactly ONE more iteration after `Present...` then DIES —
-    so `IDirect3DDevice9_Present` blocks on the guest thread in wined3d's own
-    wineserver/window code (no GL at all) AND that also wedges the main loop:
-    a **lock-ordering deadlock between the guest Present thread and the main
-    loop** (the M0 family). NEXT SESSION: instrument the wineserver IPC / syscall
-    layer (syscall64.cpp futex/select/wineserver-request path, gated to the
-    d3dtri pid) to capture the exact wait both sides are stuck on, then fix the
-    lock ordering (likely: make the main loop's tickXWirePresent / processEvents
-    not hold a lock the guest Present thread needs, or vice-versa). The benign
-    leftover GL_INVALID_ENUM (a vertex-attrib/VAO setup enum) is worth clearing
-    too. glcube still renders (immediate-mode path unaffected); selftest 234/234.
-    The whole front of the D3D pipeline (device, GLSL shaders, draw) is solid —
-    only Present remains, and it is a wineserver-threading deadlock, not a GL gap.
+  - **RESUME PATH (Present hang) — narrowed VERY hard this session; it's a
+    busy-spin or an exotic condition-wait, NOT any standard wait.** Pinpointed:
+    d3dtri per-call logging shows Clear/BeginScene/DrawPrimitive/EndScene all OK,
+    then `IDirect3DDevice9_Present()` HANGS (no "Present DONE"; total silence
+    after). A main-loop heartbeat proved the loop runs exactly ONE more iteration
+    after `Present...` then DIES. Then I instrumented EVERY plausible block point
+    and the Present thread hits NONE of them after Present: NOT a unix-socket read
+    (wineserver IPC — `USOCK-WAIT` 0 after present), NOT a 32-bit futex park, NOT a
+    64-bit futex park (indefinite OR timed) — all `FUTEX*-PARK/TIMED` 0 after
+    present, NOT a GL call / `glOnMain` hop (`GLTRAP`/`glOnMain ENTER/EXIT` 0 after
+    present, so it's not blocked waiting on the dead main thread for GL either).
+    Also ruled out: vsync (`D3DPRESENT_INTERVAL_IMMEDIATE` still hangs), our
+    readback (no `glXSwapBuffers` trap), the glemu frame hook (guarded+try/catch).
+    => The Present thread is NOT parked on any kernel wait primitive. It is either
+    (a) **busy-spinning** on a guest memory flag that never flips (wined3d/wineserver
+    sometimes spin-waits) while pegging a core + holding contention that wedges the
+    main loop, or (b) blocked in a `BOXEDWINE_CONDITION_WAIT` site I did not
+    instrument (ksignal/kevent/kpoll/ksystem — there are ~dozen). NEXT SESSION:
+    (1) add a guest **RIP sampler** for the d3dtri Present thread (there's a
+    ripSampler.cpp) to see WHERE in wined3d/ntdll it spins/loops — that names the
+    exact poll/wait; (2) failing that, instrument the remaining
+    BOXEDWINE_CONDITION_WAIT sites (grep them) the same throttled way. Once the
+    spin/wait target is known, the fix is to make whatever should flip that flag /
+    signal that condition actually run (likely the main loop must keep servicing
+    something while the Present thread spins). The benign leftover GL_INVALID_ENUM
+    (a vertex-attrib/VAO setup enum) is worth clearing too. glcube still renders;
+    selftest 234/234. The whole front of the D3D pipeline (device, GLSL shaders,
+    draw) is SOLID — only Present remains, and it is an unusual spin/wait deadlock,
+    not a GL gap.
 - **2026-06-11 — M17 EVALUATED (winetricks): NO-GO for the script itself; the
   native verb-subset is the realistic path.** The user asked to bring up
   winetricks after D3D. Findings:
