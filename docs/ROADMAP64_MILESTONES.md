@@ -96,17 +96,29 @@ them.
     longer disables it. Reverted the key. (NB: this DID exercise the M17 native
     registry-verb mechanism end-to-end — the edit applied cleanly; wine just
     ignores csmt now.)
-  - **RESUME (next session):** the deadlock is inside wined3d's CS-thread
-    synchronization — read each of the 3 d3dtri threads' EXACT wait with the
-    force-enabled RIP sampler (resolve their distinct RIPs to wined3d/ntdll
-    symbols, not just the shared libc park point) to see the main↔CS wait pair;
-    then either (a) find the wine-side event/APC that should wake the CS thread and
-    why our wineserver/kernel doesn't deliver it, or (b) check whether wined3d's CS
-    thread is itself waiting on `glOnMain`/the main thread in a way that circular-
-    waits with tid 39's Present. A full-symbol ntdll/wined3d + the per-thread RIP
-    is the key missing data. The whole FRONT (device, GLSL shaders, draw) is SOLID;
-    only this wined3d threading deadlock remains. glcube unregressed; selftest
-    234/234.
+  - **PER-THREAD RIP READ (this session): all 3 d3dtri threads are blocked at the
+    SAME libc wait-syscall stub; RIP-only sampling can't see the wine-level caller.**
+    Force-enabled the RIP sampler + heartbeat and read the final per-thread state at
+    the hang: d3dtri (pid 38) tid 39/40/41 are ALL at `libc.so.6+0xd22ec`, dIns=0 —
+    the generic glibc futex/wait syscall wrapper that EVERY blocked thread parks at
+    (pid 22's idle threads sit at the same 0xd22ec). The only ACTIVE thread is
+    pid 14 tid 15 (a wineserver/wine thread) idle-POLLING (~386 insns/tick at
+    `0x700108ef3`, occasional bursts into the guest image 0x400000000+ and libc) —
+    healthy, not stuck. So the system (main loop, wineserver, pid 14) is alive and
+    idle; only d3dtri's 3 threads are parked in a wait syscall for a wakeup nobody
+    delivers. CONCLUSION: RIP-only sampling has hit its limit — all blocked threads
+    show the libc syscall boundary, NOT the wined3d/ntdll function that called the
+    wait. The next probe must be a **guest STACK BACKTRACE** (walk the RBP chain
+    from the blocked RIP) resolved against wined3d/ntdll, to name the wine-level
+    wait (an event/critical-section/APC the CS thread expects). 
+  - **RESUME (next session):** (1) add a guest-stack-backtrace dump for a chosen
+    blocked thread (RBP-chain walk in the sampler or a one-shot SIGUSR-style probe)
+    + full-symbol wined3d.dll/ntdll.so so the frames resolve — this names the exact
+    wined3d wait. (2) Then find the wine event/APC that should wake the CS thread
+    and why our wineserver/kernel doesn't deliver it (cross-thread APC nudge is a
+    known fragile area — see the cpu64 deliverPendingSignals comment in
+    kthread.cpp). The whole FRONT (device, GLSL shaders, draw) is SOLID; only this
+    wined3d threading deadlock remains. glcube unregressed; selftest 234/234.
 - **2026-06-11 — M16 UPDATE #3 (D3D Present hang): MAJOR CORRECTION — the main
   loop is ALIVE; Present blocks in a libc wait having sent NO X request / GL call
   / socket / futex.** Continued narrowing the Present() deadlock and overturned a
