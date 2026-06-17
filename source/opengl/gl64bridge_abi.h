@@ -241,6 +241,31 @@ enum {
     GL64_fn_glGetStringi = 590,         // (name, index) -> const char* (returns 0; guest stub)
     GL64_fn_glGetShaderSource,          // (shader, bufSize, out length*, out source*) — rarely used
 
+    // --- ARB_sync (fence objects). wined3d's Present/flush path issues a fence
+    //     then polls glClientWaitSync until signaled. We render synchronously, so
+    //     a fence is always already-done; returning a non-null sync + an
+    //     ALREADY_SIGNALED wait result unblocks the Present busy-wait. ---
+    GL64_fn_glFenceSync = 600,          // (condition, flags) -> GLsync (opaque non-null id)
+    GL64_fn_glClientWaitSync,           // (sync, flags, timeout) -> GLenum (ALREADY_SIGNALED)
+    GL64_fn_glWaitSync,                 // (sync, flags, timeout) -> void (server-side; no-op)
+    GL64_fn_glDeleteSync,               // (sync) -> void
+    GL64_fn_glIsSync,                   // (sync) -> GLboolean
+    GL64_fn_glGetSynciv,                // (sync, pname, bufSize, out length*, out values*) -> reports SIGNALED
+
+    // --- occlusion / timer queries. wined3d uses these for occlusion + event
+    //     queries; returning result-available=1 and a benign result keeps its
+    //     query state machine from stalling. ---
+    GL64_fn_glGenQueries = 610,         // (n, out ids*)
+    GL64_fn_glDeleteQueries,            // (n, ids*)
+    GL64_fn_glIsQuery,                  // (id) -> GLboolean
+    GL64_fn_glBeginQuery,               // (target, id)
+    GL64_fn_glEndQuery,                 // (target)
+    GL64_fn_glGetQueryiv,               // (target, pname, out params*)
+    GL64_fn_glGetQueryObjectiv,         // (id, pname, out params*)
+    GL64_fn_glGetQueryObjectuiv,        // (id, pname, out params*)
+    GL64_fn_glGetQueryObjectui64v,      // (id, pname, out params* (64-bit))
+    GL64_fn_glQueryCounter,             // (id, target)
+
     GL64_fn__MAX
 };
 

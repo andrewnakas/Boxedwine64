@@ -201,7 +201,27 @@ enum {
     GL64_fn_glCompressedTexImage2D,
 
     GL64_fn_glGetStringi = 590,
-    GL64_fn_glGetShaderSource
+    GL64_fn_glGetShaderSource,
+
+    // ARB_sync (must match source/opengl/gl64bridge_abi.h)
+    GL64_fn_glFenceSync = 600,
+    GL64_fn_glClientWaitSync,
+    GL64_fn_glWaitSync,
+    GL64_fn_glDeleteSync,
+    GL64_fn_glIsSync,
+    GL64_fn_glGetSynciv,
+
+    // occlusion / timer queries
+    GL64_fn_glGenQueries = 610,
+    GL64_fn_glDeleteQueries,
+    GL64_fn_glIsQuery,
+    GL64_fn_glBeginQuery,
+    GL64_fn_glEndQuery,
+    GL64_fn_glGetQueryiv,
+    GL64_fn_glGetQueryObjectiv,
+    GL64_fn_glGetQueryObjectuiv,
+    GL64_fn_glGetQueryObjectui64v,
+    GL64_fn_glQueryCounter
 };
 
 // ---- the trap ---------------------------------------------------------------
@@ -636,6 +656,48 @@ API const GLubyte* glGetStringi(GLenum name, GLuint index){
     return (const GLubyte*)"";
 }
 
+// --- ARB_sync (fence objects) ---------------------------------------------
+// wined3d's Present/flush issues a fence then polls glClientWaitSync until it
+// reports signaled. Our GL work is synchronous (glOnMain), so the host reports
+// ALREADY_SIGNALED immediately, ending wined3d's wait loop. GLsync is an opaque
+// pointer; we round-trip the host handle through a uint64_t.
+typedef void* GLsync_t;
+API GLsync_t glFenceSync(GLenum condition, GLbitfield flags){
+    GL64Args a={{0}}; a.a[0]=condition; a.a[1]=flags;
+    return (GLsync_t)(uintptr_t)gl64_trap(GL64_fn_glFenceSync,&a);
+}
+API GLenum glClientWaitSync(GLsync_t sync, GLbitfield flags, uint64_t timeout){
+    GL64Args a={{0}}; a.a[0]=(uint64_t)(uintptr_t)sync; a.a[1]=flags; a.a[2]=timeout;
+    return (GLenum)gl64_trap(GL64_fn_glClientWaitSync,&a);
+}
+API void glWaitSync(GLsync_t sync, GLbitfield flags, uint64_t timeout){
+    GL64Args a={{0}}; a.a[0]=(uint64_t)(uintptr_t)sync; a.a[1]=flags; a.a[2]=timeout;
+    (void)gl64_trap(GL64_fn_glWaitSync,&a);
+}
+API void glDeleteSync(GLsync_t sync){
+    GL64Args a={{0}}; a.a[0]=(uint64_t)(uintptr_t)sync; (void)gl64_trap(GL64_fn_glDeleteSync,&a);
+}
+API GLboolean glIsSync(GLsync_t sync){
+    GL64Args a={{0}}; a.a[0]=(uint64_t)(uintptr_t)sync; return (GLboolean)gl64_trap(GL64_fn_glIsSync,&a);
+}
+API void glGetSynciv(GLsync_t sync, GLenum pname, GLsizei bufSize, GLsizei* length, GLint* values){
+    GL64Args a={{0}}; a.a[0]=(uint64_t)(uintptr_t)sync; a.a[1]=pname; a.a[2]=(uint64_t)(uint32_t)bufSize;
+    a.a[3]=(uint64_t)(uintptr_t)length; a.a[4]=(uint64_t)(uintptr_t)values;
+    (void)gl64_trap(GL64_fn_glGetSynciv,&a);
+}
+
+// --- occlusion / timer queries --------------------------------------------
+API void glGenQueries(GLsizei n, GLuint* ids){ GL64Args a={{0}}; a.a[0]=(uint64_t)(uint32_t)n; a.a[1]=(uint64_t)(uintptr_t)ids; (void)gl64_trap(GL64_fn_glGenQueries,&a); }
+API void glDeleteQueries(GLsizei n, const GLuint* ids){ GL64Args a={{0}}; a.a[0]=(uint64_t)(uint32_t)n; a.a[1]=(uint64_t)(uintptr_t)ids; (void)gl64_trap(GL64_fn_glDeleteQueries,&a); }
+API GLboolean glIsQuery(GLuint id){ GL64Args a={{0}}; a.a[0]=id; return (GLboolean)gl64_trap(GL64_fn_glIsQuery,&a); }
+API void glBeginQuery(GLenum target, GLuint id){ GL64Args a={{0}}; a.a[0]=target; a.a[1]=id; (void)gl64_trap(GL64_fn_glBeginQuery,&a); }
+API void glEndQuery(GLenum target){ GL64Args a={{0}}; a.a[0]=target; (void)gl64_trap(GL64_fn_glEndQuery,&a); }
+API void glQueryCounter(GLuint id, GLenum target){ GL64Args a={{0}}; a.a[0]=id; a.a[1]=target; (void)gl64_trap(GL64_fn_glQueryCounter,&a); }
+API void glGetQueryiv(GLenum target, GLenum pname, GLint* params){ GL64Args a={{0}}; a.a[0]=target; a.a[1]=pname; a.a[2]=(uint64_t)(uintptr_t)params; (void)gl64_trap(GL64_fn_glGetQueryiv,&a); }
+API void glGetQueryObjectiv(GLuint id, GLenum pname, GLint* params){ GL64Args a={{0}}; a.a[0]=id; a.a[1]=pname; a.a[2]=(uint64_t)(uintptr_t)params; (void)gl64_trap(GL64_fn_glGetQueryObjectiv,&a); }
+API void glGetQueryObjectuiv(GLuint id, GLenum pname, GLuint* params){ GL64Args a={{0}}; a.a[0]=id; a.a[1]=pname; a.a[2]=(uint64_t)(uintptr_t)params; (void)gl64_trap(GL64_fn_glGetQueryObjectuiv,&a); }
+API void glGetQueryObjectui64v(GLuint id, GLenum pname, uint64_t* params){ GL64Args a={{0}}; a.a[0]=id; a.a[1]=pname; a.a[2]=(uint64_t)(uintptr_t)params; (void)gl64_trap(GL64_fn_glGetQueryObjectui64v,&a); }
+
 // ===========================================================================
 // glXGetProcAddressARB — opengl32/winex11 resolve every gl*/glX* through here.
 // Return our own wrapper for names we implement, or a harmless no-op stub for
@@ -689,6 +751,12 @@ static const struct procEntry g_procs[] = {
     E(glActiveTexture), E(glGenTextures), E(glBindTexture), E(glDeleteTextures),
     E(glTexParameteri), E(glTexParameterf), E(glTexImage2D), E(glTexSubImage2D),
     E(glGenerateMipmap), E(glCompressedTexImage2D), E(glGetStringi),
+    // --- ARB_sync + queries (wined3d Present/flush + occlusion) ---
+    E(glFenceSync), E(glClientWaitSync), E(glWaitSync), E(glDeleteSync),
+    E(glIsSync), E(glGetSynciv),
+    E(glGenQueries), E(glDeleteQueries), E(glIsQuery), E(glBeginQuery),
+    E(glEndQuery), E(glQueryCounter), E(glGetQueryiv), E(glGetQueryObjectiv),
+    E(glGetQueryObjectuiv), E(glGetQueryObjectui64v),
 };
 #undef E
 #define NPROCS (sizeof(g_procs)/sizeof(g_procs[0]))

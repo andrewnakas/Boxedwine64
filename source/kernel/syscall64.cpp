@@ -347,6 +347,34 @@ static void crashRingDump(const char* why) {
     }
 }
 
+// BW64_RIPSAMPLE module registration for PE DLLs.
+//
+// Modern wine ships its DLLs (wined3d.dll, d3d9.dll, ...) as native PE32+ files,
+// NOT winelib .so halves. wine's PE loader does NOT mmap those section bodies
+// from an fd — it `read()`/`pread()`s an entire section in one call into an
+// ANONYMOUS guest mapping (see the long comments in sys_read64/sys_pread64 about
+// "wine's PE loader reads whole multi-MB sections in one read()"). Because that
+// path never touches sys_mmap64_file, the PE image range is never handed to
+// ripSamplerNoteModule — so a sampled RIP inside wined3d.dll resolves to nothing
+// and any stack backtrace through it is blank. (The fd-mmap registration at
+// sys_mmap64_file only covers ELF .so DLLs and a PE's *header* page.)
+//
+// Fix: whenever a read/pread fills guest memory FROM a file whose path ends in a
+// PE image extension, register the destination range [dst, dst+len) under that
+// file's basename. Each section read registers its own slice; the newest-wins
+// resolver in ripSampler stitches them so an address in any section resolves to
+// "wined3d.dll+0xNNN". Gated by ripSamplerEnabled() — zero cost in normal runs.
+static void ripSamplerNotePeRead(CPU64* cpu, const KFileDescriptorPtr& fdesc,
+                                 U64 dst, U64 len) {
+    if (!ripSamplerEnabled() || len == 0 || !cpu->thread || !cpu->thread->process) return;
+    std::shared_ptr<KFile> kf = std::dynamic_pointer_cast<KFile>(fdesc->kobject);
+    if (!kf || !kf->openFile || !kf->openFile->node) return;
+    const BString& path = kf->openFile->node->path;
+    // Match PE images by extension (case-insensitive): .dll / .exe.
+    if (!path.endsWith(".dll", true) && !path.endsWith(".exe", true)) return;
+    ripSamplerNoteModule((int)cpu->thread->process->id, dst, len, path.c_str());
+}
+
 static U64 sys_write64(CPU64* cpu, U64 fd, U64 buf, U64 count) {
     if (count == 0) return 0;
     // Ceiling only (was a 1MB cap that silently truncated large writes for any
@@ -926,6 +954,9 @@ static U64 sys_read64(CPU64* cpu, U64 fd, U64 buf, U64 count) {
     }
     if (got > 0) {
         cpu->memory->memcpyToGuest(buf, tmp.data(), got);
+        // PE DLL section bodies arrive here (read-into-anonymous, not fd-mmap) —
+        // register the range so a sampled RIP resolves to wined3d.dll+off, etc.
+        ripSamplerNotePeRead(cpu, fdesc, buf, got);
     }
     if (wsSock) {
         size_t recvAfter = wsSock->debugRecvUsed();
@@ -1216,7 +1247,12 @@ static U64 sys_pread64(CPU64* cpu, U64 fd, U64 buf, U64 count, U64 offset) {
         got = readFully();
     }
     if (got < 0) return (U64)got;
-    if (got > 0) cpu->memory->memcpyToGuest(buf, tmp.data(), (U64)got);
+    if (got > 0) {
+        cpu->memory->memcpyToGuest(buf, tmp.data(), (U64)got);
+        // PE DLL section bodies arrive here too (the loader preads whole sections
+        // into anonymous guest memory) — register for RIP resolution.
+        ripSamplerNotePeRead(cpu, fdesc, buf, (U64)got);
+    }
     return (U64)got;
 }
 

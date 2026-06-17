@@ -1845,6 +1845,128 @@ U64 gl64Bridge(CPU64* cpu, U64 fnId, U64 argsAddr) {
             return 0; // guest wrapper returns "" itself
         case GL64_fn_glGetShaderSource:
             return 0; // not needed
+
+        // === ARB_sync ====================================================
+        // wined3d's Present/flush issues a fence then polls glClientWaitSync
+        // until it reports signaled. All our GL work runs synchronously on the
+        // main thread via glOnMain, so by the time the guest polls, the work is
+        // already done — report ALREADY_SIGNALED so the wait loop exits at once.
+        // We still create a REAL GLsync (so glGetSynciv/glIsSync are coherent),
+        // but never actually block.
+        case GL64_fn_glFenceSync: {
+            U64 ret = 0;
+            if (g_glContext) {
+                GLenum cond = (GLenum)ai(args,0); GLbitfield fl = (GLbitfield)ai(args,1);
+                GLsync s = 0;
+                GL_MT(s = glFenceSync(cond ? cond : GL_SYNC_GPU_COMMANDS_COMPLETE, fl));
+                ret = (U64)(uintptr_t)s;
+            }
+            // Never hand back 0 (guest treats null GLsync as failure → may spin).
+            if (!ret) ret = 0x1; // opaque non-null sentinel
+            return ret;
+        }
+        case GL64_fn_glClientWaitSync: {
+            // (sync, flags, timeout) -> GLenum. Always signaled for us.
+            if (g_glContext) {
+                GLsync s = (GLsync)(uintptr_t)ai(args,0);
+                // Flush so any pending commands are submitted, then report done.
+                if (s && (U64)(uintptr_t)s != 0x1) GL_MT(glFlush());
+            }
+            return 0x911A; // GL_ALREADY_SIGNALED
+        }
+        case GL64_fn_glWaitSync:
+            return 0; // server-side wait — nothing to do, never blocks
+        case GL64_fn_glDeleteSync: {
+            if (g_glContext) {
+                GLsync s = (GLsync)(uintptr_t)ai(args,0);
+                if (s && (U64)(uintptr_t)s != 0x1) GL_MT(glDeleteSync(s));
+            }
+            return 0;
+        }
+        case GL64_fn_glIsSync: {
+            GLsync s = (GLsync)(uintptr_t)ai(args,0);
+            return (s != 0) ? 1 : 0;
+        }
+        case GL64_fn_glGetSynciv: {
+            // (sync, pname, bufSize, length*, values*). Report SIGNALED status.
+            GLenum pname = (GLenum)ai(args,1);
+            GLsizei bufSize = (GLsizei)ai(args,2);
+            U64 lenAddr = args.a[3], valAddr = args.a[4];
+            U32 val = 0;
+            switch (pname) {
+                case 0x9114 /*GL_SYNC_STATUS*/:    val = 0x9119 /*GL_SIGNALED*/; break;
+                case 0x9112 /*GL_OBJECT_TYPE*/:    val = 0x9116 /*GL_SYNC_FENCE*/; break;
+                case 0x9113 /*GL_SYNC_CONDITION*/: val = 0x9117 /*GL_SYNC_GPU_COMMANDS_COMPLETE*/; break;
+                case 0x9115 /*GL_SYNC_FLAGS*/:     val = 0; break;
+                default: val = 0; break;
+            }
+            if (valAddr && bufSize >= 1) cpu->memory->writed(valAddr, val);
+            if (lenAddr) cpu->memory->writed(lenAddr, (bufSize >= 1) ? 1 : 0);
+            return 0;
+        }
+
+        // === occlusion / timer queries ===================================
+        // wined3d uses queries for occlusion + event/timestamp tracking. We
+        // create real query objects so begin/end are coherent, and report
+        // "result available" with a benign result so its state machine advances.
+        case GL64_fn_glGenQueries: {
+            if (g_glContext && args.a[1]) {
+                GLsizei n = (GLsizei)ai(args,0);
+                if (n > 0 && n <= 65536) {
+                    std::vector<GLuint> ids((size_t)n, 0); GLuint* p = ids.data();
+                    GL_MT(glGenQueries(n, p));
+                    cpu->memory->memcpyToGuest(args.a[1], ids.data(), (U64)n * 4);
+                }
+            }
+            return 0;
+        }
+        case GL64_fn_glDeleteQueries: {
+            if (g_glContext && args.a[1]) {
+                GLsizei n = (GLsizei)ai(args,0);
+                if (n > 0 && n <= 65536) {
+                    std::vector<GLuint> ids((size_t)n, 0);
+                    cpu->memory->memcpyFromGuest(ids.data(), args.a[1], (U64)n * 4);
+                    const GLuint* p = ids.data();
+                    GL_MT(glDeleteQueries(n, p));
+                }
+            }
+            return 0;
+        }
+        case GL64_fn_glIsQuery:
+            return (ai(args,0) != 0) ? 1 : 0;
+        case GL64_fn_glBeginQuery:
+            // Many wined3d query targets (TIMESTAMP, etc.) aren't valid in WebGL2;
+            // begin/end are best-effort and errors are swallowed by the GLERR path.
+            if (g_glContext) GL_MT(glBeginQuery((GLenum)ai(args,0), (GLuint)ai(args,1)));
+            return 0;
+        case GL64_fn_glEndQuery:
+            if (g_glContext) GL_MT(glEndQuery((GLenum)ai(args,0)));
+            return 0;
+        case GL64_fn_glQueryCounter:
+            return 0; // GL_TIMESTAMP — not in WebGL2; ignore
+        case GL64_fn_glGetQueryiv: {
+            // (target, pname, params*). GL_QUERY_COUNTER_BITS=0, current query=0.
+            if (args.a[2]) cpu->memory->writed(args.a[2], 0);
+            return 0;
+        }
+        case GL64_fn_glGetQueryObjectiv:
+        case GL64_fn_glGetQueryObjectuiv: {
+            // (id, pname, params*). Report RESULT_AVAILABLE=true and RESULT=0/1.
+            GLenum pname = (GLenum)ai(args,1);
+            U32 v = 0;
+            if (pname == 0x8867 /*GL_QUERY_RESULT_AVAILABLE*/) v = 1;
+            else if (pname == 0x8866 /*GL_QUERY_RESULT*/)      v = 1; // samples passed
+            if (args.a[2]) cpu->memory->writed(args.a[2], v);
+            return 0;
+        }
+        case GL64_fn_glGetQueryObjectui64v: {
+            GLenum pname = (GLenum)ai(args,1);
+            U64 v = 0;
+            if (pname == 0x8867 /*GL_QUERY_RESULT_AVAILABLE*/) v = 1;
+            else if (pname == 0x8866 /*GL_QUERY_RESULT*/)      v = 1;
+            if (args.a[2]) cpu->memory->writeq(args.a[2], v);
+            return 0;
+        }
 #endif // __EMSCRIPTEN__
 
         default:
