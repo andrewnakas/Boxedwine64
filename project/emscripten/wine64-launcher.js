@@ -151,7 +151,18 @@
             "HOME=" + PREFIX_HOME,
             "WINEPREFIX=" + PREFIX_WINE,
             "WINESERVER=" + WINESERVER64,
-            "WINEDLLPATH=/usr/lib/x86_64-linux-gnu/wine"
+            "WINEDLLPATH=/usr/lib/x86_64-linux-gnu/wine",
+            // Force wined3d's command stream SINGLE-THREADED (csmt=0). wined3d 8.0
+            // defaults CSMT on, which spawns a worker thread (wined3d_cs_run) and
+            // makes Present() submit to a queue + spin until the worker drains it.
+            // On our backend that worker never ran for the render process, so
+            // Present() busy-waited forever (no GL emitted). WINE_D3D_CONFIG is read
+            // directly by wined3d's DllMain (wined3d_main.c) and overrides the
+            // registry, so it takes effect even where the prefix's HKCU csmt value
+            // doesn't reach wined3d. With csmt=0 wined3d uses the inline st ops:
+            // Present runs glClear/glDrawArrays/SwapBuffers synchronously on the
+            // calling thread — no worker thread to wait on.
+            "WINE_D3D_CONFIG=csmt=0x0"
         ];
         // TEMP D3D bring-up: ?winedbg=<channels> sets WINEDEBUG for the reload
         // (?session=0) path so we can see loaddll/d3d failures. Remove before ship.

@@ -181,6 +181,20 @@ public:
     // one stale frame).
     uint32_t glPresentDrawable = 0;
 
+    // GLXWindow XID -> underlying X window XID. winex11 calls glXCreateWindow to
+    // wrap its on-screen GL child window in a GLXWindow drawable with a DISTINCT
+    // XID, then glXMakeCurrent/present that GLXWindow. The GLXWindow id is NOT a
+    // real window in `windows`, so without this map the gl64 present sink can't
+    // resolve the current drawable to a window and wined3d's windowed Present
+    // livelocks (falls back to GDI swapchain_blit). Populated from the GLX wire
+    // X_GLXCreateWindow request; resolved in gl64bridge glXMakeCurrent. Guarded by
+    // regMutex. See resolveGlxDrawable().
+    std::unordered_map<uint32_t, uint32_t> glxDrawables;
+    // Map a (possibly GLXWindow) drawable id to its underlying X window id. Returns
+    // the input unchanged if it's already a real window or unknown. Caller must NOT
+    // hold regMutex (this takes it).
+    uint32_t resolveGlxDrawable(uint32_t drawable);
+
     // GC id -> graphics context (foreground/background/font for core-text). Font
     // id -> name (all map to the single builtin 5x7 font for now). Both guarded
     // by regMutex like the window registry.

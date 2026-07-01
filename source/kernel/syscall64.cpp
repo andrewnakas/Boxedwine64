@@ -4267,6 +4267,16 @@ void ksyscall64(CPU64* cpu) {
         case X64_SYS_exit_group:
             ret = sys_exit64(cpu, a1, true);
             break;
+        case 74:  // fsync(fd)
+        case 75:  // fdatasync(fd)
+        case 26:  // msync(addr,len,flags)
+            // Our VFS writes are effectively synchronous (no host page cache to
+            // flush for the guest's purposes), so a flush is a successful no-op.
+            // Previously these fell to the default -ENOSYS, which some callers
+            // (e.g. fontconfig cache write, sqlite, wine's registry save) RETRY
+            // — appearing as a repeating "unimplemented syscall #74" near a hang.
+            ret = 0;
+            break;
         default:
             klog_fmt("ksyscall64: unimplemented syscall #%llu (%s) at RIP=0x%llx — RDI=0x%llx RSI=0x%llx RDX=0x%llx R10=0x%llx R8=0x%llx R9=0x%llx",
                      (unsigned long long)nr,

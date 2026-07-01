@@ -84,6 +84,37 @@ public:
     // message pump until it sees the window become viewable. Sent on X_MapWindow.
     void sendMapNotify(uint32_t window);
 
+    // ReparentNotify (21): winex11 reparents its GL child drawable into the HWND and
+    // BLOCKS its message pump (StructureNotifyMask) waiting for this confirmation —
+    // the same map-state machine as MapNotify. wined3d's WINDOWED Present needs the
+    // resulting on-screen GLX child drawable, so without this the present parks
+    // forever (THE D3D-Present hang). Sent on X_ReparentWindow (opcode 7, previously
+    // dropped as "unhandled"). Mirrors sendMapNotify.
+    void sendReparentNotify(uint32_t window, uint32_t parent, int16_t x, int16_t y,
+                            bool overrideRedirect);
+
+    // ConfigureNotify (22): winex11 ALSO selects StructureNotifyMask and blocks its
+    // message pump after a ConfigureWindow waiting for this confirmation of the new
+    // geometry. wined3d's windowed Present reconfigures the D3D window, so without
+    // this the present's internal message wait parks forever (the D3D-Present hang).
+    // Sent on X_ConfigureWindow, mirroring sendMapNotify.
+    void sendConfigureNotify(uint32_t window, int16_t x, int16_t y,
+                             uint16_t w, uint16_t h);
+
+    // NoExpose (14): X11 sends this on a CopyArea/CopyPlane whose GC has
+    // graphics_exposures=True (the default) when the copy was fully satisfied (no
+    // obscured source). winex11's blit-via-pixmap present path waits for it; without
+    // it the present's message pump can park. Sent after X_CopyArea (drawable=dst).
+    void sendNoExpose(uint32_t drawable);
+
+    // PropertyNotify (28): X11 sends this to clients selecting PropertyChangeMask on
+    // a window when one of its properties is changed/deleted. winex11 selects
+    // PropertyChangeMask on its top-levels and its window-state/activation machinery
+    // (and wined3d's present) can park its message pump waiting for a PropertyNotify
+    // that confirms a property write — which XWire stored but never notified. state:
+    // 0=NewValue, 1=Deleted. Sent after X_ChangeProperty / X_DeleteProperty.
+    void sendPropertyNotify(uint32_t window, uint32_t atom, uint8_t state);
+
     // Emit an EnterNotify/LeaveNotify crossing event (code 7/8). winex11 selects
     // for EnterWindowMask and uses the crossing to associate the pointer with
     // the window; without it clicks are mishandled (they defocus the edit and
@@ -109,6 +140,9 @@ private:
     void writeToClient(const void* data, uint32_t len);
     void flushReplies();
     void sendError(uint8_t code, uint16_t seq, uint32_t badValue, uint8_t majorOp, uint16_t minorOp);
+    // #67: RandR display enumeration — reply with one fixed 1024×768 monitor so wine
+    // sees a display output and wined3d's windowed Present converges (see .cpp).
+    void handleRandr(const uint8_t* req, uint32_t len);
 
     bool handshakeDone = false;
     bool bigEndian = false;             // client byte order

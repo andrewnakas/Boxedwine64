@@ -942,7 +942,11 @@ U64 gl64Bridge(CPU64* cpu, U64 fnId, U64 argsAddr) {
             // glXMakeCurrent(drawable, ctx)            -> a[0]=drawable
             // glXMakeContextCurrent(draw, read, ctx)   -> a[0]=draw
             if (!ensureContext()) return 0;
-            g_currentDrawable = (U32)args.a[0];
+            // winex11 calls glXMakeCurrent with a GLXWindow drawable whose XID is
+            // distinct from the underlying X window (glXCreateWindow). Resolve it to
+            // a real mapped window so the present sink can find it (otherwise wined3d's
+            // windowed present has no window to blit/read back against).
+            g_currentDrawable = XWireServer::instance().resolveGlxDrawable((U32)args.a[0]);
             // Claim the present slot for this GL app. Its readback frames are
             // tagged with this drawable id (not the X11 window it maps), so the
             // present sink's window filter needs to know the drawable belongs to

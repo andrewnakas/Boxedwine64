@@ -101,6 +101,7 @@ namespace {
         X_ChangeWindowAttributes= 2,
         X_GetWindowAttributes   = 3,
         X_DestroyWindow         = 4,
+        X_ReparentWindow        = 7,
         X_MapWindow             = 8,
         X_UnmapWindow           = 10,
         X_ConfigureWindow       = 12,
@@ -183,6 +184,45 @@ namespace {
         X_GLXQueryVersion        = 7,
         X_GLXQueryServerString   = 19,
         X_GLXClientInfo          = 20,
+        // glXCreateWindow: wraps an on-screen GL child window in a GLXWindow
+        // drawable with a NEW XID. We must record glxWindow->window so the gl64
+        // present sink can resolve the current drawable to a real window (else
+        // wined3d's windowed Present livelocks). Request layout (GLX proto):
+        // screen@4, fbconfig@8, window@12, glx_window@16, num_attribs@20.
+        X_GLXCreateWindow        = 31,
+        X_GLXDestroyWindow       = 32,
+    };
+
+    // RANDR extension (#67). wine 8.0 winex11.drv's xrandr handler needs RandR >= 1.4
+    // to register a display-device handler that reports monitors. Without ANY display
+    // handler (RandR + Xinerama both absent), wine's get_host_primary_monitor_rect()
+    // returns {0} → ZERO monitors → wined3d's windowed Present busy-loops re-enumerating
+    // the (missing) output forever (the rt_sigprocmask spin — see memory #58..#67). We
+    // advertise RANDR 1.4 and answer a FIXED single 1024×768 CRTC+output+mode so the
+    // xrandr handler registers exactly one monitor and Present converges.
+    enum {
+        RANDR_MAJOR_OPCODE = 150,
+        RANDR_FIRST_EVENT  = 89,
+        RANDR_FIRST_ERROR  = 150,
+        // RandR minor opcodes (subset wine 8.0 issues during display enumeration).
+        X_RRQueryVersion              = 0,
+        X_RRSetScreenConfig           = 2,
+        X_RRSelectInput               = 4,
+        X_RRGetScreenInfo             = 5,
+        X_RRGetScreenSizeRange        = 6,
+        X_RRGetScreenResources        = 8,
+        X_RRGetOutputInfo             = 9,
+        X_RRGetOutputProperty         = 15,
+        X_RRGetCrtcInfo               = 20,
+        X_RRGetScreenResourcesCurrent = 25,
+        X_RRGetOutputPrimary          = 31,
+        X_RRGetProviderResources      = 32,
+    };
+    // Fixed resource ids for our single virtual monitor (#67).
+    enum {
+        RR_CRTC_ID = 0x40,
+        RR_OUTPUT_ID = 0x50,
+        RR_MODE_ID = 0x60,
     };
 
     // error codes
@@ -558,6 +598,40 @@ void XWireConnection::processOneRequest(const uint8_t* req, uint32_t len) {
             }
             break;
         }
+        case X_ReparentWindow: {
+            // ReparentWindow(window, parent, x, y). winex11 reparents its GL child
+            // drawable into the HWND (and frames toplevels) and — like MapWindow —
+            // selects StructureNotifyMask and BLOCKS its message pump waiting for the
+            // ReparentNotify (event 21) that confirms the new parent. Without it,
+            // wined3d's WINDOWED Present parks: it needs a valid on-screen GLX child
+            // drawable, whose creation winex11 confirms via this reparent round-trip.
+            // (This is opcode 7 — previously "unhandled request opcode=7", silently
+            // dropped, so d3dtri's Present never saw its drawable confirmed.) Update
+            // the parent under the registry lock, then emit ReparentNotify.
+            uint32_t wid    = rd32(req + 4);
+            uint32_t parent = rd32(req + 8);
+            int16_t  rx     = (int16_t)rd16(req + 12);
+            int16_t  ry     = (int16_t)rd16(req + 14);
+            bool ovr = false, found = false;
+            {
+                XWireServer& srv = XWireServer::instance();
+                std::lock_guard<std::mutex> lk(srv.regMutex);
+                auto it = srv.windows.find(wid);
+                if (it != srv.windows.end()) {
+                    // DO NOT clobber x/y here: the reparent x/y are relative to the
+                    // NEW parent, while XWire stores absolute geometry the compositor
+                    // + wined3d's adapter probe rely on. Overwriting them with
+                    // parent-relative coords corrupted that geometry (Direct3DCreate9
+                    // returned NULL). Record the parent only; leave x/y/size intact.
+                    it->second.parent = parent;
+                    ovr = it->second.overrideRedirect;
+                    found = true;
+                }
+            }
+            if (found)
+                sendReparentNotify(wid, parent, rx, ry, ovr);
+            break;
+        }
         case X_MapWindow: {
             uint32_t wid = rd32(req + 4);
             uint16_t ew = 0, eh = 0;
@@ -694,29 +768,44 @@ void XWireConnection::processOneRequest(const uint8_t* req, uint32_t len) {
             uint16_t mask = rd16(req + 8);
             const uint8_t* vals = req + 12;
             XWireServer& srv = XWireServer::instance();
-            std::lock_guard<std::mutex> lk(srv.regMutex);
-            auto it = srv.windows.find(wid);
-            if (it != srv.windows.end()) {
-                uint32_t slot = 0;
-                for (int bit = 0; bit < 7; bit++) {
-                    if (mask & (1u << bit)) {
-                        int32_t v = (int32_t)rd32(vals + slot * 4);
-                        switch (bit) {
-                            case 0: it->second.x = (int16_t)v; break;
-                            case 1: it->second.y = (int16_t)v; break;
-                            case 2: it->second.width = (uint16_t)v; break;
-                            case 3: it->second.height = (uint16_t)v; break;
-                            default: break;   // border/sibling/stack — ignored
+            // Capture the resulting geometry to confirm back via ConfigureNotify
+            // after releasing the registry lock (don't write to the client socket
+            // while holding regMutex).
+            int16_t cx = 0, cy = 0; uint16_t cw = 0, ch = 0; bool have = false;
+            {
+                std::lock_guard<std::mutex> lk(srv.regMutex);
+                auto it = srv.windows.find(wid);
+                if (it != srv.windows.end()) {
+                    uint32_t slot = 0;
+                    for (int bit = 0; bit < 7; bit++) {
+                        if (mask & (1u << bit)) {
+                            int32_t v = (int32_t)rd32(vals + slot * 4);
+                            switch (bit) {
+                                case 0: it->second.x = (int16_t)v; break;
+                                case 1: it->second.y = (int16_t)v; break;
+                                case 2: it->second.width = (uint16_t)v; break;
+                                case 3: it->second.height = (uint16_t)v; break;
+                                default: break;   // border/sibling/stack — ignored
+                            }
+                            slot++;
                         }
-                        slot++;
+                    }
+                    cx = it->second.x; cy = it->second.y;
+                    cw = it->second.width  ? it->second.width  : screenWidth;
+                    ch = it->second.height ? it->second.height : screenHeight;
+                    have = true;
+                    if (getenv("BW64_XWIRE")) {
+                        klog_fmt("XWire: ConfigureWindow wid=0x%x -> x=%d y=%d %dx%d",
+                                 (int)wid, (int)cx, (int)cy, (int)cw, (int)ch);
                     }
                 }
-                if (getenv("BW64_XWIRE")) {
-                    klog_fmt("XWire: ConfigureWindow wid=0x%x -> x=%d y=%d %dx%d",
-                             (int)wid, (int)it->second.x, (int)it->second.y,
-                             (int)it->second.width, (int)it->second.height);
-                }
             }
+            // Confirm the geometry back to winex11 with a ConfigureNotify — it
+            // selects StructureNotifyMask and blocks its message pump waiting for
+            // it (same pattern as the MapNotify path above). This is the fix for
+            // the D3D Present() hang: wined3d's windowed present reconfigures the
+            // D3D window and parks in its internal message wait until this arrives.
+            if (have) sendConfigureNotify(wid, cx, cy, cw, ch);
             break;
         }
         case X_CreateGC: {
@@ -808,6 +897,10 @@ void XWireConnection::processOneRequest(const uint8_t* req, uint32_t len) {
             uint16_t cw = rd16(req + 24);
             uint16_t ch = rd16(req + 26);
             copyAreaPixmapToWindow(srcId, dstId, srcX, srcY, dstX, dstY, cw, ch);
+            // X11 sends NoExpose after a CopyArea (GC graphics_exposures default
+            // True); winex11's present blit can park its message pump waiting for
+            // it. Mirror the MapNotify/ConfigureNotify confirmation pattern.
+            sendNoExpose(dstId);
             break;
         }
         case X_ClearArea:
@@ -934,6 +1027,21 @@ void XWireConnection::processOneRequest(const uint8_t* req, uint32_t len) {
             }
             if (harvested) {
                 klog_fmt("XWire: harvested guest clipboard (%d bytes)", (int)bytes);
+            }
+            // PropertyNotify to the window's listeners: X11 sends it whenever a
+            // property changes on a window selecting PropertyChangeMask. winex11
+            // selects it (the D3D window's mask is 0x62c05f incl 0x400000) and can
+            // block its message pump waiting for it — the likely D3D Present() hang.
+            // Send unconditionally if the window selected PropertyChangeMask.
+            {
+                bool wantProp = false;
+                {
+                    std::lock_guard<std::mutex> lk(srv.regMutex);
+                    auto it = srv.windows.find(window);
+                    if (it != srv.windows.end() && (it->second.eventMask & 0x400000))
+                        wantProp = true;
+                }
+                if (wantProp) sendPropertyNotify(window, property, /*state=*/0);
             }
             break;
         }
@@ -1444,6 +1552,13 @@ void XWireConnection::processOneRequest(const uint8_t* req, uint32_t len) {
                 r[9] = GLX_MAJOR_OPCODE;       // major-opcode
                 r[10] = GLX_FIRST_EVENT;       // first-event
                 r[11] = 0;                     // first-error
+            } else if (extName == "RANDR") {
+                // #67: advertise RandR so wine's xrandr display handler registers one
+                // monitor (it needs RandR>=1.4; see X_RRQueryVersion below).
+                r[8] = 1;                      // present = true
+                r[9] = RANDR_MAJOR_OPCODE;     // major-opcode
+                r[10] = RANDR_FIRST_EVENT;     // first-event
+                r[11] = RANDR_FIRST_ERROR;     // first-error
             } else {
                 r[8] = 0;                      // present = false
                 r[9] = 0;
@@ -1489,6 +1604,28 @@ void XWireConnection::processOneRequest(const uint8_t* req, uint32_t len) {
                 case X_GLXClientInfo:
                     // no reply expected (client->server info)
                     break;
+                case X_GLXCreateWindow: {
+                    // Record glxWindow -> underlying window so the gl64 present
+                    // sink can resolve the current drawable (glXMakeCurrent passes
+                    // the GLXWindow id, which is NOT in the windows map). No reply.
+                    uint32_t window    = rd32(req + 12);
+                    uint32_t glxWindow = rd32(req + 16);
+                    if (glxWindow && window) {
+                        XWireServer& srv = XWireServer::instance();
+                        std::lock_guard<std::mutex> lk(srv.regMutex);
+                        srv.glxDrawables[glxWindow] = window;
+                    }
+                    break;
+                }
+                case X_GLXDestroyWindow: {
+                    uint32_t glxWindow = rd32(req + 4);
+                    if (glxWindow) {
+                        XWireServer& srv = XWireServer::instance();
+                        std::lock_guard<std::mutex> lk(srv.regMutex);
+                        srv.glxDrawables.erase(glxWindow);
+                    }
+                    break;
+                }
                 default: {
                     // Any other reply-expecting GLX request: send an empty 32-byte
                     // reply so a synchronous client doesn't hang. (Requests with no
@@ -1500,6 +1637,12 @@ void XWireConnection::processOneRequest(const uint8_t* req, uint32_t len) {
                     break;
                 }
             }
+            break;
+        }
+        case RANDR_MAJOR_OPCODE: {
+            // #67: RandR display enumeration. Answer with a FIXED single 1024×768
+            // CRTC+output+mode so wine's xrandr handler registers exactly one monitor.
+            handleRandr(req, len);
             break;
         }
         case X_QueryColors: {
@@ -2540,6 +2683,256 @@ void XWireConnection::sendMapNotify(uint32_t window) {
     memcpy(e + 4, &window, 4);                 // event window
     memcpy(e + 8, &window, 4);                 // window
     e[12] = 0;                                 // override-redirect
+    writeToClient(e, sizeof(e));
+}
+
+void XWireConnection::sendReparentNotify(uint32_t window, uint32_t parent,
+                                         int16_t x, int16_t y, bool overrideRedirect) {
+    // ReparentNotify (event code 21). Sent after a ReparentWindow; winex11 selects
+    // StructureNotifyMask and BLOCKS its message pump waiting for it (same map-state
+    // machine as MapNotify). Layout: code(1) unused(1) seq(2) event-window(4)
+    // window(4) parent(4) x(2) y(2) override-redirect(1) pad(11). We send the
+    // StructureNotify form (event-window == window).
+    uint8_t e[32] = {0};
+    e[0] = 21;                                 // ReparentNotify
+    e[2] = (uint8_t)(sequence & 0xff);
+    e[3] = (uint8_t)(sequence >> 8);
+    memcpy(e + 4, &window, 4);                 // event window
+    memcpy(e + 8, &window, 4);                 // window
+    memcpy(e + 12, &parent, 4);                // parent
+    e[16] = (uint8_t)(x & 0xff);  e[17] = (uint8_t)((x >> 8) & 0xff);
+    e[18] = (uint8_t)(y & 0xff);  e[19] = (uint8_t)((y >> 8) & 0xff);
+    e[20] = overrideRedirect ? 1 : 0;
+    writeToClient(e, sizeof(e));
+}
+
+void XWireConnection::sendConfigureNotify(uint32_t window, int16_t x, int16_t y,
+                                          uint16_t w, uint16_t h) {
+    // ConfigureNotify (event code 22). winex11 selects StructureNotifyMask and
+    // BLOCKS its message pump after a ConfigureWindow, waiting for this event to
+    // confirm the new geometry (X11DRV's sync_window_position / the configure
+    // state machine, same pattern as MapNotify). Without it, wined3d's windowed
+    // Present — which reconfigures the D3D window — parks in its internal message
+    // wait forever (the long-hunted D3D Present() hang). event-window(4)==window(8)
+    // for the non-redirected top-level form. above-sibling(12)=None(0),
+    // override-redirect(26)=0.
+    uint8_t e[32] = {0};
+    e[0] = 22;                                 // ConfigureNotify
+    e[2] = (uint8_t)(sequence & 0xff);
+    e[3] = (uint8_t)(sequence >> 8);
+    memcpy(e + 4, &window, 4);                 // event window
+    memcpy(e + 8, &window, 4);                 // window
+    // above-sibling @12 = None (0)
+    memcpy(e + 16, &x, 2);                     // x
+    memcpy(e + 18, &y, 2);                     // y
+    memcpy(e + 20, &w, 2);                     // width
+    memcpy(e + 22, &h, 2);                     // height
+    // border-width @24 = 0; override-redirect @26 = 0
+    writeToClient(e, sizeof(e));
+}
+
+// #67: RandR display enumeration — answer with a FIXED single 1024×768 monitor so
+// wine 8.0's winex11 xrandr handler registers exactly one output/crtc/mode. Without
+// any monitor, get_host_primary_monitor_rect()={0} → wined3d's windowed Present
+// busy-loops re-enumerating forever (the rt_sigprocmask spin, memory #58..#67).
+// All replies follow the X11 RandR protocol; the fixed 32-byte reply header is:
+//   [0]=1 reply, [1]=pad, [2..3]=sequence, [4..7]=reply length (extra 4-byte units).
+void XWireConnection::handleRandr(const uint8_t* req, uint32_t len) {
+    uint8_t minor = req[1];
+    auto hdr32 = [&](uint8_t* r, uint32_t extraWords) {
+        r[0] = 1;
+        r[2] = (uint8_t)(sequence & 0xff);
+        r[3] = (uint8_t)(sequence >> 8);
+        uint32_t L = extraWords;
+        memcpy(r + 4, &L, 4);
+    };
+    const uint32_t SW = screenWidth, SH = screenHeight; // 1024×768
+    switch (minor) {
+        case X_RRQueryVersion: {
+            // reply: major(4)@8=1, minor(4)@12=4  (MUST be >=1.4)
+            uint8_t r[32] = {0}; hdr32(r, 0);
+            uint32_t maj = 1, min = 4;
+            memcpy(r + 8, &maj, 4); memcpy(r + 12, &min, 4);
+            writeToClient(r, sizeof(r));
+            break;
+        }
+        case X_RRGetScreenSizeRange: {
+            // minWidth(2)@8 minHeight(2)@10 maxWidth(2)@12 maxHeight(2)@14
+            uint8_t r[32] = {0}; hdr32(r, 0);
+            uint16_t mnW = (uint16_t)SW, mnH = (uint16_t)SH, mxW = (uint16_t)SW, mxH = (uint16_t)SH;
+            memcpy(r + 8, &mnW, 2); memcpy(r + 10, &mnH, 2);
+            memcpy(r + 12, &mxW, 2); memcpy(r + 14, &mxH, 2);
+            writeToClient(r, sizeof(r));
+            break;
+        }
+        case X_RRGetScreenResources:
+        case X_RRGetScreenResourcesCurrent: {
+            // Reply body (after 32B header):
+            //   timestamp(4) config_timestamp(4) nCrtcs(2) nOutputs(2) nModes(2)
+            //   nBytesNames(2) pad(8)  [= 24 bytes in the fixed reply part @8..31]
+            // then: CRTCS[nCrtcs](4 each), OUTPUTS[nOutputs](4 each),
+            //   MODEINFO[nModes](32 each), then name bytes (nBytesNames), padded.
+            const char* modeName = "1024x768"; uint16_t nameLen = 8;
+            uint32_t crtcs = 1, outputs = 1, modes = 1;
+            // extra payload after the 32B header:
+            //   crtcs(4) + outputs(4) + modeinfo(32) + names(8 → pad to 8)
+            uint32_t namesPadded = (nameLen + 3) & ~3u;
+            uint32_t payload = crtcs*4 + outputs*4 + modes*32 + namesPadded;
+            std::vector<uint8_t> r(32 + payload, 0);
+            hdr32(r.data(), payload / 4);
+            // #72: timestamp must be >= config_timestamp; if they're EQUAL wine may think a
+            // reconfig is pending and re-poll. Make timestamp newer than config_timestamp.
+            uint32_t ts = 2, cts = 1;
+            memcpy(&r[8], &ts, 4); memcpy(&r[12], &cts, 4);
+            uint16_t nc = (uint16_t)crtcs, no = (uint16_t)outputs, nm = (uint16_t)modes, nbn = nameLen;
+            memcpy(&r[16], &nc, 2); memcpy(&r[18], &no, 2);
+            memcpy(&r[20], &nm, 2); memcpy(&r[22], &nbn, 2);
+            // pad @24..31
+            uint32_t off = 32;
+            uint32_t crtc = RR_CRTC_ID; memcpy(&r[off], &crtc, 4); off += 4;
+            uint32_t outp = RR_OUTPUT_ID; memcpy(&r[off], &outp, 4); off += 4;
+            // MODEINFO (32 bytes): id(4) width(2) height(2) dotClock(4) hSyncStart(2)
+            //   hSyncEnd(2) hTotal(2) hSkew(2) vSyncStart(2) vSyncEnd(2) vTotal(2)
+            //   nameLength(2) modeFlags(4)
+            uint32_t modeId = RR_MODE_ID; memcpy(&r[off], &modeId, 4);
+            uint16_t modeW = (uint16_t)SW, modeH = (uint16_t)SH;
+            memcpy(&r[off + 4], &modeW, 2); memcpy(&r[off + 6], &modeH, 2);
+            uint32_t dot = 65000000; memcpy(&r[off + 8], &dot, 4);
+            uint16_t hTotal = 1344, vTotal = 806;
+            // hSyncStart@12 hSyncEnd@14 hTotal@16 hSkew@18 vSyncStart@20 vSyncEnd@22 vTotal@24
+            memcpy(&r[off + 16], &hTotal, 2);
+            memcpy(&r[off + 24], &vTotal, 2);
+            uint16_t mnl = nameLen; memcpy(&r[off + 26], &mnl, 2);
+            // modeFlags@28 = 0
+            off += 32;
+            memcpy(&r[off], modeName, nameLen); off += namesPadded;
+            writeToClient(r.data(), (uint32_t)r.size());
+            break;
+        }
+        case X_RRGetCrtcInfo: {
+            // Reply body: timestamp(4)@8 x(2)@12 y(2)@14 width(2)@16 height(2)@18
+            //   mode(4)@20 rotation(2)@24 rotations(2)@26 nOutput(2)@28 nPossible(2)@30
+            //   then OUTPUTS[nOutput](4) POSSIBLE[nPossible](4)
+            // status(1) is in the reply header's [1] byte (RRSetConfigSuccess=0).
+            uint32_t outputs = 1, possible = 1;
+            uint32_t payload = outputs*4 + possible*4;
+            std::vector<uint8_t> r(32 + payload, 0);
+            hdr32(r.data(), payload / 4);
+            r[1] = 0; // status = RRSetConfigSuccess
+            uint32_t ts = 1; memcpy(&r[8], &ts, 4);
+            int16_t x = 0, y = 0; uint16_t w = (uint16_t)SW, h = (uint16_t)SH;
+            memcpy(&r[12], &x, 2); memcpy(&r[14], &y, 2);
+            memcpy(&r[16], &w, 2); memcpy(&r[18], &h, 2);
+            uint32_t mode = RR_MODE_ID; memcpy(&r[20], &mode, 4);
+            uint16_t rot = 1 /*RR_Rotate_0*/, rots = 1; memcpy(&r[24], &rot, 2); memcpy(&r[26], &rots, 2);
+            uint16_t no = (uint16_t)outputs, np = (uint16_t)possible;
+            memcpy(&r[28], &no, 2); memcpy(&r[30], &np, 2);
+            uint32_t off = 32;
+            uint32_t o = RR_OUTPUT_ID; memcpy(&r[off], &o, 4); off += 4;
+            uint32_t p = RR_OUTPUT_ID; memcpy(&r[off], &p, 4); off += 4;
+            writeToClient(r.data(), (uint32_t)r.size());
+            break;
+        }
+        case X_RRGetOutputInfo: {
+            // Reply body: timestamp(4)@8 crtc(4)@12 mm_width(4)@16 mm_height(4)@20
+            //   connection(1)@24 subpixel_order(1)@25 nCrtcs(2)@26 nModes(2)@28
+            //   nPreferred(2)@30 nClones(2)@32 nameLength(2)@34
+            //   then CRTCS[nCrtcs](4) MODES[nModes](4) CLONES[nClones](4) name(padded)
+            // status(1) in reply header [1].
+            const char* name = "Wine Output"; uint16_t nameLen = 11;
+            uint32_t nCrtcs = 1, nModes = 1, nClones = 0;
+            uint32_t namesPadded = (nameLen + 3) & ~3u;
+            uint32_t payload = nCrtcs*4 + nModes*4 + nClones*4 + namesPadded;
+            std::vector<uint8_t> r(36 + payload, 0); // fixed part runs to @36 (nameLength@34..35)
+            hdr32(r.data(), (4 + payload) / 4);      // extra words = (bytes after @32) /4
+            r[1] = 0; // status = RRSetConfigSuccess
+            uint32_t ts = 1; memcpy(&r[8], &ts, 4);
+            uint32_t crtc = RR_CRTC_ID; memcpy(&r[12], &crtc, 4);
+            uint32_t mmw = 270, mmh = 203; memcpy(&r[16], &mmw, 4); memcpy(&r[20], &mmh, 4);
+            r[24] = 0; // connection = RR_Connected
+            r[25] = 0; // subpixel order = Unknown
+            uint16_t ncr = (uint16_t)nCrtcs, nmo = (uint16_t)nModes, npref = 1, ncl = (uint16_t)nClones, nl = nameLen;
+            memcpy(&r[26], &ncr, 2); memcpy(&r[28], &nmo, 2);
+            memcpy(&r[30], &npref, 2); memcpy(&r[32], &ncl, 2);
+            memcpy(&r[34], &nl, 2);
+            uint32_t off = 36;
+            uint32_t c = RR_CRTC_ID; memcpy(&r[off], &c, 4); off += 4;
+            uint32_t m = RR_MODE_ID; memcpy(&r[off], &m, 4); off += 4;
+            // no clones
+            memcpy(&r[off], name, nameLen); off += namesPadded;
+            writeToClient(r.data(), (uint32_t)r.size());
+            break;
+        }
+        case X_RRGetOutputPrimary: {
+            // reply: output(4)@8
+            uint8_t r[32] = {0}; hdr32(r, 0);
+            uint32_t o = RR_OUTPUT_ID; memcpy(r + 8, &o, 4);
+            writeToClient(r, sizeof(r));
+            break;
+        }
+        case X_RRGetProviderResources: {
+            // reply: timestamp(4)@8 nProviders(2)@12 pad(2)@14 ... (we report 0)
+            uint8_t r[32] = {0}; hdr32(r, 0);
+            uint32_t ts = 1; memcpy(r + 8, &ts, 4);
+            // nProviders @12 = 0
+            writeToClient(r, sizeof(r));
+            break;
+        }
+        case X_RRGetOutputProperty: {
+            // EDID etc — report no property (format 0, type None, 0 items).
+            uint8_t r[32] = {0}; hdr32(r, 0);
+            // r[1]=format=0; bytes_after(4)@8=0; num_items(4)@12=0
+            writeToClient(r, sizeof(r));
+            break;
+        }
+        case X_RRSelectInput:
+            // no reply
+            break;
+        default: {
+            // Any other reply-expecting RandR request: minimal empty reply so a
+            // synchronous client never hangs. (wine's enumeration only needs the
+            // ones above.)
+            uint8_t r[32] = {0}; hdr32(r, 0);
+            writeToClient(r, sizeof(r));
+            break;
+        }
+    }
+}
+
+void XWireConnection::sendNoExpose(uint32_t drawable) {
+    // NoExpose (event code 14). X11 emits this for a CopyArea/CopyPlane whose GC
+    // has graphics_exposures=True (the default) once the copy completed with no
+    // obscured source region. winex11's present blit (pixmap->window CopyArea)
+    // selects for it and its message pump can park waiting for it — a sibling of
+    // the MapNotify/ConfigureNotify gaps. Format: drawable(4), minor-opcode(8,
+    // u16)=0, major-opcode(10,u8)=62 (CopyArea).
+    uint8_t e[32] = {0};
+    e[0] = 14;                                 // NoExpose
+    e[2] = (uint8_t)(sequence & 0xff);
+    e[3] = (uint8_t)(sequence >> 8);
+    memcpy(e + 4, &drawable, 4);               // drawable
+    // minor-opcode @8 = 0; major-opcode @10 = 62 (X_CopyArea)
+    e[10] = 62;
+    writeToClient(e, sizeof(e));
+}
+
+void XWireConnection::sendPropertyNotify(uint32_t window, uint32_t atom, uint8_t state) {
+    // PropertyNotify (event code 28). Sent to a window's PropertyChangeMask
+    // listeners when a property is changed (state 0) or deleted (state 1). winex11
+    // selects PropertyChangeMask and its state/activation machinery + wined3d's
+    // present can BLOCK its message pump waiting for the PropertyNotify that
+    // confirms a property write (XWire stored the property but never notified — a
+    // sibling of the MapNotify/ConfigureNotify gaps, and the likely cause of the
+    // D3D Present() hang since the D3D window selects PropertyChangeMask=0x400000).
+    // window(4), atom(8), time(12)=CurrentTime(0), state(16).
+    uint8_t e[32] = {0};
+    e[0] = 28;                                 // PropertyNotify
+    e[2] = (uint8_t)(sequence & 0xff);
+    e[3] = (uint8_t)(sequence >> 8);
+    memcpy(e + 4, &window, 4);                 // window
+    memcpy(e + 8, &atom, 4);                   // atom
+    // time @12 = CurrentTime (0)
+    e[16] = state;                             // 0=NewValue, 1=Deleted
     writeToClient(e, sizeof(e));
 }
 

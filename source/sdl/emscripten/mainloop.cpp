@@ -80,38 +80,42 @@ void mainloop() {
         // undefined", which kills this main loop and deadlocks every glOnMain. Patch
         // the hook IN THIS THREAD's GL instance (the one the hook actually uses) to
         // also bail for a proxied context. Once (static guard); near-zero cost after.
+        // BW64 M16 (#54): the OLD patch was a ONE-SHOT (framePatched=true set
+        // unconditionally) — if GL.newRenderingFrameStarted didn't exist yet on the
+        // first mainloop iteration (GL inits later), the patch was SKIPPED FOREVER and
+        // the glemu frame hook later threw "Cannot set properties of undefined" on our
+        // proxied gl64 context → the exception escaped emscripten's MainLoop.runIter
+        // (OUTSIDE this mainloop()'s try/catch — the hook runs as a preMainLoop) →
+        // the loop stopped scheduling → every glOnMain/xwireRunOnMainThread deadlocked
+        // = the D3D Present glDrawArrays hang (one draw, then total silence). FIX:
+        // RETRY every iteration until the patch actually installs (latch only on
+        // success), and make the wrapper bulletproof — ALWAYS run orig inside
+        // try/catch so NO glemu throw can ever kill the loop, regardless of which
+        // temp-buffer array is missing. EM_ASM returns 1 once patched (or already
+        // patched / GL absent-but-harmless); we keep retrying while it returns 0.
         static bool framePatched = false;
         if (!framePatched) {
-            framePatched = true;
-            EM_ASM({
+            int patched = EM_ASM_INT({
                 try {
-                    if (typeof GL !== 'undefined' && GL.newRenderingFrameStarted &&
-                        !GL.newRenderingFrameStarted.__bw64Patched) {
-                        var orig = GL.newRenderingFrameStarted;
-                        GL.newRenderingFrameStarted = function() {
-                            if (GL.currentContextIsProxied ||
-                                !GL.currentContext ||
-                                typeof GL.currentContext !== 'object') return;
-                            // Our gl64 WebGL2 context is created via
-                            // emscripten_webgl_create_context (NOT the SDL/Browser
-                            // path), so glemu's per-context temp-vertex-buffer arrays
-                            // don't exist on it. When a wined3d GLSL draw leaves OUR
-                            // context current, orig() then does
-                            // `currentContext.tempVertexBufferCounters1[i]=0` →
-                            // "Cannot read/set properties of undefined", which throws
-                            // out of the main loop and DEADLOCKS every later glOnMain
-                            // (the D3D Present stall: one draw, then total silence).
-                            // Bail when those arrays are absent.
-                            if (!GL.currentContext.tempVertexBufferCounters1) return;
-                            // Belt-and-suspenders: never let a throw from glemu's
-                            // frame hook escape the main loop (that would deadlock
-                            // every glOnMain forever).
-                            try { return orig.apply(this, arguments); } catch (e) {}
-                        };
-                        GL.newRenderingFrameStarted.__bw64Patched = true;
-                    }
-                } catch (e) {}
+                    if (typeof GL === 'undefined') return 0; // GL not up yet — retry
+                    if (!GL.newRenderingFrameStarted) return 0; // hook not registered yet
+                    if (GL.newRenderingFrameStarted.__bw64Patched) return 1; // done
+                    var orig = GL.newRenderingFrameStarted;
+                    GL.newRenderingFrameStarted = function() {
+                        // Run glemu's original frame hook but NEVER let it throw out of
+                        // the main loop. The throw happens because our gl64 WebGL2
+                        // context (emscripten_webgl_create_context, proxied) lacks
+                        // glemu's per-context tempVertexBuffer* arrays, so when it is
+                        // current at frame start orig() does
+                        // (ctx).tempVertexBufferCounters1[i]=0 → TypeError. Containing
+                        // it here keeps the present pump (every glOnMain hop) alive.
+                        try { return orig.apply(this, arguments); } catch (e) {}
+                    };
+                    GL.newRenderingFrameStarted.__bw64Patched = true;
+                    return 1;
+                } catch (e) { return 1; } // never spin on an unexpected error
             });
+            if (patched) framePatched = true;
         }
         // Present the in-process X11 wire server's latest frame AND drain work the
         // gl64 bridge deferred to the main thread (WebGL context creation, FBO

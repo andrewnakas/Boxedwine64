@@ -28,6 +28,38 @@ XWireServer& XWireServer::instance() {
     return s;
 }
 
+uint32_t XWireServer::resolveGlxDrawable(uint32_t drawable) {
+    if (!drawable) return drawable;
+    std::lock_guard<std::mutex> lk(regMutex);
+    // Already a real window? leave it.
+    if (windows.find(drawable) != windows.end()) return drawable;
+    // GLXWindow wrapper id -> underlying window (recorded from X_GLXCreateWindow,
+    // IF winex11 sends it over the wire — it usually does NOT; it uses the direct
+    // GLX path, so glxDrawables is typically empty).
+    auto it = glxDrawables.find(drawable);
+    if (it != glxDrawables.end()) return it->second;
+    // FALLBACK (the common case): winex11 made the GLXWindow drawable via the
+    // direct GLX path, so XWire never saw it and can't map it. wined3d presents a
+    // windowed D3D swapchain that covers a single top-level content window. Resolve
+    // the unknown GL drawable to the foreground content window = the largest mapped,
+    // non-override-redirect, child-of-root window (the d3dtri HWND, e.g. 472x333),
+    // excluding the 1024x768 root itself. Without this the present sink can't find a
+    // window for the drawable, the frame is dropped, and wined3d's windowed Present
+    // livelocks (get_update_region spin, glXSwapBuffers never reached).
+    uint32_t best = 0; uint64_t bestArea = 0;
+    for (auto& kv : windows) {
+        const XWireWindow& w = kv.second;
+        if (!w.mapped || w.overrideRedirect) continue;
+        if (w.parent == 0) continue;          // skip the root window (parent==0)
+        uint64_t area = (uint64_t)w.width * (uint64_t)w.height;
+        if (area <= 1) continue;               // skip 1x1 / 104x1 helper strips
+        if (area > bestArea) { bestArea = area; best = kv.first; }
+    }
+    if (best)
+        return best;
+    return drawable;
+}
+
 bool XWireServer::isXDisplayPath(const char* path) {
     if (!path) return false;
     // libX11 unix transport: "/tmp/.X11-unix/X0", "/tmp/.X11-unix/X1", ...

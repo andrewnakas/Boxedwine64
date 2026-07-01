@@ -72,7 +72,20 @@ void drainMainThreadWork() {
             job = g_mtwQueue.front();
             g_mtwQueue.pop_front();
         }
-        (*job->fn)();
+        // A hopped closure must NEVER escape this loop with the job unsignaled:
+        // if (*job->fn)() throws (e.g. a WebGL call surfaces a JS exception through
+        // emscripten), the old code skipped `job->done = true` and the guest thread
+        // waiting in xwireRunOnMainThread blocked FOREVER — observed as the D3D
+        // Present() hang (glDrawArrays hops fine, the next hop's closure throws, the
+        // waiter orphans). Contain the throw and ALWAYS signal done so the guest can
+        // make progress (or fail) instead of livelocking the whole VM.
+        try {
+            (*job->fn)();
+        } catch (const std::exception& e) {
+            klog_fmt("BW64 drainMainThreadWork: hopped job threw std::exception: %s (job signaled anyway)", e.what());
+        } catch (...) {
+            klog_fmt("BW64 drainMainThreadWork: hopped job threw non-std exception (job signaled anyway)");
+        }
         {
             std::lock_guard<std::mutex> lk(job->m);
             job->done = true;

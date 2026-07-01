@@ -5189,8 +5189,26 @@ void CPU64::run() {
         // by design), so without this check run() never returns and the killed
         // process can never finish dying. One flag test every 64k instructions
         // is noise next to step()'s cost.
-        if ((instructionCount & 0xFFFF) == 0 && thread && thread->terminating) {
-            break;
+        //
+        // SAME cadence, second job (M16, D3D Present fix): deliver any pending
+        // cross-thread signal. In the MULTI-THREADED build each guest thread runs
+        // its OWN cpu64->run() loop (normalPlatformMultiThreaded.cpp), which —
+        // unlike the cooperative scheduler and the futex-wait path — never
+        // delivered pendingSignals. A thread that BUSY-POLLS (non-blocking
+        // recvmsg/read in a spin, never entering a futex wait) therefore never
+        // received the wineserver's SIGUSR1 "APC nudge" carrying an async-I/O
+        // completion. That was the D3D Present() hang: wined3d's render thread
+        // spun on the wineserver socket for Present's completion whose APC nudge
+        // sat undelivered in pendingSignals forever. Delivering here runs the
+        // client's APC handler so Present can return. Cheap: only fires when
+        // pendingSignals is set, gated to once per 64k instructions.
+        if ((instructionCount & 0xFFFF) == 0) {
+            if (thread && thread->terminating) {
+                break;
+            }
+            if (thread && thread->pendingSignals) {
+                deliverPendingSignals();
+            }
         }
     }
 }

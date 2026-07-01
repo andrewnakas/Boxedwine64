@@ -137,6 +137,33 @@ done
 # the marker also makes the populated tree visible when debugging the VFS.)
 find "$STAGE/$DRIVE_C/users" -type d -empty -exec touch '{}/.keep' \;
 
+# === Direct3D: disable wined3d's multithreaded command stream (CSMT) ===========
+# wined3d 8.0 defaults cs_multithreaded = WINED3D_CSMT_ENABLE. With CSMT on it
+# spawns a worker thread (wined3d_cs_run) and Present() submits ops to a queue +
+# spins (wined3d_cs_mt_finish / the pending_presents latency loop) until the
+# worker drains them. On our backend that worker thread was never created for the
+# render process, so Present() busy-waited forever (zero GL traps — it parked
+# before doing any GL). Setting csmt=0 clears WINED3D_CSMT_ENABLE so wined3d keeps
+# the inline single-threaded ops (wined3d_cs_st_*): submit runs the op handler on
+# the CALLING thread immediately and finish is a no-op, so Present executes
+# glClear/glDrawArrays/SwapBuffers synchronously with no worker thread to wait on.
+# Verified against wine-8.0 dlls/wined3d/cs.c (wined3d_cs_create gate at L3423-3435,
+# wined3d_cs_st_submit at L2924, wined3d_main.c reads "csmt" DWORD under
+# HKCU\Software\Wine\Direct3D). Belt-and-suspenders vs the GL-extension fence gate
+# (we also don't advertise GL_ARB_sync/NV_fence/APPLE_fence).
+USER_REG="$STAGE/$PREFIX_IN_ZIP/user.reg"
+if [ -f "$USER_REG" ] && ! grep -q '^\[Software\\\\Wine\\\\Direct3D\]' "$USER_REG"; then
+  echo "=== injecting [Software\\Wine\\Direct3D] csmt=0 into user.reg ==="
+  cat >> "$USER_REG" <<'REGEOF'
+
+[Software\\Wine\\Direct3D] 1780332434
+#time=1dcf1e649929046
+"csmt"=dword:00000000
+REGEOF
+else
+  echo "=== user.reg already has [Software\\Wine\\Direct3D] (or no user.reg) — skipping csmt inject ==="
+fi
+
 echo "=== rezipping prefix64.zip ==="
 rm -f "$ZIP"
 ( cd "$STAGE" && zip -qry9 "$ZIP" . )
