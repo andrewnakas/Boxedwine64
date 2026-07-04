@@ -62,7 +62,11 @@ jobs:
       - name: Setup Emscripten
         uses: mymindstorm/setup-emsdk@v14
         with:
-          version: latest
+          # Pinned to the locally-verified toolchain (the wasm is browser-tested
+          # locally before deploys; `latest` made CI silently build with a newer
+          # emscripten than anything ever tested — a reproducibility hazard).
+          # Bump deliberately, re-verifying notepad/glcube/d3dtri locally first.
+          version: 6.0.0
           actions-cache-folder: emsdk-cache
 
       - name: Build wasm64-mt
@@ -92,6 +96,54 @@ jobs:
             --clobber
           echo "Rootfs assets in $out:"
           ls -la "$out" | grep -E 'zip|manifest' || true
+
+      - name: Verify rootfs integrity (stale-CDN guard)
+        # 2026-07-04 incident: replacing same-name Release assets minutes before
+        # a deploy made GitHub's release-asset CDN hand this download a MIXED
+        # old/new part set (the manifest + some parts stale, others fresh). The
+        # reassembled wine64.zip was silently corrupt for exactly the entries
+        # that had moved — notepad still booted (its entries' offsets were
+        # unchanged) so the smoke gate stayed green while the GL/D3D files were
+        # broken on the live site. This step makes that failure loud: every
+        # manifest's totalBytes must match the actual assembled bytes, and every
+        # (re)assembled zip must pass a full CRC test.
+        run: |
+          set -euo pipefail
+          cd project/emscripten/Build/Wasm64Mt
+          python3 - <<'PY'
+          import glob, json, os, subprocess, sys, zipfile
+          failed = False
+          for mf in sorted(glob.glob('*.manifest.json')):
+              m = json.load(open(mf))
+              name, want = m['name'], int(m['totalBytes'])
+              parts = m.get('parts') or [name]
+              have = sum(os.path.getsize(p) for p in parts)
+              print(f"{name}: manifest totalBytes={want} actual={have} parts={len(parts)}")
+              if want != have:
+                  print(f"::error::{name}: size mismatch (stale release-asset CDN?) — manifest says {want}, parts sum to {have}")
+                  failed = True
+                  continue
+              whole = name if len(parts) == 1 else name + '.assembled'
+              if len(parts) > 1:
+                  with open(whole, 'wb') as out:
+                      for p in parts:
+                          with open(p, 'rb') as f:
+                              while chunk := f.read(1 << 20):
+                                  out.write(chunk)
+              try:
+                  bad = zipfile.ZipFile(whole).testzip()
+                  if bad is not None:
+                      print(f"::error::{name}: CRC failure at entry '{bad}' — corrupt/mixed parts")
+                      failed = True
+                  else:
+                      print(f"{name}: zip CRC OK ({len(zipfile.ZipFile(whole).namelist())} entries)")
+              except Exception as e:
+                  print(f"::error::{name}: unreadable as zip: {e}")
+                  failed = True
+              if len(parts) > 1:
+                  os.remove(whole)
+          sys.exit(1 if failed else 0)
+          PY
 
       - name: Assemble _site
         run: |
