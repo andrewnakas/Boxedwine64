@@ -1673,6 +1673,20 @@ static U64 sys_execve64(CPU64* cpu, U64 pathAddr, U64 argvAddr, U64 envpAddr) {
     std::vector<BString> envs;
     readStringArray64(cpu, argvAddr, args);
     readStringArray64(cpu, envpAddr, envs);
+    // Boot reliability (M18): wine64 auto-spawns a BARE wineserver at boot
+    // (argc==1) which races the launcher's later `wineserver64 -p` pin for the
+    // server lock. When the bare/transient instance wins (a coin flip), the
+    // session's wineserver is non-persistent and shuts down in the first
+    // zero-client moment of the slow interpreted boot (the wineboot-chain ->
+    // app handoff), cleanly killing explorer and the never-mapped app —
+    // ~1-in-2 cold boots died this way. Make every bare wineserver spawn
+    // persistent, so whichever instance wins the lock keeps the session alive.
+    // Flagged spawns (-p pin, -k, -w) are left untouched (argc > 1).
+    if (args.size() == 1 &&
+        (path.endsWith("/wineserver64") || path.endsWith("/wineserver"))) {
+        args.push_back(B("-p"));
+        klog_fmt("sys_execve64: bare wineserver spawn made persistent (-p) for boot reliability");
+    }
     klog_fmt("sys_execve64: pid=%d path='%s' argv0='%s' argc=%d envc=%d",
              (int)(cpu->thread && cpu->thread->process ? cpu->thread->process->id : -1),
              path.c_str(),
