@@ -57,7 +57,6 @@ struct UrlPart {
 struct RangedFile {
     std::vector<UrlPart> parts;
     U64 total = 0;
-    U64 pos = 0;
     bool error = false;
     U64 fetched = 0;      // stats: bytes downloaded so far
     U64 lastLogged = 0;
@@ -115,7 +114,7 @@ struct RangedFile {
         return raw;
     }
 
-    U32 read(void* out, U32 size) {
+    U32 readAt(U64& pos, void* out, U32 size) {
         std::lock_guard<std::mutex> lk(m);
         U8* dst = (U8*)out;
         U32 done = 0;
@@ -142,13 +141,26 @@ struct RangedFile {
     }
 };
 
+// One RangedFile (block cache) is shared per spec across every unzOpen of it
+// (FsZip::init + the static helpers each open the zip; without sharing, each
+// re-fetched the central directory). Streams carry their own cursor.
+struct RangedStream {
+    std::shared_ptr<RangedFile> file;
+    U64 pos = 0;
+};
+std::mutex g_registryMutex;
+std::map<std::string, std::shared_ptr<RangedFile>> g_registry;
+
 voidpf urlOpen64(voidpf opaque, const void* filename, int mode) {
     (void)filename; (void)mode;
-    return opaque; // the RangedFile* itself is the stream
+    RangedStream* st = new RangedStream();
+    st->file = *(std::shared_ptr<RangedFile>*)opaque;
+    return st;
 }
 uLong urlRead(voidpf opaque, voidpf stream, void* buf, uLong size) {
     (void)opaque;
-    return ((RangedFile*)stream)->read(buf, (U32)size);
+    RangedStream* st = (RangedStream*)stream;
+    return st->file->readAt(st->pos, buf, (U32)size);
 }
 uLong urlWrite(voidpf opaque, voidpf stream, const void* buf, uLong size) {
     (void)opaque; (void)stream; (void)buf; (void)size;
@@ -156,25 +168,24 @@ uLong urlWrite(voidpf opaque, voidpf stream, const void* buf, uLong size) {
 }
 ZPOS64_T urlTell64(voidpf opaque, voidpf stream) {
     (void)opaque;
-    return ((RangedFile*)stream)->pos;
+    return ((RangedStream*)stream)->pos;
 }
 long urlSeek64(voidpf opaque, voidpf stream, ZPOS64_T offset, int origin) {
     (void)opaque;
-    RangedFile* f = (RangedFile*)stream;
-    std::lock_guard<std::mutex> lk(f->m);
-    U64 base = (origin == ZLIB_FILEFUNC_SEEK_CUR) ? f->pos
-             : (origin == ZLIB_FILEFUNC_SEEK_END) ? f->total : 0;
-    f->pos = base + offset;
+    RangedStream* st = (RangedStream*)stream;
+    U64 base = (origin == ZLIB_FILEFUNC_SEEK_CUR) ? st->pos
+             : (origin == ZLIB_FILEFUNC_SEEK_END) ? st->file->total : 0;
+    st->pos = base + offset;
     return 0;
 }
 int urlClose(voidpf opaque, voidpf stream) {
     (void)opaque;
-    delete (RangedFile*)stream;
+    delete (RangedStream*)stream; // the shared RangedFile lives in the registry
     return 0;
 }
 int urlError(voidpf opaque, voidpf stream) {
     (void)opaque;
-    return ((RangedFile*)stream)->error ? 1 : 0;
+    return ((RangedStream*)stream)->file->error ? 1 : 0;
 }
 
 } // namespace
@@ -188,7 +199,21 @@ unzFile fsZipUrlOpen(BString spec) {
         klog_fmt("fszipurl: bad spec (need total;url|size...): %s", spec.c_str());
         return nullptr;
     }
-    auto f = std::make_unique<RangedFile>();
+    std::lock_guard<std::mutex> reg(g_registryMutex);
+    auto& slot = g_registry[std::string(spec.c_str())];
+    if (slot) {
+        zlib_filefunc64_def fns = {};
+        fns.zopen64_file = urlOpen64;
+        fns.zread_file = urlRead;
+        fns.zwrite_file = urlWrite;
+        fns.ztell64_file = urlTell64;
+        fns.zseek64_file = urlSeek64;
+        fns.zclose_file = urlClose;
+        fns.zerror_file = urlError;
+        fns.opaque = &slot;
+        return unzOpen2_64(spec.c_str(), &fns);
+    }
+    auto f = std::make_shared<RangedFile>();
     f->total = (U64)atoll(fields[0].c_str());
     U64 cum = 0;
     for (size_t i = 1; i < fields.size(); i++) {
@@ -210,6 +235,7 @@ unzFile fsZipUrlOpen(BString spec) {
                  (unsigned long long)cum, (unsigned long long)f->total);
         return nullptr;
     }
+    slot = f; // registered BEFORE open so opaque points at stable storage
     zlib_filefunc64_def fns = {};
     fns.zopen64_file = urlOpen64;
     fns.zread_file = urlRead;
@@ -218,12 +244,13 @@ unzFile fsZipUrlOpen(BString spec) {
     fns.zseek64_file = urlSeek64;
     fns.zclose_file = urlClose;
     fns.zerror_file = urlError;
-    fns.opaque = f.get();
+    fns.opaque = &slot;
     unzFile z = unzOpen2_64(spec.c_str(), &fns);
     if (z) {
         klog_fmt("fszipurl: mounted %llu MB zip lazily (%d part(s), 512KB blocks)",
                  (unsigned long long)(f->total >> 20), (int)f->parts.size());
-        f.release(); // owned by the unzFile stream now (freed in urlClose)
+    } else {
+        g_registry.erase(std::string(spec.c_str()));
     }
     return z;
 }
