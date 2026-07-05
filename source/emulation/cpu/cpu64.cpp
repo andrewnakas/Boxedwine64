@@ -379,7 +379,7 @@ static void flagsLogic(U32& f, U64 r, U32 width) {
     setSZP(f, r, width);
 }
 
-void CPU64::runAlu(U8 aluOp, U32 size, bool destIsRM, U64 lhs, U64 rhs,
+__attribute__((always_inline)) inline void CPU64::runAlu(U8 aluOp, U32 size, bool destIsRM, U64 lhs, U64 rhs,
                    const ModRM& m, bool rexPresentLocal) {
     // aluOp: 0=ADD 1=OR 2=ADC 3=SBB 4=AND 5=SUB 6=XOR 7=CMP
     U64 result = 0;
@@ -444,7 +444,7 @@ bool CPU64::evalCC(U8 cc) const {
 // Compute SHL/SHR/SAR/ROL/ROR/RCL/RCR result + flags. count is already masked.
 // Returns the new value; flag effects are applied to rflags. For rotates the
 // SZP flags are not touched (per Intel SDM); only CF (and OF for count==1).
-static U64 doShift(U32& rflags, U8 sub, U64 v, U8 count, U32 width) {
+__attribute__((always_inline)) inline static U64 doShift(U32& rflags, U8 sub, U64 v, U8 count, U32 width) {
     if (count == 0) return v;
     U64 mask = maskFor(width);
     v &= mask;
