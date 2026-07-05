@@ -19,36 +19,82 @@ bool fsZipUrlIsSpec(BString path) {
 // zlib_filefunc64_def etc. come via unzip.h (already included by fszipurl.h
 // inside extern "C"); ioapi.h alone doesn't parse without zlib.h's macros.
 
-// Synchronous same-origin Range fetch on THIS worker thread via the
-// emscripten fetch API (EMSCRIPTEN_FETCH_SYNCHRONOUS: the calling pthread
-// Atomics-waits while the fetch worker does an async fetch — no sync XHR,
-// which newer Chrome builds reject in COEP worker contexts; that rejection
-// is exactly what the CI smoke caught). Returns bytes copied or a negative
-// status/-1.
-#include <emscripten/fetch.h>
+// Synchronous same-origin Range fetch from a guest pthread, built on
+// fetch() ONLY. Chrome ~151/152 rejects the XHR paths in this COEP worker
+// context (both a hand-rolled sync XHR and emscripten_fetch — whose internal
+// transport is XHR — start returning network errors after which lazy reads
+// fail; bisected on Chrome-for-Testing 152, passes on 149/150). Mechanism:
+// the calling pthread queues a task to the browser main runtime thread with
+// emscripten_proxy_sync_with_ctx and blocks; on the main thread an EM_JS kicks
+// an async fetch(Range) whose .then copies the bytes into the (SAB-backed)
+// destination, stores the byte count, and finishes the proxy ctx, waking the
+// caller. fetch() is exactly what the launcher's eager path uses — the one
+// transport every Chrome keeps working.
+#include <emscripten/proxying.h>
+#include <emscripten/threading.h>
+
+namespace {
+struct FetchJob {
+    const char* url;
+    U64 start;
+    U64 endIncl;
+    U8* dst;
+    int want;
+    int result; // bytes copied or negative status/-1
+};
+}
+
+extern "C" {
+// Called from JS on the main thread when the fetch settles.
+EMSCRIPTEN_KEEPALIVE void bw64FetchDone(double ctxAddr, double jobAddr, int result) {
+    FetchJob* job = (FetchJob*)(uintptr_t)jobAddr;
+    job->result = result;
+    emscripten_proxy_finish((em_proxying_ctx*)(uintptr_t)ctxAddr);
+}
+}
+
+EM_JS(void, bw64StartFetch, (double ctxAddr, double jobAddr, const char* url, double start, double endIncl, double dstAddr, int want), {
+    var u = UTF8ToString(url);
+    var range = 'bytes=' + start + '-' + endIncl;
+    fetch(u, { headers: { 'Range': range }, cache: 'no-store' }).then(function (r) {
+        if (r.status != 206 && !(r.status == 200 && start == 0)) {
+            throw { bwStatus: r.status };
+        }
+        return r.arrayBuffer();
+    }).then(function (ab) {
+        var src = new Uint8Array(ab);
+        var n = src.length < want ? src.length : want;
+        if (typeof growMemViews === 'function') growMemViews();
+        HEAPU8.set(src.subarray(0, n), Number(dstAddr));
+        _bw64FetchDone(ctxAddr, jobAddr, n);
+    }).catch(function (e) {
+        var code = (e && e.bwStatus) ? -e.bwStatus : -1;
+        _bw64FetchDone(ctxAddr, jobAddr, code);
+    });
+});
+
+static void bw64FetchOnMain(em_proxying_ctx* ctx, void* arg) {
+    FetchJob* job = (FetchJob*)arg;
+    bw64StartFetch((double)(uintptr_t)ctx, (double)(uintptr_t)job, job->url,
+                   (double)job->start, (double)job->endIncl,
+                   (double)(uintptr_t)job->dst, job->want);
+    // Do NOT finish here — bw64FetchDone finishes when the fetch settles.
+}
 
 static int bw64SyncFetchRange(const char* url, double start, double endIncl, U8* dst, int want) {
-    emscripten_fetch_attr_t attr;
-    emscripten_fetch_attr_init(&attr);
-    strcpy(attr.requestMethod, "GET");
-    attr.attributes = EMSCRIPTEN_FETCH_LOAD_TO_MEMORY | EMSCRIPTEN_FETCH_SYNCHRONOUS;
-    char rangeVal[64];
-    snprintf(rangeVal, sizeof(rangeVal), "bytes=%llu-%llu",
-             (unsigned long long)start, (unsigned long long)endIncl);
-    const char* headers[] = { "Range", rangeVal, nullptr };
-    attr.requestHeaders = headers;
-    emscripten_fetch_t* f = emscripten_fetch(&attr, url);
-    if (!f) return -1;
-    int status = f->status;
-    int n = -1;
-    if (status == 206 || (status == 200 && start == 0)) {
-        n = (int)std::min<U64>((U64)f->numBytes, (U64)want);
-        memcpy(dst, f->data, (size_t)n);
-    } else {
-        n = -status;
+    FetchJob job;
+    job.url = url;
+    job.start = (U64)start;
+    job.endIncl = (U64)endIncl;
+    job.dst = dst;
+    job.want = want;
+    job.result = -1;
+    if (!emscripten_proxy_sync_with_ctx(emscripten_proxy_get_system_queue(),
+                                        emscripten_main_runtime_thread_id(),
+                                        bw64FetchOnMain, &job)) {
+        return -1;
     }
-    emscripten_fetch_close(f);
-    return n;
+    return job.result;
 }
 
 namespace {
