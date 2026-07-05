@@ -87,7 +87,10 @@ void CPU64::cloneRegistersFrom(const CPU64* from) {
     sigAltStack = from->sigAltStack;
 }
 
-U8 CPU64::fetchByte(U64 addr) {
+// Hot enough to appear as its own frame in native profiles (i.e. the compiler
+// chose not to inline it into step()'s huge body) — force it: the fast path is
+// a compare + two array indexes and call overhead dominates it.
+__attribute__((always_inline)) inline U8 CPU64::fetchByte(U64 addr) {
     if (!memory) return 0;
     // Fast path: same code page as the last fetch -> read straight from the
     // cached backing buffer, no lock, no map lookup. Code locality makes this
@@ -148,7 +151,9 @@ void CPU64::writeReg8(U8 index, U8 value, bool rexPresent) {
     reg[index].setU8(value);
 }
 
-U32 CPU64::consumePrefixes(Prefixes& out) {
+// Same story as fetchByte: ~14% of interpreter time as a standalone frame,
+// mostly call overhead + spilling `out` — inline it into step().
+__attribute__((always_inline)) inline U32 CPU64::consumePrefixes(Prefixes& out) {
     U32 off = 0;
     // Loop until we hit a non-prefix byte. REX, if present, MUST be the last
     // prefix immediately before the opcode (Intel SDM Vol.2 §2.2.1) — we
