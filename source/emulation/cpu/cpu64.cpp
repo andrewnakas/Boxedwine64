@@ -5515,6 +5515,48 @@ bool CPU64::buildBlock(U64 startRip, BBlock& b) {
             if (!decodeModRMRecipe(r + opOff + 2, p, 0, rec.mr)) break;
             rec.kind = BK_IMUL_R_RM;
             rec.len = (U8)(opOff + 2 + rec.mr.length);
+        } else if (op == 0x85) {
+            if (!decodeModRMRecipe(r + opOff + 1, p, 0, rec.mr)) break;
+            rec.kind = BK_TEST_RM_R;
+            rec.len = (U8)(opOff + 1 + rec.mr.length);
+        } else if (op == 0x8D) {
+            if (!decodeModRMRecipe(r + opOff + 1, p, 0, rec.mr)) break;
+            if (rec.mr.isReg) break;               // LEA reg-form undefined
+            rec.kind = BK_LEA;
+            rec.len = (U8)(opOff + 1 + rec.mr.length);
+        } else if (op == 0xC7) {
+            if (!decodeModRMRecipe(r + opOff + 1, p, 4, rec.mr)) break;
+            if ((rec.mr.regField & 0x7) != 0) break;
+            rec.kind = BK_MOV_RM_IMM;
+            S32 imm32 = (S32)fetchDword(r + opOff + 1 + rec.mr.length);
+            rec.imm = (size == 8) ? (U64)(S64)imm32 : (U64)(U32)imm32;
+            rec.len = (U8)(opOff + 1 + rec.mr.length + 4);
+        } else if (op >= 0xB8 && op <= 0xBF) {
+            rec.kind = BK_MOV_R_IMM;
+            rec.sub = (U8)((op - 0xB8) | ((p.rex & 0x01) ? 0x08 : 0));
+            if (rexW) {
+                rec.imm = fetchQword(r + opOff + 1);
+                rec.len = (U8)(opOff + 1 + 8);
+            } else {
+                rec.imm = fetchDword(r + opOff + 1);
+                rec.len = (U8)(opOff + 1 + 4);
+            }
+        } else if (op >= 0x50 && op <= 0x57) {
+            rec.kind = BK_PUSH;
+            rec.sub = (U8)((op - 0x50) | ((p.rex & 0x01) ? 0x08 : 0));
+            rec.len = (U8)(opOff + 1);
+        } else if (op >= 0x58 && op <= 0x5F) {
+            rec.kind = BK_POP;
+            rec.sub = (U8)((op - 0x58) | ((p.rex & 0x01) ? 0x08 : 0));
+            rec.len = (U8)(opOff + 1);
+        } else if (op == 0x0F && fetchByte(r + opOff + 1) >= 0x80 && fetchByte(r + opOff + 1) <= 0x8F) {
+            rec.kind = BK_JCC8;                    // same executor as rel8
+            rec.sub = fetchByte(r + opOff + 1) & 0xF;
+            rec.jccDelta = (S32)fetchDword(r + opOff + 2);
+            rec.len = (U8)(opOff + 2 + 4);
+            b.n++;
+            r += rec.len;
+            break;                                  // terminator
         } else if (op >= 0x70 && op <= 0x7F) {
             rec.kind = BK_JCC8;
             rec.sub = op & 0xF;
@@ -5618,6 +5660,43 @@ U32 CPU64::execBlock(const BBlock& b) {
             rip += rec.len;
             break;
         }
+        case BK_TEST_RM_R: {
+            ModRM m = resolveRecipe(rec.mr);
+            U64 a = loadRM(m, size, rexPresent);
+            U64 bv = (size == 4) ? (U64)reg[m.regField].u32 : reg[m.regField].u64;
+            flagsLogic(rflags, a & bv, size);
+            rip += rec.len;
+            break;
+        }
+        case BK_LEA: {
+            ModRM m = resolveRecipe(rec.mr);
+            if (size == 4) reg[m.regField].setU32((U32)m.effAddr);
+            else reg[m.regField].setU64(m.effAddr);
+            rip += rec.len;
+            break;
+        }
+        case BK_MOV_RM_IMM: {
+            ModRM m = resolveRecipe(rec.mr);
+            storeRM(m, size, rec.imm, rexPresent);
+            rip += rec.len;
+            break;
+        }
+        case BK_MOV_R_IMM: {
+            if (size == 4) reg[rec.sub].setU32((U32)rec.imm);
+            else reg[rec.sub].setU64(rec.imm);
+            rip += rec.len;
+            break;
+        }
+        case BK_PUSH: {
+            push64(reg[rec.sub].u64);
+            rip += rec.len;
+            break;
+        }
+        case BK_POP: {
+            reg[rec.sub].setU64(pop64());
+            rip += rec.len;
+            break;
+        }
         case BK_JCC8: {
             rip += rec.len;
             if (evalCC(rec.sub)) rip += (U64)(S64)rec.jccDelta;
@@ -5634,7 +5713,20 @@ U32 CPU64::tryBlockStep() {
     U64 r = rip;
     U32 neg = (U32)((r ^ (r >> 10)) & 1023);
     if (blockNegCache[neg] == r) return 0;
-    if (!blockTable) blockTable = std::make_unique<BBlock[]>(BBLOCK_SLOTS);
+    if (!blockTable) {
+        blockTable = std::make_unique<BBlock[]>(BBLOCK_SLOTS);
+        if (std::getenv("BW64_BLOCKSTATS")) {
+            static CPU64* statsCpu = this;
+            std::atexit([] {
+                klog_fmt("BLOCKSTATS: built=%llu execs=%llu insnsInBlocks=%llu totalInsns=%llu coverage=%.1f%%",
+                         (unsigned long long)statsCpu->blockStatsBuilt,
+                         (unsigned long long)statsCpu->blockStatsExec,
+                         (unsigned long long)statsCpu->blockStatsInsn,
+                         (unsigned long long)statsCpu->instructionCount,
+                         statsCpu->instructionCount ? 100.0 * statsCpu->blockStatsInsn / statsCpu->instructionCount : 0.0);
+            });
+        }
+    }
     BBlock& b = blockTable[(U32)((r ^ (r >> 9)) & (BBLOCK_SLOTS - 1))];
     if (b.startRip == r) {
         if (KMemory64::blockPageGenOf(b.page0) == b.gen0 &&

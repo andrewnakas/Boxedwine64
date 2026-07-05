@@ -257,7 +257,8 @@ private:
     };
     enum BKind : U8 {
         BK_MOV_RM_R, BK_MOV_R_RM, BK_ALU_RM_R, BK_ALU_R_RM,
-        BK_ALU_RM_IMM, BK_SHIFT_IMM, BK_IMUL_R_RM, BK_JCC8
+        BK_ALU_RM_IMM, BK_SHIFT_IMM, BK_IMUL_R_RM, BK_JCC8,
+        BK_TEST_RM_R, BK_LEA, BK_MOV_RM_IMM, BK_MOV_R_IMM, BK_PUSH, BK_POP
     };
     struct BRec {
         U8  kind = 0;
