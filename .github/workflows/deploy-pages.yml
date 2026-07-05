@@ -199,7 +199,7 @@ jobs:
             sleep 0.2
           done
           node project/emscripten/smoke-test.mjs \
-            "http://127.0.0.1:8077/wine64.html?chunked=1&p=notepad.exe" \
+            "http://127.0.0.1:8077/wine64.html?chunked=1&p=notepad.exe&lazy=0" \
             --timeout=420000 --attempts=2
           rm -f _site/server.mjs
 
@@ -207,8 +207,9 @@ jobs:
         # The M7 lazy mount (?lazy=1) fails on CI's Chrome/runner combination in
         # ways local+live Chromes don't show (fetch status=0 after ~150 range
         # requests). Run it visibly but don't gate the deploy on it while the
-        # emscripten_fetch backend soaks. Flip lazy to default once this step
-        # is reliably green.
+        # emscripten_fetch backend soaks. Lazy is now the site DEFAULT (the
+        # gating smoke above certifies the ?lazy=0 escape hatch); this step
+  # monitors the runner-only anomaly.
         continue-on-error: true
         working-directory: project/emscripten
         run: |
