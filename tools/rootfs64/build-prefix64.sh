@@ -83,7 +83,7 @@ done
 # these against this pre-booted prefix, so they must live both at the HOME root
 # (Z:\home\username\<prog>) and under drive_c (C:\<prog>), mirroring glcube.exe.
 GLTEST="$HERE/gltest"
-for exe in gltri.exe d3dtri.exe; do
+for exe in gltri.exe d3dtri.exe deskpin.exe; do
   if [ -f "$GLTEST/$exe" ]; then
     cp "$GLTEST/$exe" "$STAGE/home/username/$exe"
     cp "$GLTEST/$exe" "$STAGE/$DRIVE_C/$exe"

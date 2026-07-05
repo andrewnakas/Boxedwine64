@@ -934,6 +934,14 @@
                     currentAppPid = lastSpawnedPid();
                     console.log("session: boot app pid=" + currentAppPid);
                     spawnArgv([WINESERVER64, "-p"], "wineserver64 -p (pin persistent)");
+                    // Desktop pin (M18 boot reliability): wineserver WM_CLOSEs an
+                    // "empty" desktop (only explorer's threads left) after 1s, and
+                    // the slow interpreted wineboot->app handoff routinely leaves
+                    // the desktop empty for seconds — explorer died mid-boot on
+                    // ~1-in-3 cold boots. deskpin.exe holds a hidden window (a
+                    // desktop *user*, blocked in GetMessage, zero CPU) so the
+                    // close timeout never arms. All wine binaries stay stock.
+                    spawnArgv(wineProgArgv("Z:\\home\\username\\deskpin.exe"), "deskpin (hold desktop open)");
                 }
                 return;
             }

@@ -339,9 +339,12 @@ to a pthread twice).
 
 What runs today in the browser build, why the sweet spot is shaped the way it is,
 and how to bring your own app. The hard limits that decide feasibility: the x86-64
-CPU is **interpreted (no JIT)** so CPU-bound code is ~10×+ slower; rendering only
-works through the **GDI/USER32** path (`BitBlt`/`StretchDIBits`/`PutImage`) or the
-basic **OpenGL→WebGL2** bridge — **no Direct3D/Direct2D/DirectWrite, no GPU
+CPU is **interpreted (no JIT)** so CPU-bound code is ~10×+ slower; rendering
+works through the **GDI/USER32** path (`BitBlt`/`StretchDIBits`/`PutImage`), the
+**OpenGL→WebGL2** bridge, or (new) **basic Direct3D 9** via wine's wined3d over
+that same GL bridge — but D3D presents take seconds per frame under the
+interpreter, so it's a capability demo, not a way to play GPU games; there is
+still **no Direct2D/DirectWrite and no GPU
 compute**; there is **no audio backend yet**; there is **no network** inside the
 guest; and the whole rootfs is downloaded up front (no lazy loading), so **small
 matters**. The bullseye is classic **Win32/GDI** apps — the 2000s–early-2010s
@@ -357,13 +360,14 @@ freeware era.
 | **Minesweeper** (`winemine`) | GDI/USER32 | ✅ Works | |
 | **Snake / Tetris** | GDI/USER32 | ✅ Works | Self-contained Win32, built with mingw-w64 (`tools/rootfs64/games`) |
 | **glcube / gltri** | OpenGL → WebGL2 | ✅ Works | Spinning shaded cube via the `gl64` WGL→WebGL2 bridge |
+| **d3dtri** | Direct3D 9 → wined3d → WebGL2 | ✅ Works | A D3D9 gradient triangle renders end-to-end (device → shaders → VBO → present). First frame takes ~2–3 min under the interpreter |
 | **DOOM** (`doomgeneric`) | GDI/USER32 | ✅ Playable | Shareware WAD; renders + keyboard/menu/movement work. Fire = **Ctrl / F / X** (browsers intercept Ctrl). No mouse/turn or sound yet |
 | **HxD** (hex editor) | GDI/USER32 | ✅ Works | Real third-party Delphi app (WineHQ Platinum); renders the full editor — menu bar, toolbar, data-type inspector. Bundled byte-exact per its license. Give it ~60–80 s to come up |
 | **Your own `.exe`** | depends on the app | ✅ via "Run my own .exe" | Drag in a **portable Win32/GDI** exe; see below |
 | Task Mgr / regedit / control / explorer / IE / oleview | mixed | 🧪 Experimental | May not come up — depend on heavier shell/COM/X11 surface |
 | .NET (WinForms) utilities | wine-mono + GDI+ | ⚠️ Poor fit | The CLR JITs IL at runtime — brutal under a non-JIT interpreter, plus a large wine-mono payload. WPF is Direct3D-backed → unsupported |
 | System-info tools (CPU-Z, HWiNFO, Speccy…) | kernel driver + WMI | ❌ Won't run | No kernel driver / real hardware / WMI to read |
-| Direct3D / GPU games & media players | D3D/DXVA | ❌ Unsupported | No D3D/Direct2D/DirectWrite backend |
+| Direct3D / GPU games & media players | D3D/DXVA | ❌ Impractical | Basic D3D9 now renders (see d3dtri), but a present takes seconds under the interpreter — real D3D games/media are far out of reach; Direct2D/DirectWrite have no backend |
 
 **Run your own `.exe`** — the **"⬆ Run my own .exe"** toolbar button lets you pick
 a Windows executable from your machine; it's written into the in-browser sandbox

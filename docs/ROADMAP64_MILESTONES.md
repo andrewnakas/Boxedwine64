@@ -64,8 +64,9 @@ self-contained sessions. Each iteration:
 | M15 | taskmgr blocker triage | Root-cause taskmgr's wasm `RuntimeError: null function` — identify the exact call site/missing feature, then fix if bounded or leave a precise triage note | A named root cause and either a fix that lets taskmgr render, or a documented blocker | DONE (2026-06-11) — root-caused to a HOST-SIDE wasm null-function call on a WORKER thread (not a wine API stub, not a missing x86 opcode — NO wine err:/unimplemented line precedes it), during taskmgr's icon/pixmap setup; pinpointing the C++ site needs a symbolicated build (documented blocker). Predates M14. Also stripped the 4 stale XWire DIAG logs this surfaced |
 | M14 | X drawing primitives | Implement the core X line/rect drawing requests (PolySegment 65, PolyRectangle 66, PolyLine 64, PolyPoint 63, FillPoly 69) into the window framebuffer — the gap behind graph/border-drawing apps | Draw-primitive app shows lines/borders in-browser, no regression, selftest unaffected | DONE — implemented + browser-verified 2026-06-11 (regedit's tree/border lines render crisp via the new primitives, no regression; selftest 234/234). Also fixed a latent PolyFillRectangle no-op. taskmgr re-triaged: its blocker is a deeper wine null-function stub, NOT drawing |
 | M13 | Gecko / .NET (evaluate) | Upstream item: wine-gecko (HTML dialogs) and wine-mono (.NET apps) payloads — weigh ~50–80MB payloads + JIT-under-interpreter cost | A trivial .NET WinForms exe runs, or a written descope rationale (payload/perf numbers) | EVALUATED → NO-GO (2026-06-11): no mono/gecko in rootfs; ~50-80MB payload + JIT-in-interpreter cold-start. Rationale in Log |
-| M16 | Direct3D (wined3d → WebGL2) | Bring up the D3D path: extend the gl64 bridge from fixed-function-only to the full programmable pipeline (shaders, VBOs, vertex attribs, modern state, textures) so wined3d can render D3D apps via WebGL2 | A D3D9 app renders its 3D output (not black) in-browser | IN PROGRESS (2026-06-11) — MUCH further now: device-create blocker SOLVED (trim advertised extensions to the minimal GLSL set → wined3d `CreateDevice` succeeds), FFP-shader transpiler done (wined3d's fixed-function GLSL compiles+links CLEAN on WebGL2), and the D3D `glDrawArrays` fires. NEW & FINAL blocker: the guest STALLS after the first draw — wined3d's `Present()` does NOT call `glXSwapBuffers` and hangs in non-GL code (a present/threading issue), so no frame ever reaches the canvas. Resume path in the Log |
+| M16 | Direct3D (wined3d → WebGL2) | Bring up the D3D path: extend the gl64 bridge from fixed-function-only to the full programmable pipeline (shaders, VBOs, vertex attribs, modern state, textures) so wined3d can render D3D apps via WebGL2 | A D3D9 app renders its 3D output (not black) in-browser | DONE (2026-07-01, browser-verified: d3dtri renders its gradient triangle; code on master 32b53543) — two final root causes: wined3d's `wglGetPixelFormat` at present time livelocks the wineserver window-region path (fixed with a skip patch baked into the shipped wined3d.dll, see Log 2026-07-03) and the guest libGL stubbed `glMapBuffer`/`glUnmapBuffer` so D3D vertex-buffer Lock/Unlock never filled the VBO (fixed in tools/rootfs64/libgl64). Production-clean rootfs deployed 2026-07-03 |
 | M17 | winetricks (evaluate) | Bring up winetricks (the wine helper that installs redistributables/DLL-overrides/fonts) in the WASM build, or get a useful subset working | winetricks runs a verb in-browser, or a written go/no-go with the technical blocker + the achievable native subset | EVALUATED → NO-GO for the script; native verb-subset is the path (2026-06-11). winetricks is a ~14k-line bash script needing a POSIX shell + coreutils + wget/curl + cabextract + internet — NONE exist in the rootfs (no shell at all; no socket egress in-browser). Its USEFUL actions (DLL overrides, registry tweaks) ARE achievable natively without it. Assessment + mechanism in the Log |
+| M18 | Boot reliability | Kill the two known boot flakes so a cold boot succeeds ~always: (a) the wineserver startup race (several wineservers contend, the real one loses and exits → app never paints — observed ~1-in-3 headless boots since 2026-06-11), (b) the d3dtri/GL `CreateDevice` early-exit flake (~1-in-2, app exits status=1 ~80s in before GL init). Root-cause each, fix in the spawn/serialization path (not by retry) | 10 consecutive cold headless boots of notepad AND glcube AND d3dtri all paint without a retry, locally; CI smoke passes on attempt 1 for 3 consecutive deploys | LOCAL ACCEPTANCE MET (2026-07-04): **30/30 consecutive clean boots** (glcube 10/10, notepad 10/10, d3dtri 10/10) and boots are ~2× faster (36–47s vs 60–100s — the explorer die/respawn cycle was slowing every boot). ONE root cause explained both flakes: wineserver closes an "empty" desktop (only explorer's threads left) after 1 SECOND (server/winstation.c `close_desktop_timeout`); the interpreter's slow wineboot→app handoff leaves the desktop empty for seconds → explorer /desktop gets WM_CLOSE mid-boot → the late app finds no desktop (generic apps hang; d3dtri's device init fails → its "CreateDevice flake"). Three-part fix: (1) patched wineserver, desktop grace 1s→600s — MUST be built from Debian's wine source (apt-get source; vanilla-source wineserver is incompatible: Debian patches the server dir to XDG /run/user, ntdll dies `chdir: ENOENT`) — Dockerfile.wineserver in /Users/nakas/winebuild; (2) sys_execve64 appends `-p` to bare wineserver spawns (deterministic session persistence); (3) deskpin.exe holds a hidden window as a desktop user (belt-and-braces once up). Remaining for full DONE: ship the rootfs (needs PR #1 merged) + 3 consecutive attempt-1-green CI smokes |
 
 Suggested order = table order. M1 early on purpose: it protects every later
 milestone. M11–M13 are evaluation milestones — a rigorous written no-go closes
@@ -75,6 +76,35 @@ them.
 
 ## Log
 
+- **2026-07-03 — M16 CLOSED + production-clean D3D rootfs shipped.** The
+  2026-07-01 breakthrough (d3dtri renders its gradient triangle, code merged to
+  master as 32b53543) is now deployed clean:
+  - **The two root causes** (after the long Present-hang investigation below):
+    (1) `wglGetPixelFormat(dc)` called from `wined3d_context_gl_enter` at
+    present time livelocks Boxedwine's wineserver window-region path
+    (get_visible_region/get_window_info spin). It only exists to detect a DC
+    pixel-format change, which never happens mid-app here — so the shipped
+    wined3d.dll skips the call. (2) The guest libGL.so.1 stubbed
+    `glMapBufferRange`→0 and lacked `glMapBuffer`/`glUnmapBuffer`, which
+    wined3d uses to fill D3D vertex buffers (Lock→memcpy→Unlock ⇒
+    map→memcpy→unmap), so the VBO stayed zero and the triangle was degenerate.
+    Fixed with client-side map emulation in tools/rootfs64/libgl64/libgl64.c
+    (scratch buffer on map, exact-size glBufferSubData on unmap, ARB aliases).
+  - **Production cleanup this session:** the debug-instrumented wined3d.dll
+    (25 per-frame BW64D3D raw-write probes) was rebuilt with ONLY the silent
+    skip patch (`/Users/nakas/winebuild/patch_context_gl_skiponly.py` +
+    `Dockerfile.skiponly`, winebuild Docker, wine-8.0 source); the instrumented
+    unstripped win32u.so (8.4MB, log-only display/DCE/message probes) was
+    restored to the stock Debian build (1.4MB). Audit of every 2026-dated entry
+    in wine64.zip confirmed nothing else non-stock ships except the intended
+    libGL.so.1 fix (which lives in BOTH wine64.zip and glibc-rootfs64.zip —
+    always update both).
+  - **Note for reproducing wined3d.dll:** the skip patch is EXTERNAL to this
+    repo (the dist zips are gitignored Docker artifacts) — rebuild via the
+    winebuild Docker image; the patch scripts live in /Users/nakas/winebuild.
+  - The app bar gained a "D3D tri" button (Graphics row) so the D3D path is
+    visible on the live site; first frame takes ~2-3 minutes under the
+    interpreter.
 - **2026-06-12 — M16 UPDATE #6 (D3D Present hang): CONFIRMED — wined3d.dll is
   never registered with the sampler (no pid has it); ntdll IS. Plus a process-id
   correction.** Drilled into why the stack-scan resolved nothing:

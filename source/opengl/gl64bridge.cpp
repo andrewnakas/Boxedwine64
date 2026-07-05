@@ -604,15 +604,17 @@ void readFloats(CPU64* cpu, U64 guestAddr, float* out, int count) {
     cpu->memory->memcpyFromGuest(out, guestAddr, (U64)count * 4);
 }
 
+// Tiny ring of the most recent gl64 fnIds, for annotating nonzero glGetError
+// logs (which GL call likely produced the error). Guarded by g_glMutex.
+// Outside the __EMSCRIPTEN__ guard: the GLERR log site that reads it is
+// compiled on all platforms (the wasm-only guard here broke the native build).
+U64 g_lastFnIds[8] = {0};
+int g_lastFnIdx = 0;
+
 #ifdef __EMSCRIPTEN__
 // True once any draw has hit our offscreen FBO this frame — lets the swap path
 // know a programmable-pipeline frame was produced (vs. the immediate-mode path).
 std::atomic<bool> g_glDrew{false};
-
-// Tiny ring of the most recent gl64 fnIds, for annotating nonzero glGetError
-// logs (which GL call likely produced the error). Guarded by g_glMutex.
-U64 g_lastFnIds[8] = {0};
-int g_lastFnIdx = 0;
 
 // Translate wined3d's desktop-GLSL (#version 120/130) shader source into the
 // GLSL ES 3.00 dialect WebGL2 requires. WebGL2 rejects `#version 120` outright,

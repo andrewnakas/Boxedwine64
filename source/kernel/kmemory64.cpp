@@ -19,6 +19,7 @@
 #include <unordered_map>
 #include <memory>
 #include <mutex>
+#include <atomic>
 
 // ---------------------------------------------------------------------------
 // Process-shared file mappings (MAP_SHARED). A single host buffer per
@@ -68,8 +69,61 @@ std::shared_ptr<SharedFilePage> getSharedFilePage(const std::string& path, U64 o
 #define K_ENOMEM 12
 #endif
 
+// ---------------------------------------------------------------------------
+// Per-thread data-page TLB. Every guest DATA access (operand reads/writes,
+// push/pop) used to take pagesMutex + an unordered_map lookup via getPage /
+// commitPageLocked — a native profile of a CPU-bound guest loop showed ~21%
+// of interpreter time in pthread mutex slow paths from exactly this. The
+// instruction-FETCH side already has its per-CPU page cache (CPU64::fetchByte);
+// this is the data-side equivalent: a small direct-mapped, thread-local
+// page -> host-buffer cache consulted before the locked slow path.
+//
+// Why so little invalidation is needed (all verified against this file):
+//   - munmap frees ADDRESS SPACE only; page buffers deliberately survive.
+//   - mprotect only rewrites flags; reads ignore flags entirely and writes
+//     commit-on-write regardless, so cached data* stays behaviorally exact.
+//   - mmap over an existing committed page zeroes IN PLACE (buffer stable).
+//   - K64Page::commit() never reallocates an existing buffer.
+// The only events that free/replace a committed buffer are the KMemory64
+// destructor (execve reset, process exit — also covers heap-address reuse of
+// the KMemory64* tag) and K64Page::adoptShared (the shared-file mmap path).
+// Both bump the global generation; a TLB hit requires a generation match.
+// Entries are tagged with the owning KMemory64* because kernel code on one
+// thread can touch another process's memory (fork ctid writes, ptrace-style
+// peeks), and one host thread serves exactly one running guest thread.
+namespace {
+struct K64DTlbEntry { const void* mem; U64 page; U8* data; U32 gen; };
+constexpr U32 K64_DTLB_SIZE = 64; // direct-mapped, per-thread (~2KB)
+thread_local K64DTlbEntry g_k64DTlb[K64_DTLB_SIZE];
+std::atomic<U32> g_k64DTlbGen{1};
+
+inline U8* k64DTlbLookup(const void* mem, U64 pageNum) {
+    const K64DTlbEntry& e = g_k64DTlb[pageNum & (K64_DTLB_SIZE - 1)];
+    if (e.mem == mem && e.page == pageNum &&
+        e.gen == g_k64DTlbGen.load(std::memory_order_acquire)) {
+        return e.data;
+    }
+    return nullptr;
+}
+inline void k64DTlbInsert(const void* mem, U64 pageNum, U8* data) {
+    K64DTlbEntry& e = g_k64DTlb[pageNum & (K64_DTLB_SIZE - 1)];
+    e.mem = mem;
+    e.page = pageNum;
+    e.data = data;
+    e.gen = g_k64DTlbGen.load(std::memory_order_acquire);
+}
+inline void k64DTlbInvalidateAll() {
+    g_k64DTlbGen.fetch_add(1, std::memory_order_release);
+}
+} // namespace
+
 KMemory64::KMemory64(KProcess* process) : process(process) {}
-KMemory64::~KMemory64() = default;
+KMemory64::~KMemory64() {
+    // Page buffers die with the object — invalidate every thread's data TLB
+    // (execve gives the process a fresh KMemory64; a later allocation could
+    // also reuse this heap address as a tag).
+    k64DTlbInvalidateAll();
+}
 
 // BW64_STRAYWRITE tripwire: ASan cannot see writes that land inside the
 // emulated guest address space (one big host allocation), so a syscall handler
@@ -272,7 +326,10 @@ U64 KMemory64::mmapSharedFile(U64 addr, U64 len, U32 prot, const char* path,
         }
         bool created = false;
         std::shared_ptr<SharedFilePage> shared = getSharedFilePage(p, fpage, seed, seedLen, created);
+        // adoptShared REPLACES (and may free) the page's buffer — stale data
+        // TLB entries for this page must not survive.
         page->adoptShared(shared->data);
+        k64DTlbInvalidateAll();
         if (std::getenv("BW64_SHAREMAP")) {
             klog_fmt("SHAREMAP: pid=%u %s fpage=%llu guest=0x%llx path='%s'",
                      (unsigned)(process ? process->id : 0), created ? "CREATE" : "ALIAS ",
@@ -472,6 +529,20 @@ void kmemory64DumpMemRing(U64 nearAddr) {
 }
 
 void KMemory64::memcpyToGuest(U64 dstGuest, const void* src, U64 len) {
+    // Data-TLB fast path. Only when every gated write diagnostic (straywrite /
+    // memring / watch) is confirmed OFF — the slow path is what initializes
+    // those gates, so the first few writes always go the long way. Writes
+    // ignore page flags (commit-on-write), so a cached committed buffer is
+    // behaviorally identical to the locked path.
+    U64 offsetInPage = dstGuest & K64_PAGE_MASK;
+    if (len && offsetInPage + len <= K64_PAGE_SIZE &&
+        g_strayInit && !g_strayOn && g_memRingInit && !g_memRingOn &&
+        g_watchInit && !g_watchAddr) {
+        if (U8* hit = k64DTlbLookup(this, dstGuest >> K64_PAGE_SHIFT)) {
+            ::memcpy(hit + offsetInPage, src, (size_t)len);
+            return;
+        }
+    }
     const U8* s = (const U8*)src;
     strayWriteCheck(dstGuest, len);
     {
@@ -490,10 +561,11 @@ void KMemory64::memcpyToGuest(U64 dstGuest, const void* src, U64 len) {
     }
     while (len) {
         U64 pageNum = dstGuest >> K64_PAGE_SHIFT;
-        U64 offsetInPage = dstGuest & K64_PAGE_MASK;
+        offsetInPage = dstGuest & K64_PAGE_MASK;
         U64 chunk = K64_PAGE_SIZE - offsetInPage;
         if (chunk > len) chunk = len;
         U8* data = commitPageLocked(pageNum, K64_PAGE_MAPPED | K64_PAGE_READ | K64_PAGE_WRITE);
+        k64DTlbInsert(this, pageNum, data);
         ::memcpy(data + offsetInPage, s, (size_t)chunk); // commit-on-write (MT-safe)
         dstGuest += chunk;
         s += chunk;
@@ -502,17 +574,29 @@ void KMemory64::memcpyToGuest(U64 dstGuest, const void* src, U64 len) {
 }
 
 void KMemory64::memcpyFromGuest(void* dst, U64 srcGuest, U64 len) {
+    // Data-TLB fast path: the whole span inside one already-seen page (the
+    // overwhelmingly common case — every operand read lands here) skips the
+    // pagesMutex + map lookup entirely.
+    U64 offsetInPage = srcGuest & K64_PAGE_MASK;
+    if (len && offsetInPage + len <= K64_PAGE_SIZE) {
+        if (U8* hit = k64DTlbLookup(this, srcGuest >> K64_PAGE_SHIFT)) {
+            ::memcpy(dst, hit + offsetInPage, (size_t)len);
+            return;
+        }
+    }
     U8* d = (U8*)dst;
     while (len) {
         U64 pageNum = srcGuest >> K64_PAGE_SHIFT;
-        U64 offsetInPage = srcGuest & K64_PAGE_MASK;
+        offsetInPage = srcGuest & K64_PAGE_MASK;
         U64 chunk = K64_PAGE_SIZE - offsetInPage;
         if (chunk > len) chunk = len;
         K64Page* page = getPage(pageNum);
         if (page && page->committed()) {
+            k64DTlbInsert(this, pageNum, page->data);
             ::memcpy(d, page->data + offsetInPage, (size_t)chunk);
         } else {
             // Absent slot OR reserved-but-uncommitted page → reads as zero.
+            // (Not cached: a later write commits a buffer the TLB must see.)
             ::memset(d, 0, (size_t)chunk);
         }
         srcGuest += chunk;
@@ -536,8 +620,14 @@ void KMemory64::memsetGuest(U64 dstGuest, U8 value, U64 len) {
 }
 
 U8 KMemory64::readb(U64 addr) {
-    K64Page* p = getPage(addr >> K64_PAGE_SHIFT);
-    return (p && p->committed()) ? p->data[addr & K64_PAGE_MASK] : 0;
+    U64 pageNum = addr >> K64_PAGE_SHIFT;
+    if (U8* hit = k64DTlbLookup(this, pageNum)) return hit[addr & K64_PAGE_MASK];
+    K64Page* p = getPage(pageNum);
+    if (p && p->committed()) {
+        k64DTlbInsert(this, pageNum, p->data);
+        return p->data[addr & K64_PAGE_MASK];
+    }
+    return 0;
 }
 
 U16 KMemory64::readw(U64 addr) {
@@ -553,9 +643,17 @@ U64 KMemory64::readq(U64 addr) {
 }
 
 void KMemory64::writeb(U64 addr, U8 value) {
+    U64 pageNum = addr >> K64_PAGE_SHIFT;
+    if (g_strayInit && !g_strayOn && g_memRingInit && !g_memRingOn) {
+        if (U8* hit = k64DTlbLookup(this, pageNum)) {
+            hit[addr & K64_PAGE_MASK] = value;
+            return;
+        }
+    }
     strayWriteCheck(addr, 1);
     recordMemWrite(addr, 1, value);
-    U8* data = commitPageLocked(addr >> K64_PAGE_SHIFT, K64_PAGE_MAPPED | K64_PAGE_READ | K64_PAGE_WRITE);
+    U8* data = commitPageLocked(pageNum, K64_PAGE_MAPPED | K64_PAGE_READ | K64_PAGE_WRITE);
+    k64DTlbInsert(this, pageNum, data);
     data[addr & K64_PAGE_MASK] = value; // commit-on-write (MT-safe)
 }
 
