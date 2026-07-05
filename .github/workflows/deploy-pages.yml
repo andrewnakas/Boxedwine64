@@ -203,6 +203,16 @@ jobs:
             --timeout=420000 --attempts=2
           rm -f _site/server.mjs
 
+      - name: Lazy-rootfs smoke (informational, non-gating)
+        # The M7 lazy mount (?lazy=1) fails on CI's Chrome/runner combination in
+        # ways local+live Chromes don't show (fetch status=0 after ~150 range
+        # requests). Run it visibly but don't gate the deploy on it while the
+        # emscripten_fetch backend soaks. Flip lazy to default once this step
+        # is reliably green.
+        continue-on-error: true
+        working-directory: project/emscripten
+        run: |
+          node smoke-test.mjs "http://127.0.0.1:8077/wine64.html?p=notepad.exe&lazy=1&chunked=1" --timeout=240000 --attempts=1 || echo "lazy smoke failed (non-gating)"
       - name: Upload Pages artifact
         uses: actions/upload-pages-artifact@v3
         with:
