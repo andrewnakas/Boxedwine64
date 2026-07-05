@@ -339,12 +339,17 @@ void KProcess::deleteThread(KThread* thread) {
     }
 }
 
-FsOpenNode* openCommandLine(const std::shared_ptr<FsNode>& node, U32 flags, U32 data) {
-    return new BufferAccess(node, flags, KThread::currentThread()->process->commandLine);
-}
-
 void KProcess::setupCommandlineNode() {
-    Fs::addVirtualFile(this->processNode->path +"/cmdline", openCommandLine, K__S_IREAD, 0, this->processNode);
+    // Capture THIS process: the old static open fn returned the CURRENT
+    // thread's command line, so any process reading another pid's
+    // /proc/<pid>/cmdline (taskmgr's command-line column, ps-alikes) saw its
+    // own cmdline instead of the target's.
+    KProcessWeakPtr weak_process = shared_from_this();
+    Fs::addVirtualFile(this->processNode->path +"/cmdline",
+        [weak_process](const std::shared_ptr<FsNode>& node, U32 flags, U32 data) -> FsOpenNode* {
+            KProcessPtr p = weak_process.lock();
+            return new BufferAccess(node, flags, p ? p->commandLine : B(""));
+        }, K__S_IREAD, 0, this->processNode);
 }
 
 BString KProcess::getAbsoluteExePath() { 
