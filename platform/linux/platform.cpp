@@ -17,6 +17,7 @@
  */
 
 #include "boxedwine.h"
+#include <chrono>
 #include <sys/time.h>
 #include <dirent.h>
 #include <string.h>
@@ -218,7 +219,32 @@ U32 Platform::allocateNativeMemory(U64 address) {
 }
 
 BString Platform::procStat() {
+#ifdef __EMSCRIPTEN__
+    // The browser sandbox has no host /proc/stat (the MEMFS fopen fails and
+    // fread(NULL) used to trap as a wasm null-function call — the taskmgr
+    // crash). Synthesize monotonic CPU counters from wall time so /proc/stat
+    // readers (taskmgr's CPU meter) see plausible, advancing jiffies.
+    static const auto bootTime = std::chrono::steady_clock::now();
+    unsigned long long jiffies = (unsigned long long)std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - bootTime).count() / 10 + 100000;
+    unsigned long long user = jiffies / 5;
+    unsigned long long sys = jiffies / 10;
+    unsigned long long idle = jiffies - user - sys;
+    char buf[512];
+    snprintf(buf, sizeof(buf),
+             "cpu  %llu 0 %llu %llu 0 0 0 0 0 0\n"
+             "cpu0 %llu 0 %llu %llu 0 0 0 0 0 0\n"
+             "intr 0\n"
+             "ctxt 0\n"
+             "btime 0\n"
+             "processes 1\n"
+             "procs_running 1\n"
+             "procs_blocked 0\n",
+             user, sys, idle, user, sys, idle);
+    return BString::copy(buf);
+#else
     return BReadFile(B("/proc/stat")).readAll();
+#endif
 }
 
 U8* Platform::reserveNativeMemory64k(U32 count) {

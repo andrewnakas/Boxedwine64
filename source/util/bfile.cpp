@@ -76,14 +76,17 @@ BString BReadFile::readAll() {
 }
 
 U32 BReadFile::read(char* buffer, U64 len) {
+	if (!file) return 0; // open failed; fread(NULL) traps in wasm
 	return (U32)std::fread(buffer, 1, (size_t)len, file);
 }
 
 U32 BReadFile::read(S8* buffer, U64 len) {
+	if (!file) return 0; // open failed; fread(NULL) traps in wasm
 	return (U32)std::fread(buffer, 1, (size_t)len, file);
 }
 
 U32 BReadFile::read(U8* buffer, U64 len) {
+	if (!file) return 0; // open failed; fread(NULL) traps in wasm
 	return (U32)std::fread(buffer, 1, (size_t)len, file);
 }
 
