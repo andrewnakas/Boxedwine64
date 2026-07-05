@@ -187,7 +187,7 @@ __attribute__((always_inline)) inline U32 CPU64::consumePrefixes(Prefixes& out) 
     }
 }
 
-CPU64::ModRM CPU64::decodeModRM(U64 modrmAddr, const Prefixes& p, U32 trailingImmBytes) {
+__attribute__((always_inline)) inline CPU64::ModRM CPU64::decodeModRM(U64 modrmAddr, const Prefixes& p, U32 trailingImmBytes) {
     ModRM m;
     U8 modrm = fetchByte(modrmAddr);
     U8 mod = (modrm >> 6) & 0x3;
@@ -272,7 +272,7 @@ CPU64::ModRM CPU64::decodeModRM(U64 modrmAddr, const Prefixes& p, U32 trailingIm
     return m;
 }
 
-U64 CPU64::loadRM(const ModRM& m, U32 size, bool rexPresent) {
+__attribute__((always_inline)) inline U64 CPU64::loadRM(const ModRM& m, U32 size, bool rexPresent) {
     if (m.isReg) {
         switch (size) {
             case 1: return readReg8(m.rmIndex, rexPresent);
@@ -291,7 +291,7 @@ U64 CPU64::loadRM(const ModRM& m, U32 size, bool rexPresent) {
     return 0;
 }
 
-void CPU64::storeRM(const ModRM& m, U32 size, U64 value, bool rexPresent) {
+__attribute__((always_inline)) inline void CPU64::storeRM(const ModRM& m, U32 size, U64 value, bool rexPresent) {
     if (m.isReg) {
         switch (size) {
             case 1: writeReg8(m.rmIndex, (U8)value, rexPresent); return;
