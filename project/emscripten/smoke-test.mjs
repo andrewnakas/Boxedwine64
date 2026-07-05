@@ -156,6 +156,14 @@ function runAttempt(n) {
             `--user-data-dir=${profile}`,
             "--no-first-run", "--no-default-browser-check",
             "--no-sandbox",
+            // macOS: a fresh Chrome binary (e.g. a downloaded Chrome-for-Testing)
+            // triggers a keychain-access prompt that headless can never answer —
+            // and the blocked cookie-store init silently hangs ALL http(s)
+            // requests (navigation starts, no response ever arrives, empty
+            // console). Mock keychain avoids the prompt; basic password store
+            // is the no-op equivalent on Linux. Harmless on CI.
+            "--use-mock-keychain",
+            "--password-store=basic",
             "--disable-dev-shm-usage",
             "--enable-features=SharedArrayBuffer",
             "--enable-unsafe-swiftshader",
