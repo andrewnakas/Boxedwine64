@@ -101,9 +101,21 @@ echo "=== done (snake.exe, tetris.exe, clipset.exe, clipget.exe) ==="
 #   st_stuff.c tables.c v_video.c wi_stuff.c w_checksum.c w_file.c w_main.c \
 #   w_wad.c z_zone.c w_file_stdc.c i_input.c i_video.c doomgeneric.c \
 #   doomgeneric_win.c"
-# x86_64-w64-mingw32-gcc -O2 -std=gnu11 -DNORMALUNIX -w -I. $SRC \
-#   -o doom.exe -lgdi32 -luser32 -lwinmm
+# x86_64-w64-mingw32-gcc -O2 -std=gnu11 -DNORMALUNIX -DFEATURE_SOUND -w -I. \
+#   $SRC i_winsound.c -o doom.exe -lgdi32 -luser32 -lwinmm
 # (-std=gnu11 because doom's `boolean { false, true }` enum clashes with C23
-#  keywords. No audio: the base source set uses the dummy i_sound, not SDL.)
+#  keywords.)
+#
+# SOUND (M5, 2026-07-04): build with -DFEATURE_SOUND + src/i_winsound.c (copied
+# into the checkout) — a waveOut sfx mixer (8ch, S16 stereo 11025 Hz) feeding
+# winmm -> winealsa -> libasound(plug) -> pcm_oss -> /dev/dsp -> WebAudio.
+# Music is intentionally silent (MIDI needs a synth). Console shows
+# "i_winsound: waveOut mixer up" on boot when working.
+#
+# THE WHOLE PATCH SET IS NOW SCRIPTED: src/doom_apply_patches.py applies
+# patches #1-3 to a fresh doomgeneric clone and dies loudly on upstream drift:
+#   git clone --depth 1 https://github.com/ozkl/doomgeneric
+#   python3 src/doom_apply_patches.py doomgeneric/doomgeneric
+#   cp src/i_winsound.c doomgeneric/doomgeneric/
 # shareware WAD (freely redistributable by id Software):
 #   doom1.wad  md5 f0cefca49926d00903cf57551d901abe  (~4.2 MB)

@@ -192,6 +192,27 @@ else
          "wine64 will run but with OpenGL disabled." >&2
 fi
 
+# Stage the ALSA->OSS sound bridge (M5). wine's winealsa needs libasound to
+# resolve "default"; the rootfs has no real ALSA cards, so we route it to the
+# emulated OSS /dev/dsp (KDspAudio -> SDL/WebAudio):
+#   - /usr/share/alsa            libasound's base config (without it snd_pcm_open
+#                                fails for ANY name — this was why audio never worked)
+#   - alsa-lib/*_oss.so          the pcm_oss/ctl_oss plugins (Debian libasound2-plugins)
+#   - /etc/asound.conf           default = plug->oss:/dev/dsp (plug converts
+#                                rate/format so any app format reaches the sink)
+# The artifacts are checked in under tools/rootfs64/alsa (436K); refresh from
+# Debian with the docker one-liner in tools/rootfs64/alsa/README if needed.
+ALSA_PREBUILT="$HERE/alsa"
+if [ -d "$ALSA_PREBUILT/usr/share/alsa" ]; then
+    echo "--- staging ALSA->OSS sound bridge ---"
+    mkdir -p "$STAGEHOST/usr/lib/x86_64-linux-gnu/alsa-lib" "$STAGEHOST/usr/share" "$STAGEHOST/etc"
+    cp "$ALSA_PREBUILT"/usr/lib/x86_64-linux-gnu/alsa-lib/*.so "$STAGEHOST/usr/lib/x86_64-linux-gnu/alsa-lib/"
+    cp -R "$ALSA_PREBUILT/usr/share/alsa" "$STAGEHOST/usr/share/"
+    printf 'pcm.!default {\n    type plug\n    slave.pcm {\n        type oss\n        device /dev/dsp\n    }\n}\nctl.!default {\n    type oss\n    device /dev/mixer\n}\n' > "$STAGEHOST/etc/asound.conf"
+else
+    echo "WARNING: $ALSA_PREBUILT missing — audio bridge not staged." >&2
+fi
+
 echo "=== zipping on host (macOS zip preserves the symlinks) ==="
 rm -f "$DIST/glibc-rootfs64.zip" "$DIST/wine64.zip"
 # Base: glibc + deps. Overlay: wine trees + launchers. -y keeps symlinks as links.
