@@ -71,6 +71,62 @@ KProcessPtr KProcess::create() {
             return BString::empty;
             });
         Fs::addVirtualFile(process->processNode->path + "/loginuid", K__S_IREAD, k_mdev(0, 0), process->processNode, B("1"));
+        // /proc/<pid>/stat + /proc/<pid>/status: wine's per-process CPU/memory
+        // queries (taskmgr's Processes tab, NtQuerySystemInformation fallbacks)
+        // probe these for every pid it learns from wineserver; without them the
+        // opens ENOENT and the process list shows no numbers. Times are
+        // synthesized from wall-clock (the interpreter doesn't track per-process
+        // CPU); memory is REAL (committed guest pages).
+        U64 startJiffies = (U64)KSystem::getMilliesSinceStart() / 10;
+        Fs::addVirtualFile(process->processNode->path + "/stat",
+            [weak_process, startJiffies](const std::shared_ptr<FsNode>& node, U32 flags, U32 data) -> FsOpenNode* {
+                KProcessPtr p = weak_process.lock();
+                if (!p) {
+                    return new BufferAccess(node, flags, B(""));
+                }
+                U64 now = (U64)KSystem::getMilliesSinceStart() / 10;
+                U64 up = now > startJiffies ? now - startJiffies : 0;
+                U64 utime = up / 10, stime = up / 20; // plausible light activity
+                U64 rssPages = 0;
+#ifdef BOXEDWINE_GUEST_X64
+                if (p->memory64) {
+                    rssPages = p->memory64->committedPageCount();
+                }
+#endif
+                char buf[512];
+                snprintf(buf, sizeof(buf),
+                         "%u (%s) S 1 %u %u 0 -1 4194304 0 0 0 0 %llu %llu 0 0 20 0 %u 0 %llu %llu %llu "
+                         "18446744073709551615 0 0 0 0 0 0 0 0 0 0 0 0 17 0 0 0 0 0 0 0 0 0 0 0 0 0 0\n",
+                         p->id, p->name.length() ? p->name.c_str() : "wine64", p->id, p->id,
+                         (unsigned long long)utime, (unsigned long long)stime,
+                         (U32)p->threads.size(),
+                         (unsigned long long)startJiffies,
+                         (unsigned long long)(rssPages * 4096), (unsigned long long)rssPages);
+                return new BufferAccess(node, flags, BString::copy(buf));
+            }, K__S_IREAD, k_mdev(0, 0), process->processNode);
+        Fs::addVirtualFile(process->processNode->path + "/status",
+            [weak_process](const std::shared_ptr<FsNode>& node, U32 flags, U32 data) -> FsOpenNode* {
+                KProcessPtr p = weak_process.lock();
+                if (!p) {
+                    return new BufferAccess(node, flags, B(""));
+                }
+                U64 rssKb = 0;
+#ifdef BOXEDWINE_GUEST_X64
+                if (p->memory64) {
+                    rssKb = p->memory64->committedPageCount() * 4;
+                }
+#endif
+                char buf[512];
+                snprintf(buf, sizeof(buf),
+                         "Name:\t%s\nUmask:\t0022\nState:\tS (sleeping)\nPid:\t%u\nPPid:\t1\n"
+                         "Uid:\t1000\t1000\t1000\t1000\nGid:\t1000\t1000\t1000\t1000\n"
+                         "VmPeak:\t%8llu kB\nVmSize:\t%8llu kB\nVmRSS:\t%8llu kB\nVmSwap:\t       0 kB\n"
+                         "Threads:\t%u\n",
+                         p->name.length() ? p->name.c_str() : "wine64", p->id,
+                         (unsigned long long)rssKb, (unsigned long long)rssKb, (unsigned long long)rssKb,
+                         (U32)p->threads.size());
+                return new BufferAccess(node, flags, BString::copy(buf));
+            }, K__S_IREAD, k_mdev(0, 0), process->processNode);
         process->fdNode = Fs::addFileNode(process->processNode->path + "/fd", B(""), B(""), true, process->processNode);
         process->taskNode = Fs::addFileNode(process->processNode->path + B("/task"), B(""), B(""), true, process->processNode);
     }
