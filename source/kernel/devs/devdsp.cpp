@@ -21,13 +21,20 @@
 #include "kscheduler.h"
 #include "../../io/fsvirtualopennode.h"
 #include "oss.h"
+#ifdef BOXEDWINE_GUEST_X64
+#include "kmemory64.h"
+#endif
 #include <algorithm>
 #include <math.h>
 #include <string.h>
 #include "kdspaudio.h"
 
 #ifdef __EMSCRIPTEN__
-static U32 dspMaxOutputFreq = 11025;
+// 48000 like native: SDL2's emscripten audio feeds WebAudio, which resamples
+// any rate natively — the old 11025 cap predates that and broke the M5 ALSA
+// bridge (pcm_oss requests 22050/44100, sees the clamped write-back, -EINVAL,
+// and winealsa's stream create fails => waveOutOpen NOTENABLED).
+static U32 dspMaxOutputFreq = 48000;
 static const U32 DSP_DEFAULT_FRAGMENT_SIZE = 1024;
 #else
 static U32 dspMaxOutputFreq = 48000;
@@ -49,6 +56,7 @@ public:
     // From FsOpenNode
     bool setLength(S64 length) override;
     U32 ioctl(KThread* thread, U32 request) override;
+    U32 ioctl64(U32 request, U64 argAddr, KMemory64* mem) override;
     U32 readNative(U8* buffer, U32 len) override;
     U32 writeNative(U8* buffer, U32 len) override;
     void waitForEvents(BOXEDWINE_CONDITION& parentCondition, U32 events) override;
@@ -120,6 +128,132 @@ U32 DevDsp::getAvailableBufferSize() {
 
 bool DevDsp::isWriteReady() {
     return this->getAvailableBufferSize() >= this->audio->getFragmentSize();
+}
+
+// 64-bit-guest OSS ioctls (M5 sound bridge). alsa-lib's pcm_oss plugin (the
+// wine winealsa -> libasound -> /dev/dsp route) drives the device with the
+// classic OSS ioctl set; the 32-bit ioctl() above can't serve a 64-bit guest
+// because it reads/writes the arg through the 32-bit KMemory. This mirrors the
+// same state logic with the arg accessed через the guest-64 address space.
+// Unknown requests klog once per value so the next missing ioctl is visible.
+U32 DevDsp::ioctl64(U32 request, U64 argAddr, KMemory64* mem) {
+    bool write = (request & 0x80000000) != 0;
+    switch (request & 0xFFFF) {
+    case 0x5000: // SNDCTL_DSP_RESET
+        this->audio->closeAudio();
+        this->freq = 8000;
+        this->channels = 1;
+        this->format = AFMT_U8;
+        this->audio->setFragmentSize(DSP_DEFAULT_FRAGMENT_SIZE);
+        this->fragmentCount = DSP_DEFAULT_FRAGMENT_COUNT;
+        this->bytesWritten = 0;
+        this->lastOutputBlocks = 0;
+        return 0;
+    case 0x5001: // SNDCTL_DSP_SYNC — drain; our sink paces via the SDL callback,
+        return 0; // pending bytes keep playing, so report done immediately.
+    case 0x5002: { // SNDCTL_DSP_SPEED
+        U32 oldFreq = this->freq;
+        this->freq = std::min(mem->readd(argAddr), dspMaxOutputFreq);
+        if (oldFreq != this->freq) {
+            this->audio->closeAudio();
+        }
+        if (write) mem->writed(argAddr, this->freq);
+        return 0;
+    }
+    case 0x5003: { // SNDCTL_DSP_STEREO
+        U32 fmt = mem->readd(argAddr);
+        if (fmt != (U32)(this->channels - 1)) {
+            this->audio->closeAudio();
+        }
+        this->channels = (fmt == 1) ? 2 : 1;
+        if (write) mem->writed(argAddr, this->channels - 1);
+        return 0;
+    }
+    case 0x5005: { // SNDCTL_DSP_SETFMT
+        U32 fmt = mem->readd(argAddr);
+        if (fmt != AFMT_QUERY && fmt != this->format) {
+            this->audio->closeAudio();
+        }
+        switch (fmt) {
+        case AFMT_QUERY: break;
+        case AFMT_S16_LE: this->format = AFMT_S16_LE; break;
+        case AFMT_S16_BE: this->format = AFMT_S16_BE; break;
+        case AFMT_S8:     this->format = AFMT_S8; break;
+        case AFMT_U16_LE: this->format = AFMT_U16_LE; break;
+        case AFMT_U16_BE: this->format = AFMT_U16_BE; break;
+        case AFMT_FLOAT:  this->format = AFMT_S16_LE; break;
+        default:          this->format = AFMT_U8; break;
+        }
+        if (write) mem->writed(argAddr, this->format);
+        return 0;
+    }
+    case 0x5006: { // SOUND_PCM_WRITE_CHANNELS
+        U32 ch = mem->readd(argAddr);
+        if (ch != this->channels) {
+            this->audio->closeAudio();
+        }
+        this->channels = (ch == 1) ? 1 : 2;
+        if (write) mem->writed(argAddr, this->channels);
+        return 0;
+    }
+    case 0x500A: { // SNDCTL_DSP_SETFRAGMENT
+        U32 value = mem->readd(argAddr);
+        U32 shift = value & 0xFFFF;
+        U32 count = value >> 16;
+        if (shift > 15) shift = 15;
+        this->audio->setFragmentSize(1 << shift);
+        this->fragmentCount = std::clamp(count, (U32)2, (U32)64);
+        return 0;
+    }
+    case 0x500B: // SNDCTL_DSP_GETFMTS
+        mem->writed(argAddr, AFMT_U8 | AFMT_S16_LE | AFMT_S16_BE | AFMT_S8 | AFMT_U16_LE | AFMT_U16_BE);
+        return 0;
+    case 0x500C: { // SNDCTL_DSP_GETOSPACE (audio_buf_info)
+        U32 capacity = this->getEffectiveBufferCapacity();
+        U32 used = this->getUsedBufferSize();
+        U32 available = capacity - used;
+        U32 frag = this->audio->getFragmentSize();
+        mem->writed(argAddr, frag ? available / frag : 0);      // fragments
+        mem->writed(argAddr + 4, frag ? capacity / frag : 0);   // fragstotal
+        mem->writed(argAddr + 8, frag);                         // fragsize
+        mem->writed(argAddr + 12, available);                   // bytes
+        return 0;
+    }
+    case 0x500D: { // SNDCTL_DSP_GETISPACE — no capture; report an empty buffer
+        U32 frag = this->audio->getFragmentSize();
+        mem->writed(argAddr, 0);
+        mem->writed(argAddr + 4, this->fragmentCount);
+        mem->writed(argAddr + 8, frag);
+        mem->writed(argAddr + 12, 0);
+        return 0;
+    }
+    case 0x500F: // SNDCTL_DSP_GETCAPS
+        mem->writed(argAddr, DSP_CAP_TRIGGER);
+        return 0;
+    case 0x5010: // SNDCTL_DSP_SETTRIGGER — playback runs freely; accept.
+        return 0;
+    case 0x5012: { // SNDCTL_DSP_GETOPTR (count_info)
+        U32 fragmentSize = this->audio->getFragmentSize();
+        U32 currentBlocks = fragmentSize ? this->bytesWritten / fragmentSize : 0;
+        U32 blocks = currentBlocks - this->lastOutputBlocks;
+        this->lastOutputBlocks = currentBlocks;
+        U32 capacity = this->getEffectiveBufferCapacity();
+        mem->writed(argAddr, this->bytesWritten);
+        mem->writed(argAddr + 4, blocks);
+        mem->writed(argAddr + 8, capacity ? this->bytesWritten % capacity : 0);
+        return 0;
+    }
+    case 0x5016: // SNDCTL_DSP_SETDUPLEX
+        return (U32)-K_EINVAL;
+    case 0x5017: // SNDCTL_DSP_GETODELAY
+        mem->writed(argAddr, this->getUsedBufferSize());
+        return 0;
+    default:
+        klog_fmt("DevDsp::ioctl64: unimplemented OSS ioctl 0x%x (len=%d dir=%c%c)",
+                 request & 0xFFFF, (request >> 16) & 0x3FFF,
+                 (request & 0x40000000) ? 'R' : '-', write ? 'W' : '-');
+        return (U32)-K_ENOTTY;
+    }
 }
 
 U32 DevDsp::ioctl(KThread* thread, U32 request) {

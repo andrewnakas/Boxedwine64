@@ -40,7 +40,13 @@ public:
     virtual S64  seek(S64 pos)=0;	    
     virtual U32  map(KThread* thread, U32 address, U32 len, S32 prot, S32 flags, U64 off)=0;
     virtual bool canMap()=0;
-    virtual U32  ioctl(KThread* thread, U32 request)=0;	
+    virtual U32  ioctl(KThread* thread, U32 request)=0;
+    // 64-bit-guest ioctl: the classic ioctl() reads/writes its arg through the
+    // 32-bit KMemory + CPU registers, which is wrong for a 64-bit guest (args
+    // live at a guest-64 pointer). Devices that support 64-bit guests override
+    // this; the default ENOTTY keeps every other node's behavior unchanged
+    // (sys_ioctl64 then falls back to its conservative tty handling).
+    virtual U32  ioctl64(U32 request, U64 argAddr, class KMemory64* mem) { return (U32)-25; /* -K_ENOTTY (kerror.h not yet included here) */ }
     virtual void setAsync(bool isAsync)=0;
     virtual bool isAsync()=0;
     virtual void waitForEvents(BOXEDWINE_CONDITION& parentCondition, U32 events)=0;

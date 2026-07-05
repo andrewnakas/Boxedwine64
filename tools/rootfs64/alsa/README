@@ -1,0 +1,12 @@
+ALSA->OSS sound bridge artifacts (M5), staged into the rootfs by
+build-wine64-zip.sh. Extracted from Debian bookworm (libasound2 +
+libasound2-plugins). Refresh with:
+
+  docker run --rm --platform linux/amd64 -v $PWD:/out debian:bookworm bash -c \
+    'apt-get update -qq && apt-get install -y -qq libasound2 libasound2-plugins && \
+     mkdir -p /out/usr/lib/x86_64-linux-gnu/alsa-lib /out/usr/share && \
+     cp /usr/lib/x86_64-linux-gnu/alsa-lib/libasound_module_pcm_oss.so \
+        /usr/lib/x86_64-linux-gnu/alsa-lib/libasound_module_ctl_oss.so \
+        /out/usr/lib/x86_64-linux-gnu/alsa-lib/ && \
+     cp -R /usr/share/alsa /out/usr/share/ && \
+     rm -rf /out/usr/share/alsa/ucm /out/usr/share/alsa/ucm2 /out/usr/share/alsa/topology'

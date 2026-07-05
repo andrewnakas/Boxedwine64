@@ -3026,6 +3026,19 @@ void ksyscall64(CPU64* cpu) {
             //    for a regular file / non-tty and what wine's fallback expects.
             if (!cpu->thread || !cpu->thread->process) { ret = (U64)-K_ENOSYS; break; }
             U32 cmd = (U32)a2;
+            // Device ioctls (M5 sound bridge): give the fd's open node first
+            // shot via the 64-bit-aware ioctl64 (default returns ENOTTY, so
+            // only devices that opt in — /dev/dsp — change behavior here).
+            {
+                KFileDescriptorPtr fdesc = cpu->thread->process->getFileDescriptor((FD)(S32)a1);
+                if (fdesc) {
+                    std::shared_ptr<KFile> kf = std::dynamic_pointer_cast<KFile>(fdesc->kobject);
+                    if (kf && kf->openFile) {
+                        U32 r = kf->openFile->ioctl64(cmd, a3, cpu->memory);
+                        if ((S32)r != -K_ENOTTY) { ret = (U64)(S64)(S32)r; break; }
+                    }
+                }
+            }
             if (cmd == 0x5421) { // FIONBIO: arg = int* (0=blocking, !=0 nonblocking)
                 U32 on = a3 ? cpu->memory->readd(a3) : 0;
                 cpu->thread->process->fcntrl(cpu->thread, (FD)(S32)a1, K_F_SETFL,
