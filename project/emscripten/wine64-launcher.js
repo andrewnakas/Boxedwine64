@@ -104,11 +104,14 @@
     if (BASE === null) BASE = "./";
     if (BASE.length && !BASE.endsWith("/")) BASE += "/";
     var CHUNKED = param("chunked") === "1"; // fetch zips as <zip>.partNNN via manifest
-    // ?lazy=1 (M7): don't download wine64.zip (~196MB) up front — mount it FROM
-    // ITS URL. The C++ side (source/io/fszipurl.cpp) fetches 512KB block ranges
-    // on demand with sync XHR on the guest worker threads. glibc+prefix (~28MB)
-    // stay eager: they're small and hold the boot-critical loader bits.
-    var LAZY = param("lazy") === "1";
+    // Lazy rootfs (M7, DEFAULT since 2026-07-05; ?lazy=0 opts out): don't
+    // download wine64.zip (~196MB) up front — mount it FROM ITS URL. The C++
+    // side (source/io/fszipurl.cpp) fetches 512KB block ranges on demand with
+    // sync XHR on the guest worker threads (~55MB actually read for a boot =
+    // 65% less transfer, measured). glibc+prefix (~28MB) stay eager: they're
+    // small and hold the boot-critical loader bits. Validated: 13/13 local
+    // boots + in-session app switch + 4/4 live-on-Pages boots.
+    var LAZY = param("lazy") !== "0";
     var wineZipArg = "wine64.zip"; // replaced by a bw64url: spec in lazy mode
 
     // --- current run configuration ------------------------------------------
@@ -876,6 +879,22 @@
             waited += STEP;
             if (waited >= LIMIT) {
                 clearInterval(iv);
+                // The coi-serviceworker's own reload occasionally races its
+                // controller claim and the page comes back NOT isolated (a
+                // known live flake — the SW *is* installed by now, so one more
+                // reload reliably lands isolated). Retry once per session,
+                // marked via sessionStorage so a genuinely broken environment
+                // still gets the clear error instead of a reload loop.
+                var KEY = "bw64CoiRetried";
+                var retried = false;
+                try { retried = sessionStorage.getItem(KEY) === "1"; } catch (e) {}
+                if (!retried) {
+                    try { sessionStorage.setItem(KEY, "1"); } catch (e) {}
+                    console.log("crossOriginIsolated still false after " + LIMIT +
+                                "ms — service worker is installed; reloading once to pick it up.");
+                    window.location.reload();
+                    return;
+                }
                 setStatusText("Could not enable cross-origin isolation — try a hard reload " +
                               "(⌘/Ctrl+Shift+R). SharedArrayBuffer/WebGL need COOP/COEP.");
                 console.error("crossOriginIsolated still false after " + LIMIT +
