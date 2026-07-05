@@ -19,30 +19,37 @@ bool fsZipUrlIsSpec(BString path) {
 // zlib_filefunc64_def etc. come via unzip.h (already included by fszipurl.h
 // inside extern "C"); ioapi.h alone doesn't parse without zlib.h's macros.
 
-// Synchronous same-origin Range fetch on THIS worker thread. Returns bytes
-// copied to dst, or a negative HTTP status / -1 on error. Sync XHR cannot use
-// responseType=arraybuffer, so we use the classic x-user-defined charset trick
-// and copy char codes into the heap. A 200 response (server ignored Range) is
-// only usable when start==0; otherwise it is data from the wrong offset.
-EM_JS(int, bw64SyncFetchRange, (const char* url, double start, double endIncl, double dstAddr, int want), {
-    try {
-        var u = UTF8ToString(url);
-        var xhr = new XMLHttpRequest();
-        xhr.open('GET', u, false);
-        xhr.setRequestHeader('Range', 'bytes=' + start + '-' + endIncl);
-        xhr.overrideMimeType('text/plain; charset=x-user-defined');
-        xhr.send(null);
-        if (xhr.status != 206 && !(xhr.status == 200 && start == 0)) return -xhr.status;
-        var t = xhr.responseText;
-        var n = t.length < want ? t.length : want;
-        if (typeof growMemViews === 'function') growMemViews();
-        var dst = Number(dstAddr);
-        for (var i = 0; i < n; i++) HEAPU8[dst + i] = t.charCodeAt(i) & 0xff;
-        return n;
-    } catch (e) {
-        return -1;
+// Synchronous same-origin Range fetch on THIS worker thread via the
+// emscripten fetch API (EMSCRIPTEN_FETCH_SYNCHRONOUS: the calling pthread
+// Atomics-waits while the fetch worker does an async fetch — no sync XHR,
+// which newer Chrome builds reject in COEP worker contexts; that rejection
+// is exactly what the CI smoke caught). Returns bytes copied or a negative
+// status/-1.
+#include <emscripten/fetch.h>
+
+static int bw64SyncFetchRange(const char* url, double start, double endIncl, U8* dst, int want) {
+    emscripten_fetch_attr_t attr;
+    emscripten_fetch_attr_init(&attr);
+    strcpy(attr.requestMethod, "GET");
+    attr.attributes = EMSCRIPTEN_FETCH_LOAD_TO_MEMORY | EMSCRIPTEN_FETCH_SYNCHRONOUS;
+    char rangeVal[64];
+    snprintf(rangeVal, sizeof(rangeVal), "bytes=%llu-%llu",
+             (unsigned long long)start, (unsigned long long)endIncl);
+    const char* headers[] = { "Range", rangeVal, nullptr };
+    attr.requestHeaders = headers;
+    emscripten_fetch_t* f = emscripten_fetch(&attr, url);
+    if (!f) return -1;
+    int status = f->status;
+    int n = -1;
+    if (status == 206 || (status == 200 && start == 0)) {
+        n = (int)std::min<U64>((U64)f->numBytes, (U64)want);
+        memcpy(dst, f->data, (size_t)n);
+    } else {
+        n = -status;
     }
-});
+    emscripten_fetch_close(f);
+    return n;
+}
 
 namespace {
 
@@ -75,7 +82,7 @@ struct RangedFile {
             U64 chunk = std::min(len, p->size - inPart);
             int got = bw64SyncFetchRange(p->url.c_str(), (double)inPart,
                                          (double)(inPart + chunk - 1),
-                                         (double)(uintptr_t)dst, (int)chunk);
+                                         dst, (int)chunk);
             if (got != (int)chunk) {
                 klog_fmt("fszipurl: range fetch FAILED url=%s off=%llu len=%llu -> %d",
                          p->url.c_str(), (unsigned long long)inPart,
