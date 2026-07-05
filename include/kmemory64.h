@@ -13,6 +13,7 @@
 #ifdef BOXEDWINE_GUEST_X64
 
 #include <memory>
+#include <atomic>
 #include <unordered_map>
 #include <map>
 #include <cstring>
@@ -201,6 +202,35 @@ public:
     // every mapped page is committed, so this equals mappedPageCount(); afterward
     // it tracks only pages whose K64Page::data is non-null (i.e. actually touched).
     U64 committedPageCount() const;
+
+#ifdef BOXEDWINE_BLOCK_CACHE_INFRA
+    // ---- decoded-block-cache invalidation infra (Phase 1; see the block-
+    // cache brief in the milestone notes). A future block executor caches
+    // pre-decoded instruction runs keyed by RIP and must observe every store
+    // that could touch cached code. Pages holding blocks REGISTER here; every
+    // guest-write funnel calls noteGuestWrite*, which bumps the page slot's
+    // generation. A cached block records its pages' generations at build time
+    // and revalidates with one compare per page per execution. While no page
+    // is registered (today: always), the write-path cost is a single relaxed
+    // atomic load + branch. Slots are hashed, so collisions only cause false
+    // invalidation — never a stale block.
+    // Tables live at file scope in kmemory64.cpp (global, shared across all
+    // address spaces — cross-process slot collisions only cause false
+    // invalidation, never a stale block) so this object's hot-member layout
+    // is untouched. The gate/check helpers are defined there too.
+    static U32  blockSlot(U64 pageNum) { return (U32)((pageNum ^ (pageNum >> 12)) & 4095); }
+    static void blockPageRegister(U64 pageNum);   // mark page as holding blocks
+    static U32  blockPageGenOf(U64 pageNum);
+    static void noteGuestWrite(U64 pageNum);
+    static void noteGuestWriteRange(U64 addr, U64 len);
+#else
+    // Compiled out (measured ~4% on cpu_bench from code-layout displacement
+    // alone — pay it only when the Phase 2 block executor buys it back).
+    static void blockPageRegister(U64) {}
+    static U32  blockPageGenOf(U64) { return 0; }
+    static void noteGuestWrite(U64) {}
+    static void noteGuestWriteRange(U64, U64) {}
+#endif
 
     // BW64_STRAYWRITE tripwire (see kmemory64.cpp): logs a guest write whose
     // target page was never mapped/reserved — a stray write candidate for the

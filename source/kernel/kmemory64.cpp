@@ -91,6 +91,10 @@ std::shared_ptr<SharedFilePage> getSharedFilePage(const std::string& path, U64 o
 // Entries are tagged with the owning KMemory64* because kernel code on one
 // thread can touch another process's memory (fork ctid writes, ptrace-style
 // peeks), and one host thread serves exactly one running guest thread.
+#ifdef BOXEDWINE_BLOCK_CACHE_INFRA
+bool bw64PageHoldsBlocks(U64 pageNum); // defined below, with the block tables
+#endif
+
 namespace {
 struct K64DTlbEntry { const void* mem; U64 page; U8* data; U32 gen; };
 constexpr U32 K64_DTLB_SIZE = 64; // direct-mapped, per-thread (~2KB)
@@ -106,6 +110,15 @@ inline U8* k64DTlbLookup(const void* mem, U64 pageNum) {
     return nullptr;
 }
 inline void k64DTlbInsert(const void* mem, U64 pageNum, U8* data) {
+#ifdef BOXEDWINE_BLOCK_CACHE_INFRA
+    // Block-cache invalidation contract: a page registered as holding decoded
+    // blocks is barred from the data TLB. All its accesses then take the slow
+    // (locked) paths, and only the WRITE slow paths bump its generation — so
+    // the scorching read/write fast paths carry zero extra cost.
+    if (bw64PageHoldsBlocks(pageNum)) {
+        return;
+    }
+#endif
     K64DTlbEntry& e = g_k64DTlb[pageNum & (K64_DTLB_SIZE - 1)];
     e.mem = mem;
     e.page = pageNum;
@@ -116,6 +129,57 @@ inline void k64DTlbInvalidateAll() {
     g_k64DTlbGen.fetch_add(1, std::memory_order_release);
 }
 } // namespace
+
+#ifdef BOXEDWINE_BLOCK_CACHE_INFRA
+// Block-cache invalidation tables (see kmemory64.h). File-scope globals:
+// zero impact on KMemory64's object layout, shared across address spaces.
+static std::atomic<U32> g_blockPagesRegistered{0};
+static std::atomic<U32> g_blockPageGen[4096];
+static std::atomic<U32> g_blockPageMark[128];
+
+bool bw64PageHoldsBlocks(U64 pageNum) {
+    if (g_blockPagesRegistered.load(std::memory_order_relaxed) == 0) {
+        return false;
+    }
+    U32 slot = KMemory64::blockSlot(pageNum);
+    return (g_blockPageMark[slot >> 5].load(std::memory_order_relaxed) & (1u << (slot & 31))) != 0;
+}
+
+void KMemory64::blockPageRegister(U64 pageNum) {
+    U32 slot = blockSlot(pageNum);
+    U32 word = slot >> 5, bit = 1u << (slot & 31);
+    if (!(g_blockPageMark[word].load(std::memory_order_relaxed) & bit)) {
+        g_blockPageMark[word].fetch_or(bit, std::memory_order_release);
+        g_blockPagesRegistered.fetch_add(1, std::memory_order_release);
+        // Evict every thread's cached entry for (any page aliasing) this slot,
+        // so writes that were fast-pathing through the TLB start missing.
+        k64DTlbInvalidateAll();
+    }
+}
+
+U32 KMemory64::blockPageGenOf(U64 pageNum) {
+    return g_blockPageGen[blockSlot(pageNum)].load(std::memory_order_acquire);
+}
+
+static inline void bw64NoteWriteSlow(U64 pageNum) {
+    U32 slot = KMemory64::blockSlot(pageNum);
+    if (g_blockPageMark[slot >> 5].load(std::memory_order_relaxed) & (1u << (slot & 31))) {
+        g_blockPageGen[slot].fetch_add(1, std::memory_order_release);
+    }
+}
+
+void KMemory64::noteGuestWrite(U64 pageNum) {
+    if (g_blockPagesRegistered.load(std::memory_order_relaxed) == 0) return;
+    bw64NoteWriteSlow(pageNum);
+}
+
+void KMemory64::noteGuestWriteRange(U64 addr, U64 len) {
+    if (g_blockPagesRegistered.load(std::memory_order_relaxed) == 0 || len == 0) return;
+    for (U64 pn = addr >> K64_PAGE_SHIFT, last = (addr + len - 1) >> K64_PAGE_SHIFT; pn <= last; pn++) {
+        bw64NoteWriteSlow(pn);
+    }
+}
+#endif // BOXEDWINE_BLOCK_CACHE_INFRA
 
 KMemory64::KMemory64(KProcess* process) : process(process) {}
 KMemory64::~KMemory64() {
@@ -275,6 +339,7 @@ U64 KMemory64::mmapAnonymousFixed(U64 addr, U64 len, U32 prot) {
         // re-mapped (overlap) is zeroed in place to preserve MAP_ANONYMOUS
         // semantics and keep the file-mmap head/tail preservation logic valid.
         if (page->committed()) {
+            noteGuestWrite(pageStart + i); // zero-in-place = content change
             ::memset(page->data, 0, K64_PAGE_SIZE);
         }
     }
@@ -326,6 +391,7 @@ U64 KMemory64::mmapSharedFile(U64 addr, U64 len, U32 prot, const char* path,
         }
         bool created = false;
         std::shared_ptr<SharedFilePage> shared = getSharedFilePage(p, fpage, seed, seedLen, created);
+        noteGuestWrite(pageStart + i); // buffer replaced = cached blocks stale
         // adoptShared REPLACES (and may free) the page's buffer — stale data
         // TLB entries for this page must not survive.
         page->adoptShared(shared->data);
@@ -544,6 +610,7 @@ void KMemory64::memcpyToGuest(U64 dstGuest, const void* src, U64 len) {
         }
     }
     const U8* s = (const U8*)src;
+    noteGuestWriteRange(dstGuest, len); // slow path only
     strayWriteCheck(dstGuest, len);
     {
         U64 v = 0; if (len >= 8) std::memcpy(&v, src, 8); else std::memcpy(&v, src, (size_t)len);
@@ -606,6 +673,7 @@ void KMemory64::memcpyFromGuest(void* dst, U64 srcGuest, U64 len) {
 }
 
 void KMemory64::memsetGuest(U64 dstGuest, U8 value, U64 len) {
+    noteGuestWriteRange(dstGuest, len);
     strayWriteCheck(dstGuest, len);
     while (len) {
         U64 pageNum = dstGuest >> K64_PAGE_SHIFT;
@@ -652,6 +720,7 @@ void KMemory64::writeb(U64 addr, U8 value) {
     }
     strayWriteCheck(addr, 1);
     recordMemWrite(addr, 1, value);
+    noteGuestWrite(pageNum); // slow path only — fast path is barred for block pages
     U8* data = commitPageLocked(pageNum, K64_PAGE_MAPPED | K64_PAGE_READ | K64_PAGE_WRITE);
     k64DTlbInsert(this, pageNum, data);
     data[addr & K64_PAGE_MASK] = value; // commit-on-write (MT-safe)
@@ -671,6 +740,10 @@ U8* KMemory64::getRamPtr(U64 addr, U32 len) {
     // place. Once allocated, the buffer is never reallocated, so the returned
     // pointer stays valid. The commit must be locked (see commitPageLocked) so a
     // sibling thread's first-touch of the same page can't orphan our buffer.
+    // Conservative for the block cache: a raw host pointer can be written
+    // through at any later time (futex words, LOCK RMW), so treat the handout
+    // itself as a write to the page.
+    noteGuestWrite(addr >> K64_PAGE_SHIFT);
     U8* data;
     {
         BOXEDWINE_CRITICAL_SECTION_WITH_MUTEX(pagesMutex);
