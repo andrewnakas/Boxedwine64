@@ -258,11 +258,45 @@ void KProcess::cleanupProcess() {
     }
 }
 
+// /proc/<pid>/task/<tid>/stat — wine's per-thread time queries (taskmgr,
+// GetThreadTimes fallbacks) probe these for every tid; without them the opens
+// ENOENT. Same synthesized-times approach as /proc/<pid>/stat.
+static void addTaskStatNode(const KProcessPtr& process, U32 tid) {
+    if (!process->taskNode) {
+        return;
+    }
+    std::shared_ptr<FsNode> tidDir = Fs::addFileNode(process->taskNode->path + "/" + BString::valueOf(tid),
+                                                     B(""), B(""), true, process->taskNode);
+    KProcessWeakPtr weak_process = process;
+    U64 startJiffies = (U64)KSystem::getMilliesSinceStart() / 10;
+    Fs::addVirtualFile(tidDir->path + "/stat",
+        [weak_process, tid, startJiffies](const std::shared_ptr<FsNode>& node, U32 flags, U32 data) -> FsOpenNode* {
+            KProcessPtr p = weak_process.lock();
+            if (!p) {
+                return new BufferAccess(node, flags, B(""));
+            }
+            U64 now = (U64)KSystem::getMilliesSinceStart() / 10;
+            U64 up = now > startJiffies ? now - startJiffies : 0;
+            U64 utime = up / 20, stime = up / 40;
+            char buf[512];
+            snprintf(buf, sizeof(buf),
+                     "%u (%s) S 1 %u %u 0 -1 4194304 0 0 0 0 %llu %llu 0 0 20 0 1 0 %llu 0 0 "
+                     "18446744073709551615 0 0 0 0 0 0 0 0 0 0 0 0 17 0 0 0 0 0 0 0 0 0 0 0 0 0 0\n",
+                     tid, p->name.length() ? p->name.c_str() : "wine64", p->id, p->id,
+                     (unsigned long long)utime, (unsigned long long)stime,
+                     (unsigned long long)startJiffies);
+            return new BufferAccess(node, flags, BString::copy(buf));
+        }, K__S_IREAD, k_mdev(0, 0), tidDir);
+}
+
 KThread* KProcess::createThread() {	
     KThread* thread = new KThread(KSystem::getNextThreadId(), shared_from_this());
 
-    BOXEDWINE_CRITICAL_SECTION_WITH_MUTEX(threadsMutex);
-    this->threads.set(thread->id, thread);
+    {
+        BOXEDWINE_CRITICAL_SECTION_WITH_MUTEX(threadsMutex);
+        this->threads.set(thread->id, thread);
+    }
+    addTaskStatNode(shared_from_this(), thread->id);
     return thread;
 }
 
@@ -270,6 +304,9 @@ void KProcess::removeThread(KThread* thread) {
     {
         BOXEDWINE_CRITICAL_SECTION_WITH_MUTEX(threadsMutex);
         this->threads.remove(thread->id);
+    }
+    if (this->taskNode) {
+        this->taskNode->removeChildByName(BString::valueOf(thread->id));
     }
     BOXEDWINE_CRITICAL_SECTION_WITH_CONDITION(threadRemovedCondition);
     BOXEDWINE_CONDITION_SIGNAL(threadRemovedCondition);    
