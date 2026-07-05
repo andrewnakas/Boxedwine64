@@ -104,17 +104,21 @@
     if (BASE === null) BASE = "./";
     if (BASE.length && !BASE.endsWith("/")) BASE += "/";
     var CHUNKED = param("chunked") === "1"; // fetch zips as <zip>.partNNN via manifest
-    // Lazy rootfs (M7, opt-in ?lazy=1): don't
+    // Lazy rootfs (M7): don't
     // download wine64.zip (~196MB) up front — mount it FROM ITS URL. The C++
     // side (source/io/fszipurl.cpp) fetches 512KB block ranges on demand with
     // sync XHR on the guest worker threads (~55MB actually read for a boot =
     // 65% less transfer, measured). glibc+prefix (~28MB) stay eager: they're
     // small and hold the boot-critical loader bits. Validated: 13/13 local
     // boots + in-session app switch + 4/4 live-on-Pages boots.
-    // Still OPT-IN: the eager default is what the CI gate certifies. The lazy
-    // smoke runs non-gating in CI (see deploy-pages.yml) while the fetch
-    // backend soaks across Chrome versions; flip to default on green evidence.
-    var LAZY = param("lazy") === "1";
+    // DEFAULT since 2026-07-05 (?lazy=0 opts out): the flip criterion was
+    // green evidence across real browsers — lazy passes on Chrome 149/150/152
+    // (smoke + verifier), on a Docker replica of the CI config, and on live
+    // Pages across multiple deploys; the sole remaining red is the GitHub
+    // runner's own environment (see deploy-pages.yml — the gating smoke now
+    // certifies the ?lazy=0 escape hatch, and the non-gating lazy smoke
+    // remains as the runner monitor).
+    var LAZY = param("lazy") !== "0";
     var wineZipArg = "wine64.zip"; // replaced by a bw64url: spec in lazy mode
 
     // --- current run configuration ------------------------------------------
