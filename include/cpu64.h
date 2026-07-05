@@ -13,6 +13,7 @@
 #ifdef BOXEDWINE_GUEST_X64
 
 #include "reg64.h"
+#include <memory>
 #include "../source/emulation/cpu/common/fpu.h"
 #include <unordered_map>
 
@@ -233,6 +234,61 @@ private:
         U8   regField = 0;    // top-3-bit "reg" field, REX.R extended (always returned)
         bool isRipRel = false;// for diagnostic/future use
     };
+
+#ifdef BOXEDWINE_BLOCK_EXEC
+    // ---- Phase 2 prototype: decoded-block executor (experiment builds only).
+    // A BBlock is a run of pre-decoded instruction records starting at a RIP,
+    // executed by a dense switch that skips fetch/prefix/ModRM parsing and the
+    // giant dispatch. Validity = Phase-1 page generations (pages register via
+    // KMemory64::blockPageRegister; any write to them bumps the gen and the
+    // block rebuilds). Registers are NEVER cached — ModRM recipes re-resolve
+    // register values on every execution.
+    struct BRecipe {
+        U8  length = 0;        // modrm+sib+disp bytes
+        U8  regField = 0;
+        bool isReg = false;
+        bool ripRel = false;
+        U8  rmIndex = 0;
+        U8  baseIdx = 0xFF, idxIdx = 0xFF, scale = 0;
+        U8  seg = 0;
+        bool asize32 = false;
+        S32 disp = 0;
+        U64 ripTarget = 0;
+    };
+    enum BKind : U8 {
+        BK_MOV_RM_R, BK_MOV_R_RM, BK_ALU_RM_R, BK_ALU_R_RM,
+        BK_ALU_RM_IMM, BK_SHIFT_IMM, BK_IMUL_R_RM, BK_JCC8,
+        BK_TEST_RM_R, BK_LEA, BK_MOV_RM_IMM, BK_MOV_R_IMM, BK_PUSH, BK_POP
+    };
+    struct BRec {
+        U8  kind = 0;
+        U8  size = 4;          // operand size (4/8 only in v1)
+        U8  sub = 0;           // aluOp / shift sub-op / jcc condition
+        U8  rexPresent = 0;
+        U8  len = 0;           // full instruction byte length
+        BRecipe mr;
+        U64 imm = 0;           // finalized immediate (sign/mask applied at build)
+        S32 jccDelta = 0;
+    };
+    static constexpr U32 BBLOCK_MAX_RECS = 24;
+    struct BBlock {
+        U64 startRip = 0;      // 0 = empty slot
+        U64 page0 = 0, page1 = 0;
+        U32 gen0 = 0, gen1 = 0;
+        U16 n = 0;
+        BRec recs[BBLOCK_MAX_RECS];
+    };
+    static constexpr U32 BBLOCK_SLOTS = 512;
+    std::unique_ptr<BBlock[]> blockTable;      // lazily allocated
+    U64 blockNegCache[1024] = {};              // rips known not to block
+    U64 blockStatsExec = 0, blockStatsInsn = 0, blockStatsBuilt = 0;
+
+    bool decodeModRMRecipe(U64 modrmAddr, const Prefixes& p, U32 trailingImmBytes, BRecipe& out);
+    ModRM resolveRecipe(const BRecipe& r);
+    bool buildBlock(U64 startRip, BBlock& b);
+    U32  execBlock(const BBlock& b);           // returns instructions executed
+    U32  tryBlockStep();                       // probe/build/exec; 0 = interpret
+#endif
 
     // Read prefixes starting at rip; advance an internal cursor. Returns
     // the byte index of the primary opcode, relative to rip.
