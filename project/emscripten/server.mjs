@@ -65,6 +65,26 @@ const server = createServer(async (request, response) => {
         "Cross-Origin-Resource-Policy": "same-origin",
         "Cache-Control": immutable ? "public, max-age=31536000, immutable" : "no-cache",
     };
+    // HTTP Range support (M7 lazy rootfs): the bw64url zip mount fetches
+    // 512KB block ranges with sync XHR; serve 206 partials like Pages does.
+    const range = request.headers.range;
+    const m = range && /^bytes=(\d+)-(\d*)$/.exec(range);
+    if (m) {
+        const start = Number(m[1]);
+        const end = m[2] ? Math.min(Number(m[2]), finalInfo.size - 1) : finalInfo.size - 1;
+        if (start > end || start >= finalInfo.size) {
+            response.writeHead(416, { "Content-Range": `bytes */${finalInfo.size}` });
+            response.end();
+            return;
+        }
+        headers["Content-Length"] = end - start + 1;
+        headers["Content-Range"] = `bytes ${start}-${end}/${finalInfo.size}`;
+        headers["Accept-Ranges"] = "bytes";
+        response.writeHead(206, headers);
+        createReadStream(finalPath, { start, end }).pipe(response);
+        return;
+    }
+    headers["Accept-Ranges"] = "bytes";
     response.writeHead(200, headers);
     createReadStream(finalPath).pipe(response);
 });

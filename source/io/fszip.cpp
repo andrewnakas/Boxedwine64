@@ -27,6 +27,7 @@ extern "C"
 #include "fsfilenode.h"
 #include "fszip.h"
 #include "fszipnode.h"
+#include "fszipurl.h"
 #include <time.h>
 #include <string.h>
 
@@ -63,7 +64,10 @@ bool FsZip::init(BString zipPath, BString mount) {
     BString strippedMount;
 
     std::shared_ptr<FsNode> root = Fs::getNodeFromLocalPath(B(""), B(""), true);
-    deleteFilePath = root->nativePath.stringByApppendingPath(Fs::getFileNameFromNativePath(zipPath) + ".deleted");
+    // A bw64url: spec is not a filesystem path — give its tombstone file a
+    // fixed name instead of deriving one from the spec string.
+    BString deleteName = fsZipUrlIsSpec(zipPath) ? B("bw64url") : Fs::getFileNameFromNativePath(zipPath);
+    deleteFilePath = root->nativePath.stringByApppendingPath(deleteName + ".deleted");
     if (mount.length()) {
         Fs::makeLocalDirs(mount);
         strippedMount = mount.substr(0, mount.length() - 1);
@@ -72,7 +76,8 @@ bool FsZip::init(BString zipPath, BString mount) {
     if (zipPath.length()) {
         unz_global_info global_info = {};
 
-        this->zipfile = unzOpen(zipPath.c_str());
+        this->zipfile = fsZipUrlIsSpec(zipPath) ? fsZipUrlOpen(zipPath)
+                                                 : unzOpen(zipPath.c_str());
         if (!this->zipfile) {
             klog_fmt("Could not load zip file: %s", zipPath.c_str());
             return false;
@@ -200,7 +205,7 @@ void FsZip::remove(BString localPath) {
 }
 
 bool FsZip::doesFileExist(BString zipFile, BString file) {
-    unzFile z = unzOpen(zipFile.c_str());
+    unzFile z = fsZipUrlIsSpec(zipFile) ? fsZipUrlOpen(zipFile) : unzOpen(zipFile.c_str());
     unz_global_info global_info = {};
     if (!z) {
         return false;
@@ -230,7 +235,7 @@ bool FsZip::doesFileExist(BString zipFile, BString file) {
 }
 
 bool FsZip::readFileFromZip(BString zipFile, BString file, BString& result) {
-    unzFile z = unzOpen(zipFile.c_str());
+    unzFile z = fsZipUrlIsSpec(zipFile) ? fsZipUrlOpen(zipFile) : unzOpen(zipFile.c_str());
     unz_global_info global_info = {};
     if (!z) {
         return false;
@@ -266,7 +271,7 @@ bool FsZip::readFileFromZip(BString zipFile, BString file, BString& result) {
 }
 
 bool FsZip::extractFileFromZip(BString zipFile, BString file, BString path) {
-    unzFile z = unzOpen(zipFile.c_str());
+    unzFile z = fsZipUrlIsSpec(zipFile) ? fsZipUrlOpen(zipFile) : unzOpen(zipFile.c_str());
     unz_global_info global_info = {};
     if (!z) {
         return false;
@@ -320,7 +325,7 @@ bool FsZip::extractFileFromZip(BString zipFile, BString file, BString path) {
 }
 
 bool FsZip::iterateFiles(BString zipFile, std::function<void(BString)> it) {
-    unzFile z = unzOpen(zipFile.c_str());
+    unzFile z = fsZipUrlIsSpec(zipFile) ? fsZipUrlOpen(zipFile) : unzOpen(zipFile.c_str());
     unz_global_info global_info = {};
     if (!z) {
         return false;
@@ -351,7 +356,7 @@ bool FsZip::detectGuestIs64(BString zipFile) {
     // at the first hit and avoids constructing a full FsZip / opening every
     // entry. Used by the UI launcher to badge installed Wine zips before
     // any container is created.
-    unzFile z = unzOpen(zipFile.c_str());
+    unzFile z = fsZipUrlIsSpec(zipFile) ? fsZipUrlOpen(zipFile) : unzOpen(zipFile.c_str());
     if (!z) {
         return false;
     }
@@ -381,7 +386,7 @@ bool FsZip::detectGuestIs64(BString zipFile) {
 }
 
 BString FsZip::unzip(BString zipFile, BString path, std::function<void(U32, BString fileName)> percentDone) {
-    unzFile z = unzOpen(zipFile.c_str());
+    unzFile z = fsZipUrlIsSpec(zipFile) ? fsZipUrlOpen(zipFile) : unzOpen(zipFile.c_str());
     unz_global_info global_info = {};
     if (!z) {
         return "Could not open zip file: " + zipFile;

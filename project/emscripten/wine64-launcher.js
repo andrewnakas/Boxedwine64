@@ -104,6 +104,12 @@
     if (BASE === null) BASE = "./";
     if (BASE.length && !BASE.endsWith("/")) BASE += "/";
     var CHUNKED = param("chunked") === "1"; // fetch zips as <zip>.partNNN via manifest
+    // ?lazy=1 (M7): don't download wine64.zip (~196MB) up front — mount it FROM
+    // ITS URL. The C++ side (source/io/fszipurl.cpp) fetches 512KB block ranges
+    // on demand with sync XHR on the guest worker threads. glibc+prefix (~28MB)
+    // stay eager: they're small and hold the boot-critical loader bits.
+    var LAZY = param("lazy") === "1";
+    var wineZipArg = "wine64.zip"; // replaced by a bw64url: spec in lazy mode
 
     // --- current run configuration ------------------------------------------
     // These describe the run being booted RIGHT NOW. The bare-page defaults come
@@ -184,7 +190,7 @@
 
     // --- build the wine64 argv ----------------------------------------------
     function buildArguments() {
-        var args = ["-root", ROOT, "-zip", GLIBC_ZIP, "-zip", WINE_ZIP];
+        var args = ["-root", ROOT, "-zip", GLIBC_ZIP, "-zip", wineZipArg];
         // The pre-booted prefix is a third overlay; mount it only when we'll use
         // it, so the bare --version / ?boot=1 paths stay byte-for-byte unchanged.
         if (USE_PREFIX) args.push("-zip", PREFIX_ZIP);
@@ -395,8 +401,44 @@
     var zipDownloads = null; // name -> Promise<Uint8Array>
     function neededZips() {
         var names = [GLIBC_ZIP, WINE_ZIP];
+        if (LAZY) names = [GLIBC_ZIP]; // wine64.zip mounts lazily from its URL
         if (USE_PREFIX) names.push(PREFIX_ZIP);
         return names;
+    }
+
+    // Resolve the bw64url: spec for wine64.zip in lazy mode:
+    //   bw64url:<total>;<absUrl>|<size>;...
+    // Prefer the whole-file URL (local server, Range-capable); fall back to the
+    // split parts via the manifest (GitHub Pages). URLs are absolutized because
+    // the sync XHR runs on pthread workers whose base URL is not the page's.
+    function resolveLazyWineSpec() {
+        if (!LAZY) return Promise.resolve();
+        var abs = function (u) { return new URL(u, window.location.href).href; };
+        var wholeUrl = BASE + WINE_ZIP;
+        var probe = CHUNKED ? Promise.reject(new Error("chunked")) :
+            fetch(wholeUrl, { method: "HEAD" }).then(function (r) {
+                if (!r.ok) throw new Error("HTTP " + r.status);
+                var len = Number(r.headers.get("Content-Length") || 0);
+                if (!len) throw new Error("no length");
+                return "bw64url:" + len + ";" + abs(wholeUrl) + "|" + len;
+            });
+        return probe.catch(function () {
+            return fetch(BASE + WINE_ZIP + ".manifest.json", { cache: "no-cache" })
+                .then(function (r) { return r.json(); })
+                .then(function (mf) {
+                    var spec = "bw64url:" + mf.totalBytes;
+                    var left = mf.totalBytes;
+                    for (var i = 0; i < mf.parts.length; i++) {
+                        var sz = Math.min(mf.chunkBytes, left);
+                        left -= sz;
+                        spec += ";" + abs(BASE + mf.parts[i]) + "|" + sz;
+                    }
+                    return spec;
+                });
+        }).then(function (spec) {
+            wineZipArg = spec;
+            console.log("lazy rootfs: wine64.zip will mount on demand (" + spec.split(";").length + " field(s))");
+        });
     }
     // One progress line for the whole concurrent download set: sum the per-URL
     // byte counts (each zip/part reports under its own label) into a single
@@ -702,6 +744,9 @@
                         if (zipDownloads) zipDownloads[name] = Promise.resolve(null);
                     });
                 }, Promise.resolve());
+            })
+            .then(function () {
+                return resolveLazyWineSpec(); // no-op unless ?lazy=1
             })
             .then(function () {
                 // Restore persisted user files into the writable MEMFS layer
