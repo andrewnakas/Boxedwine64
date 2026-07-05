@@ -26,7 +26,7 @@ window. This is the whole pipeline — window creation, the Win32 message pump,
 
 ---
 
-## Current state (June 2026)
+## Current state (July 2026)
 
 **`wine64 notepad.exe` now runs as a real, interactive GUI app on macOS arm64 —
 including File ▸ Save As all the way to a file on disk.** The full Windows-PE +
@@ -127,10 +127,6 @@ The 64-bit guest path can:
 ### What does not work yet
 
 - **No 64-bit JIT** — interpreter only (by design; v1 ships interpreter-only)
-- **No lazy/streamable rootfs in the browser yet** — the WASM build mounts the
-  full `wine64.zip` (~196 MB) up front, so first boot is slow (~2.5 min). The core
-  itself runs under `-sMEMORY64` and renders GUIs in a tab — see
-  [WebAssembly / browser](#webassembly-and-the-browser) below.
 - **X core-font text** (`PolyText8`/`PolyText16`) is unimplemented, so control/
   dialog text drawn through X core fonts doesn't paint yet (notepad's main edit
   area paints fine via GDI → `PutImage`)
@@ -234,7 +230,7 @@ This project drives the [`docs/PLAN_64BIT.md`](docs/PLAN_64BIT.md) §3.7–§3.1
 | **F — Windows PE + GUI** | populate the prefix with Windows PE files, then the X server / GUI path; interactive input + a working common dialog | ✅ Complete — notepad paints, takes keyboard+mouse, and Save As writes a file to the host |
 | **G — App breadth + X completeness** | get a spread of bundled apps (winecfg, regedit, clock, write, …) usable, fill the remaining X core opcodes they need | ⏳ Next |
 | **H — Interpreter throughput** | close the gap to interactive speed: faster hot-path decode, fewer per-op map lookups, block/trace caching | 🟡 In progress — instruction-fetch page cache + profiled hot-opcode dispatch hoist landed (`BW64_OPPROF`); full decoded-block cache still open |
-| **I — WASM memory64 + v1 polish** | Emscripten `-sMEMORY64`, Web Workers + SharedArrayBuffer threading, WebGL GL backend, lazy DLL fetch, browser tests — see [WebAssembly / browser](#webassembly-and-the-browser) | 🟢 Mostly there — self-tests pass headless in Node on `wasm32` and `-sMEMORY64` (234/234); the **multi-threaded browser build** (`make wasm64-mt`) **renders GUIs in a tab**: `glcube.exe` spins via the WebGL2 backend and `notepad.exe` is interactive (File ▸ Save As + a "download my files" button), verified in Chrome and Safari. Remaining: lazy/streamable rootfs (so the page doesn't pull ~196 MB up front), CI browser tests, and a couple of still-stubbed wineserver socket syscalls |
+| **I — WASM memory64 + v1 polish** | Emscripten `-sMEMORY64`, Web Workers + SharedArrayBuffer threading, WebGL GL backend, lazy DLL fetch, browser tests — see [WebAssembly / browser](#webassembly-and-the-browser) | 🟢 Mostly there — self-tests pass headless in Node on `wasm32` and `-sMEMORY64` (234/234); the **multi-threaded browser build** (`make wasm64-mt`) **renders GUIs in a tab**: `glcube.exe` spins via the WebGL2 backend and `notepad.exe` is interactive (File ▸ Save As + a "download my files" button), verified in Chrome and Safari. Lazy rootfs **shipped and on by default** (a boot fetches ~55 MB of 196 MB on demand), the deploy pipeline **gates on browser smoke tests** (boot-to-first-paint + rootfs CRC), and **sound plays end-to-end**. Remaining: a couple of still-stubbed wineserver socket syscalls |
 
 The commit log (`git log --oneline`) is the canonical, blow-by-blow record of the
 bring-up — each commit names the opcode or syscall and the real binary that
@@ -345,10 +341,12 @@ works through the **GDI/USER32** path (`BitBlt`/`StretchDIBits`/`PutImage`), the
 that same GL bridge — but D3D presents take seconds per frame under the
 interpreter, so it's a capability demo, not a way to play GPU games; there is
 still **no Direct2D/DirectWrite and no GPU
-compute**; there is **no audio backend yet**; there is **no network** inside the
-guest; and the whole rootfs is downloaded up front (no lazy loading), so **small
-matters**. The bullseye is classic **Win32/GDI** apps — the 2000s–early-2010s
-freeware era.
+compute**; there is **no network** inside the
+guest. **Audio works** (winmm → winealsa → an in-emulator ALSA→OSS bridge →
+WebAudio), and the rootfs now **lazy-loads by default** — a boot fetches
+~55 MB of the 196 MB `wine64.zip` as 512 KB ranges on demand (65% less
+transfer; add `?lazy=0` to pre-download everything instead). The bullseye is
+classic **Win32/GDI** apps — the 2000s–early-2010s freeware era.
 
 | App | Path | Status | Notes |
 |---|---|---|---|
@@ -361,10 +359,11 @@ freeware era.
 | **Snake / Tetris** | GDI/USER32 | ✅ Works | Self-contained Win32, built with mingw-w64 (`tools/rootfs64/games`) |
 | **glcube / gltri** | OpenGL → WebGL2 | ✅ Works | Spinning shaded cube via the `gl64` WGL→WebGL2 bridge |
 | **d3dtri** | Direct3D 9 → wined3d → WebGL2 | ✅ Works | A D3D9 gradient triangle renders end-to-end (device → shaders → VBO → present). First frame takes ~2–3 min under the interpreter |
-| **DOOM** (`doomgeneric`) | GDI/USER32 | ✅ Playable | Shareware WAD; renders + keyboard/menu/movement work. Fire = **Ctrl / F / X** (browsers intercept Ctrl). No mouse/turn or sound yet |
+| **DOOM** (`doomgeneric`) | GDI/USER32 | ✅ Playable | Shareware WAD; renders + keyboard/menu/movement work, **sound effects play** (waveOut mixer). Fire = **Ctrl / F / X** (browsers intercept Ctrl). No mouse/turn or music yet |
 | **HxD** (hex editor) | GDI/USER32 | ✅ Works | Real third-party Delphi app (WineHQ Platinum); renders the full editor — menu bar, toolbar, data-type inspector. Bundled byte-exact per its license. Give it ~60–80 s to come up |
 | **Your own `.exe`** | depends on the app | ✅ via "Run my own .exe" | Drag in a **portable Win32/GDI** exe; see below |
-| Task Mgr / regedit / control / explorer / IE / oleview | mixed | 🧪 Experimental | May not come up — depend on heavier shell/COM/X11 surface |
+| **Task Mgr** | GDI/USER32 + /proc | ✅ Works | Full GUI with a live CPU meter and real per-process memory (the emulator synthesizes `/proc/stat` + per-pid files) |
+| regedit / control / explorer / IE / oleview | mixed | 🧪 Experimental | May not come up — depend on heavier shell/COM/X11 surface |
 | .NET (WinForms) utilities | wine-mono + GDI+ | ⚠️ Poor fit | The CLR JITs IL at runtime — brutal under a non-JIT interpreter, plus a large wine-mono payload. WPF is Direct3D-backed → unsupported |
 | System-info tools (CPU-Z, HWiNFO, Speccy…) | kernel driver + WMI | ❌ Won't run | No kernel driver / real hardware / WMI to read |
 | Direct3D / GPU games & media players | D3D/DXVA | ❌ Impractical | Basic D3D9 now renders (see d3dtri), but a present takes seconds under the interpreter — real D3D games/media are far out of reach; Direct2D/DirectWrite have no backend |
