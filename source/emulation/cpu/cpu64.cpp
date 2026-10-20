@@ -5261,6 +5261,7 @@ unhandled:
 }
 
 void CPU64::run() {
+    U64 nextPoll = (instructionCount | 0xFFFF) + 1;
     // Optional instruction tracer for bring-up debugging. Gated on env so it
     // never costs anything in normal runs. BOXEDWINE64_TRACE_FROM/TO bound the
     // instructionCount window; each traced step prints RIP + the leading
@@ -5332,6 +5333,12 @@ void CPU64::run() {
             U32 bn = tryBlockStep();
             if (bn) {
                 instructionCount += bn;
+                if (instructionCount >= nextPoll) {
+                    nextPoll = instructionCount + 0x10000;
+                    if (thread && thread->terminating) break;
+                    if (thread && thread->pendingSignals) deliverPendingSignals();
+                    blockStatsMaybeReport();
+                }
                 continue;
             }
         }
@@ -5358,19 +5365,32 @@ void CPU64::run() {
         // sat undelivered in pendingSignals forever. Delivering here runs the
         // client's APC handler so Present can return. Cheap: only fires when
         // pendingSignals is set, gated to once per 64k instructions.
-        if ((instructionCount & 0xFFFF) == 0) {
+        // Threshold, not `& 0xFFFF == 0`: the block executor advances
+        // instructionCount by whole blocks, which would skip exact multiples.
+        if (instructionCount >= nextPoll) {
+            nextPoll = instructionCount + 0x10000;
             if (thread && thread->terminating) {
                 break;
             }
             if (thread && thread->pendingSignals) {
                 deliverPendingSignals();
             }
+#ifdef BOXEDWINE_BLOCK_EXEC
+            blockStatsMaybeReport();
+#endif
         }
     }
 }
 
 
 #ifdef BOXEDWINE_BLOCK_EXEC
+static std::atomic<U64> g_bsBuilt{0}, g_bsExec{0}, g_bsInsn{0}, g_bsTotal{0}, g_bsNextReport{100000000ULL};
+static std::atomic<U64> g_bsEndOp[512];
+static int bw64BlockStatsLevel() {
+    static int level = [] { const char* e = std::getenv("BW64_BLOCKSTATS"); return e ? std::atoi(e) : 0; }();
+    return level;
+}
+
 // ---- Phase 2 prototype implementation (see cpu64.h). Semantics of every
 // record kind are copied from the interpreter bodies below — same helpers
 // (loadRM/storeRM/runAlu/doShift/evalCC), same flag behavior.
@@ -5452,7 +5472,14 @@ __attribute__((always_inline)) inline CPU64::ModRM CPU64::resolveRecipe(const BR
 bool CPU64::buildBlock(U64 startRip, BBlock& b) {
     b.startRip = 0;
     b.n = 0;
+    if (blockArenaCursor + BBLOCK_MAX_RECS > BBLOCK_ARENA_RECS) {
+        blockArenaCursor = 0;
+        blockEpoch++;                      // invalidates every existing block
+    }
+    b.recOff = blockArenaCursor;
+    BRec* recs = &blockArena[b.recOff];
     U64 r = startRip;
+    U32 endOp = 0xFFFF;
     while (b.n < BBLOCK_MAX_RECS) {
         Prefixes p;
         U64 savedRip = rip;
@@ -5463,14 +5490,45 @@ bool CPU64::buildBlock(U64 startRip, BBlock& b) {
             opOff = consumePrefixes(p);
         }
         rip = savedRip;
-        if (p.lock || p.rep || p.osize16) break;   // unsupported in v1
         U8 op = fetchByte(r + opOff);
+        if (bw64BlockStatsLevel() >= 2) {
+            // provisional: overwritten each iteration, counted once at the end
+            endOp = (op == 0x0F) ? (0x100 | fetchByte(r + opOff + 1)) : op;
+        }
+        if (p.lock) break;
         bool rexW = (p.rex & 0x08) != 0;
         U8 size = rexW ? 8 : 4;
-        BRec& rec = b.recs[b.n];
+        BRec& rec = recs[b.n];
         rec = BRec();
         rec.size = size;
         rec.rexPresent = (p.rex != 0) ? 1 : 0;
+
+        // SSE forms where 66/F3 are MANDATORY prefixes (opcode selectors, not
+        // operand-size/rep). Conditions mirror the interpreter's 0F handlers.
+        if (op == 0x0F) {
+            U8 op2 = fetchByte(r + opOff + 1);
+            bool mov128 =
+                ((op2 == 0x10 || op2 == 0x11 || op2 == 0x28 || op2 == 0x29) && !p.rep) ||
+                ((op2 == 0x6F || op2 == 0x7F) && (p.osize16 || p.rep == 0xF3));
+            bool sse66 = p.osize16 && !p.rep;
+            int kind = -1;
+            if (mov128) kind = (op2 == 0x11 || op2 == 0x29 || op2 == 0x7F) ? BK_MOV128_ST : BK_MOV128_LD;
+            else if (!p.rep && (op2 == 0x54 || op2 == 0x55 || op2 == 0x56 || op2 == 0x57)) kind = BK_PLOGIC;
+            else if (sse66 && (op2 == 0xEF || op2 == 0xEB || op2 == 0xDB || op2 == 0xDF)) kind = BK_PLOGIC;
+            else if (sse66 && (op2 == 0x74 || op2 == 0x75 || op2 == 0x76)) kind = BK_PCMPEQ;
+            else if (sse66 && op2 == 0xD7) kind = BK_PMOVMSKB;
+            if (kind >= 0) {
+                if (!decodeModRMRecipe(r + opOff + 2, p, 0, rec.mr)) break;
+                if (kind == BK_PMOVMSKB && !rec.mr.isReg) break;
+                rec.kind = (U8)kind;
+                rec.sub = (kind == BK_PCMPEQ) ? (U8)((op2 == 0x74) ? 8 : (op2 == 0x75) ? 16 : 32) : op2;
+                rec.len = (U8)(opOff + 2 + rec.mr.length);
+                b.n++;
+                r += rec.len;
+                continue;
+            }
+        }
+        if (p.rep || p.osize16) break;             // 16-bit / string forms: interpreter
 
         if (op == 0x89 || op == 0x8B) {
             if (!decodeModRMRecipe(r + opOff + 1, p, 0, rec.mr)) break;
@@ -5478,11 +5536,94 @@ bool CPU64::buildBlock(U64 startRip, BBlock& b) {
             rec.len = (U8)(opOff + 1 + rec.mr.length);
         } else if (op <= 0x3D && ((op & 0x06) != 0x06) && (op & 0x7) <= 3) {
             U8 form = op & 0x7;
-            if ((form & 1) == 0) break;            // 8-bit forms unsupported in v1
+            if ((form & 1) == 0) rec.size = 1;
             if (!decodeModRMRecipe(r + opOff + 1, p, 0, rec.mr)) break;
             rec.kind = (form < 2) ? BK_ALU_RM_R : BK_ALU_R_RM;
             rec.sub = (op >> 3) & 0x7;
             rec.len = (U8)(opOff + 1 + rec.mr.length);
+        } else if (op <= 0x3D && ((op & 0x06) != 0x06) && ((op & 0x7) == 4 || (op & 0x7) == 5)) {
+            // ALU AL/eAX/RAX, imm (04/05, 0C/0D, ... 3C/3D)
+            rec.kind = BK_ALU_RM_IMM;
+            rec.sub = (op >> 3) & 0x7;
+            rec.mr.isReg = true; rec.mr.rmIndex = X64_RAX;
+            if ((op & 1) == 0) {
+                rec.size = 1;
+                rec.imm = fetchByte(r + opOff + 1);
+                rec.len = (U8)(opOff + 2);
+            } else {
+                U32 i32 = fetchDword(r + opOff + 1);
+                rec.imm = (size == 8) ? (U64)(S64)(S32)i32 : (U64)i32;
+                rec.len = (U8)(opOff + 5);
+            }
+        } else if (op == 0x80) {
+            if (!decodeModRMRecipe(r + opOff + 1, p, 1, rec.mr)) break;
+            rec.kind = BK_ALU_RM_IMM;
+            rec.size = 1;
+            rec.sub = rec.mr.regField & 0x7;
+            rec.imm = fetchByte(r + opOff + 1 + rec.mr.length);
+            rec.len = (U8)(opOff + 1 + rec.mr.length + 1);
+        } else if (op == 0x84 || op == 0x88 || op == 0x8A) {
+            if (!decodeModRMRecipe(r + opOff + 1, p, 0, rec.mr)) break;
+            rec.kind = (op == 0x84) ? BK_TEST_RM_R : (op == 0x88) ? BK_MOV_RM_R : BK_MOV_R_RM;
+            rec.size = 1;
+            rec.len = (U8)(opOff + 1 + rec.mr.length);
+        } else if (op == 0xC6) {
+            if (!decodeModRMRecipe(r + opOff + 1, p, 1, rec.mr)) break;
+            if ((rec.mr.regField & 0x7) != 0) break;
+            rec.kind = BK_MOV_RM_IMM;
+            rec.size = 1;
+            rec.imm = fetchByte(r + opOff + 1 + rec.mr.length);
+            rec.len = (U8)(opOff + 1 + rec.mr.length + 1);
+        } else if (op == 0xA8 || op == 0xA9) {
+            rec.kind = BK_TEST_RM_IMM;
+            rec.mr.isReg = true; rec.mr.rmIndex = X64_RAX;
+            if (op == 0xA8) {
+                rec.size = 1;
+                rec.imm = fetchByte(r + opOff + 1);
+                rec.len = (U8)(opOff + 2);
+            } else {
+                U32 i32 = fetchDword(r + opOff + 1);
+                rec.imm = (size == 8) ? (U64)(S64)(S32)i32 : (U64)i32;
+                rec.len = (U8)(opOff + 5);
+            }
+        } else if (op == 0xF6 || op == 0xF7) {
+            U32 immLen = (op == 0xF6) ? 1u : 4u;
+            if (!decodeModRMRecipe(r + opOff + 1, p, immLen, rec.mr)) break;
+            if ((rec.mr.regField & 0x7) != 0) break;   // only /0 TEST imm
+            rec.kind = BK_TEST_RM_IMM;
+            U64 immAddr = r + opOff + 1 + rec.mr.length;
+            if (op == 0xF6) {
+                rec.size = 1;
+                rec.imm = fetchByte(immAddr);
+            } else {
+                U32 i32 = fetchDword(immAddr);
+                rec.imm = (size == 8) ? (U64)(S64)(S32)i32 : (U64)i32;
+            }
+            rec.len = (U8)(opOff + 1 + rec.mr.length + immLen);
+        } else if (op == 0xFF) {
+            if (!decodeModRMRecipe(r + opOff + 1, p, 0, rec.mr)) break;
+            U8 sub = rec.mr.regField & 0x7;
+            rec.len = (U8)(opOff + 1 + rec.mr.length);
+            if (sub == 0 || sub == 1) {
+                rec.kind = BK_INCDEC;
+                rec.sub = sub;
+            } else if (sub == 6) {
+                rec.kind = BK_PUSH_RM;
+            } else if (sub == 2 || sub == 4) {
+                rec.kind = (sub == 2) ? BK_CALL_IND : BK_JMP_IND;
+                b.n++;
+                r += rec.len;
+                break;                              // terminator
+            } else {
+                break;
+            }
+        } else if (op == 0x0F && fetchByte(r + opOff + 1) == 0x1F) {
+            if (!decodeModRMRecipe(r + opOff + 2, p, 0, rec.mr)) break;
+            rec.kind = BK_NOP;
+            rec.len = (U8)(opOff + 2 + rec.mr.length);
+        } else if (op == 0x90 && !(p.rex & 0x01)) {
+            rec.kind = BK_NOP;
+            rec.len = (U8)(opOff + 1);
         } else if (op == 0x81 || op == 0x83) {
             U32 trailing = (op == 0x81) ? 4u : 1u;
             if (!decodeModRMRecipe(r + opOff + 1, p, trailing, rec.mr)) break;
@@ -5504,13 +5645,22 @@ bool CPU64::buildBlock(U64 startRip, BBlock& b) {
                 immLen = 4;
             }
             rec.len = (U8)(opOff + 1 + rec.mr.length + immLen);
-        } else if (op == 0xC1) {
-            if (!decodeModRMRecipe(r + opOff + 1, p, 1, rec.mr)) break;
-            rec.kind = BK_SHIFT_IMM;
+        } else if (op == 0xC0 || op == 0xC1 || (op >= 0xD0 && op <= 0xD3)) {
+            bool hasImm = (op == 0xC0 || op == 0xC1);
+            if (op == 0xC0 || op == 0xD0 || op == 0xD2) rec.size = 1;
+            if (!decodeModRMRecipe(r + opOff + 1, p, hasImm ? 1 : 0, rec.mr)) break;
             rec.sub = rec.mr.regField & 0x7;
-            U8 count = fetchByte(r + opOff + 1 + rec.mr.length);
-            rec.imm = count & ((size == 8) ? 0x3F : 0x1F);
-            rec.len = (U8)(opOff + 1 + rec.mr.length + 1);
+            U8 mask = (rec.size == 8) ? 0x3F : 0x1F;
+            if (op == 0xD2 || op == 0xD3) {
+                rec.kind = BK_SHIFT_CL;
+                rec.imm = mask;
+                rec.len = (U8)(opOff + 1 + rec.mr.length);
+            } else {
+                rec.kind = BK_SHIFT_IMM;
+                U8 count = hasImm ? fetchByte(r + opOff + 1 + rec.mr.length) : 1;
+                rec.imm = count & mask;
+                rec.len = (U8)(opOff + 1 + rec.mr.length + (hasImm ? 1 : 0));
+            }
         } else if (op == 0x0F && fetchByte(r + opOff + 1) == 0xAF) {
             if (!decodeModRMRecipe(r + opOff + 2, p, 0, rec.mr)) break;
             rec.kind = BK_IMUL_R_RM;
@@ -5565,11 +5715,46 @@ bool CPU64::buildBlock(U64 startRip, BBlock& b) {
             b.n++;
             r += rec.len;
             break;                                  // terminator
+        } else if (op == 0xE8 || op == 0xE9 || op == 0xEB) {
+            rec.kind = (op == 0xE8) ? BK_CALL : BK_JMP;
+            if (op == 0xEB) {
+                rec.jccDelta = (S32)(S8)fetchByte(r + opOff + 1);
+                rec.len = (U8)(opOff + 2);
+            } else {
+                rec.jccDelta = (S32)fetchDword(r + opOff + 1);
+                rec.len = (U8)(opOff + 5);
+            }
+            b.n++;
+            r += rec.len;
+            break;                                  // terminator
+        } else if (op == 0xC3) {
+            rec.kind = BK_RET;
+            rec.len = (U8)(opOff + 1);
+            b.n++;
+            r += rec.len;
+            break;                                  // terminator
+        } else if (op == 0x63) {
+            if (!decodeModRMRecipe(r + opOff + 1, p, 0, rec.mr)) break;
+            rec.kind = BK_MOVSXD;
+            rec.sub = 4;
+            rec.len = (U8)(opOff + 1 + rec.mr.length);
+        } else if (op == 0x0F && (fetchByte(r + opOff + 1) & 0xF6) == 0xB6) {
+            // 0F B6/B7 MOVZX, 0F BE/BF MOVSX
+            U8 op2 = fetchByte(r + opOff + 1);
+            if (!decodeModRMRecipe(r + opOff + 2, p, 0, rec.mr)) break;
+            rec.kind = (op2 & 0x08) ? BK_MOVSX : BK_MOVZX;
+            rec.sub = (op2 & 1) ? 2 : 1;
+            rec.len = (U8)(opOff + 2 + rec.mr.length);
         } else {
             break;                                  // unsupported → end block here
         }
         b.n++;
         r += rec.len;
+    }
+    if (endOp < 512 && b.n < BBLOCK_MAX_RECS) {
+        // the instruction at the end wasn't consumed (terminators did b.n++
+        // AND advanced r, so only count when the last record isn't a Jcc)
+        if (b.n == 0 || recs[b.n - 1].kind < BK_CALL && recs[b.n - 1].kind != BK_JCC8) g_bsEndOp[endOp]++;
     }
     if (b.n < 2) {
         return false;                               // not worth a block
@@ -5583,20 +5768,28 @@ bool CPU64::buildBlock(U64 startRip, BBlock& b) {
     b.gen0 = KMemory64::blockPageGenOf(b.page0);
     b.gen1 = KMemory64::blockPageGenOf(b.page1);
     b.startRip = startRip;
+    b.epoch = blockEpoch;
+    blockArenaCursor += b.n;
     blockStatsBuilt++;
     return true;
 }
 
+inline U64 CPU64::blockRegRead(U8 idx, U32 size, bool rexPresent) {
+    return (size == 1) ? (U64)readReg8(idx, rexPresent)
+         : (size == 4) ? (U64)reg[idx].u32 : reg[idx].u64;
+}
+
 U32 CPU64::execBlock(const BBlock& b) {
     U32 executed = 0;
+    const BRec* recs = &blockArena[b.recOff];
     for (U16 i = 0; i < b.n; i++) {
-        const BRec& rec = b.recs[i];
+        const BRec& rec = recs[i];
         bool rexPresent = rec.rexPresent != 0;
         U32 size = rec.size;
         switch (rec.kind) {
         case BK_MOV_RM_R: {
             ModRM m = resolveRecipe(rec.mr);
-            U64 src = (size == 4) ? (U64)reg[m.regField].u32 : reg[m.regField].u64;
+            U64 src = blockRegRead(m.regField, size, rexPresent);
             storeRM(m, size, src, rexPresent);
             rip += rec.len;
             break;
@@ -5604,7 +5797,8 @@ U32 CPU64::execBlock(const BBlock& b) {
         case BK_MOV_R_RM: {
             ModRM m = resolveRecipe(rec.mr);
             U64 val = loadRM(m, size, rexPresent);
-            if (size == 4) reg[m.regField].setU32((U32)val);
+            if (size == 1) writeReg8(m.regField, (U8)val, rexPresent);
+            else if (size == 4) reg[m.regField].setU32((U32)val);
             else reg[m.regField].setU64(val);
             rip += rec.len;
             break;
@@ -5612,14 +5806,14 @@ U32 CPU64::execBlock(const BBlock& b) {
         case BK_ALU_RM_R: {
             ModRM m = resolveRecipe(rec.mr);
             U64 a = loadRM(m, size, rexPresent);
-            U64 bv = (size == 4) ? (U64)reg[m.regField].u32 : reg[m.regField].u64;
+            U64 bv = blockRegRead(m.regField, size, rexPresent);
             runAlu(rec.sub, size, true, a, bv, m, rexPresent);
             rip += rec.len;
             break;
         }
         case BK_ALU_R_RM: {
             ModRM m = resolveRecipe(rec.mr);
-            U64 a = (size == 4) ? (U64)reg[m.regField].u32 : reg[m.regField].u64;
+            U64 a = blockRegRead(m.regField, size, rexPresent);
             U64 bv = loadRM(m, size, rexPresent);
             runAlu(rec.sub, size, false, a, bv, m, rexPresent);
             rip += rec.len;
@@ -5632,9 +5826,10 @@ U32 CPU64::execBlock(const BBlock& b) {
             rip += rec.len;
             break;
         }
+        case BK_SHIFT_CL:
         case BK_SHIFT_IMM: {
             ModRM m = resolveRecipe(rec.mr);
-            U8 count = (U8)rec.imm;
+            U8 count = (rec.kind == BK_SHIFT_CL) ? (U8)(reg[X64_RCX].u8 & (U8)rec.imm) : (U8)rec.imm;
             U64 v = loadRM(m, size, rexPresent);
             U64 res = doShift(rflags, rec.sub, v, count, size);
             if (count != 0) storeRM(m, size, res, rexPresent);
@@ -5663,10 +5858,119 @@ U32 CPU64::execBlock(const BBlock& b) {
         case BK_TEST_RM_R: {
             ModRM m = resolveRecipe(rec.mr);
             U64 a = loadRM(m, size, rexPresent);
-            U64 bv = (size == 4) ? (U64)reg[m.regField].u32 : reg[m.regField].u64;
+            U64 bv = blockRegRead(m.regField, size, rexPresent);
             flagsLogic(rflags, a & bv, size);
             rip += rec.len;
             break;
+        }
+        case BK_TEST_RM_IMM: {
+            ModRM m = resolveRecipe(rec.mr);
+            U64 a = loadRM(m, size, rexPresent);
+            flagsLogic(rflags, a & rec.imm, size);
+            rip += rec.len;
+            break;
+        }
+        case BK_INCDEC: {
+            ModRM m = resolveRecipe(rec.mr);
+            U64 a = loadRM(m, size, rexPresent);
+            U64 res = (rec.sub == 0) ? a + 1 : a - 1;
+            U32 savedCF = rflags & X64_CF;
+            if (rec.sub == 0) flagsAdd(rflags, a, 1, res, size);
+            else              flagsSub(rflags, a, 1, res, size);
+            rflags = (rflags & ~X64_CF) | savedCF;
+            storeRM(m, size, res, rexPresent);
+            rip += rec.len;
+            break;
+        }
+        case BK_PUSH_RM: {
+            ModRM m = resolveRecipe(rec.mr);
+            push64(loadRM(m, 8, rexPresent));
+            rip += rec.len;
+            break;
+        }
+        case BK_NOP: {
+            rip += rec.len;
+            break;
+        }
+        case BK_MOV128_LD: {
+            ModRM m = resolveRecipe(rec.mr);
+            if (m.isReg) {
+                xmm[m.regField] = xmm[m.rmIndex];
+            } else {
+                xmm[m.regField].lo = memory->readq(m.effAddr);
+                xmm[m.regField].hi = memory->readq(m.effAddr + 8);
+            }
+            rip += rec.len;
+            break;
+        }
+        case BK_MOV128_ST: {
+            ModRM m = resolveRecipe(rec.mr);
+            if (m.isReg) {
+                xmm[m.rmIndex] = xmm[m.regField];
+            } else {
+                memory->writeq(m.effAddr,     xmm[m.regField].lo);
+                memory->writeq(m.effAddr + 8, xmm[m.regField].hi);
+            }
+            rip += rec.len;
+            break;
+        }
+        case BK_PLOGIC: {
+            ModRM m = resolveRecipe(rec.mr);
+            U64 srcLo, srcHi;
+            if (m.isReg) { srcLo = xmm[m.rmIndex].lo; srcHi = xmm[m.rmIndex].hi; }
+            else { srcLo = memory->readq(m.effAddr); srcHi = memory->readq(m.effAddr + 8); }
+            U64 dLo = xmm[m.regField].lo, dHi = xmm[m.regField].hi;
+            switch (rec.sub) {
+                case 0x54: case 0xDB: xmm[m.regField].lo = dLo & srcLo;  xmm[m.regField].hi = dHi & srcHi;  break;
+                case 0x55: case 0xDF: xmm[m.regField].lo = ~dLo & srcLo; xmm[m.regField].hi = ~dHi & srcHi; break;
+                case 0x56: case 0xEB: xmm[m.regField].lo = dLo | srcLo;  xmm[m.regField].hi = dHi | srcHi;  break;
+                default:              xmm[m.regField].lo = dLo ^ srcLo;  xmm[m.regField].hi = dHi ^ srcHi;  break;
+            }
+            rip += rec.len;
+            break;
+        }
+        case BK_PCMPEQ: {
+            ModRM m = resolveRecipe(rec.mr);
+            U64 srcLo, srcHi;
+            if (m.isReg) { srcLo = xmm[m.rmIndex].lo; srcHi = xmm[m.rmIndex].hi; }
+            else { srcLo = memory->readq(m.effAddr); srcHi = memory->readq(m.effAddr + 8); }
+            U32 elemBits = rec.sub;
+            U64 mask = (1ULL << elemBits) - 1;
+            U64 outLo = 0, outHi = 0;
+            for (U32 off = 0; off < 64; off += elemBits) {
+                if (((xmm[m.regField].lo >> off) & mask) == ((srcLo >> off) & mask)) outLo |= mask << off;
+                if (((xmm[m.regField].hi >> off) & mask) == ((srcHi >> off) & mask)) outHi |= mask << off;
+            }
+            xmm[m.regField].lo = outLo;
+            xmm[m.regField].hi = outHi;
+            rip += rec.len;
+            break;
+        }
+        case BK_PMOVMSKB: {
+            ModRM m = resolveRecipe(rec.mr);
+            U64 lo = xmm[m.rmIndex].lo, hi = xmm[m.rmIndex].hi;
+            U32 msk = 0;
+            for (U32 i = 0; i < 8; i++) {
+                if (lo & (1ULL << (i * 8 + 7))) msk |= (1u << i);
+                if (hi & (1ULL << (i * 8 + 7))) msk |= (1u << (i + 8));
+            }
+            reg[m.regField].setU32(msk);
+            rip += rec.len;
+            break;
+        }
+        case BK_CALL_IND: {
+            ModRM m = resolveRecipe(rec.mr);
+            U64 target = loadRM(m, 8, rexPresent);
+            push64(rip + rec.len);
+            rip = target;
+            executed++;
+            return executed;
+        }
+        case BK_JMP_IND: {
+            ModRM m = resolveRecipe(rec.mr);
+            rip = loadRM(m, 8, rexPresent);
+            executed++;
+            return executed;
         }
         case BK_LEA: {
             ModRM m = resolveRecipe(rec.mr);
@@ -5703,10 +6007,84 @@ U32 CPU64::execBlock(const BBlock& b) {
             executed++;
             return executed;
         }
+        case BK_CALL: {
+            U64 nextRip = rip + rec.len;
+            push64(nextRip);
+            rip = nextRip + (U64)(S64)rec.jccDelta;
+            executed++;
+            return executed;
+        }
+        case BK_JMP: {
+            rip += rec.len + (U64)(S64)rec.jccDelta;
+            executed++;
+            return executed;
+        }
+        case BK_RET: {
+            rip = pop64();
+            executed++;
+            return executed;
+        }
+        case BK_MOVZX: {
+            ModRM m = resolveRecipe(rec.mr);
+            U64 v = loadRM(m, rec.sub, rexPresent);
+            if (size == 4) reg[m.regField].setU32((U32)v);
+            else reg[m.regField].setU64(v);
+            rip += rec.len;
+            break;
+        }
+        case BK_MOVSX: {
+            ModRM m = resolveRecipe(rec.mr);
+            U64 raw = loadRM(m, rec.sub, rexPresent);
+            S64 v = (rec.sub == 1) ? (S64)(S8)raw : (S64)(S16)raw;
+            if (size == 4) reg[m.regField].setU32((U32)v);
+            else reg[m.regField].setU64((U64)v);
+            rip += rec.len;
+            break;
+        }
+        case BK_MOVSXD: {
+            ModRM m = resolveRecipe(rec.mr);
+            U64 raw = loadRM(m, 4, rexPresent);
+            if (size == 8) reg[m.regField].setU64((U64)(S64)(S32)raw);
+            else reg[m.regField].setU32((U32)raw);
+            rip += rec.len;
+            break;
+        }
         }
         executed++;
     }
     return executed;
+}
+
+// BW64_BLOCKSTATS=1: every guest thread folds its counters into process-wide
+// totals at the run-loop poll cadence; a line is logged every ~100M guest
+// instructions (wine sessions are usually killed, so no atexit report).
+// BW64_BLOCKSTATS=2 also histograms the opcode that ENDED each block build
+// (the "what to implement next" list), logged with the totals.
+
+void CPU64::blockStatsMaybeReport() {
+    if (!bw64BlockStatsLevel()) return;
+    g_bsBuilt += blockStatsBuilt - bsFlushedBuilt; bsFlushedBuilt = blockStatsBuilt;
+    g_bsExec  += blockStatsExec  - bsFlushedExec;  bsFlushedExec  = blockStatsExec;
+    g_bsInsn  += blockStatsInsn  - bsFlushedInsn;  bsFlushedInsn  = blockStatsInsn;
+    U64 total = (g_bsTotal += instructionCount - bsFlushedTotal); bsFlushedTotal = instructionCount;
+    U64 due = g_bsNextReport.load();
+    if (total < due || !g_bsNextReport.compare_exchange_strong(due, due + 100000000ULL)) return;
+    U64 insn = g_bsInsn.load();
+    klog_fmt("BLOCKSTATS: built=%llu execs=%llu insnsInBlocks=%llu totalInsns=%llu coverage=%.1f%%",
+             (unsigned long long)g_bsBuilt.load(), (unsigned long long)g_bsExec.load(),
+             (unsigned long long)insn, (unsigned long long)total, total ? 100.0 * insn / total : 0.0);
+    if (bw64BlockStatsLevel() >= 2) {
+        // top 16 block-ending opcodes (index: 0x000-0x0FF one-byte, 0x100-0x1FF 0F-prefixed)
+        U64 snap[512];
+        for (int i = 0; i < 512; i++) snap[i] = g_bsEndOp[i].load();
+        for (int k = 0; k < 16; k++) {
+            int best = -1;
+            for (int i = 0; i < 512; i++) if (snap[i] && (best < 0 || snap[i] > snap[best])) best = i;
+            if (best < 0) break;
+            klog_fmt("BLOCKSTATS:   end-op %s%02x  x%llu", best >= 256 ? "0f " : "", best & 0xFF, (unsigned long long)snap[best]);
+            snap[best] = 0;
+        }
+    }
 }
 
 U32 CPU64::tryBlockStep() {
@@ -5715,20 +6093,10 @@ U32 CPU64::tryBlockStep() {
     if (blockNegCache[neg] == r) return 0;
     if (!blockTable) {
         blockTable = std::make_unique<BBlock[]>(BBLOCK_SLOTS);
-        if (std::getenv("BW64_BLOCKSTATS")) {
-            static CPU64* statsCpu = this;
-            std::atexit([] {
-                klog_fmt("BLOCKSTATS: built=%llu execs=%llu insnsInBlocks=%llu totalInsns=%llu coverage=%.1f%%",
-                         (unsigned long long)statsCpu->blockStatsBuilt,
-                         (unsigned long long)statsCpu->blockStatsExec,
-                         (unsigned long long)statsCpu->blockStatsInsn,
-                         (unsigned long long)statsCpu->instructionCount,
-                         statsCpu->instructionCount ? 100.0 * statsCpu->blockStatsInsn / statsCpu->instructionCount : 0.0);
-            });
-        }
+        blockArena = std::make_unique<BRec[]>(BBLOCK_ARENA_RECS);
     }
     BBlock& b = blockTable[(U32)((r ^ (r >> 9)) & (BBLOCK_SLOTS - 1))];
-    if (b.startRip == r) {
+    if (b.startRip == r && b.epoch == blockEpoch) {
         if (KMemory64::blockPageGenOf(b.page0) == b.gen0 &&
             KMemory64::blockPageGenOf(b.page1) == b.gen1) {
             U32 n = execBlock(b);
@@ -5787,6 +6155,9 @@ U64 CPU64::runBounded(U64 maxInsn) {
         instructionCount++;
         ran++;
     }
+#ifdef BOXEDWINE_BLOCK_EXEC
+    blockStatsMaybeReport();
+#endif
     return ran;
 }
 

@@ -258,7 +258,11 @@ private:
     enum BKind : U8 {
         BK_MOV_RM_R, BK_MOV_R_RM, BK_ALU_RM_R, BK_ALU_R_RM,
         BK_ALU_RM_IMM, BK_SHIFT_IMM, BK_IMUL_R_RM, BK_JCC8,
-        BK_TEST_RM_R, BK_LEA, BK_MOV_RM_IMM, BK_MOV_R_IMM, BK_PUSH, BK_POP
+        BK_TEST_RM_R, BK_LEA, BK_MOV_RM_IMM, BK_MOV_R_IMM, BK_PUSH, BK_POP,
+        BK_MOVZX, BK_MOVSX, BK_MOVSXD,          // sub = source size (1/2/4)
+        BK_TEST_RM_IMM, BK_INCDEC, BK_PUSH_RM, BK_NOP, BK_SHIFT_CL,
+        BK_MOV128_LD, BK_MOV128_ST, BK_PLOGIC, BK_PCMPEQ, BK_PMOVMSKB,  // SSE (sub = op2 / elem bits)
+        BK_CALL, BK_RET, BK_JMP, BK_CALL_IND, BK_JMP_IND   // terminators (keep last)
     };
     struct BRec {
         U8  kind = 0;
@@ -270,23 +274,35 @@ private:
         U64 imm = 0;           // finalized immediate (sign/mask applied at build)
         S32 jccDelta = 0;
     };
-    static constexpr U32 BBLOCK_MAX_RECS = 24;
+    // Blocks are variable-length runs in a per-CPU record arena (average
+    // block is ~3-4 records, so fixed-size slots wasted most of their space
+    // and forced a tiny table). When the arena fills, the epoch bumps — every
+    // block becomes stale at once — and the cursor restarts at 0.
+    static constexpr U32 BBLOCK_MAX_RECS = 32;
+    static constexpr U32 BBLOCK_ARENA_RECS = 16384;
     struct BBlock {
         U64 startRip = 0;      // 0 = empty slot
         U64 page0 = 0, page1 = 0;
         U32 gen0 = 0, gen1 = 0;
+        U32 epoch = 0;
+        U32 recOff = 0;        // first record in blockArena
         U16 n = 0;
-        BRec recs[BBLOCK_MAX_RECS];
     };
-    static constexpr U32 BBLOCK_SLOTS = 512;
+    static constexpr U32 BBLOCK_SLOTS = 4096;
     std::unique_ptr<BBlock[]> blockTable;      // lazily allocated
+    std::unique_ptr<BRec[]> blockArena;
+    U32 blockArenaCursor = 0;
+    U32 blockEpoch = 1;
     U64 blockNegCache[1024] = {};              // rips known not to block
     U64 blockStatsExec = 0, blockStatsInsn = 0, blockStatsBuilt = 0;
+    U64 bsFlushedExec = 0, bsFlushedInsn = 0, bsFlushedBuilt = 0, bsFlushedTotal = 0;
+    void blockStatsMaybeReport();
 
     bool decodeModRMRecipe(U64 modrmAddr, const Prefixes& p, U32 trailingImmBytes, BRecipe& out);
     ModRM resolveRecipe(const BRecipe& r);
     bool buildBlock(U64 startRip, BBlock& b);
     U32  execBlock(const BBlock& b);           // returns instructions executed
+    U64  blockRegRead(U8 idx, U32 size, bool rexPresent);
     U32  tryBlockStep();                       // probe/build/exec; 0 = interpret
 #endif
 
