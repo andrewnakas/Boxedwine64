@@ -78,7 +78,9 @@ wasm64-selftest-mem64: export EXTRA_LD_FLAGS := -sMEMORY64=1 -sENVIRONMENT=node 
 # the BOXEDWINE_OPENGL build fails with "unknown type name 'GLenum'" on a CLEAN
 # tree (a stale .o hid it locally). DISABLE_GL_EXTENSIONS empties the large legacy
 # 32-bit glfunctions_ext* marshaling (unused by the 64-bit gl64 bridge).
-wasm64-mt: export EXTRA_CPP_FLAGS := -DBOXEDWINE_GUEST_X64=1 -DBOXEDWINE_MULTI_THREADED -DBOXEDWINE_OPENGL '-DGLH=<SDL_opengl.h>' -DDISABLE_GL_EXTENSIONS -pthread -DNDEBUG
+# BOXEDWINE_BLOCK_EXEC(+_CACHE_INFRA): CPU64 decoded-block executor, default ON
+# since M19 (blockfuzz-verified against the interpreter; see cpu64.cpp).
+wasm64-mt: export EXTRA_CPP_FLAGS := -DBOXEDWINE_GUEST_X64=1 -DBOXEDWINE_MULTI_THREADED -DBOXEDWINE_OPENGL '-DGLH=<SDL_opengl.h>' -DDISABLE_GL_EXTENSIONS -DBOXEDWINE_BLOCK_EXEC=1 -DBOXEDWINE_BLOCK_CACHE_INFRA=1 -pthread -DNDEBUG
 wasm64-mt: export BUILD_DIR := Build/Wasm64Mt
 wasm64-mt: export SHELL_FILE := shell.html
 wasm64-mt: export TARGET_EXEC := boxedwine64.html
