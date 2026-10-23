@@ -185,6 +185,34 @@ else
   echo "=== user.reg already has [Software\\Wine\\Direct3D] (or no user.reg) — skipping csmt inject ==="
 fi
 
+# === Core fonts (M26): metric-compatible Liberation fonts =====================
+# fetch-liberation-fonts.py drops Debian's fonts-liberation2 TTFs (SIL OFL) into
+# work/fonts. Copy them into C:\windows\Fonts (wine loads that dir) and map the
+# Windows core faces onto them, so Arial / Times New Roman / Courier New text
+# lays out at Windows widths instead of falling back to wine's Tahoma-ish set.
+FONTS_SRC="$HERE/work/fonts"
+if ls "$FONTS_SRC"/Liberation*.ttf >/dev/null 2>&1; then
+  mkdir -p "$STAGE/$DRIVE_C/windows/Fonts"
+  cp "$FONTS_SRC"/Liberation*.ttf "$STAGE/$DRIVE_C/windows/Fonts/"
+  echo "  + $(ls "$FONTS_SRC"/Liberation*.ttf | wc -l | tr -d ' ') Liberation fonts -> C:\\windows\\Fonts"
+  if [ -f "$USER_REG" ] && ! grep -q '^\[Software\\\\Wine\\\\Fonts\\\\Replacements\]' "$USER_REG"; then
+    cat >> "$USER_REG" <<'REGEOF'
+
+[Software\\Wine\\Fonts\\Replacements] 1780332434
+#time=1dcf1e649929046
+"Arial"="Liberation Sans"
+"Arial Narrow"="Liberation Sans"
+"Courier New"="Liberation Mono"
+"Helvetica"="Liberation Sans"
+"Times"="Liberation Serif"
+"Times New Roman"="Liberation Serif"
+REGEOF
+    echo "  + [Software\\Wine\\Fonts\\Replacements] Arial/Times New Roman/Courier New -> Liberation"
+  fi
+else
+  echo "NOTE: no Liberation fonts in $FONTS_SRC (run fetch-liberation-fonts.py) — core-font substitutes skipped" >&2
+fi
+
 echo "=== rezipping prefix64.zip ==="
 rm -f "$ZIP"
 ( cd "$STAGE" && zip -qry9 "$ZIP" . )
