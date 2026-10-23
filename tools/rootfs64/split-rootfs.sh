@@ -40,7 +40,7 @@ OUT_DIR="${2:-$SRC_DIR/pages}"
 CHUNK_BYTES=$((90 * 1024 * 1024))
 
 # Zips the launcher mounts, in overlay order. Small ones pass through untouched.
-ZIPS=(glibc-rootfs64.zip wine64.zip prefix64.zip)
+ZIPS=(glibc-rootfs64.zip wine64.zip wine32.zip prefix64.zip)
 
 mkdir -p "$OUT_DIR"
 

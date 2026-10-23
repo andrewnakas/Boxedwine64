@@ -78,6 +78,16 @@ for d in "${PROFILE_DIRS[@]}"; do
   mkdir -p "$STAGE/$DRIVE_C/$d"
 done
 
+# 32-bit programs (M22): C:\windows\syswow64 is a Boxedwine link (same trick as
+# the base zip's system32.link -> x86_64-windows) to the i386 builtin DLL tree
+# that wine32.zip provides. That is ALL the prefix needs for 32-bit exes: a
+# fresh WoW64 'wineboot --init' registry also works but doubles system.reg
+# (Wow6432Node) and auto-starts 4 extra services, which slowed every boot by
+# ~15s and made it flaky. No link target -> 32-bit wine reports
+# "could not load kernel32.dll".
+printf '%s' /usr/lib/i386-linux-gnu/wine/i386-windows > "$STAGE/$DRIVE_C/windows/syswow64.link"
+echo "  + windows/syswow64.link -> i386-windows (wine32.zip)"
+
 # Bundle the extra GL demo executables the app launcher offers (glcube.exe is
 # already in the base zip). The launcher's app bar (?p=<prog> / launchApp) runs
 # these against this pre-booted prefix, so they must live both at the HOME root

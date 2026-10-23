@@ -69,8 +69,8 @@ self-contained sessions. Each iteration:
 | M18 | Boot reliability | Kill the two known boot flakes so a cold boot succeeds ~always: (a) the wineserver startup race (several wineservers contend, the real one loses and exits → app never paints — observed ~1-in-3 headless boots since 2026-06-11), (b) the d3dtri/GL `CreateDevice` early-exit flake (~1-in-2, app exits status=1 ~80s in before GL init). Root-cause each, fix in the spawn/serialization path (not by retry) | 10 consecutive cold headless boots of notepad AND glcube AND d3dtri all paint without a retry, locally; CI smoke passes on attempt 1 for 3 consecutive deploys | LOCAL ACCEPTANCE MET (2026-07-04): **30/30 consecutive clean boots** (glcube 10/10, notepad 10/10, d3dtri 10/10) and boots are ~2× faster (36–47s vs 60–100s — the explorer die/respawn cycle was slowing every boot). ONE root cause explained both flakes: wineserver closes an "empty" desktop (only explorer's threads left) after 1 SECOND (server/winstation.c `close_desktop_timeout`); the interpreter's slow wineboot→app handoff leaves the desktop empty for seconds → explorer /desktop gets WM_CLOSE mid-boot → the late app finds no desktop (generic apps hang; d3dtri's device init fails → its "CreateDevice flake"). Three-part fix: (1) patched wineserver, desktop grace 1s→600s — MUST be built from Debian's wine source (apt-get source; vanilla-source wineserver is incompatible: Debian patches the server dir to XDG /run/user, ntdll dies `chdir: ENOENT`) — Dockerfile.wineserver in /Users/nakas/winebuild; (2) sys_execve64 appends `-p` to bare wineserver spawns (deterministic session persistence); (3) deskpin.exe holds a hidden window as a desktop user (belt-and-braces once up). Remaining for full DONE: ship the rootfs (needs PR #1 merged) + 3 consecutive attempt-1-green CI smokes |
 | M19 | Block executor default-on | Ship the decoded-block executor (`BOXEDWINE_BLOCK_EXEC` + `BOXEDWINE_BLOCK_CACHE_INFRA`) by default after validating it under a real wine boot, native and wasm; grow record-kind coverage from `BW64_BLOCKSTATS` on a wine boot | notepad cold boot ≥30% faster than 42s, 30/30 boot matrix, selftest 234/234, cpu_bench hash unchanged | DONE (2026-10-23, local; ships with the M19/M20 PR) — default ON in wasm64-mt. Browser 30-boot matrix 30/30 (notepad 10/10 avg ~24s, glcube 10/10 ~20s, d3dtri 10/10 ~21s; notepad was ~45s), glcube 21.7s, d3dtri 22.8s (triangle pixel-verified ~107s, was 2-3 min), DOOM 22.3s. Native notepad 50-68s -> 9-10s; cpu_bench 6.6s -> 3.1s user with identical hash. Most of the BROWSER win was NOT the CPU: a missing /etc/hosts+nsswitch.conf made every boot wait out two 5s DNS timeouts (see Log). selftest 907/907, blockfuzz 0 mismatches. |
 | M20 | ISA breadth (SSE3/SSSE3/SSE4) | Implement + advertise SSE3/SSSE3/SSE4.1/4.2 in CPUID; decode common VEX-128 forms (AVX stays unadvertised) | selftest extended + green; a mingw `-msse4.2` test exe runs in-browser | DONE (2026-10-23, local) — ported from the Winbox fork (Kn0tzer) + fixes; CPUID now advertises SSE3/SSSE3/SSE4.1/SSE4.2/POPCNT/CX16 (no AVX). tools/x64test/sse4_diff.sh: 107/107 intrinsics identical to Rosetta x86_64. VEX-128 decode NOT done (AVX stays unadvertised). |
-| M21 | Mixed-arch kernel | 32-bit ELF processes alongside 64-bit ones in one GUEST_X64 kernel (fix `is64Bit` on exec, keep 32-bit CPU/KMemory alive in wasm) | wasm session: 64-bit ELF execs a 32-bit hello and back | TODO |
-| M22 | wine32 (32-bit exes) | Stage Debian i386 wine side (i386-windows/unix, `wine` loader, i386 glibc + X11/freetype/asound) as a lazily-fetched `wine32.zip` sharing the wineserver | a 32-bit `-m32` GUI exe renders next to a 64-bit app on the same wineserver | TODO (blocked-by M21) |
+| M21 | Mixed-arch kernel | 32-bit ELF processes alongside 64-bit ones in one GUEST_X64 kernel (fix `is64Bit` on exec, keep 32-bit CPU/KMemory alive in wasm) | wasm session: 64-bit ELF execs a 32-bit hello and back | DONE (2026-10-23) — execve switches bitness by the new ELF class (CPU64/memory64 retired + reaped after run() returns; MT platform thread got an arch-switch loop). 64->32, 32->64, 64->32->64 probes pass natively and in the browser (?elf= + ?extrazip= launcher test hooks). |
+| M22 | wine32 (32-bit exes) | Stage Debian i386 wine side (i386-windows/unix, `wine` loader, i386 glibc + X11/freetype/asound) as a lazily-fetched `wine32.zip` sharing the wineserver | a 32-bit `-m32` GUI exe renders next to a 64-bit app on the same wineserver | DONE (2026-10-23, local+release assets) — Debian i386 wine 8.0~repack-4 (same build as wine64) as wine32.zip (tools/rootfs64/build-wine32-zip.py, no Docker), lazily URL-mounted; wine64 hands 32-bit PEs to the i386 loader on the SAME wineserver. Prefix needs only windows/syswow64.link. hello32gui.exe (i686) renders "Hello from a 32-bit exe" in-browser; 64-bit boots unchanged (notepad ~25s, glcube ~21s, d3dtri ~23s, 9/9). |
 | M23 | 32-bit GL/D3D | gl64 bridge trap on the 32-bit syscall path (i386 libgl shim) | 32-bit glcube + 32-bit d3d9 triangle render | TODO (blocked-by M22) |
 | M24 | Get apps in | Drag-drop files/folders/zips into HOME/C:, args + working dir, lift the 256MB cap | drag a zip of a portable app in → it runs | TODO |
 | M25 | Installers + shortcuts | setup.exe (Inno/NSIS) and `msiexec /i` complete; Start Menu/Desktop .lnk → persisted "My apps" row; fix `?boot=1` | an Inno installer + an MSI install, survive reload, relaunch from My apps | TODO |
@@ -87,6 +87,35 @@ them.
 ---
 
 ## Log
+
+- **2026-10-23 — M21 + M22 DONE: 32-bit Windows programs run in the 64-bit
+  session.**
+  - M21: KProcess::execve takes bitness from the NEW image (ELF class), retires
+    the running CPU64/memory64 on 64->32 (freed by reapRetired64 once run()
+    returned), and the multi-threaded platform thread loops between the CPU64
+    and 32-bit CPU paths. Probes in tools/testdata/mixedarch.
+  - M22: wine32.zip = the i386 half of Debian bookworm's multiarch wine
+    8.0~repack-4, built WITHOUT Docker by tools/rootfs64/build-wine32-zip.py
+    (Packages/Contents index -> SHA256-verified .debs -> ELF32 DT_NEEDED
+    closure + dlopen list + libz-mingw-w64's PE zlib1.dll, which user32
+    imports). Same wine build as wine64 => 32-bit processes share the 64-bit
+    wineserver (real single-session WoW64, unlike the Winbox fork's separate
+    ?arch=x86 runtime). The launcher always lazy-mounts wine32.zip from its URL
+    (fail-soft; ?wine32=0 disables), so 64-bit-only users pay ~nothing.
+  - Prefix lesson: a fresh WoW64 'wineboot --init' prefix works but doubled
+    system.reg and auto-started Eventlog/NDIS/PlugPlay/nsiproxy: notepad
+    ~25s -> ~45s and flaky; demand-starting them made it worse (PlugPlay
+    matters). The old prefix + ONE file (windows/syswow64.link -> the i386
+    builtin dir, like system32.link) is all 32-bit programs need.
+  - Native gotchas: the Mac build's 32-bit armv8 JIT panics ("getCF unknown
+    flags") on 32-bit wine; a native no-JIT tool must keep
+    BOXEDWINE_MULTI_THREADED (MAC_JIT implies it; the single-threaded
+    scheduler panics "Node already in list" spawning wineserver).
+  - Release: wine32.zip parts + new prefix64.zip uploaded to rootfs-pages;
+    split-rootfs.sh now includes wine32.zip.
+  - Known follow-up: an intermittent worker exception seen twice when a
+    headless test resized the page (full-page screenshot) — investigate as a
+    canvas/WebGL resize bug.
 
 - **2026-10-23 — M19 + M20 DONE (local), Winbox fork triaged.**
   - **Winbox fork** (github.com/Kn0tzer/Winbox, 756 commits on top of our
