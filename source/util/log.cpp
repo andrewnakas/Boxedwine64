@@ -75,3 +75,41 @@ void internal_log(BString msg, FILE* f) {
     OutputDebugStringA(msg.c_str());
 #endif
 }
+
+// ---- unknown-instruction recover policy (ported from Winbox 2b504cf99) ----
+#include <atomic>
+#include <cstdlib>
+#include <mutex>
+#include <set>
+static std::atomic<unsigned long long> g_recoverSkippedInstructions{0};
+static std::atomic<unsigned long long> g_recoverLoggedRips{0};
+static std::atomic<unsigned long long> g_recoverSigillFallbacks{0};
+static std::mutex g_recoverRipMutex;
+static std::set<std::pair<unsigned, U64>> g_recoverLoggedRipSet;
+
+bool bw64RecoverEnabled() {
+    const char* value = std::getenv("BW64_RECOVER");
+    if (value && value[0] == '0') return false;
+    if (value && value[0] == '1') return true;
+    // Opt-in: skipping an unknown instruction keeps an app alive but can
+    // silently corrupt its results; the default is an honest SIGILL.
+    return false;
+}
+
+void bw64RecoverNoteSkippedInstruction(bool loggedRip) {
+    g_recoverSkippedInstructions.fetch_add(1, std::memory_order_relaxed);
+    if (loggedRip) g_recoverLoggedRips.fetch_add(1, std::memory_order_relaxed);
+}
+
+void bw64RecoverNoteSigillFallback() {
+    g_recoverSigillFallbacks.fetch_add(1, std::memory_order_relaxed);
+}
+
+bool bw64RecoverClaimRip(unsigned architecture, U64 rip) {
+    std::lock_guard<std::mutex> lock(g_recoverRipMutex);
+    const auto key = std::make_pair(architecture, rip);
+    if (g_recoverLoggedRipSet.find(key) != g_recoverLoggedRipSet.end() ||
+        g_recoverLoggedRipSet.size() >= 200) return false;
+    g_recoverLoggedRipSet.insert(key);
+    return true;
+}

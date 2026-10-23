@@ -15,10 +15,15 @@
 #include "kmemory64.h"
 #include "syscall64.h"
 #include "ksignal.h"   // K_SIGFPE
+#include "common/splitLock.h"
+
+// Defined here until the CPU32 split-lock path (Winbox common_lock.cpp) is ported.
+std::mutex g_splitLockMutex;
 
 #include <cmath>
 #include <cstring>
 #include <mutex>
+#include <chrono>
 
 // Sharded locks for CPU64 atomic read-modify-write memory ops (XCHG with
 // memory, CMPXCHG, XADD, LOCK-prefixed ALU). In the multi-threaded build each
@@ -26,16 +31,11 @@
 // pthread mutexes/condvars — which rely on these instructions being atomic —
 // would race without this.
 //
-// We keep the existing (verified) loadRM/runAlu/storeRM RMW logic intact and
-// only serialize it under a lock keyed on the operand's guest address. A single
-// global mutex would serialize EVERY locked op across all threads even when
-// they touch unrelated words (glibc hammers distinct futex/lock words from
-// different threads), so instead we hash the operand's page address into a
-// bank of locks: two threads working different pages take different locks and
-// run in parallel. Two ops on the same word always collide on the same lock,
-// which is exactly the atomicity we need. Recursive so a guest exception/signal
-// path that re-enters can't self-deadlock; cheap and uncontended in the
-// single-threaded build.
+// Aligned operands use sharded recursive mutexes, so unrelated locked words
+// can proceed concurrently. Unaligned operands use g_splitLockMutex and plain
+// guest-memory reads/writes: WebAssembly atomic instructions trap on a
+// misaligned host address. Recursive locks also let a guest exception/signal
+// path re-enter an aligned operation without self-deadlocking.
 //
 // CPU64_ATOMIC_LOCKS must be a power of two so the mask is a single AND.
 #define CPU64_ATOMIC_LOCKS 256
@@ -49,6 +49,30 @@ static inline std::recursive_mutex& cpu64AtomicLockFor(U64 effAddr) {
     return g_cpu64AtomicLocks[(effAddr >> K64_PAGE_SHIFT) & (CPU64_ATOMIC_LOCKS - 1)];
 }
 
+class CPU64AtomicLock {
+public:
+    CPU64AtomicLock(KMemory64* memory, U64 effAddr, U32 width, std::defer_lock_t)
+        : memory(memory), effAddr(effAddr), width(width),
+          alignedLock(cpu64AtomicLockFor(effAddr), std::defer_lock),
+          splitLock(g_splitLockMutex, std::defer_lock) {}
+
+    void lock() {
+        U8* hostAddress = memory->getRamPtr(effAddr, width);
+        if (!hostAddress || (reinterpret_cast<uintptr_t>(hostAddress) & (width - 1))) {
+            splitLock.lock();
+        } else {
+            alignedLock.lock();
+        }
+    }
+
+private:
+    KMemory64* memory;
+    U64 effAddr;
+    U32 width;
+    std::unique_lock<std::recursive_mutex> alignedLock;
+    std::unique_lock<std::mutex> splitLock;
+};
+
 // FPU status-word C0/C2/C3 bit positions (see Intel SDM Vol 1 §8.1.3).
 // We can't reuse the macros in fpu.cpp because they're file-local there.
 static inline void cpu64_fpu_set_c012_3(FPU& f, int c3, int c2, int c0) {
@@ -58,8 +82,193 @@ static inline void cpu64_fpu_set_c012_3(FPU& f, int c3, int c2, int c0) {
     if (c0) f.sw |= 0x0100;
 }
 
+// FCOM/FUCOM compare result: C3/C2/C0 = 111 unordered, 100 equal,
+// 001 ST(0)<src, 000 ST(0)>src.
+static inline void cpu64_fpu_compare(FPU& f, double a, double b) {
+    if (std::isnan(a) || std::isnan(b)) {
+        cpu64_fpu_set_c012_3(f, 1, 1, 1);
+    } else if (a == b) {
+        cpu64_fpu_set_c012_3(f, 1, 0, 0);
+    } else if (a < b) {
+        cpu64_fpu_set_c012_3(f, 0, 0, 1);
+    } else {
+        cpu64_fpu_set_c012_3(f, 0, 0, 0);
+    }
+}
+
+static inline double cpu64RoundByMxcsr(double value, U32 mxcsr) {
+    switch ((mxcsr >> 13) & 3) {
+        case 1: return std::floor(value);
+        case 2: return std::ceil(value);
+        case 3: return std::trunc(value);
+        default: {
+            // Round-to-nearest, ties-to-even without depending on the host's
+            // process-wide floating-point rounding mode.
+            double lower = std::floor(value);
+            double fraction = value - lower;
+            if (fraction < 0.5) return lower;
+            if (fraction > 0.5) return lower + 1.0;
+            return std::fmod(std::fabs(lower), 2.0) == 0.0 ? lower : lower + 1.0;
+        }
+    }
+}
+
+static inline U64 cpu64ConvertFpToInt(double value, bool is64, bool truncate,
+                                      U32 mxcsr) {
+    if (!std::isfinite(value)) return is64 ? 0x8000000000000000ULL : 0x80000000U;
+    double rounded = truncate ? std::trunc(value) : cpu64RoundByMxcsr(value, mxcsr);
+    double minValue = is64 ? -0x1p63 : -0x1p31;
+    double maxValue = is64 ?  0x1p63 :  0x1p31;
+    if (rounded < minValue || rounded >= maxValue)
+        return is64 ? 0x8000000000000000ULL : 0x80000000U;
+    S64 result = (S64)rounded;
+    return is64 ? (U64)result : (U32)(S32)result;
+}
+
+static inline U32 cpu64StringElement(U64 lo, U64 hi, U32 index, U32 bits) {
+    U32 bit = index * bits;
+    U64 lane = bit < 64 ? lo >> bit : hi >> (bit - 64);
+    return (U32)(lane & (bits == 8 ? 0xFFU : 0xFFFFU));
+}
+
+static inline bool cpu64StringElementCompare(U32 a, U32 b, U32 bits,
+                                              bool isSigned, U32 operation) {
+    if (isSigned) {
+        S32 sa = bits == 8 ? (S8)a : (S16)a;
+        S32 sb = bits == 8 ? (S8)b : (S16)b;
+        if (operation == 0) return sa == sb;
+        if (operation == 1) return sb >= sa;
+        return sb <= sa;
+    }
+    if (operation == 0) return a == b;
+    if (operation == 1) return b >= a;
+    return b <= a;
+}
+
+struct CPU64PackedStringResult {
+    U32 mask;
+    U32 length1;
+    U32 length2;
+};
+
+static inline U32 cpu64StringLength(S64 length, U32 limit) {
+    if (length >= (S64)limit || length <= -(S64)limit) return limit;
+    return (U32)(length < 0 ? -length : length);
+}
+
+static inline CPU64PackedStringResult cpu64ComparePackedStrings(
+    U64 firstLo, U64 firstHi, U64 secondLo, U64 secondHi,
+    U8 control, bool explicitLength, S64 inputLength1, S64 inputLength2) {
+    const U32 bits = (control & 1) ? 16 : 8;
+    const U32 count = (control & 1) ? 8 : 16;
+    const bool isSigned = (control & 2) != 0;
+    const U32 aggregation = (control >> 2) & 3;
+    U32 length1 = count, length2 = count;
+    if (explicitLength) {
+        length1 = cpu64StringLength(inputLength1, count);
+        length2 = cpu64StringLength(inputLength2, count);
+    } else {
+        for (U32 i = 0; i < count; i++) {
+            if (cpu64StringElement(firstLo, firstHi, i, bits) == 0) {
+                length1 = i;
+                break;
+            }
+        }
+        for (U32 i = 0; i < count; i++) {
+            if (cpu64StringElement(secondLo, secondHi, i, bits) == 0) {
+                length2 = i;
+                break;
+            }
+        }
+    }
+
+    U32 result = 0;
+    if (aggregation == 0) { // equal any: each second-string element vs all first
+        for (U32 j = 0; j < count; j++) {
+            bool found = false;
+            if (j < length2) {
+                for (U32 i = 0; i < count; i++) {
+                    if (i < length1 && cpu64StringElementCompare(
+                            cpu64StringElement(firstLo, firstHi, i, bits),
+                            cpu64StringElement(secondLo, secondHi, j, bits),
+                            bits, isSigned, 0)) {
+                        found = true;
+                        break;
+                    }
+                }
+            }
+            if (found) result |= 1U << j;
+        }
+    } else if (aggregation == 1) { // ranges: even/odd first-string bounds
+        for (U32 j = 0; j < count; j++) {
+            if (j >= length2) continue;
+            U32 value = cpu64StringElement(secondLo, secondHi, j, bits);
+            for (U32 i = 0; i < count; i += 2) {
+                if (i + 1 >= length1) continue;
+                U32 lower = cpu64StringElement(firstLo, firstHi, i, bits);
+                U32 upper = cpu64StringElement(firstLo, firstHi, i + 1, bits);
+                if (cpu64StringElementCompare(lower, value, bits, isSigned, 1) &&
+                    cpu64StringElementCompare(upper, value, bits, isSigned, 2)) {
+                    result |= 1U << j;
+                    break;
+                }
+            }
+        }
+    } else if (aggregation == 2) { // equal each; invalid pairs follow SDM table
+        for (U32 i = 0; i < count; i++) {
+            bool valid1 = i < length1, valid2 = i < length2;
+            bool equal = valid1 == valid2 &&
+                (!valid1 || cpu64StringElementCompare(
+                    cpu64StringElement(firstLo, firstHi, i, bits),
+                    cpu64StringElement(secondLo, secondHi, i, bits), bits,
+                    isSigned, 0));
+            if (equal) result |= 1U << i;
+        }
+    } else { // equal ordered: first string searched within the second string
+        for (U32 start = 0; start < count; start++) {
+            bool matched = true;
+            for (U32 i = 0; i < count - start; i++) {
+                bool valid1 = i < length1;
+                bool valid2 = start + i < length2;
+                if (!valid1) continue; // invalid first-string lanes are wildcards
+                if (!valid2 || !cpu64StringElementCompare(
+                        cpu64StringElement(firstLo, firstHi, i, bits),
+                        cpu64StringElement(secondLo, secondHi, start + i, bits),
+                        bits, isSigned, 0)) {
+                    matched = false;
+                    break;
+                }
+            }
+            if (matched) result |= 1U << start;
+        }
+    }
+
+    const U32 resultMask = (1U << count) - 1;
+    U32 polarity = (control >> 4) & 3;
+    if (polarity == 1) {
+        result = (~result) & resultMask;
+    } else if (polarity == 3) {
+        for (U32 i = 0; i < count; i++) {
+            if (i < length2) result ^= 1U << i;
+        }
+    }
+    return {result, length1, length2};
+}
+
+static inline U32 cpu64Crc32c(U32 crc, U64 value, U32 sourceBytes) {
+    constexpr U32 polynomial = 0x82F63B78U; // reflected CRC-32C / Castagnoli
+    for (U32 byte = 0; byte < sourceBytes; byte++) {
+        crc ^= (U8)(value >> (byte * 8));
+        for (U32 bit = 0; bit < 8; bit++)
+            crc = (crc >> 1) ^ ((crc & 1) ? polynomial : 0);
+    }
+    return crc;
+}
+
+
 CPU64::CPU64(KMemory64* memory) : memory(memory) {
     reg[X64_RSP].setU64(0);
+    mxcsr = 0x1F80;
     fpu.FINIT();
 }
 
@@ -73,6 +282,7 @@ void CPU64::cloneRegistersFrom(const CPU64* from) {
     rflags = from->rflags;
     fsbase = from->fsbase;
     gsbase = from->gsbase;
+    mxcsr = from->mxcsr;
     for (int i = 0; i < 16; i++) {
         xmm[i] = from->xmm[i];
     }
@@ -373,6 +583,54 @@ static void flagsSub(U32& f, U64 a, U64 b, U64 r, U32 width) {
     setSZP(f, rm, width);
 }
 
+
+// ADC: flags for a + b + cIn. Uses unsigned __int128 for the full sum
+// so CF/AF/OF are derived from the true operation, not a wrapped operand.
+static void flagsAdc(U32& f, U64 a, U64 b, U64 cIn, U64 r, U32 width) {
+    U64 mask = maskFor(width);
+    a &= mask; b &= mask;
+    U64 rm = r & mask;
+    U32 wbits = width * 8;
+    f &= ~(X64_CF | X64_OF | X64_AF);
+    unsigned __int128 full = (unsigned __int128)a + b + (cIn & 1);
+    // CF: unsigned carry out of the top bit.
+    if ((full >> wbits) != 0) f |= X64_CF;
+    // OF: signed overflow. Sign-extend a, b to 128 bits and check the
+    // true signed sum against the signed range.
+    U64 sb = signBitFor(width);
+    __int128 sa = (a & sb) ? (__int128)a | (~(__int128)mask) : (__int128)a;
+    __int128 sbb = (b & sb) ? (__int128)b | (~(__int128)mask) : (__int128)b;
+    __int128 sfull = sa + sbb + (cIn & 1);
+    __int128 smin = -(__int128)sb;
+    __int128 smax = (__int128)(sb - 1);
+    if (sfull < smin || sfull > smax) f |= X64_OF;
+    // AF: carry from bit 3 to bit 4.
+    if (((a & 0xF) + (b & 0xF) + (cIn & 1)) > 0xF) f |= X64_AF;
+    setSZP(f, rm, width);
+}
+
+// SBB: flags for a - b - cIn. Borrow and signed overflow from 128-bit.
+static void flagsSbb(U32& f, U64 a, U64 b, U64 cIn, U64 r, U32 width) {
+    U64 mask = maskFor(width);
+    a &= mask; b &= mask;
+    U64 rm = r & mask;
+    f &= ~(X64_CF | X64_OF | X64_AF);
+    unsigned __int128 subtrahend = (unsigned __int128)b + (cIn & 1);
+    // CF (borrow): 1 if a < b + cIn (unsigned).
+    if ((unsigned __int128)a < subtrahend) f |= X64_CF;
+    // OF: signed overflow on a - b - cIn.
+    U64 sb = signBitFor(width);
+    __int128 sa = (a & sb) ? (__int128)a | (~(__int128)mask) : (__int128)a;
+    __int128 sbb = (b & sb) ? (__int128)b | (~(__int128)mask) : (__int128)b;
+    __int128 sfull = sa - sbb - (cIn & 1);
+    __int128 smin = -(__int128)sb;
+    __int128 smax = (__int128)(sb - 1);
+    if (sfull < smin || sfull > smax) f |= X64_OF;
+    // AF: borrow from bit 4 (a_low4 < b_low4 + cIn).
+    if ((a & 0xF) < ((b & 0xF) + (cIn & 1))) f |= X64_AF;
+    setSZP(f, rm, width);
+}
+
 // Logical ops always clear CF and OF, leave AF undefined (we clear it).
 static void flagsLogic(U32& f, U64 r, U32 width) {
     f &= ~(X64_CF | X64_OF | X64_AF);
@@ -391,10 +649,10 @@ __attribute__((always_inline)) inline void CPU64::runAlu(U8 aluOp, U32 size, boo
                 flagsLogic(rflags, result, size); break;
         case 2: { U64 cIn = (rflags & X64_CF) ? 1 : 0;
                 result = lhs + rhs + cIn;
-                flagsAdd(rflags, lhs, rhs + cIn, result, size); break; }
+                flagsAdc(rflags, lhs, rhs, cIn, result, size); break; }
         case 3: { U64 cIn = (rflags & X64_CF) ? 1 : 0;
                 result = lhs - rhs - cIn;
-                flagsSub(rflags, lhs, rhs + cIn, result, size); break; }
+                flagsSbb(rflags, lhs, rhs, cIn, result, size); break; }
         case 4: result = lhs & rhs;
                 flagsLogic(rflags, result, size); break;
         case 5: result = lhs - rhs;
@@ -612,6 +870,10 @@ static void refWatchInit() {
 
 U32 CPU64::step() {
     U64 ipStart = rip;
+    if (ipStart != recoverLastRip) {
+        recoverLastRip = ipStart;
+        recoverFaultsAtRip = 0;
+    }
 
     // BW64_REFWATCH probe: catch wineserver's double-release at release_object
     // entry, one instruction before the assert. See the big comment above.
@@ -695,6 +957,26 @@ U32 CPU64::step() {
 
     U8 op = fetchByte(rip + opOff);
 
+    // Deliver a synchronous, instruction-addressed fault. The test harness
+    // has no attached thread or signal handlers, so an unhandled fault yields
+    // at the faulting RIP; a guest handler instead receives the saved context.
+    auto faultAtInstruction = [&](U32 sig, U32 trapNo) -> U32 {
+        if (trapNo == 13 && std::getenv("BW64_UNIMPLDUMP")) {
+            klog_fmt("CPU64: #GP at RIP=0x%llx bytes=%02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x",
+                     (unsigned long long)ipStart,
+                     fetchByte(ipStart), fetchByte(ipStart + 1), fetchByte(ipStart + 2),
+                     fetchByte(ipStart + 3), fetchByte(ipStart + 4), fetchByte(ipStart + 5),
+                     fetchByte(ipStart + 6), fetchByte(ipStart + 7), fetchByte(ipStart + 8),
+                     fetchByte(ipStart + 9), fetchByte(ipStart + 10), fetchByte(ipStart + 11),
+                     fetchByte(ipStart + 12), fetchByte(ipStart + 13), fetchByte(ipStart + 14));
+        }
+        if (raiseSyncFault(sig, trapNo, 0, ipStart)) return 0;
+        if (thread && thread->process) thread->process->signalProcess(sig);
+        yield = true;
+        return 0;
+    };
+
+
     if (!g_opProfInit) {
         g_opProfInit = true;
         g_opProf = std::getenv("BW64_OPPROF") != nullptr;
@@ -703,6 +985,40 @@ U32 CPU64::step() {
     if (g_opProf) {
         if (op == 0x0F) g_opProfCount[0x0F][fetchByte(rip + opOff + 1)]++;
         else g_opProf1[op]++;
+    }
+
+    // Instructions unavailable in this user-mode CPU model fault at their
+    // original RIP. INT3 retains its debugger/breakpoint yield behavior below.
+    if (op == 0x0F && fetchByte(rip + opOff + 1) == 0x0B) { // UD2: #UD
+        if (bw64RecoverEnabled()) bw64RecoverNoteSigillFallback();
+        return faultAtInstruction(K_SIGILL, 6);
+    }
+    // Browser recovery treats an absent I/O port as returning zero. Support
+    // the single non-REP INSD form used by the Q3 startup probe; strict mode
+    // still raises the architectural user-mode #GP below.
+    if (op == 0x6D && p.rep == 0 && bw64RecoverEnabled()) {
+        const U32 size = p.osize16 ? 2 : 4;
+        const U64 dst = p.asize32 ? (U64)reg[X64_RDI].u32 : reg[X64_RDI].u64;
+        if (size == 2) memory->writew(dst, 0);
+        else memory->writed(dst, 0);
+        const S64 step = (rflags & X64_DF) ? -(S64)size : (S64)size;
+        if (p.asize32) reg[X64_RDI].setU32(reg[X64_RDI].u32 + (U32)step);
+        else reg[X64_RDI].setU64(reg[X64_RDI].u64 + (U64)step);
+        U32 used = opOff + 1;
+        rip += used;
+        return used;
+    }
+    if (op == 0xCD || op == 0xF1 || op == 0xF4 || op == 0xFA || op == 0xFB ||
+        (op >= 0x6C && op <= 0x6F) || (op >= 0xE4 && op <= 0xE7) ||
+        (op >= 0xEC && op <= 0xEF) || op == 0x9A || op == 0xEA ||
+        op == 0xCA || op == 0xCB) {
+        return faultAtInstruction(K_SIGSEGV, 13); // #GP in user mode
+    }
+    if (op == 0xFF) {
+        U8 modrmByte = fetchByte(rip + opOff + 1);
+        U8 group = (modrmByte >> 3) & 7;
+        if (group == 3 || group == 5) // far CALL/JMP r/m
+            return faultAtInstruction(K_SIGSEGV, 13);
     }
 
     // ---- Dispatch jump table ----
@@ -751,48 +1067,185 @@ U32 CPU64::step() {
         case 0x68: case 0x6a: goto dsp_22;
         case 0x0f: goto dsp_23;
         case 0xc3: goto dsp_26;
-        case 0xcf: goto dsp_27;
-        case 0xa0: case 0xa1: case 0xa2: case 0xa3: goto dsp_28;
-        case 0xa8: case 0xa9: goto dsp_29;
-        case 0xf6: case 0xf7: goto dsp_30;
-        case 0xfe: goto dsp_31;
-        case 0xff: goto dsp_32;
-        case 0x8f: goto dsp_33;
-        case 0xe8: goto dsp_34;
-        case 0xe9: goto dsp_35;
-        case 0xeb: goto dsp_36;
+        case 0xc2: goto dsp_27;
+        case 0xcf: goto dsp_28;
+        case 0xa0: case 0xa1: case 0xa2: case 0xa3: goto dsp_29;
+        case 0xa8: case 0xa9: goto dsp_30;
+        case 0xf6: case 0xf7: goto dsp_31;
+        case 0xfe: goto dsp_32;
+        case 0xff: goto dsp_33;
+        case 0x8f: goto dsp_34;
+        case 0xe8: goto dsp_35;
+        case 0xe9: goto dsp_36;
+        case 0xeb: goto dsp_37;
         case 0x70: case 0x71: case 0x72: case 0x73: case 0x74: case 0x75: case 0x76: case 0x77: 
         case 0x78: case 0x79: case 0x7a: case 0x7b: case 0x7c: case 0x7d: case 0x7e: case 0x7f: 
-        goto dsp_37;
-        case 0x63: goto dsp_39;
-        case 0xc0: case 0xc1: case 0xd0: case 0xd1: case 0xd2: case 0xd3: goto dsp_40;
-        case 0x69: case 0x6b: goto dsp_41;
-        case 0xa4: case 0xa5: case 0xaa: case 0xab: goto dsp_42;
-        case 0xa6: case 0xa7: case 0xae: case 0xaf: goto dsp_43;
-        case 0xc9: goto dsp_44;
-        case 0x9c: goto dsp_45;
-        case 0x9d: goto dsp_46;
-        case 0x9e: goto dsp_47;
-        case 0x9f: goto dsp_48;
-        case 0xcc: goto dsp_49;
-        case 0xfc: goto dsp_50;
-        case 0xfd: goto dsp_51;
-        case 0xf5: goto dsp_52;
-        case 0xf8: goto dsp_53;
-        case 0xf9: goto dsp_54;
+        goto dsp_38;
+        case 0x63: goto dsp_40;
+        case 0xc0: case 0xc1: case 0xd0: case 0xd1: case 0xd2: case 0xd3: goto dsp_41;
+        case 0x69: case 0x6b: goto dsp_42;
+        case 0xa4: case 0xa5: case 0xaa: case 0xab: goto dsp_43;
+        case 0xa6: case 0xa7: case 0xae: case 0xaf: goto dsp_44;
+        case 0xc9: goto dsp_45;
+        case 0x9c: goto dsp_46;
+        case 0x9d: goto dsp_47;
+        case 0x9e: goto dsp_48;
+        case 0x9f: goto dsp_49;
+        case 0xcc: goto dsp_50;
+        case 0xfc: goto dsp_51;
+        case 0xfd: goto dsp_52;
+        case 0xf5: goto dsp_53;
+        case 0xf8: goto dsp_54;
+        case 0xf9: goto dsp_55;
         case 0xd8: case 0xd9: case 0xda: case 0xdb: case 0xdc: case 0xdd: case 0xde: case 0xdf: 
-        goto dsp_58;
+        goto dsp_59;
         case 0x06: case 0x07: case 0x0e: case 0x16: case 0x17: case 0x1e: case 0x1f: case 0x26: 
         case 0x27: case 0x2e: case 0x2f: case 0x36: case 0x37: case 0x3e: case 0x3f: case 0x40: 
         case 0x41: case 0x42: case 0x43: case 0x44: case 0x45: case 0x46: case 0x47: case 0x48: 
         case 0x49: case 0x4a: case 0x4b: case 0x4c: case 0x4d: case 0x4e: case 0x4f: case 0x60: 
         case 0x61: case 0x62: case 0x64: case 0x65: case 0x66: case 0x67: case 0x6c: case 0x6d: 
-        case 0x6e: case 0x6f: case 0x82: case 0x9a: case 0xac: case 0xad: case 0xc2: case 0xc4: 
-        case 0xc5: case 0xc8: case 0xca: case 0xcb: case 0xcd: case 0xce: case 0xd4: case 0xd5: 
-        case 0xd6: case 0xe0: case 0xe1: case 0xe2: case 0xe3: case 0xe4: case 0xe5: case 0xe6: 
-        case 0xe7: case 0xea: case 0xec: case 0xed: case 0xee: case 0xef: case 0xf0: case 0xf1: 
-        case 0xf2: case 0xf3: case 0xf4: case 0xfa: case 0xfb: goto unhandled;
+        case 0x6e: case 0x6f: case 0x82: case 0x9a: case 0xc4: case 0xc5: 
+        case 0xca: case 0xcb: case 0xcd: case 0xce: case 0xd4: case 0xd5: case 0xd6: 
+        case 0xe3: goto dsp_60;
+        case 0xe0: case 0xe1: case 0xe2: goto dsp_61;
+        case 0xac: case 0xad: goto dsp_62;
+        case 0xc8: goto dsp_63;
+        case 0xe4: case 0xe5: case 0xe6: case 0xe7: 
+        case 0xea: case 0xec: case 0xed: case 0xee: case 0xef: case 0xf0: case 0xf1: case 0xf2: 
+        case 0xf3: case 0xf4: case 0xfa: case 0xfb: goto unhandled;
     }
+
+    // JRCXZ rel8 (E3 cb). Jump short if RCX is zero. The 0x67
+    // address-size prefix selects the 32-bit ECX test (JECXZ);
+    // 0x66 operand-size prefix has no effect. Follows the dsp_37
+    // (JMP rel8) rip/used pattern.
+dsp_60:
+    if (op == 0xE3) {
+        S8 disp = (S8)fetchByte(rip + opOff + 1);
+        U32 used = opOff + 2;
+        U64 count = p.asize32 ? (U64)reg[X64_RCX].u32 : reg[X64_RCX].u64;
+        rip = (count == 0) ? (rip + used + (U64)(S64)disp) : (rip + used);
+        return used;
+    }
+    goto unhandled;
+
+    // LOOP/LOOPE/LOOPNE rel8 (E2/E1/E0 cb). Decrement the count register
+    // (RCX, or ECX with the 0x67 address-size prefix), then jump short if
+    // the decremented count is non-zero and, for E1/E0, the ZF condition
+    // holds: E2 jumps when count != 0; E1 when count != 0 && ZF==1;
+    // E0 when count != 0 && ZF==0. The decrement does not modify flags.
+    // The 0x66 operand-size prefix has no effect. Follows the dsp_60
+    // (JRCXZ) rip/used pattern.
+dsp_61:
+    if (op >= 0xE0 && op <= 0xE2) {
+        S8 disp = (S8)fetchByte(rip + opOff + 1);
+        U32 used = opOff + 2;
+        U64 count;
+        if (p.asize32) {
+            U32 c = reg[X64_RCX].u32 - 1;
+            reg[X64_RCX].setU32(c);   // 32-bit write zero-extends, per x86-64
+            count = c;
+        } else {
+            count = reg[X64_RCX].u64 - 1;
+            reg[X64_RCX].setU64(count);
+        }
+        bool zf = (rflags & X64_ZF) != 0;
+        bool take = (count != 0) &&
+                    (op == 0xE2 || (op == 0xE1 ? zf : !zf));
+        rip = take ? (rip + used + (U64)(S64)disp) : (rip + used);
+        return used;
+    }
+    goto unhandled;
+
+    // LODS -- string load. LODSB (AC): AL = [RSI]; LODSW/LODSD/LODSQ (AD):
+    // AX/EAX/RAX = [RSI]. The index is then adjusted by +/- the operand
+    // size according to DF (CLD increments, STD decrements). Address size
+    // defaults to 64-bit (RSI); the 0x67 prefix selects 32-bit ESI -- the
+    // effective address is masked to 32 bits and the ESI update
+    // zero-extends into RSI, per x86-64 semantics (cf. dsp_61 LOOP asize32
+    // handling). Follows the dsp_43 (MOVS) memory/DF conventions. REP
+    // prefixes have no effect on LODS (single iteration).
+dsp_62:
+    if (op == 0xAC || op == 0xAD) {
+        U32 size = (op == 0xAC) ? 1 : opSize;
+        S64 step = (rflags & X64_DF) ? -(S64)size : (S64)size;
+        U64 addr = reg[X64_RSI].u64;
+        if (p.asize32) addr &= 0xFFFFFFFFULL;
+        switch (size) {
+            case 1:
+                writeReg8(X64_RAX, memory->readb(addr), rexPresent);
+                break;
+            case 2:
+                reg[X64_RAX].setU16(memory->readw(addr));
+                break;
+            case 4:
+                reg[X64_RAX].setU32(memory->readd(addr));
+                break;
+            default:
+                reg[X64_RAX].setU64(memory->readq(addr));
+                break;
+        }
+        if (p.asize32) {
+            reg[X64_RSI].setU32(reg[X64_RSI].u32 + (U32)step);
+        } else {
+            reg[X64_RSI].setU64(reg[X64_RSI].u64 + (U64)step);
+        }
+        U32 used = opOff + 1;
+        rip += used;
+        return used;
+    }
+    goto unhandled;
+
+    // ENTER imm16, imm8 (C8 iw ib). Create a stack frame for a procedure.
+    // AllocSize (imm16) bytes are reserved on the stack; NestingLevel
+    // (imm8, only the low 5 bits are used) controls how many display
+    // entries are pushed for nested lexical scopes (Borland/Delphi style).
+    //   64-bit (default): push RBP; FrameTemp = RSP;
+    //     for i in 1..Level-1: push [RBP - i*8]; if Level > 0: push FrameTemp;
+    //     RBP = FrameTemp; RSP -= AllocSize.
+    //   16-bit (0x66 prefix): same shape with 2-byte pushes on BP/SP.
+    // The 0x67 address-size prefix has no effect. Follows the dsp_45
+    // (LEAVE) register conventions and dsp_60 rip/used pattern.
+dsp_63:
+    if (op == 0xC8) {
+        U16 allocSize = (U16)(fetchByte(rip + opOff + 1) |
+                              ((U16)fetchByte(rip + opOff + 2) << 8));
+        U8 level = (U8)(fetchByte(rip + opOff + 3) & 0x1F);
+        U32 used = opOff + 4;
+        if (p.osize16) {
+            // 16-bit operand size: 2-byte pushes, BP/SP with 16-bit wrap.
+            U16 bp = reg[X64_RBP].u16;
+            reg[X64_RSP].setU16(reg[X64_RSP].u16 - 2);
+            memory->writew(reg[X64_RSP].u64, bp);
+            U16 frameTemp = reg[X64_RSP].u16;
+            for (U8 i = 1; i < level; i++) {
+                reg[X64_RSP].setU16(reg[X64_RSP].u16 - 2);
+                memory->writew(reg[X64_RSP].u64,
+                               memory->readw((U64)(bp - (U16)(i * 2))));
+            }
+            if (level > 0) {
+                reg[X64_RSP].setU16(reg[X64_RSP].u16 - 2);
+                memory->writew(reg[X64_RSP].u64, frameTemp);
+            }
+            reg[X64_RBP].setU16(frameTemp);
+            reg[X64_RSP].setU16(reg[X64_RSP].u16 - allocSize);
+        } else {
+            // 64-bit: 8-byte pushes on RBP/RSP.
+            push64(reg[X64_RBP].u64);
+            U64 frameTemp = reg[X64_RSP].u64;
+            for (U8 i = 1; i < level; i++) {
+                push64(memory->readq(reg[X64_RBP].u64 - (U64)i * 8));
+            }
+            if (level > 0) {
+                push64(frameTemp);
+            }
+            reg[X64_RBP].setU64(frameTemp);
+            reg[X64_RSP].setU64(reg[X64_RSP].u64 - allocSize);
+        }
+        rip += used;
+        return used;
+    }
+    goto unhandled;
 
     // ---- Single-byte opcodes ----
 
@@ -904,7 +1357,7 @@ dsp_6:
             ModRM m = decodeModRM(rip + opOff + 1, p, 0);
             // `lock add`/`lock or`/`lock and`/... on a memory dest must be an
             // atomic RMW across host threads (glibc futex/lock words use these).
-            std::unique_lock<std::recursive_mutex> atomicLock(cpu64AtomicLockFor(m.effAddr), std::defer_lock);
+            CPU64AtomicLock atomicLock(memory, m.effAddr, size, std::defer_lock);
             if (p.lock && destIsRM && !m.isReg) atomicLock.lock();
             U64 a, b;
             if (destIsRM) {
@@ -977,7 +1430,7 @@ dsp_7:
                 imm = (U64)(S64)i32; immLen = 4;
             }
         }
-        std::unique_lock<std::recursive_mutex> atomicLock(cpu64AtomicLockFor(m.effAddr), std::defer_lock);
+        CPU64AtomicLock atomicLock(memory, m.effAddr, size, std::defer_lock);
         if (p.lock && !m.isReg) atomicLock.lock();
         U64 a = loadRM(m, size, rexPresent);
         runAlu(aluOp, size, true, a, imm, m, rexPresent);
@@ -1160,7 +1613,7 @@ dsp_18:
         // XCHG with a memory operand is implicitly atomic on x86 (LOCK is
         // assumed); serialize it across host threads so glibc's spinlock
         // acquire (xchg [lock], eax) is correct under real threading.
-        std::unique_lock<std::recursive_mutex> atomicLock(cpu64AtomicLockFor(m.effAddr), std::defer_lock);
+        CPU64AtomicLock atomicLock(memory, m.effAddr, size, std::defer_lock);
         if (!m.isReg) atomicLock.lock();
         U64 a = loadRM(m, size, rexPresent);
         U64 b = (size == 1) ? readReg8(m.regField, rexPresent)
@@ -1351,6 +1804,19 @@ dsp_26:
         return opOff + 1;
     }
 
+    // RET imm16 (C2 iw) — near return, then pop imm16 bytes of parameters.
+    // Win64 callees that forward to a stdcall-style helper (and tiny loader
+    // stubs like BALDI.exe's entry tail) emit `ret 0`. RSP is a plain GPR
+    // here, so the add is exact.
+dsp_27:
+    if (op == 0xC2) {
+        U16 imm = (U16)(fetchByte(rip + opOff + 1) |
+                        ((U16)fetchByte(rip + opOff + 2) << 8));
+        rip = pop64();
+        reg[X64_RSP].u64 += imm;
+        return opOff + 3;
+    }
+
     // IRETQ (REX.W CF == 48 CF), and the non-promoted IRET (CF) / IRETD.
     // Wine's PE-side ntdll uses iretq to return from its user-mode exception
     // dispatcher (NtContinue / the KiUserExceptionDispatcher tail). In long
@@ -1363,7 +1829,7 @@ dsp_26:
     // only the user-visible arithmetic/direction/IF bits are writable; the
     // reserved bits keep their fixed values. This is effectively a privileged
     // return-from-frame, structurally the same as restoreSignalFrame.
-dsp_27:
+dsp_28:
     if (op == 0xCF) {
         const U32 writable = 0x00254FD5u; // CF PF AF ZF SF TF IF DF OF (matches POPFQ)
         if (rexW) {
@@ -1405,7 +1871,7 @@ dsp_27:
     // -fno-pic compiled against fixed-address globals, and for any static
     // ET_EXEC that addresses a known absolute symbol. Surfaced by
     // tools/buildMultiSegmentElf64.py via the unimpl-tracer.
-dsp_28:
+dsp_29:
     if (op == 0xA0 || op == 0xA1 || op == 0xA2 || op == 0xA3) {
         U32 size = (op == 0xA0 || op == 0xA2) ? 1 : opSize;
         // Fetch the 8-byte absolute address that follows the opcode.
@@ -1439,7 +1905,7 @@ dsp_28:
         return used;
     }
 
-dsp_29:
+dsp_30:
     if (op == 0xA8 || op == 0xA9) {
         U32 size = (op == 0xA8) ? 1 : opSize;
         U64 a = (size == 1) ? reg[X64_RAX].u8
@@ -1465,18 +1931,17 @@ dsp_29:
 
     // F6/F7 — group 3: /0 TEST imm, /2 NOT, /3 NEG, /4 MUL, /5 IMUL, /6 DIV, /7 IDIV.
     // v1: only /0 TEST imm wired (needed by ld-linux); rest unimpl.
-dsp_30:
+dsp_31:
     if (op == 0xF6 || op == 0xF7) {
         U32 size = (op == 0xF6) ? 1 : opSize;
-        // Decode with NO trailing immediate: only the /0 TEST subform carries
-        // an immediate, and the sub-opcode lives in the ModRM reg field which
-        // we can't know until we decode. trailingImmBytes ONLY shifts the
-        // RIP-relative effective address (disp is relative to end-of-insn), so
-        // a blanket nonzero value mis-addresses the no-immediate subforms (DIV/
-        // IDIV/NOT/NEG/MUL/IMUL) by the immediate width — a real bug that made
-        // a RIP-relative `divq [rip+disp]` read 4 bytes past its operand. We
-        // fix up the TEST operand's RIP-relative address below, once we know it.
-        ModRM m = decodeModRM(rip + opOff + 1, p, 0);
+        // Only /0 TEST carries an immediate. Inspect its sub-opcode before
+        // decoding so RIP-relative operands use the end of the complete
+        // instruction; the other group-3 forms have no trailing immediate.
+        U8 groupSub = (fetchByte(rip + opOff + 1) >> 3) & 0x7;
+        U32 immBytes = groupSub == 0
+            ? (size == 1 ? 1 : size == 2 ? 2 : 4)
+            : 0;
+        ModRM m = decodeModRM(rip + opOff + 1, p, immBytes);
         U8 sub = m.regField & 0x7;
         if (sub == 0) {
             U64 imm; U32 immLen;
@@ -1491,10 +1956,6 @@ dsp_30:
                 S32 i32 = (S32)fetchDword(immAddr);
                 imm = (U64)(S64)i32; immLen = 4;
             }
-            // RIP-relative TEST: the disp is relative to the address after the
-            // whole instruction, which includes this immediate. decodeModRM
-            // computed effAddr with trailing=0, so add the immediate length.
-            if (m.isRipRel) m.effAddr += immLen;
             U64 a = loadRM(m, size, rexPresent);
             flagsLogic(rflags, a & imm, size);
             U32 used = opOff + 1 + m.length + immLen;
@@ -1502,6 +1963,8 @@ dsp_30:
             return used;
         }
         if (sub == 2) { // NOT — no flags affected
+            CPU64AtomicLock atomicLock(memory, m.effAddr, size, std::defer_lock);
+            if (p.lock && !m.isReg) atomicLock.lock();
             U64 a = loadRM(m, size, rexPresent);
             storeRM(m, size, ~a, rexPresent);
             U32 used = opOff + 1 + m.length;
@@ -1509,6 +1972,8 @@ dsp_30:
             return used;
         }
         if (sub == 3) { // NEG — same as 0 - r/m, flags set per SUB.
+            CPU64AtomicLock atomicLock(memory, m.effAddr, size, std::defer_lock);
+            if (p.lock && !m.isReg) atomicLock.lock();
             U64 a = loadRM(m, size, rexPresent);
             U64 r = (U64)0 - a;
             flagsSub(rflags, 0, a, r, size);
@@ -1703,11 +2168,13 @@ dsp_30:
     // FE — group 4: INC r/m8 (/0) and DEC r/m8 (/1). Byte-only sibling of the
     // FF group; all other /digit values are invalid encodings. wineserver's
     // startup hits this (INC byte ptr [rip+disp32] on a refcount/flag byte).
-dsp_31:
+dsp_32:
     if (op == 0xFE) {
-        ModRM m = decodeModRM(rip + opOff + 1, p, 1);
+        ModRM m = decodeModRM(rip + opOff + 1, p, 0);
         U8 sub = m.regField & 0x7;
         if (sub == 0 || sub == 1) {
+            CPU64AtomicLock atomicLock(memory, m.effAddr, 1, std::defer_lock);
+            if (p.lock && !m.isReg) atomicLock.lock();
             U64 a = loadRM(m, 1, rexPresent);
             U64 r = (sub == 0) ? a + 1 : a - 1;
             // INC/DEC preserve CF; other flags per ADD/SUB of 1.
@@ -1725,11 +2192,13 @@ dsp_31:
 
     // INC/DEC r/m via FF /0 and /1. (Single-byte 40-4F encodings are REX
     // in long mode and are already consumed by the prefix loop.)
-dsp_32:
+dsp_33:
     if (op == 0xFF) {
         ModRM m = decodeModRM(rip + opOff + 1, p, 0);
         U8 sub = m.regField & 0x7;
         if (sub == 0 || sub == 1) {
+            CPU64AtomicLock atomicLock(memory, m.effAddr, opSize, std::defer_lock);
+            if (p.lock && !m.isReg) atomicLock.lock();
             U64 a = loadRM(m, opSize, rexPresent);
             U64 r = (sub == 0) ? a + 1 : a - 1;
             // INC/DEC don't affect CF; preserve it. Other flags per ADD/SUB.
@@ -1766,7 +2235,7 @@ dsp_32:
     }
 
     // 8F /0 — POP r/m (operand size always 64 in long mode for POP).
-dsp_33:
+dsp_34:
     if (op == 0x8F) {
         ModRM m = decodeModRM(rip + opOff + 1, p, 0);
         if ((m.regField & 0x7) != 0) goto unhandled;
@@ -1781,7 +2250,7 @@ dsp_33:
 
     // CALL rel32 (E8 cd). Pushes RIP-of-next-instruction; jumps to
     // RIP-of-next + sign_ext(disp32).
-dsp_34:
+dsp_35:
     if (op == 0xE8) {
         S32 disp = (S32)fetchDword(rip + opOff + 1);
         U32 used = opOff + 1 + 4;
@@ -1792,7 +2261,7 @@ dsp_34:
     }
 
     // JMP rel32 (E9 cd).
-dsp_35:
+dsp_36:
     if (op == 0xE9) {
         S32 disp = (S32)fetchDword(rip + opOff + 1);
         U32 used = opOff + 1 + 4;
@@ -1801,7 +2270,7 @@ dsp_35:
     }
 
     // JMP rel8 (EB cb).
-dsp_36:
+dsp_37:
     if (op == 0xEB) {
         S8 disp = (S8)fetchByte(rip + opOff + 1);
         U32 used = opOff + 1 + 1;
@@ -1810,7 +2279,7 @@ dsp_36:
     }
 
     // Jcc rel8 (70-7F). Condition encoded in low 4 bits.
-dsp_37:
+dsp_38:
     if (op >= 0x70 && op <= 0x7F) {
         S8 disp = (S8)fetchByte(rip + opOff + 1);
         U32 used = opOff + 1 + 1;
@@ -1872,12 +2341,18 @@ dsp_37:
             if (opSize == 2) { sa = (S64)(S16)a; sb = (S64)(S16)b; }
             else if (opSize == 4) { sa = (S64)(S32)a; sb = (S64)(S32)b; }
             else { sa = (S64)a; sb = (S64)b; }
-            S64 r = sa * sb;
-            // CF/OF set if signed result doesn't fit in opSize.
+            // Note: 64-bit signed multiply can overflow S64 (UB), so do the
+            // 64-bit path in __int128 and truncate; 16/32-bit products always
+            // fit in S64.
+            S64 r;
             bool overflow = false;
-            if (opSize == 2) overflow = (r != (S64)(S16)r);
-            else if (opSize == 4) overflow = (r != (S64)(S32)r);
-            else { __int128 r128 = (__int128)sa * (__int128)sb; overflow = (r128 != (__int128)r); }
+            if (opSize == 2) { r = sa * sb; overflow = (r != (S64)(S16)r); }
+            else if (opSize == 4) { r = sa * sb; overflow = (r != (S64)(S32)r); }
+            else {
+                __int128 r128 = (__int128)sa * (__int128)sb;
+                r = (S64)r128;
+                overflow = (r128 != (__int128)r);
+            }
             rflags &= ~(X64_CF | X64_OF);
             if (overflow) rflags |= X64_CF | X64_OF;
             switch (opSize) {
@@ -1973,7 +2448,7 @@ dsp_37:
             ModRM m = decodeModRM(rip + opOff + 2, p, 0);
             // CMPXCHG is glibc's mutex fast path; make the read-compare-write
             // atomic across host threads when the operand is in memory.
-            std::unique_lock<std::recursive_mutex> atomicLock(cpu64AtomicLockFor(m.effAddr), std::defer_lock);
+            CPU64AtomicLock atomicLock(memory, m.effAddr, size, std::defer_lock);
             if (!m.isReg) atomicLock.lock();
             U64 dest = loadRM(m, size, rexPresent);
             U64 acc = (size == 1) ? reg[X64_RAX].u8
@@ -1999,17 +2474,197 @@ dsp_37:
             return used;
         }
 
-        // 0F A3 /r — BT  r/m, r       (test bit, no modify)
+        // 0F C7 /1 — CMPXCHG8B m64 (REX.W=0) / CMPXCHG16B m128 (REX.W=1).
+        // Compares EDX:EAX (8B) or RDX:RAX (16B) with the memory operand:
+        // equal -> ZF=1 and ECX:EBX / RCX:RBX stored to memory, else ZF=0
+        // and the memory value loaded into the accumulator pair. Only ZF is
+        // modified; other arithmetic flags are preserved. Register destination is #UD on hardware;
+        // fall through to the unhandled diagnostic in that case. Mono's GC
+        // and Unity's Baselib atomics emit the 16-byte form.
+        if (op2 == 0xC7) {
+            ModRM m = decodeModRM(rip + opOff + 2, p, 0);
+            if (!m.isReg && (m.regField & 0x7) == 1) {
+                CPU64AtomicLock atomicLock(memory, m.effAddr, (p.rex & 0x08) ? 16 : 8, std::defer_lock);
+                atomicLock.lock();
+                if (!(p.rex & 0x08)) {
+                    U64 acc = ((U64)reg[X64_RDX].u32 << 32) | reg[X64_RAX].u32;
+                    U64 mem = ((U64)memory->readd(m.effAddr + 4) << 32) | memory->readd(m.effAddr);
+                    rflags = (rflags & ~X64_ZF) | (acc == mem ? X64_ZF : 0);
+                    if (acc == mem) {
+                        memory->writed(m.effAddr, reg[X64_RBX].u32);
+                        memory->writed(m.effAddr + 4, reg[X64_RCX].u32);
+                    } else {
+                        reg[X64_RAX].setU64((U32)mem);
+                        reg[X64_RDX].setU64((U32)(mem >> 32));
+                    }
+                } else {
+                    U64 accLo = reg[X64_RAX].u64, accHi = reg[X64_RDX].u64;
+                    U64 memLo = memory->readq(m.effAddr);
+                    U64 memHi = memory->readq(m.effAddr + 8);
+                    bool eq = (accLo == memLo && accHi == memHi);
+                    rflags = (rflags & ~X64_ZF) | (eq ? X64_ZF : 0);
+                    if (eq) {
+                        memory->writeq(m.effAddr, reg[X64_RBX].u64);
+                        memory->writeq(m.effAddr + 8, reg[X64_RCX].u64);
+                    } else {
+                        reg[X64_RAX].setU64(memLo);
+                        reg[X64_RDX].setU64(memHi);
+                    }
+                }
+                U32 used = opOff + 2 + m.length;
+                rip += used;
+                return used;
+            }
+        }
+        // Packed single-precision reciprocal ops: RSQRTPS 0F 52 / RCPPS 0F 53
+        // (no prefix) and scalar RSQRTSS/RCPSS (F3 prefix, low lane only,
+        // upper lanes pass through). Hardware returns ~12-bit approximations;
+        // exact host results are a valid refinement (games follow with a
+        // Newton-Raphson MULPS, as Unity's math does). Inf/NaN flow through
+        // IEEE rules naturally.
+        if ((!p.osize16 && p.rep == 0 && (op2 == 0x52 || op2 == 0x53)) ||
+            (p.rep == 0xF3 && (op2 == 0x52 || op2 == 0x53))) {
+            bool scalar = (p.rep == 0xF3);
+            ModRM m = decodeModRM(rip + opOff + 2, p, 0);
+            U64 srcLo, srcHi;
+            if (m.isReg) {
+                srcLo = xmm[m.rmIndex].lo;
+                srcHi = xmm[m.rmIndex].hi;
+            } else {
+                srcLo = scalar ? memory->readd(m.effAddr) : memory->readq(m.effAddr);
+                srcHi = scalar ? 0 : memory->readq(m.effAddr + 8);
+            }
+            auto u32f = [](U32 b){ float f; std::memcpy(&f,&b,4); return f; };
+            auto fu32 = [](float f){ U32 b; std::memcpy(&b,&f,4); return b; };
+            U64 outLo, outHi;
+            if (scalar) {
+                float b0 = u32f((U32)(srcLo & 0xFFFFFFFFULL));
+                float r0 = (op2 == 0x52) ? (1.0f / std::sqrt(b0)) : (1.0f / b0);
+                outLo = (fu32(r0) & 0xFFFFFFFFULL) | (xmm[m.regField].lo & 0xFFFFFFFF00000000ULL);
+                outHi = xmm[m.regField].hi;
+            } else {
+                float b[4];
+                b[0] = u32f((U32)(srcLo & 0xFFFFFFFFULL));
+                b[1] = u32f((U32)(srcLo >> 32));
+                b[2] = u32f((U32)(srcHi & 0xFFFFFFFFULL));
+                b[3] = u32f((U32)(srcHi >> 32));
+                U32 r[4];
+                for (int i = 0; i < 4; i++) {
+                    float v = (op2 == 0x52) ? (1.0f / std::sqrt(b[i])) : (1.0f / b[i]);
+                    r[i] = fu32(v);
+                }
+                outLo = (U64)r[0] | ((U64)r[1] << 32);
+                outHi = (U64)r[2] | ((U64)r[3] << 32);
+            }
+            xmm[m.regField].lo = outLo;
+            xmm[m.regField].hi = outHi;
+            U32 used = opOff + 2 + m.length;
+            rip += used;
+            return used;
+        }
+
+        // FP conversions between scalar/packed singles, doubles and integers.
+        //   F3 0F 5A CVTSS2SD   F2 0F 5A CVTSD2SS   0F 5A CVTPS2PD
+        //   66 0F 5A CVTPD2PS  F3 0F 2A CVTSI2SS   F2 0F 2A CVTSI2SD
+        //   F3 0F 2D/2C CVT(T)SS2SI   F2 0F 2D/2C CVT(T)SD2SI
+        // Non-truncating float-to-integer conversions use MXCSR.RC.
+        // Out-of-range and NaN inputs yield the integer indefinite value,
+        // per the SDM. Unity's
+        // startup (rsqrtps -> cvtss2sd -> movsd) and Mono's time/GC paths hit
+        // these immediately.
+        if ((p.rep == 0xF3 && (op2 == 0x5A || op2 == 0x2A || op2 == 0x2D || op2 == 0x2C)) ||
+            (p.rep == 0xF2 && (op2 == 0x5A || op2 == 0x2A || op2 == 0x2D || op2 == 0x2C)) ||
+            (p.rep == 0 && op2 == 0x5A)) {
+            bool toInt = (op2 == 0x2D || op2 == 0x2C);
+            bool trunc = (op2 == 0x2C);
+            bool dbl = (p.rep == 0xF2) || (p.osize16 && op2 == 0x5A);
+            bool i64 = (p.rex & 0x08) != 0;
+            ModRM m = decodeModRM(rip + opOff + 2, p, 0);
+            auto u32f = [](U32 b){ float f; std::memcpy(&f,&b,4); return f; };
+            auto fu32 = [](float f){ U32 b; std::memcpy(&b,&f,4); return b; };
+            auto u64d = [](U64 b){ double d; std::memcpy(&d,&b,8); return d; };
+            auto du64 = [](double d){ U64 b; std::memcpy(&b,&d,8); return b; };
+            if (!toInt && op2 == 0x5A && p.rep == 0 && !p.osize16) {
+                // CVTPS2PD: two packed singles -> two doubles.
+                U64 sLo = m.isReg ? xmm[m.rmIndex].lo : memory->readq(m.effAddr);
+                float b0 = u32f((U32)(sLo & 0xFFFFFFFFULL));
+                float b1 = u32f((U32)(sLo >> 32));
+                xmm[m.regField].lo = du64((double)b0);
+                xmm[m.regField].hi = du64((double)b1);
+            } else if (!toInt && op2 == 0x5A && p.rep == 0 && p.osize16) {
+                // CVTPD2PS: two packed doubles -> two singles, upper zeroed.
+                U64 sLo = m.isReg ? xmm[m.rmIndex].lo : memory->readq(m.effAddr);
+                U64 sHi = m.isReg ? xmm[m.rmIndex].hi : memory->readq(m.effAddr + 8);
+                float r0 = (float)u64d(sLo), r1 = (float)u64d(sHi);
+                xmm[m.regField].lo = (U64)fu32(r0) | ((U64)fu32(r1) << 32);
+                xmm[m.regField].hi = 0;
+            } else if (!toInt && op2 == 0x5A && p.rep == 0xF3) {
+                // CVTSS2SD: scalar single -> scalar double, upper preserved.
+                U32 bits = m.isReg ? (U32)(xmm[m.rmIndex].lo & 0xFFFFFFFFULL)
+                                   : memory->readd(m.effAddr);
+                xmm[m.regField].lo = du64((double)u32f(bits));
+            } else if (!toInt && op2 == 0x5A && p.rep == 0xF2) {
+                // CVTSD2SS: scalar double -> scalar single, upper preserved.
+                U64 bits = m.isReg ? xmm[m.rmIndex].lo : memory->readq(m.effAddr);
+                float r = (float)u64d(bits);
+                xmm[m.regField].lo = (xmm[m.regField].lo & 0xFFFFFFFF00000000ULL) | fu32(r);
+            } else if (!toInt && op2 == 0x2A) {
+                // CVTSI2SS / CVTSI2SD: integer -> scalar float/double.
+                S64 iv = i64 ? (S64)(m.isReg ? reg[m.rmIndex].u64 : memory->readq(m.effAddr))
+                             : (S64)(S32)(m.isReg ? reg[m.rmIndex].u32 : memory->readd(m.effAddr));
+                if (dbl) {
+                    xmm[m.regField].lo = du64((double)iv);
+                } else {
+                    float r = (float)iv;
+                    xmm[m.regField].lo = (xmm[m.regField].lo & 0xFFFFFFFF00000000ULL) | fu32(r);
+                }
+            } else if (toInt) {
+                // CVT(T)SS2SI / CVT(T)SD2SI: scalar float/double -> GP reg.
+                double v;
+                if (dbl) {
+                    v = u64d(m.isReg ? xmm[m.rmIndex].lo : memory->readq(m.effAddr));
+                } else {
+                    U32 bits = m.isReg ? (U32)(xmm[m.rmIndex].lo & 0xFFFFFFFFULL)
+                                       : memory->readd(m.effAddr);
+                    v = (double)u32f(bits);
+                }
+                U64 converted = cpu64ConvertFpToInt(v, i64, trunc, mxcsr);
+                if (i64) reg[m.regField].setU64(converted);
+                else     reg[m.regField].setU32((U32)converted);
+            }
+            U32 used = opOff + 2 + m.length;
+            rip += used;
+            return used;
+        }
         // 0F AB /r — BTS r/m, r       (set bit, return old in CF)
         // 0F B3 /r — BTR r/m, r       (reset bit)
         // 0F BB /r — BTC r/m, r       (complement bit)
         if (op2 == 0xA3 || op2 == 0xAB || op2 == 0xB3 || op2 == 0xBB) {
             ModRM m = decodeModRM(rip + opOff + 2, p, 0);
-            U64 v = loadRM(m, opSize, rexPresent);
-            U64 idx = (opSize == 8) ? reg[m.regField].u64 :
-                      (opSize == 4) ? (U64)reg[m.regField].u32 :
-                                      (U64)reg[m.regField].u16;
-            U64 bit = idx & (opSize * 8 - 1);
+            U64 rawIndex = (opSize == 8) ? reg[m.regField].u64 :
+                           (opSize == 4) ? (U64)reg[m.regField].u32 :
+                                           (U64)reg[m.regField].u16;
+            ModRM bitOperand = m;
+            U64 bit;
+            if (m.isReg) {
+                bit = rawIndex & (opSize * 8 - 1);
+            } else {
+                S64 index = opSize == 8 ? (S64)rawIndex :
+                            opSize == 4 ? (S64)(S32)(U32)rawIndex :
+                                          (S64)(S16)(U16)rawIndex;
+                S64 bitsPerOperand = (S64)opSize * 8;
+                S64 operandIndex = index / bitsPerOperand;
+                S64 bitIndex = index % bitsPerOperand;
+                if (bitIndex < 0) {
+                    operandIndex--;
+                    bitIndex += bitsPerOperand;
+                }
+                bitOperand.effAddr += (U64)(operandIndex * (S64)opSize);
+                bit = (U64)bitIndex;
+            }
+            CPU64AtomicLock atomicLock(memory, bitOperand.effAddr, opSize, std::defer_lock);
+            if (p.lock && op2 != 0xA3 && !m.isReg) atomicLock.lock();
+            U64 v = loadRM(bitOperand, opSize, rexPresent);
             U64 mask = 1ULL << bit;
             bool old = (v & mask) != 0;
             rflags &= ~X64_CF;
@@ -2019,7 +2674,7 @@ dsp_37:
                 if (op2 == 0xAB) nv |= mask;
                 else if (op2 == 0xB3) nv &= ~mask;
                 else nv ^= mask; // BTC
-                storeRM(m, opSize, nv, rexPresent);
+                storeRM(bitOperand, opSize, nv, rexPresent);
             }
             U32 used = opOff + 2 + m.length;
             rip += used;
@@ -2031,6 +2686,8 @@ dsp_37:
             ModRM m = decodeModRM(rip + opOff + 2, p, 1);
             U8 sub = m.regField & 0x7;
             if (sub >= 4 && sub <= 7) {
+                CPU64AtomicLock atomicLock(memory, m.effAddr, opSize, std::defer_lock);
+                if (p.lock && sub != 4 && !m.isReg) atomicLock.lock();
                 U64 v = loadRM(m, opSize, rexPresent);
                 U8 imm = fetchByte(rip + opOff + 2 + m.length);
                 U64 bit = imm & (opSize * 8 - 1);
@@ -2094,36 +2751,24 @@ dsp_37:
             return used;
         }
 
-        // F3 0F B8 — POPCNT r, r/m  (REP prefix selects POPCNT vs BSF)
-        // F3 0F BC — TZCNT (vs 0F BC BSF)
-        // F3 0F BD — LZCNT (vs 0F BD BSR)
-        if ((op2 == 0xB8 && p.rep == 0xF3) ||
-            (op2 == 0xBC && p.rep == 0xF3) ||
-            (op2 == 0xBD && p.rep == 0xF3)) {
+        // F3 0F B8 — POPCNT r, r/m.
+        if (op2 == 0xB8 && p.rep == 0xF3) {
             ModRM m = decodeModRM(rip + opOff + 2, p, 0);
             U64 src = loadRM(m, opSize, rexPresent) & maskFor(opSize);
-            U64 result;
-            if (op2 == 0xB8) { // POPCNT
-                result = __builtin_popcountll(src);
-            } else if (op2 == 0xBC) { // TZCNT
-                result = src ? __builtin_ctzll(src) : opSize * 8;
-            } else { // LZCNT
-                U32 bits = opSize * 8;
-                result = src ? (__builtin_clzll(src) - (64 - bits)) : bits;
-            }
+            U64 result = __builtin_popcountll(src);
             if (opSize == 8) reg[m.regField].setU64(result);
             else if (opSize == 4) reg[m.regField].setU64((U32)result);
             else reg[m.regField].setU16((U16)result);
             rflags &= ~(X64_ZF | X64_CF | X64_OF | X64_SF | X64_PF | X64_AF);
-            if (op2 == 0xB8) { if (result == 0) rflags |= X64_ZF; }
-            else if (op2 == 0xBC) { if (src == 0) rflags |= X64_CF; if ((result & maskFor(opSize)) == 0) rflags |= X64_ZF; }
-            else { if (src == 0) rflags |= X64_CF; if ((result & maskFor(opSize)) == 0) rflags |= X64_ZF; }
+            if (result == 0) rflags |= X64_ZF;
             U32 used = opOff + 2 + m.length;
             rip += used;
             return used;
         }
 
-        // 0F BC — BSF r, r/m  (bit scan forward); 0F BD — BSR (reverse).
+        // 0F BC/BD remain BSF/BSR when F3 is present because ABM is not
+        // advertised; on pre-ABM CPUs the prefix is ignored.
+        // 0F BC — BSF r, r/m (bit scan forward); 0F BD — BSR (reverse).
         if (op2 == 0xBC || op2 == 0xBD) {
             ModRM m = decodeModRM(rip + opOff + 2, p, 0);
             U64 src = loadRM(m, opSize, rexPresent) & maskFor(opSize);
@@ -2160,7 +2805,7 @@ dsp_37:
             ModRM m = decodeModRM(rip + opOff + 2, p, 0);
             // XADD (LOCK XADD) backs glibc's atomic counters; serialize the
             // memory RMW across host threads.
-            std::unique_lock<std::recursive_mutex> atomicLock(cpu64AtomicLockFor(m.effAddr), std::defer_lock);
+            CPU64AtomicLock atomicLock(memory, m.effAddr, size, std::defer_lock);
             if (!m.isReg) atomicLock.lock();
             U64 d = loadRM(m, size, rexPresent);
             U64 s = (size == 1) ? readReg8(m.regField, rexPresent)
@@ -2183,7 +2828,7 @@ dsp_37:
 
     // 63 /r — MOVSXD r64, r/m32 (with REX.W). Without REX.W it acts like
     // MOV r32, r/m32 (Intel: deprecated form). We support both.
-dsp_39:
+dsp_40:
     if (op == 0x63) {
         ModRM m = decodeModRM(rip + opOff + 1, p, 0);
         U64 raw = loadRM(m, 4, rexPresent);
@@ -2203,7 +2848,7 @@ dsp_39:
     //   /0 ROL  /1 ROR  /2 RCL  /3 RCR
     // D0/C0 = byte form; D1/C1 = opSize form. D0/D1 shift by 1; D2/D3 shift
     // by CL; C0/C1 shift by imm8.
-dsp_40:
+dsp_41:
     if (op == 0xD0 || op == 0xD1 || op == 0xD2 || op == 0xD3 ||
         op == 0xC0 || op == 0xC1) {
         U32 size = (op == 0xD0 || op == 0xD2 || op == 0xC0) ? 1 : opSize;
@@ -2237,7 +2882,7 @@ dsp_40:
     }
 
     // IMUL r, r/m, imm (69 iz / 6B ib). Three-operand signed multiply.
-dsp_41:
+dsp_42:
     if (op == 0x69 || op == 0x6B) {
         ModRM m = decodeModRM(rip + opOff + 1, p,
             (op == 0x69) ? (opSize == 2 ? 2 : 4) : 1);
@@ -2256,11 +2901,14 @@ dsp_41:
         }
         S64 sa = (opSize == 2) ? (S64)(S16)a
                : (opSize == 4) ? (S64)(S32)a : (S64)a;
-        S64 r = sa * imm;
+        // Compute before truncating: overflowing S64 multiplication is undefined
+        // and lets native optimizers discard the guest's CF/OF overflow test.
+        __int128 r128 = (__int128)sa * (__int128)imm;
+        S64 r = (S64)r128;
         bool overflow = false;
         if (opSize == 2) overflow = (r != (S64)(S16)r);
         else if (opSize == 4) overflow = (r != (S64)(S32)r);
-        else { __int128 r128 = (__int128)sa * (__int128)imm; overflow = (r128 != (__int128)r); }
+        else overflow = (r128 != (__int128)r);
         rflags &= ~(X64_CF | X64_OF);
         if (overflow) rflags |= X64_CF | X64_OF;
         switch (opSize) {
@@ -2279,7 +2927,7 @@ dsp_41:
     //
     // MOVSB/MOVSW/MOVSD/MOVSQ — A4 (byte), A5 (opSize).
     // STOSB/STOSW/STOSD/STOSQ — AA (byte), AB (opSize). Source is RAX.
-dsp_42:
+dsp_43:
     if (op == 0xA4 || op == 0xA5 || op == 0xAA || op == 0xAB) {
         U32 size = (op == 0xA4 || op == 0xAA) ? 1 : opSize;
         bool isStos = (op == 0xAA || op == 0xAB);
@@ -2323,7 +2971,7 @@ dsp_42:
     // both also break when RCX reaches 0.
     //   CMPSB/CMPSW/CMPSD/CMPSQ — A6 / A7
     //   SCASB/SCASW/SCASD/SCASQ — AE / AF
-dsp_43:
+dsp_44:
     if (op == 0xA6 || op == 0xA7 || op == 0xAE || op == 0xAF) {
         U32 size = (op == 0xA6 || op == 0xAE) ? 1 : opSize;
         bool isScas = (op == 0xAE || op == 0xAF);
@@ -2373,7 +3021,7 @@ dsp_43:
     }
 
     // LEAVE (C9). Equivalent to: RSP = RBP; RBP = pop64().
-dsp_44:
+dsp_45:
     if (op == 0xC9) {
         reg[X64_RSP].setU64(reg[X64_RBP].u64);
         reg[X64_RBP].setU64(pop64());
@@ -2385,13 +3033,13 @@ dsp_44:
     // extended to 64; POPFQ pops 64 bits but only the low 32 carry the
     // user-visible flags. We mirror that: writeable mask covers the
     // arithmetic and direction flags + IF.
-dsp_45:
+dsp_46:
     if (op == 0x9C) {
         push64((U64)rflags);
         rip += opOff + 1;
         return opOff + 1;
     }
-dsp_46:
+dsp_47:
     if (op == 0x9D) {
         U64 v = pop64();
         const U32 writable = 0x00254FD5u; // CF PF AF ZF SF TF IF DF OF + others
@@ -2402,7 +3050,7 @@ dsp_46:
 
     // SAHF (9E). Load the low 8 bits of rflags from AH. Only SF/ZF/AF/PF/CF
     // are user-visible in those bits per AMD64; bit 1 reads as 1.
-dsp_47:
+dsp_48:
     if (op == 0x9E) {
         U8 ah = (U8)((reg[X64_RAX].u64 >> 8) & 0xFF);
         const U32 mask = X64_SF | X64_ZF | X64_AF | X64_PF | X64_CF;
@@ -2413,7 +3061,7 @@ dsp_47:
 
     // LAHF (9F). Store the low 8 bits of rflags (SF/ZF/0/AF/0/PF/1/CF) into
     // AH. Bit 1 is always 1, bits 3/5 are always 0.
-dsp_48:
+dsp_49:
     if (op == 0x9F) {
         U8 v = (U8)(rflags & (X64_SF | X64_ZF | X64_AF | X64_PF | X64_CF));
         v |= 0x02; // reserved bit 1 reads as 1
@@ -2428,7 +3076,7 @@ dsp_48:
     // without real signal delivery, klog the trap and yield so the guest
     // exits cleanly instead of looping or corrupting host state. assert()
     // failure paths and debugger-injected breakpoints emit this.
-dsp_49:
+dsp_50:
     if (op == 0xCC) {
         klog_fmt("CPU64: INT3 at RIP=0x%llx — yielding (no SIGTRAP delivery yet)",
                  (unsigned long long)rip);
@@ -2438,49 +3086,54 @@ dsp_49:
     }
 
     // CLD (FC) / STD (FD). Direction flag for string ops.
-dsp_50:
-    if (op == 0xFC) { rflags &= ~X64_DF; rip += opOff + 1; return opOff + 1; }
 dsp_51:
+    if (op == 0xFC) { rflags &= ~X64_DF; rip += opOff + 1; return opOff + 1; }
+dsp_52:
     if (op == 0xFD) { rflags |=  X64_DF; rip += opOff + 1; return opOff + 1; }
 
     // CMC (F5) / CLC (F8) / STC (F9). Carry-flag toggle/clear/set.
-dsp_52:
-    if (op == 0xF5) { rflags ^= X64_CF; rip += opOff + 1; return opOff + 1; }
 dsp_53:
-    if (op == 0xF8) { rflags &= ~X64_CF; rip += opOff + 1; return opOff + 1; }
+    if (op == 0xF5) { rflags ^= X64_CF; rip += opOff + 1; return opOff + 1; }
 dsp_54:
+    if (op == 0xF8) { rflags &= ~X64_CF; rip += opOff + 1; return opOff + 1; }
+dsp_55:
     if (op == 0xF9) { rflags |=  X64_CF; rip += opOff + 1; return opOff + 1; }
 
-    // CPUID (0F A2). Return a conservative feature set: SSE2 only, no SSE3+,
-    // no AVX. glibc IFUNC dispatchers consult ECX feature bits and select the
-    // simpler implementations when AVX/SSSE3 are clear, which keeps us off
-    // unimplemented vector opcodes during memcpy/strcmp.
+    // CPUID (0F A2). Report the implemented baseline through SSE4.2/POPCNT;
+    // AVX, BMI, and other unsupported extensions stay clear.
     if (op == 0x0F && fetchByte(rip + opOff + 1) == 0xA2) {
         U32 leaf = reg[X64_RAX].u32;
         U32 sub  = reg[X64_RCX].u32;
         U32 a = 0, b = 0, c = 0, d = 0;
         switch (leaf) {
             case 0x0:
-                a = 0x1; // max leaf
+                a = 0x7; // max basic leaf
                 // "Genu" "ineI" "ntel"
                 b = 0x756E6547; d = 0x49656E69; c = 0x6C65746E;
                 break;
             case 0x1: {
                 a = (6 << 8) | (15 << 4) | 3; // family 6 stepping 3
-                b = 0;
-                // ECX feature bits: SSE3=0, SSSE3=0, SSE4.1=0, SSE4.2=0,
-                // POPCNT=0 (bit23), XSAVE=0, OSXSAVE=0, AVX=0.
-                c = 0;
+                // EBX: eight 8-byte CLFLUSH units; one logical processor.
+                b = (8u << 8) | (1u << 16);
+                // ECX: SSE3, SSSE3, CX16, SSE4.1, SSE4.2, POPCNT.
+                c = (1u << 0) | (1u << 9) | (1u << 13) | (1u << 19) |
+                    (1u << 20) | (1u << 23);
                 // EDX bits: FPU=0 PDE=1 TSC=4 MSR=5 PAE=6 MCE=7 CX8=8
                 // APIC=9 SEP=11 MTRR=12 PGE=13 MCA=14 CMOV=15 PAT=16
                 // PSE36=17 CLFSH=19 MMX=23 FXSR=24 SSE=25 SSE2=26.
-                d = (1u<<0)|(1u<<4)|(1u<<5)|(1u<<8)|(1u<<15)|(1u<<23)|(1u<<24)|(1u<<25)|(1u<<26);
+                d = (1u<<0)|(1u<<4)|(1u<<5)|(1u<<8)|(1u<<15)|(1u<<19)|
+                    (1u<<23)|(1u<<24)|(1u<<25)|(1u<<26);
                 break;
             }
+            case 0x7:
+                // Subleaf 0 and all later subleaves advertise no extensions.
+                break;
             case 0x80000000:
                 a = 0x80000001;
                 break;
             case 0x80000001:
+                // ECX: LAHF/SAHF in long mode and PREFETCHW.
+                c = (1u << 0) | (1u << 8);
                 // EDX bit 29 = LM (long mode), bit 11 = SYSCALL, bit 20 = NX.
                 d = (1u<<29)|(1u<<11)|(1u<<20);
                 break;
@@ -2505,6 +3158,400 @@ dsp_54:
     if (op == 0x0F) {
         U8 op2 = fetchByte(rip + opOff + 1);
         bool osize66 = p.osize16; // for SSE this means "use packed-integer form"
+        if (op2 == 0x77 && !p.osize16 && p.rep == 0) {
+            // EMMS: end MMX state and mark all x87 stack registers empty.
+            fpu.SetTag(0xFFFFFFFF);
+            fpu.isMMXInUse = false;
+            U32 used = opOff + 2;
+            rip += used;
+            return used;
+        }
+        // Legacy MMX forms use the low 64-bit significands of the x87 stack
+        // registers. startMMX() resets TOP to zero and marks all eight tags
+        // valid; writing through getMMX() keeps FXSAVE/FNSAVE on the same state.
+        if (p.rep == 0 && !osize66 &&
+            (op2 == 0x6E || op2 == 0x6F || op2 == 0x7E || op2 == 0x7F)) {
+            ModRM m = decodeModRM(rip + opOff + 2, p, 0);
+            U32 used = opOff + 2 + m.length;
+            bool wide = (p.rex & 8) != 0;
+            if (op2 == 0x6E) { // MOVD/MOVQ r/m -> mm
+                U64 value = loadRM(m, wide ? 8 : 4, rexPresent);
+                fpu.startMMX();
+                fpu.getMMX(m.regField & 7)->q = wide ? value : (U32)value;
+            } else if (op2 == 0x7E) { // MOVD/MOVQ mm -> r/m
+                fpu.startMMX();
+                U64 value = fpu.getMMX(m.regField & 7)->q;
+                if (m.isReg) {
+                    if (wide) reg[m.rmIndex].setU64(value);
+                    else reg[m.rmIndex].setU32((U32)value);
+                } else {
+                    storeRM(m, wide ? 8 : 4, wide ? value : (U32)value, rexPresent);
+                }
+            } else if (op2 == 0x6F) { // MOVQ r/m64 -> mm
+                U64 value = m.isReg ? fpu.getMMX(m.rmIndex & 7)->q
+                                    : memory->readq(m.effAddr);
+                fpu.startMMX();
+                fpu.getMMX(m.regField & 7)->q = value;
+            } else { // MOVQ mm -> r/m64
+                fpu.startMMX();
+                U64 value = fpu.getMMX(m.regField & 7)->q;
+                if (m.isReg) fpu.getMMX(m.rmIndex & 7)->q = value;
+                else memory->writeq(m.effAddr, value);
+            }
+            rip += used;
+            return used;
+        }
+        if ((p.rep == 0 && (op2 == 0x2A || op2 == 0x2C || op2 == 0x2D)) ||
+            ((p.rep == 0xF3 || p.rep == 0xF2) && op2 == 0xD6)) {
+            ModRM m = decodeModRM(rip + opOff + 2, p, 0);
+            U32 used = opOff + 2 + m.length;
+            auto u32f = [](U32 b) { float f; std::memcpy(&f, &b, 4); return f; };
+            auto fu32 = [](float f) { U32 b; std::memcpy(&b, &f, 4); return b; };
+            auto u64d = [](U64 b) { double d; std::memcpy(&d, &b, 8); return d; };
+            auto du64 = [](double d) { U64 b; std::memcpy(&b, &d, 8); return b; };
+            if (op2 == 0x2A) { // CVTPI2PS/CVTPI2PD mm/m64 -> xmm
+                U64 source = m.isReg ? fpu.getMMX(m.rmIndex & 7)->q : memory->readq(m.effAddr);
+                fpu.startMMX();
+                if (osize66) {
+                    xmm[m.regField].lo = du64((double)(S32)(U32)source);
+                    xmm[m.regField].hi = du64((double)(S32)(U32)(source >> 32));
+                } else {
+                    xmm[m.regField].lo = (U64)fu32((float)(S32)(U32)source) |
+                                         ((U64)fu32((float)(S32)(U32)(source >> 32)) << 32);
+                }
+            } else if (op2 == 0x2C || op2 == 0x2D) { // CVTT/CVTPS2PI or CVTT/CVTPD2PI
+                U64 src0, src1 = 0;
+                if (osize66) {
+                    if (m.isReg) { src0 = xmm[m.rmIndex].lo; src1 = xmm[m.rmIndex].hi; }
+                    else { src0 = memory->readq(m.effAddr); src1 = memory->readq(m.effAddr + 8); }
+                } else {
+                    src0 = m.isReg ? xmm[m.rmIndex].lo : memory->readq(m.effAddr);
+                }
+                double a = osize66 ? u64d(src0) : (double)u32f((U32)src0);
+                double b = osize66 ? u64d(src1) : (double)u32f((U32)(src0 >> 32));
+                U32 low = (U32)cpu64ConvertFpToInt(a, false, op2 == 0x2C, mxcsr);
+                U32 high = (U32)cpu64ConvertFpToInt(b, false, op2 == 0x2C, mxcsr);
+                fpu.startMMX();
+                fpu.getMMX(m.regField & 7)->q = (U64)low | ((U64)high << 32);
+            } else if (p.rep == 0xF3) { // MOVQ2DQ mm -> xmm
+                if (!m.isReg) goto unhandled;
+                fpu.startMMX();
+                xmm[m.regField].lo = fpu.getMMX(m.rmIndex & 7)->q;
+                xmm[m.regField].hi = 0;
+            } else { // MOVDQ2Q xmm -> mm
+                if (!m.isReg) goto unhandled;
+                U64 value = xmm[m.rmIndex].lo;
+                fpu.startMMX();
+                fpu.getMMX(m.regField & 7)->q = value;
+            }
+            rip += used;
+            return used;
+        }
+        if (p.rep == 0 && !osize66 && op2 == 0x70) { // PSHUFW mm,mm/m64,imm8
+            ModRM m = decodeModRM(rip + opOff + 2, p, 1);
+            U64 src = m.isReg ? fpu.getMMX(m.rmIndex & 7)->q : memory->readq(m.effAddr);
+            U8 imm = fetchByte(rip + opOff + 2 + m.length);
+            U64 result = 0;
+            for (int i = 0; i < 4; i++) {
+                U16 word = (U16)(src >> (((imm >> (i * 2)) & 3) * 16));
+                result |= (U64)word << (i * 16);
+            }
+            fpu.startMMX();
+            fpu.getMMX(m.regField & 7)->q = result;
+            U32 used = opOff + 2 + m.length + 1;
+            rip += used;
+            return used;
+        }
+        if (p.rep == 0 && !osize66 && op2 == 0xC4) { // PINSRW r/m16,imm8 -> mm
+            ModRM m = decodeModRM(rip + opOff + 2, p, 1);
+            U8 imm = fetchByte(rip + opOff + 2 + m.length);
+            U16 value = (U16)loadRM(m, 2, rexPresent);
+            fpu.startMMX();
+            MMX_reg* dst = fpu.getMMX(m.regField & 7);
+            U32 shift = (imm & 3) * 16;
+            dst->q = (dst->q & ~(0xFFFFULL << shift)) | ((U64)value << shift);
+            U32 used = opOff + 2 + m.length + 1;
+            rip += used;
+            return used;
+        }
+        if (p.rep == 0 && !osize66 && op2 == 0xC5) { // PEXTRW mm,imm8 -> r32
+            ModRM m = decodeModRM(rip + opOff + 2, p, 1);
+            if (!m.isReg) goto unhandled;
+            U8 imm = fetchByte(rip + opOff + 2 + m.length);
+            fpu.startMMX();
+            U16 value = (U16)(fpu.getMMX(m.rmIndex & 7)->q >> ((imm & 3) * 16));
+            reg[m.regField].setU32(value);
+            U32 used = opOff + 2 + m.length + 1;
+            rip += used;
+            return used;
+        }
+        if (p.rep == 0 && !osize66 && op2 == 0xD7) { // PMOVMSKB r32,mm
+            ModRM m = decodeModRM(rip + opOff + 2, p, 0);
+            if (!m.isReg) goto unhandled;
+            fpu.startMMX();
+            U64 src = fpu.getMMX(m.rmIndex & 7)->q;
+            U32 mask = 0;
+            for (int i = 0; i < 8; i++) mask |= (U32)((src >> (i * 8 + 7)) & 1) << i;
+            reg[m.regField].setU32(mask);
+            U32 used = opOff + 2 + m.length;
+            rip += used;
+            return used;
+        }
+        if (p.rep == 0 && !osize66 && op2 == 0xE7) { // MOVNTQ m64,mm
+            ModRM m = decodeModRM(rip + opOff + 2, p, 0);
+            if (m.isReg) goto unhandled;
+            fpu.startMMX();
+            memory->writeq(m.effAddr, fpu.getMMX(m.regField & 7)->q);
+            U32 used = opOff + 2 + m.length;
+            rip += used;
+            return used;
+        }
+        if (p.rep == 0 && !osize66 && op2 == 0xF7) { // MASKMOVQ mm,mm -> [RDI]
+            ModRM m = decodeModRM(rip + opOff + 2, p, 0);
+            if (!m.isReg) goto unhandled;
+            fpu.startMMX();
+            U64 data = fpu.getMMX(m.regField & 7)->q;
+            U64 mask = fpu.getMMX(m.rmIndex & 7)->q;
+            U64 addr = reg[X64_RDI].u64;
+            for (U32 i = 0; i < 8; i++) {
+                U8 maskByte = (U8)(mask >> (i * 8));
+                if (maskByte & 0x80) memory->writeb(addr + i, (U8)(data >> (i * 8)));
+            }
+            U32 used = opOff + 2 + m.length;
+            rip += used;
+            return used;
+        }
+
+        if (p.rep == 0 && !osize66 && (op2 == 0x71 || op2 == 0x72 || op2 == 0x73)) {
+            // MMX immediate shifts: /2 logical right, /4 arithmetic right,
+            // /6 logical left. The immediate follows any ModRM addressing bytes.
+            ModRM m = decodeModRM(rip + opOff + 2, p, 1);
+            if (!m.isReg || (m.regField != 2 && m.regField != 4 && m.regField != 6) ||
+                (op2 == 0x73 && m.regField != 2 && m.regField != 6)) goto unhandled;
+            U8 count = fetchByte(rip + opOff + 2 + m.length);
+            U32 width = op2 == 0x71 ? 16 : op2 == 0x72 ? 32 : 64;
+            U64 mask = width == 64 ? ~0ULL : ((1ULL << width) - 1);
+            U64 value = fpu.getMMX(m.rmIndex & 7)->q;
+            U64 shifted = 0;
+            for (U32 lane = 0; lane < 64 / width; lane++) {
+                U64 element = (value >> (lane * width)) & mask;
+                U64 out = 0;
+                if (m.regField == 2) out = count >= width ? 0 : element >> count;
+                else if (m.regField == 6) out = count >= width ? 0 : (element << count) & mask;
+                else {
+                    S64 signedValue = width == 16 ? (S16)element : (S32)element;
+                    out = count >= width ? (signedValue < 0 ? mask : 0)
+                                         : ((U64)(signedValue >> count) & mask);
+                }
+                shifted |= out << (lane * width);
+            }
+            value = shifted;
+            fpu.startMMX();
+            fpu.getMMX(m.rmIndex & 7)->q = value;
+            U32 used = opOff + 2 + m.length + 1;
+            rip += used;
+            return used;
+        }
+
+        // The MMX packed integer arithmetic opcodes parallel the 128-bit
+        // SSE2 handlers below but operate on one 64-bit lane group.
+        bool mmxPacked = (op2 >= 0x60 && op2 <= 0x6B) ||
+                         (op2 >= 0x74 && op2 <= 0x76) ||
+                         (op2 >= 0xD1 && op2 <= 0xD5) ||
+                         (op2 >= 0xD8 && op2 <= 0xDF) ||
+                         (op2 >= 0xE0 && op2 <= 0xE5) ||
+                         (op2 >= 0xE8 && op2 <= 0xEF) ||
+                         (op2 >= 0xF1 && op2 <= 0xF6) ||
+                         (op2 >= 0xF8 && op2 <= 0xFE) ||
+                         op2 == 0xFC || op2 == 0xFD;
+        if (p.rep == 0 && !osize66 && mmxPacked) {
+            ModRM m = decodeModRM(rip + opOff + 2, p, 0);
+            U64 d = fpu.getMMX(m.regField & 7)->q;
+            U64 s = m.isReg ? fpu.getMMX(m.rmIndex & 7)->q : memory->readq(m.effAddr);
+            fpu.startMMX();
+            int bits = 0;
+            if (op2 == 0x60 || op2 == 0x64 || op2 == 0x74 || op2 == 0xD8 || op2 == 0xDA ||
+                op2 == 0xDC || op2 == 0xDE || op2 == 0xE0 || op2 == 0xE8 || op2 == 0xEC ||
+                op2 == 0xF8 || op2 == 0xFC) bits = 8;
+            else if (op2 == 0x61 || op2 == 0x63 || op2 == 0x65 || op2 == 0x67 || op2 == 0x68 ||
+                     op2 == 0x69 || op2 == 0x6B || op2 == 0x75 || op2 == 0xD1 || op2 == 0xD5 ||
+                     op2 == 0xD9 || op2 == 0xDD || op2 == 0xE3 || op2 == 0xE4 || op2 == 0xE5 ||
+                     op2 == 0xE9 || op2 == 0xEA || op2 == 0xED || op2 == 0xEE || op2 == 0xF1 ||
+                     op2 == 0xF5 || op2 == 0xFD || op2 == 0xE1 || op2 == 0xE9 ||
+                     op2 == 0xED || op2 == 0xF9) bits = 16;
+            else if (op2 == 0x62 || op2 == 0x66 || op2 == 0x6A || op2 == 0x76 || op2 == 0xD2 ||
+                     op2 == 0xE2 || op2 == 0xF2 || op2 == 0xFE || op2 == 0xFA) bits = 32;
+            else if (op2 == 0xD3 || op2 == 0xD4 || op2 == 0xF3 || op2 == 0xFB) bits = 64;
+            auto laneMask = [](int width) -> U64 { return width == 64 ? ~0ULL : ((1ULL << width) - 1); };
+            auto signedLane = [](U64 value, int width) -> S64 {
+                if (width == 8) return (S8)value;
+                if (width == 16) return (S16)value;
+                if (width == 32) return (S32)value;
+                return (S64)value;
+            };
+            auto mapLanes = [&](int width, auto fn) -> U64 {
+                U64 out = 0, mask = laneMask(width);
+                for (int i = 0; i < 64 / width; i++) {
+                    U64 a = (d >> (i * width)) & mask;
+                    U64 b = (s >> (i * width)) & mask;
+                    out |= (fn(a, b) & mask) << (i * width);
+                }
+                return out;
+            };
+            U64 result = d;
+            if (op2 >= 0x60 && op2 <= 0x62) {
+                int width = op2 == 0x60 ? 8 : op2 == 0x61 ? 16 : 32;
+                int lanes = 64 / width, half = lanes / 2;
+                result = 0;
+                for (int i = 0; i < half; i++) {
+                    U64 a = (d >> (i * width)) & laneMask(width);
+                    U64 b = (s >> (i * width)) & laneMask(width);
+                    result &= ~(laneMask(width) << ((i * 2) * width));
+                    result |= a << ((i * 2) * width);
+                    result |= b << ((i * 2 + 1) * width);
+                }
+            } else if (op2 >= 0x68 && op2 <= 0x6A) {
+                int width = op2 == 0x68 ? 8 : op2 == 0x69 ? 16 : 32;
+                int half = 32 / width;
+                result = 0;
+                for (int i = 0; i < half; i++) {
+                    U64 a = (d >> ((i + half) * width)) & laneMask(width);
+                    U64 b = (s >> ((i + half) * width)) & laneMask(width);
+                    result |= a << ((i * 2) * width);
+                    result |= b << ((i * 2 + 1) * width);
+                }
+            } else if (op2 == 0x63 || op2 == 0x67 || op2 == 0x6B) { // PACK*
+                result = 0;
+                int srcWidth = op2 == 0x6B ? 32 : 16;
+                int dstWidth = op2 == 0x6B ? 16 : 8;
+                U64 dstMask = laneMask(dstWidth);
+                int srcLanes = srcWidth == 32 ? 2 : 4;
+                for (int i = 0; i < srcLanes; i++) {
+                    S64 v = signedLane((d >> (i * srcWidth)) & laneMask(srcWidth), srcWidth);
+                    if (op2 == 0x67) v = std::max<S64>(0, std::min<S64>(255, v));
+                    else v = std::max<S64>(-(1LL << (dstWidth - 1)),
+                                            std::min<S64>((1LL << (dstWidth - 1)) - 1, v));
+                    result |= ((U64)v & dstMask) << (i * dstWidth);
+                }
+                for (int i = 0; i < srcLanes; i++) {
+                    S64 v = signedLane((s >> (i * srcWidth)) & laneMask(srcWidth), srcWidth);
+                    if (op2 == 0x67) v = std::max<S64>(0, std::min<S64>(255, v));
+                    else v = std::max<S64>(-(1LL << (dstWidth - 1)),
+                                            std::min<S64>((1LL << (dstWidth - 1)) - 1, v));
+                    result |= ((U64)v & dstMask) << ((i + (dstWidth == 16 ? 2 : 4)) * dstWidth);
+                }
+            } else if (op2 == 0x64 || op2 == 0x65 || op2 == 0x66) { // PCMPGT*
+                result = mapLanes(bits, [&](U64 a, U64 b) -> U64 {
+                    return signedLane(a, bits) > signedLane(b, bits) ? laneMask(bits) : 0;
+                });
+            } else if (op2 == 0x74 || op2 == 0x75 || op2 == 0x76) { // PCMPEQ*
+                result = mapLanes(bits, [&](U64 a, U64 b) -> U64 { return a == b ? laneMask(bits) : 0; });
+            } else if (op2 == 0xD1 || op2 == 0xD2 || op2 == 0xD3 ||
+                       op2 == 0xE1 || op2 == 0xE2 || op2 == 0xF1 || op2 == 0xF2 || op2 == 0xF3) {
+                U64 count = s;
+                bool left = op2 == 0xF1 || op2 == 0xF2 || op2 == 0xF3;
+                bool arithmetic = op2 == 0xE1 || op2 == 0xE2;
+                result = mapLanes(bits, [&](U64 a, U64) -> U64 {
+                    if (count >= (U64)bits) return arithmetic && signedLane(a, bits) < 0 ? laneMask(bits) : 0;
+                    if (left) return (a << count) & laneMask(bits);
+                    if (arithmetic) return (U64)(signedLane(a, bits) >> count) & laneMask(bits);
+                    return a >> count;
+                });
+            } else if (op2 == 0xD4 || op2 == 0xDB || op2 == 0xDF || op2 == 0xEB || op2 == 0xEF || op2 == 0xFB) {
+                if (op2 == 0xD4) result = d + s; // PADDQ
+                else if (op2 == 0xFB) result = d - s; // PSUBQ
+                else if (op2 == 0xDB) result = d & s;
+                else if (op2 == 0xDF) result = ~d & s;
+                else if (op2 == 0xEB) result = d | s;
+                else result = d ^ s;
+            } else if (op2 == 0xD5) { // PMULLW
+                result = mapLanes(16, [](U64 a, U64 b) -> U64 { return a * b; });
+            } else if (op2 == 0xF4) { // PMULUDQ
+                result = (U64)(U32)d * (U64)(U32)s;
+            } else if (op2 == 0xF5) { // PMADDWD
+                S64 a0 = (S16)d, a1 = (S16)(d >> 16);
+                S64 a2 = (S16)(d >> 32), a3 = (S16)(d >> 48);
+                S64 b0 = (S16)s, b1 = (S16)(s >> 16);
+                S64 b2 = (S16)(s >> 32), b3 = (S16)(s >> 48);
+                result = (U32)(a0*b0 + a1*b1) |
+                         ((U64)(U32)(a2*b2 + a3*b3) << 32);
+            } else if (op2 == 0xE4 || op2 == 0xE5) { // PMULHUW/HW
+                result = mapLanes(16, [&](U64 a, U64 b) -> U64 {
+                    S64 product = op2 == 0xE4 ? (S64)(U16)a * (U16)b : (S16)a * (S16)b;
+                    return (U64)product >> 16;
+                });
+            } else if (op2 == 0xF6) { // PSADBW
+                U32 sum = 0;
+                for (int i = 0; i < 8; i++) {
+                    int a = (U8)(d >> (i * 8)), b = (U8)(s >> (i * 8));
+                    sum += (U32)(a > b ? a - b : b - a);
+                }
+                result = sum;
+            } else if (op2 == 0xE0 || op2 == 0xE3) { // PAVG*
+                result = mapLanes(bits, [](U64 a, U64 b) -> U64 { return (a + b + 1) >> 1; });
+            } else if (op2 == 0xDA || op2 == 0xDE || op2 == 0xEA || op2 == 0xEE) { // PMIN/MAX*
+                bool isWord = op2 == 0xEA || op2 == 0xEE;
+                bool isMax = op2 == 0xDE || op2 == 0xEE;
+                result = mapLanes(isWord ? 16 : 8, [&](U64 a, U64 b) -> U64 {
+                    if (isWord) {
+                        S64 x = (S16)a, y = (S16)b;
+                        return isMax ? (x > y ? a : b) : (x < y ? a : b);
+                    }
+                    return isMax ? (a > b ? a : b) : (a < b ? a : b);
+                });
+            } else if (op2 == 0xD8 || op2 == 0xD9 || op2 == 0xDC || op2 == 0xDD ||
+                       op2 == 0xE8 || op2 == 0xE9 || op2 == 0xEC || op2 == 0xED) {
+                bool word = op2 == 0xD9 || op2 == 0xDD || op2 == 0xE9 || op2 == 0xED;
+                bool subtract = op2 == 0xD8 || op2 == 0xD9 || op2 == 0xE8 || op2 == 0xE9;
+                bool signedSat = op2 >= 0xE8;
+                int width = word ? 16 : 8;
+                result = mapLanes(width, [&](U64 a, U64 b) -> U64 {
+                    if (signedSat) {
+                        S64 x = signedLane(a, width), y = signedLane(b, width);
+                        S64 lo = -(1LL << (width - 1)), hi = (1LL << (width - 1)) - 1;
+                        S64 value = subtract ? x - y : x + y;
+                        return (U64)std::max(lo, std::min(hi, value));
+                    }
+                    U64 hi = laneMask(width);
+                    if (subtract) return a > b ? a - b : 0;
+                    U64 value = a + b;
+                    return value > hi ? hi : value;
+                });
+            } else if (op2 == 0xF8 || op2 == 0xF9 || op2 == 0xFA || op2 == 0xFC || op2 == 0xFD || op2 == 0xFE) {
+                bool subtract = op2 == 0xF8 || op2 == 0xF9 || op2 == 0xFA;
+                result = mapLanes(bits, [&](U64 a, U64 b) -> U64 { return subtract ? a - b : a + b; });
+            }
+            fpu.getMMX(m.regField & 7)->q = result;
+            U32 used = opOff + 2 + m.length;
+            rip += used;
+            return used;
+        }
+        if (op2 == 0x2B && p.rep == 0) {
+            // MOVNTPS / MOVNTPD are memory-only non-temporal 128-bit stores.
+            ModRM m = decodeModRM(rip + opOff + 2, p, 0);
+            if (m.isReg) goto unhandled;
+            memory->writeq(m.effAddr, xmm[m.regField].lo);
+            memory->writeq(m.effAddr + 8, xmm[m.regField].hi);
+            U32 used = opOff + 2 + m.length;
+            rip += used;
+            return used;
+        }
+        if (op2 == 0xF7 && osize66 && p.rep == 0) {
+            // MASKMOVDQU xmm1,xmm2: store selected data bytes to [RDI].
+            ModRM m = decodeModRM(rip + opOff + 2, p, 0);
+            if (!m.isReg) goto unhandled;
+            U64 data[2] = {xmm[m.regField].lo, xmm[m.regField].hi};
+            U64 mask[2] = {xmm[m.rmIndex].lo, xmm[m.rmIndex].hi};
+            U64 addr = reg[X64_RDI].u64;
+            for (U32 i = 0; i < 16; i++) {
+                U8 maskByte = (U8)(mask[i / 8] >> ((i % 8) * 8));
+                if (maskByte & 0x80)
+                    memory->writeb(addr + i, (U8)(data[i / 8] >> ((i % 8) * 8)));
+            }
+            U32 used = opOff + 2 + m.length;
+            rip += used;
+            return used;
+        }
         // MOVAPS/MOVAPD xmm, xmm/m128       — 0F 28 (load) / 0F 29 (store)
         // MOVUPS/MOVUPD                     — 0F 10/11
         // MOVDQA xmm, xmm/m128              — 66 0F 6F (load) / 66 0F 7F (store)
@@ -3103,6 +4150,66 @@ dsp_54:
             rip += used;
             return used;
         }
+        // Saturated packed byte/word add/sub — 66 0F D8/D9/DC/DD/E8/E9/EC/ED.
+        // Gecko's xul.dll uses PSUBUSB while laying out its first document.
+        if ((op2 == 0xD8 || op2 == 0xD9 || op2 == 0xDC || op2 == 0xDD ||
+             op2 == 0xE8 || op2 == 0xE9 || op2 == 0xEC || op2 == 0xED) && osize66) {
+            ModRM m = decodeModRM(rip + opOff + 2, p, 0);
+            U64 srcLo, srcHi;
+            if (m.isReg) {
+                srcLo = xmm[m.rmIndex].lo;
+                srcHi = xmm[m.rmIndex].hi;
+            } else {
+                srcLo = memory->readq(m.effAddr);
+                srcHi = memory->readq(m.effAddr + 8);
+            }
+            U64 dLo = xmm[m.regField].lo;
+            U64 dHi = xmm[m.regField].hi;
+            bool word = (op2 == 0xD9 || op2 == 0xDD || op2 == 0xE9 || op2 == 0xED);
+            bool sub = (op2 == 0xD8 || op2 == 0xD9 || op2 == 0xE8 || op2 == 0xE9);
+            bool sgn = (op2 == 0xE8 || op2 == 0xE9 || op2 == 0xEC || op2 == 0xED);
+            U64 oLo = 0, oHi = 0;
+            int lanes = word ? 4 : 8;
+            int width = word ? 16 : 8;
+            for (int i = 0; i < lanes; i++) {
+                U32 ua = (U32)((dLo >> (i*width)) & (word ? 0xFFFF : 0xFF));
+                U32 ub = (U32)((srcLo >> (i*width)) & (word ? 0xFFFF : 0xFF));
+                U32 uc = (U32)((dHi >> (i*width)) & (word ? 0xFFFF : 0xFF));
+                U32 ud = (U32)((srcHi >> (i*width)) & (word ? 0xFFFF : 0xFF));
+                U32 rLo, rHi;
+                if (sgn) {
+                    S32 a = word ? (S32)(S16)ua : (S32)(S8)ua;
+                    S32 b = word ? (S32)(S16)ub : (S32)(S8)ub;
+                    S32 c = word ? (S32)(S16)uc : (S32)(S8)uc;
+                    S32 d = word ? (S32)(S16)ud : (S32)(S8)ud;
+                    S32 maxV = word ? 32767 : 127;
+                    S32 minV = word ? -32768 : -128;
+                    S32 vLo = sub ? a - b : a + b;
+                    S32 vHi = sub ? c - d : c + d;
+                    if (vLo < minV) vLo = minV;
+                    if (vLo > maxV) vLo = maxV;
+                    if (vHi < minV) vHi = minV;
+                    if (vHi > maxV) vHi = maxV;
+                    rLo = (U32)(vLo & (word ? 0xFFFF : 0xFF));
+                    rHi = (U32)(vHi & (word ? 0xFFFF : 0xFF));
+                } else if (sub) {
+                    rLo = ua > ub ? ua - ub : 0;
+                    rHi = uc > ud ? uc - ud : 0;
+                } else {
+                    U32 vLo = ua + ub, vHi = uc + ud;
+                    U32 cap = word ? 0xFFFF : 0xFF;
+                    rLo = vLo > cap ? cap : vLo;
+                    rHi = vHi > cap ? cap : vHi;
+                }
+                oLo |= (U64)rLo << (i*width);
+                oHi |= (U64)rHi << (i*width);
+            }
+            xmm[m.regField].lo = oLo;
+            xmm[m.regField].hi = oHi;
+            U32 used = opOff + 2 + m.length;
+            rip += used;
+            return used;
+        }
         // PMINUB/PMAXUB — 66 0F DA/DE /r. Unsigned byte min/max across 16
         // lanes. Used by glibc's strlen/memchr fast paths.
         if ((op2 == 0xDA || op2 == 0xDE) && osize66) {
@@ -3253,6 +4360,64 @@ dsp_54:
             rip += used;
             return used;
         }
+        // PMADDWD — 66 0F F5 /r. Multiply signed word pairs and add each
+        // adjacent pair into a wrapping signed dword result.
+        if (op2 == 0xF5 && osize66) {
+            ModRM m = decodeModRM(rip + opOff + 2, p, 0);
+            U64 srcLo, srcHi;
+            if (m.isReg) {
+                srcLo = xmm[m.rmIndex].lo;
+                srcHi = xmm[m.rmIndex].hi;
+            } else {
+                srcLo = memory->readq(m.effAddr);
+                srcHi = memory->readq(m.effAddr + 8);
+            }
+            U64 dst[2] = {xmm[m.regField].lo, xmm[m.regField].hi};
+            U64 src[2] = {srcLo, srcHi};
+            U32 result[4];
+            for (int pair = 0; pair < 4; pair++) {
+                int half = pair / 2;
+                int lane = (pair % 2) * 2;
+                S16 a = (S16)(dst[half] >> (lane * 16));
+                S16 b = (S16)(dst[half] >> ((lane + 1) * 16));
+                S16 c = (S16)(src[half] >> (lane * 16));
+                S16 d = (S16)(src[half] >> ((lane + 1) * 16));
+                S64 sum = (S64)a * c + (S64)b * d;
+                result[pair] = (U32)sum;
+            }
+            xmm[m.regField].lo = (U64)result[0] | ((U64)result[1] << 32);
+            xmm[m.regField].hi = (U64)result[2] | ((U64)result[3] << 32);
+            U32 used = opOff + 2 + m.length;
+            rip += used;
+            return used;
+        }
+        // PAVGW — 66 0F E3 /r. Unsigned word average rounded toward +infinity.
+        if (op2 == 0xE3 && osize66) {
+            ModRM m = decodeModRM(rip + opOff + 2, p, 0);
+            U64 srcLo, srcHi;
+            if (m.isReg) {
+                srcLo = xmm[m.rmIndex].lo;
+                srcHi = xmm[m.rmIndex].hi;
+            } else {
+                srcLo = memory->readq(m.effAddr);
+                srcHi = memory->readq(m.effAddr + 8);
+            }
+            U64 dst[2] = {xmm[m.regField].lo, xmm[m.regField].hi};
+            U64 src[2] = {srcLo, srcHi};
+            for (int half = 0; half < 2; half++) {
+                U64 result = 0;
+                for (int lane = 0; lane < 4; lane++) {
+                    U32 a = (dst[half] >> (lane * 16)) & 0xFFFF;
+                    U32 b = (src[half] >> (lane * 16)) & 0xFFFF;
+                    result |= (U64)((a + b + 1) >> 1) << (lane * 16);
+                }
+                if (half == 0) xmm[m.regField].lo = result;
+                else xmm[m.regField].hi = result;
+            }
+            U32 used = opOff + 2 + m.length;
+            rip += used;
+            return used;
+        }
         // PMULUDQ — 66 0F F4 /r. Multiply unsigned dwords in lanes 0 and 2,
         // producing two 64-bit results.
         if (op2 == 0xF4 && osize66) {
@@ -3361,7 +4526,7 @@ dsp_54:
         // SHUFPD — 66 0F C6 /r ib. 2-qword shuffle: bit 0 picks dst lane,
         // bit 1 picks src lane.
         if (op2 == 0xC6) {
-            ModRM m = decodeModRM(rip + opOff + 2, p, 0);
+            ModRM m = decodeModRM(rip + opOff + 2, p, 1);
             U8 imm = fetchByte(rip + opOff + 2 + m.length);
             U64 srcLo, srcHi;
             if (m.isReg) {
@@ -3401,7 +4566,7 @@ dsp_54:
         // PEXTRW — 66 0F C5 /r ib. Extract one word from xmm[rmIndex] (imm8
         // & 7 selects the lane) into r32/r64.
         if (op2 == 0xC5 && osize66) {
-            ModRM m = decodeModRM(rip + opOff + 2, p, 0);
+            ModRM m = decodeModRM(rip + opOff + 2, p, 1);
             U8 imm = fetchByte(rip + opOff + 2 + m.length);
             if (m.isReg) {
                 int lane = imm & 7;
@@ -3416,7 +4581,7 @@ dsp_54:
         // PINSRW — 66 0F C4 /r ib. Insert low 16 of r32 (or m16) into xmm[reg]
         // at lane (imm8 & 7).
         if (op2 == 0xC4 && osize66) {
-            ModRM m = decodeModRM(rip + opOff + 2, p, 0);
+            ModRM m = decodeModRM(rip + opOff + 2, p, 1);
             U8 imm = fetchByte(rip + opOff + 2 + m.length);
             U16 v;
             if (m.isReg) v = (U16)reg[m.rmIndex].u32;
@@ -3613,6 +4778,13 @@ dsp_54:
         //   0F 01 F9   RDTSCP   — read TSC and processor ID
         if (op2 == 0x01) {
             U8 op3 = fetchByte(rip + opOff + 2);
+            if (op3 == 0xC8 || op3 == 0xC9) {
+                // MONITOR/MWAIT are user-mode hints with no modeled monitor
+                // state; MWAIT follows PAUSE's harmless no-op behavior here.
+                U32 used = opOff + 3;
+                rip += used;
+                return used;
+            }
             if (op3 == 0xD0) {
                 // XGETBV: glibc calls it via __get_cpu_features to decide
                 // which XMM state is enabled. We advertise legacy XSAVE
@@ -3645,8 +4817,10 @@ dsp_54:
             // Fall through to default panic for unimplemented 0F 01 .. forms.
         }
 
-        // PREFETCH* — 0F 18 /reg. Treated as a no-op (hint only).
-        if (op2 == 0x18) {
+        // PREFETCH* (0F 18) and AMD PREFETCH/PREFETCHW (0F 0D).
+        // Cache hints only: decode the full address but do not read memory.
+        // Unity's player emits PREFETCHW [rbx+0x14] during startup.
+        if (op2 == 0x18 || op2 == 0x0D) {
             ModRM m = decodeModRM(rip + opOff + 2, p, 0);
             U32 used = opOff + 2 + m.length;
             rip += used;
@@ -3672,8 +4846,314 @@ dsp_54:
         //   Concatenate dest:src into a 32-byte temp, then right-shift it
         //   by imm8 bytes, take the low 16 bytes. Used by some glibc
         //   memcpy variants and Wine's CRT.
+        if ((op2 == 0x38 || op2 == 0x3A) && p.rep == 0 && !osize66) {
+            U8 op3 = fetchByte(rip + opOff + 2);
+            bool palignr = op2 == 0x3A && op3 == 0x0F;
+            bool packed = op2 == 0x38 &&
+                (op3 == 0x00 || (op3 >= 0x01 && op3 <= 0x0B) ||
+                 (op3 >= 0x1C && op3 <= 0x1E));
+            if (palignr || packed) {
+                ModRM m = decodeModRM(rip + opOff + 3, p, palignr ? 1 : 0);
+                U64 d = fpu.getMMX(m.regField & 7)->q;
+                U64 s = m.isReg ? fpu.getMMX(m.rmIndex & 7)->q : memory->readq(m.effAddr);
+                U64 result = 0;
+                if (palignr) {
+                    U8 imm = fetchByte(rip + opOff + 3 + m.length);
+                    if (imm < 16) {
+                        for (U32 i = 0; i < 8; i++) {
+                            U32 idx = imm + i;
+                            U8 value = idx < 8 ? (U8)(s >> (idx * 8))
+                                     : idx < 16 ? (U8)(d >> ((idx - 8) * 8)) : 0;
+                            result |= (U64)value << (i * 8);
+                        }
+                    }
+                } else {
+                    U8 db[8], sb[8], out[8] = {};
+                    for (U32 i = 0; i < 8; i++) {
+                        db[i] = (U8)(d >> (i * 8));
+                        sb[i] = (U8)(s >> (i * 8));
+                    }
+                    auto sat16 = [](S64 x) -> U16 {
+                        if (x < -32768) x = -32768;
+                        if (x > 32767) x = 32767;
+                        return (U16)x;
+                    };
+                    if (op3 == 0x00) { // PSHUFB
+                        for (U32 i = 0; i < 8; i++)
+                            out[i] = (sb[i] & 0x80) ? 0 : db[sb[i] & 7];
+                    } else if (op3 == 0x1C) { // PABSB
+                        for (U32 i = 0; i < 8; i++) {
+                            S32 x = (S8)sb[i]; out[i] = (U8)(x < 0 ? -x : x);
+                        }
+                    } else if (op3 == 0x1D) { // PABSW
+                        for (U32 i = 0; i < 4; i++) {
+                            S32 x = (S16)(U16)(s >> (i * 16));
+                            U16 v = (U16)(x < 0 ? -x : x);
+                            result |= (U64)v << (i * 16);
+                        }
+                    } else if (op3 == 0x1E) { // PABSD
+                        for (U32 i = 0; i < 2; i++) {
+                            S64 x = (S32)(U32)(s >> (i * 32));
+                            U32 v = (U32)(x < 0 ? -x : x);
+                            result |= (U64)v << (i * 32);
+                        }
+                    } else if (op3 == 0x01 || op3 == 0x03 || op3 == 0x05 || op3 == 0x07) {
+                        U16 r[4] = {};
+                        for (U32 pair = 0; pair < 2; pair++) {
+                            S64 da = (S16)(U16)(d >> (pair * 32));
+                            S64 dbb = (S16)(U16)(d >> (pair * 32 + 16));
+                            S64 sa = (S16)(U16)(s >> (pair * 32));
+                            S64 sbb = (S16)(U16)(s >> (pair * 32 + 16));
+                            if (op3 == 0x01) {
+                                r[pair] = (U16)((U16)da + (U16)dbb);
+                                r[pair + 2] = (U16)((U16)sa + (U16)sbb);
+                            } else if (op3 == 0x03) {
+                                r[pair] = sat16(da + dbb); r[pair + 2] = sat16(sa + sbb);
+                            } else if (op3 == 0x05) {
+                                r[pair] = (U16)((U16)da - (U16)dbb);
+                                r[pair + 2] = (U16)((U16)sa - (U16)sbb);
+                            } else {
+                                r[pair] = sat16(da - dbb); r[pair + 2] = sat16(sa - sbb);
+                            }
+                        }
+                        for (U32 i = 0; i < 4; i++) result |= (U64)r[i] << (i * 16);
+                    } else if (op3 == 0x02 || op3 == 0x06) {
+                        U32 d0 = (U32)d, d1 = (U32)(d >> 32);
+                        U32 s0 = (U32)s, s1 = (U32)(s >> 32);
+                        U32 lo = op3 == 0x02 ? d0 + d1 : d0 - d1;
+                        U32 hi = op3 == 0x02 ? s0 + s1 : s0 - s1;
+                        result = (U64)lo | ((U64)hi << 32);
+                    } else if (op3 == 0x04) { // PMADDUBSW
+                        for (U32 i = 0; i < 4; i++) {
+                            S64 sum = (S64)db[i * 2] * (S8)sb[i * 2] +
+                                      (S64)db[i * 2 + 1] * (S8)sb[i * 2 + 1];
+                            result |= (U64)sat16(sum) << (i * 16);
+                        }
+                    } else if (op3 == 0x08) { // PSIGNB
+                        for (U32 i = 0; i < 8; i++) {
+                            S64 x = (S8)db[i], sign = (S8)sb[i];
+                            out[i] = (U8)(sign < 0 ? -x : sign == 0 ? 0 : x);
+                        }
+                    } else if (op3 == 0x09 || op3 == 0x0B) { // PSIGNW / PMULHRSW
+                        for (U32 i = 0; i < 4; i++) {
+                            S64 a = (S16)(U16)(d >> (i * 16));
+                            S64 b = (S16)(U16)(s >> (i * 16));
+                            U16 value;
+                            if (op3 == 0x09) value = (U16)(b < 0 ? -a : b == 0 ? 0 : a);
+                            else value = (U16)(((a * b + 0x4000) >> 15));
+                            result |= (U64)value << (i * 16);
+                        }
+                    } else if (op3 == 0x0A) { // PSIGND
+                        for (U32 i = 0; i < 2; i++) {
+                            S64 a = (S32)(U32)(d >> (i * 32));
+                            S64 b = (S32)(U32)(s >> (i * 32));
+                            result |= (U64)(U32)(b < 0 ? -a : b == 0 ? 0 : a) << (i * 32);
+                        }
+                    }
+                    if (op3 == 0x00 || op3 == 0x08 || op3 == 0x1C) {
+                        for (U32 i = 0; i < 8; i++) result |= (U64)out[i] << (i * 8);
+                    }
+                }
+                fpu.startMMX();
+                fpu.getMMX(m.regField & 7)->q = result;
+                U32 used = opOff + 3 + m.length + (palignr ? 1 : 0);
+                rip += used;
+                return used;
+            }
+        }
+
+        if (p.rep == 0xF2 && op2 == 0x38) {
+            U8 op3 = fetchByte(rip + opOff + 2);
+            if (op3 == 0xF0 || op3 == 0xF1) { // CRC32 r32/r64, r/m8/16/32/64
+                ModRM m = decodeModRM(rip + opOff + 3, p, 0);
+                U32 sourceBytes = op3 == 0xF0 ? 1 : rexW ? 8 : osize66 ? 2 : 4;
+                U64 source = loadRM(m, sourceBytes, rexPresent);
+                U32 crc = cpu64Crc32c(reg[m.regField].u32, source, sourceBytes);
+                if (rexW) reg[m.regField].setU64(crc);
+                else      reg[m.regField].setU32(crc);
+                U32 used = opOff + 3 + m.length;
+                rip += used;
+                return used;
+            }
+        }
+
+        if (osize66 && p.rep == 0 && op2 == 0x38 &&
+            fetchByte(rip + opOff + 2) == 0x37) { // PCMPGTQ
+            ModRM m = decodeModRM(rip + opOff + 3, p, 0);
+            U64 sourceLo, sourceHi;
+            if (m.isReg) {
+                sourceLo = xmm[m.rmIndex].lo;
+                sourceHi = xmm[m.rmIndex].hi;
+            } else {
+                sourceLo = memory->readq(m.effAddr);
+                sourceHi = memory->readq(m.effAddr + 8);
+            }
+            U64 destLo = xmm[m.regField].lo;
+            U64 destHi = xmm[m.regField].hi;
+            xmm[m.regField].lo = (S64)destLo > (S64)sourceLo ? ~0ULL : 0;
+            xmm[m.regField].hi = (S64)destHi > (S64)sourceHi ? ~0ULL : 0;
+            U32 used = opOff + 3 + m.length;
+            rip += used;
+            return used;
+        }
+
+        if (osize66 && p.rep == 0 && op2 == 0x3A) {
+            U8 op3 = fetchByte(rip + opOff + 2);
+            if (op3 >= 0x60 && op3 <= 0x63) {
+                ModRM m = decodeModRM(rip + opOff + 3, p, 1);
+                U8 control = fetchByte(rip + opOff + 3 + m.length);
+                U64 firstLo = xmm[m.regField].lo, firstHi = xmm[m.regField].hi;
+                U64 secondLo, secondHi;
+                if (m.isReg) {
+                    secondLo = xmm[m.rmIndex].lo;
+                    secondHi = xmm[m.rmIndex].hi;
+                } else {
+                    secondLo = memory->readq(m.effAddr);
+                    secondHi = memory->readq(m.effAddr + 8);
+                }
+                bool explicitLength = op3 == 0x60 || op3 == 0x61;
+                S64 length1 = rexW ? (S64)reg[X64_RAX].u64
+                                  : (S64)(S32)reg[X64_RAX].u32;
+                S64 length2 = rexW ? (S64)reg[X64_RDX].u64
+                                  : (S64)(S32)reg[X64_RDX].u32;
+                CPU64PackedStringResult result = cpu64ComparePackedStrings(
+                    firstLo, firstHi, secondLo, secondHi, control,
+                    explicitLength, length1, length2);
+                U32 count = (control & 1) ? 8 : 16;
+                U32 flags = (result.mask ? X64_CF : 0) |
+                            (result.length2 < count ? X64_ZF : 0) |
+                            (result.length1 < count ? X64_SF : 0) |
+                            ((result.mask & 1) ? X64_OF : 0);
+                rflags &= ~(X64_CF | X64_ZF | X64_SF | X64_OF | X64_AF | X64_PF);
+                rflags |= flags;
+
+                if (op3 == 0x60 || op3 == 0x62) { // PCMPESTRM / PCMPISTRM
+                    U64 outLo = 0, outHi = 0;
+                    if (control & 0x40) {
+                        U32 bits = (control & 1) ? 16 : 8;
+                        U32 lanes = 128 / bits;
+                        for (U32 i = 0; i < lanes; i++) {
+                            U32 value = (result.mask & (1U << i))
+                                ? (bits == 8 ? 0xFFU : 0xFFFFU) : 0;
+                            if (bits == 8) {
+                                if (i < 8) outLo |= (U64)value << (i * 8);
+                                else       outHi |= (U64)value << ((i - 8) * 8);
+                            } else {
+                                if (i < 4) outLo |= (U64)value << (i * 16);
+                                else       outHi |= (U64)value << ((i - 4) * 16);
+                            }
+                        }
+                    } else {
+                        outLo = result.mask;
+                    }
+                    xmm[0].lo = outLo;
+                    xmm[0].hi = outHi;
+                } else { // PCMPESTRI / PCMPISTRI
+                    S32 index = (S32)count;
+                    if (control & 0x40) {
+                        for (S32 i = (S32)count - 1; i >= 0; i--) {
+                            if (result.mask & (1U << i)) { index = i; break; }
+                        }
+                    } else {
+                        for (U32 i = 0; i < count; i++) {
+                            if (result.mask & (1U << i)) { index = (S32)i; break; }
+                        }
+                    }
+                    reg[X64_RCX].setU32((U32)index);
+                }
+                U32 used = opOff + 3 + m.length + 1;
+                rip += used;
+                return used;
+            }
+        }
+
         if ((op2 == 0x38 || op2 == 0x3A) && osize66) {
             U8 op3 = fetchByte(rip + opOff + 2);
+            if (op2 == 0x38 && (op3 == 0x03 || op3 == 0x04 ||
+                                op3 == 0x05 || op3 == 0x06 ||
+                                op3 == 0x07 || op3 == 0x0B)) {
+                // Remaining SSSE3 horizontal, mixed multiply, and rounded
+                // high-word multiply operations.
+                ModRM m = decodeModRM(rip + opOff + 3, p, 0);
+                U64 sLo, sHi;
+                if (m.isReg) {
+                    sLo = xmm[m.rmIndex].lo; sHi = xmm[m.rmIndex].hi;
+                } else {
+                    sLo = memory->readq(m.effAddr);
+                    sHi = memory->readq(m.effAddr + 8);
+                }
+                U8 d[16], s[16], out[16] = {};
+                for (U32 i = 0; i < 8; i++) {
+                    d[i] = (U8)(xmm[m.regField].lo >> (i * 8));
+                    d[i + 8] = (U8)(xmm[m.regField].hi >> (i * 8));
+                    s[i] = (U8)(sLo >> (i * 8));
+                    s[i + 8] = (U8)(sHi >> (i * 8));
+                }
+                auto sat16 = [](S64 x) -> U16 {
+                    if (x < -32768) x = -32768;
+                    if (x > 32767) x = 32767;
+                    return (U16)x;
+                };
+                if (op3 == 0x03 || op3 == 0x05 || op3 == 0x07) {
+                    for (U32 side = 0; side < 2; side++) {
+                        const U8* in = side == 0 ? d : s;
+                        for (U32 pair = 0; pair < 4; pair++) {
+                            S64 a = (S16)(U16)(in[pair * 4] | ((U16)in[pair * 4 + 1] << 8));
+                            S64 b = (S16)(U16)(in[pair * 4 + 2] | ((U16)in[pair * 4 + 3] << 8));
+                            S64 value = op3 == 0x03 ? a + b : a - b;
+                            U16 packed = (op3 == 0x03 || op3 == 0x07)
+                                ? sat16(value) : (U16)value;
+                            U32 lane = side * 4 + pair;
+                            out[lane * 2] = (U8)packed;
+                            out[lane * 2 + 1] = (U8)(packed >> 8);
+                        }
+                    }
+                } else if (op3 == 0x06) { // PHSUBD
+                    for (U32 side = 0; side < 2; side++) {
+                        const U8* in = side == 0 ? d : s;
+                        for (U32 pair = 0; pair < 2; pair++) {
+                            U32 a = (U32)in[pair * 8] |
+                                    ((U32)in[pair * 8 + 1] << 8) |
+                                    ((U32)in[pair * 8 + 2] << 16) |
+                                    ((U32)in[pair * 8 + 3] << 24);
+                            U32 b = (U32)in[pair * 8 + 4] |
+                                    ((U32)in[pair * 8 + 5] << 8) |
+                                    ((U32)in[pair * 8 + 6] << 16) |
+                                    ((U32)in[pair * 8 + 7] << 24);
+                            U32 value = a - b;
+                            U32 lane = side * 2 + pair;
+                            for (U32 byte = 0; byte < 4; byte++)
+                                out[lane * 4 + byte] = (U8)(value >> (byte * 8));
+                        }
+                    }
+                } else if (op3 == 0x04) { // PMADDUBSW
+                    for (U32 i = 0; i < 8; i++) {
+                        S64 value = (S64)d[i * 2] * (S8)s[i * 2] +
+                                    (S64)d[i * 2 + 1] * (S8)s[i * 2 + 1];
+                        U16 packed = sat16(value);
+                        out[i * 2] = (U8)packed;
+                        out[i * 2 + 1] = (U8)(packed >> 8);
+                    }
+                } else { // PMULHRSW
+                    for (U32 i = 0; i < 8; i++) {
+                        S64 a = (S16)(U16)(d[i * 2] | ((U16)d[i * 2 + 1] << 8));
+                        S64 b = (S16)(U16)(s[i * 2] | ((U16)s[i * 2 + 1] << 8));
+                        U16 packed = (U16)((a * b + 0x4000) >> 15);
+                        out[i * 2] = (U8)packed;
+                        out[i * 2 + 1] = (U8)(packed >> 8);
+                    }
+                }
+                U64 nLo = 0, nHi = 0;
+                for (U32 i = 0; i < 8; i++) {
+                    nLo |= (U64)out[i] << (i * 8);
+                    nHi |= (U64)out[i + 8] << (i * 8);
+                }
+                xmm[m.regField].lo = nLo;
+                xmm[m.regField].hi = nHi;
+                U32 used = opOff + 3 + m.length;
+                rip += used;
+                return used;
+            }
             if (op2 == 0x38 && op3 == 0x00) {
                 // PSHUFB
                 ModRM m = decodeModRM(rip + opOff + 3, p, 0);
@@ -3834,19 +5314,21 @@ dsp_54:
 
                 U64 nLo = 0, nHi = 0;
                 if (op3 == 0x1C) {            // PABSB
-                    S8 d[16]; unpackB(dLo, dHi, d);
+                    S8 d[16]; unpackB(sLo, sHi, d);
                     S8 r[16];
                     for (int i = 0; i < 16; i++) r[i] = (S8)(d[i] < 0 ? -d[i] : d[i]);
                     packB(r, nLo, nHi);
                 } else if (op3 == 0x1D) {     // PABSW
-                    S16 d[8]; unpackW(dLo, dHi, d);
+                    S16 d[8]; unpackW(sLo, sHi, d);
                     S16 r[8];
                     for (int i = 0; i < 8; i++) r[i] = (S16)(d[i] < 0 ? -d[i] : d[i]);
                     packW(r, nLo, nHi);
                 } else if (op3 == 0x1E) {     // PABSD
-                    S32 d[4]; unpackD(dLo, dHi, d);
+                    S32 d[4]; unpackD(sLo, sHi, d);
                     S32 r[4];
-                    for (int i = 0; i < 4; i++) r[i] = (d[i] < 0 ? -d[i] : d[i]);
+                    for (int i = 0; i < 4; i++) {
+                        S64 x = d[i]; r[i] = (S32)(x < 0 ? -x : x);
+                    }
                     packD(r, nLo, nHi);
                 } else if (op3 == 0x01) {     // PHADDW
                     S16 d[8], s[8]; unpackW(dLo, dHi, d); unpackW(sLo, sHi, s);
@@ -3858,10 +5340,11 @@ dsp_54:
                     packW(r, nLo, nHi);
                 } else if (op3 == 0x02) {     // PHADDD
                     S32 d[4], s[4]; unpackD(dLo, dHi, d); unpackD(sLo, sHi, s);
-                    S32 r[4];
-                    r[0]=d[0]+d[1]; r[1]=d[2]+d[3];
-                    r[2]=s[0]+s[1]; r[3]=s[2]+s[3];
-                    packD(r, nLo, nHi);
+                    U32 r[4];
+                    r[0]=(U32)d[0]+(U32)d[1]; r[1]=(U32)d[2]+(U32)d[3];
+                    r[2]=(U32)s[0]+(U32)s[1]; r[3]=(U32)s[2]+(U32)s[3];
+                    nLo = (U64)r[0] | ((U64)r[1] << 32);
+                    nHi = (U64)r[2] | ((U64)r[3] << 32);
                 } else if (op3 == 0x08) {     // PSIGNB
                     S8 d[16], s[16]; unpackB(dLo, dHi, d); unpackB(sLo, sHi, s);
                     S8 r[16];
@@ -3877,8 +5360,10 @@ dsp_54:
                 } else {                       // PSIGND (0x0A)
                     S32 d[4], s[4]; unpackD(dLo, dHi, d); unpackD(sLo, sHi, s);
                     S32 r[4];
-                    for (int i = 0; i < 4; i++)
-                        r[i] = (s[i] < 0 ? -d[i] : (s[i] == 0 ? 0 : d[i]));
+                    for (int i = 0; i < 4; i++) {
+                        S64 x = d[i];
+                        r[i] = (S32)(s[i] < 0 ? -x : (s[i] == 0 ? 0 : x));
+                    }
                     packD(r, nLo, nHi);
                 }
                 xmm[m.regField].lo = nLo;
@@ -4046,7 +5531,16 @@ dsp_54:
                     case 0x59: r[i] = a[i] * b[i]; break;
                     case 0x5C: r[i] = a[i] - b[i]; break;
                     case 0x5E: r[i] = a[i] / b[i]; break;
-                    case 0x51: r[i] = std::sqrt(b[i]); break;
+                    case 0x51: {
+                        U32 bits = fu32(b[i]);
+                        // Negative (sign bit set) and not -0.0 (0x80000000):
+                        // x86 returns the indefinite QNaN 0xFFC00000.
+                        if ((bits & 0x80000000U) != 0 && bits != 0x80000000U)
+                            r[i] = u32f(0xFFC00000U);
+                        else
+                            r[i] = std::sqrt(b[i]);
+                        break;
+                    }
                     case 0x5D: r[i] = (a[i] < b[i]) ? a[i] : b[i]; break;
                     case 0x5F: r[i] = (a[i] > b[i]) ? a[i] : b[i]; break;
                     default:   r[i] = a[i]; break;
@@ -4102,6 +5596,50 @@ dsp_54:
                 xmm[m.regField].lo = (U64)fu32(r[0]) | ((U64)fu32(r[1]) << 32);
                 xmm[m.regField].hi = (U64)fu32(r[2]) | ((U64)fu32(r[3]) << 32);
             }
+            U32 used = opOff + 2 + m.length;
+            rip += used;
+            return used;
+        }
+
+        // SSE3 ADDSUBPS/ADDSUBPD alternate subtract and add by element index.
+        // F2 0F D0 performs PS (subtract even lanes, add odd); 66 0F D0 does
+        // the same over the two packed doubles.
+        if (op2 == 0xD0 && (p.rep == 0xF2 || osize66)) {
+            ModRM m = decodeModRM(rip + opOff + 2, p, 0);
+            U64 srcLo, srcHi;
+            if (m.isReg) { srcLo = xmm[m.rmIndex].lo; srcHi = xmm[m.rmIndex].hi; }
+            else { srcLo = memory->readq(m.effAddr); srcHi = memory->readq(m.effAddr + 8); }
+            if (osize66) {
+                double d0 = u64ToDouble(xmm[m.regField].lo);
+                double d1 = u64ToDouble(xmm[m.regField].hi);
+                double s0 = u64ToDouble(srcLo);
+                double s1 = u64ToDouble(srcHi);
+                xmm[m.regField].lo = doubleToU64(d0 - s0);
+                xmm[m.regField].hi = doubleToU64(d1 + s1);
+            } else {
+                auto u32f = [](U32 b) { float f; std::memcpy(&f, &b, 4); return f; };
+                auto fu32 = [](float f) { U32 b; std::memcpy(&b, &f, 4); return b; };
+                U32 dst[4] = {(U32)xmm[m.regField].lo, (U32)(xmm[m.regField].lo >> 32),
+                              (U32)xmm[m.regField].hi, (U32)(xmm[m.regField].hi >> 32)};
+                U32 src[4] = {(U32)srcLo, (U32)(srcLo >> 32), (U32)srcHi, (U32)(srcHi >> 32)};
+                U32 out[4];
+                for (int lane = 0; lane < 4; lane++) {
+                    float a = u32f(dst[lane]), b = u32f(src[lane]);
+                    out[lane] = fu32((lane & 1) ? a + b : a - b);
+                }
+                xmm[m.regField].lo = (U64)out[0] | ((U64)out[1] << 32);
+                xmm[m.regField].hi = (U64)out[2] | ((U64)out[3] << 32);
+            }
+            U32 used = opOff + 2 + m.length;
+            rip += used;
+            return used;
+        }
+
+        if (p.rep == 0xF2 && op2 == 0xF0) { // LDDQU xmm,m128
+            ModRM m = decodeModRM(rip + opOff + 2, p, 0);
+            if (m.isReg) goto unhandled;
+            xmm[m.regField].lo = memory->readq(m.effAddr);
+            xmm[m.regField].hi = memory->readq(m.effAddr + 8);
             U32 used = opOff + 2 + m.length;
             rip += used;
             return used;
@@ -4179,6 +5717,304 @@ dsp_54:
             }
         }
 
+        // ---- Remaining SSE4.1 0F38 packed integer operations ----
+        if (osize66 && p.rep == 0 && op2 == 0x38) {
+            U8 op3b = fetchByte(rip + opOff + 2);
+            const bool supported = op3b == 0x10 || op3b == 0x14 || op3b == 0x15 ||
+                (op3b >= 0x20 && op3b <= 0x25) || op3b == 0x28 ||
+                op3b == 0x2A || op3b == 0x2B ||
+                (op3b >= 0x30 && op3b <= 0x35) || op3b == 0x3A ||
+                op3b == 0x3B || op3b == 0x3E || op3b == 0x3F || op3b == 0x41;
+            if (supported) {
+                ModRM m = decodeModRM(rip + opOff + 3, p, 0);
+                U32 sourceBytes = 16;
+                if (op3b >= 0x20 && op3b <= 0x25) {
+                    const U8 sizes[] = {8,4,2,8,4,8}; sourceBytes=sizes[op3b-0x20];
+                } else if (op3b >= 0x30 && op3b <= 0x35) {
+                    const U8 sizes[] = {8,4,2,8,4,8}; sourceBytes=sizes[op3b-0x30];
+                }
+                U64 sLo = 0, sHi = 0;
+                if (m.isReg) { sLo=xmm[m.rmIndex].lo; sHi=xmm[m.rmIndex].hi; }
+                else if (sourceBytes==16) { sLo=memory->readq(m.effAddr); sHi=memory->readq(m.effAddr+8); }
+                else if (sourceBytes==8) sLo=memory->readq(m.effAddr);
+                else if (sourceBytes==4) sLo=memory->readd(m.effAddr);
+                else if (sourceBytes==2) sLo=memory->readw(m.effAddr);
+                U64 dLo = xmm[m.regField].lo, dHi = xmm[m.regField].hi;
+                U64 nLo = 0, nHi = 0;
+                auto byteAt = [](U64 lo, U64 hi, U32 index) -> U8 {
+                    return index < 8 ? (U8)(lo >> (index * 8))
+                                     : (U8)(hi >> ((index - 8) * 8));
+                };
+                if (op3b == 0x10 || op3b == 0x14 || op3b == 0x15) {
+                    // PBLENDVB / BLENDVPS / BLENDVPD select from SRC when
+                    // the corresponding implicit XMM0 sign bit is set.
+                    U64 maskLo = xmm[0].lo, maskHi = xmm[0].hi;
+                    U8 out[16];
+                    if (op3b == 0x10) {
+                        for (U32 i = 0; i < 16; i++)
+                            out[i] = (byteAt(maskLo,maskHi,i) & 0x80)
+                                ? byteAt(sLo,sHi,i) : byteAt(dLo,dHi,i);
+                    } else if (op3b == 0x14) {
+                        for (U32 lane = 0; lane < 4; lane++) {
+                            U32 dv = (U32)(lane < 2 ? dLo >> (lane*32) : dHi >> ((lane-2)*32));
+                            U32 sv = (U32)(lane < 2 ? sLo >> (lane*32) : sHi >> ((lane-2)*32));
+                            U32 mv = (U32)(lane < 2 ? maskLo >> (lane*32) : maskHi >> ((lane-2)*32));
+                            U32 v = (mv & 0x80000000U) ? sv : dv;
+                            for (U32 b = 0; b < 4; b++) out[lane*4+b] = (U8)(v >> (b*8));
+                        }
+                    } else {
+                        for (U32 lane = 0; lane < 2; lane++) {
+                            U64 dv = lane ? dHi : dLo, sv = lane ? sHi : sLo;
+                            U64 mv = lane ? maskHi : maskLo;
+                            U64 v = (mv >> 63) ? sv : dv;
+                            for (U32 b = 0; b < 8; b++) out[lane*8+b] = (U8)(v >> (b*8));
+                        }
+                    }
+                    for (U32 i = 0; i < 8; i++) {
+                        nLo |= (U64)out[i] << (i*8);
+                        nHi |= (U64)out[i+8] << (i*8);
+                    }
+                } else if (op3b >= 0x20 && op3b <= 0x25) {
+                    // PMOVSX{BW,BD,BQ,WD,WQ,DQ}
+                    U32 srcBits, dstBits;
+                    switch (op3b) {
+                        case 0x20: srcBits=8; dstBits=16; break;
+                        case 0x21: srcBits=8; dstBits=32; break;
+                        case 0x22: srcBits=8; dstBits=64; break;
+                        case 0x23: srcBits=16; dstBits=32; break;
+                        case 0x24: srcBits=16; dstBits=64; break;
+                        default:   srcBits=32; dstBits=64; break;
+                    }
+                    U32 lanes = 128 / dstBits;
+                    U64 src = sLo;
+                    U64 outs[2] = {};
+                    for (U32 i = 0; i < lanes; i++) {
+                        U64 raw = (src >> (i * srcBits)) & ((1ULL << srcBits) - 1);
+                        S64 value = srcBits == 8 ? (S8)raw : srcBits == 16 ? (S16)raw : (S32)raw;
+                        U32 bit = i * dstBits;
+                        U64 encoded = (U64)value;
+                        if (dstBits < 64) encoded &= (1ULL << dstBits) - 1;
+                        outs[bit / 64] |= encoded << (bit & 63);
+                    }
+                    nLo=outs[0]; nHi=outs[1];
+                } else if (op3b >= 0x30 && op3b <= 0x35) {
+                    // PMOVZX{BW,BD,BQ,WD,WQ,DQ}
+                    U32 srcBits, dstBits;
+                    switch (op3b) {
+                        case 0x30: srcBits=8; dstBits=16; break;
+                        case 0x31: srcBits=8; dstBits=32; break;
+                        case 0x32: srcBits=8; dstBits=64; break;
+                        case 0x33: srcBits=16; dstBits=32; break;
+                        case 0x34: srcBits=16; dstBits=64; break;
+                        default:   srcBits=32; dstBits=64; break;
+                    }
+                    U32 lanes = 128 / dstBits;
+                    U64 src = sLo;
+                    U64 outs[2] = {};
+                    for (U32 i = 0; i < lanes; i++) {
+                        U64 value = (src >> (i * srcBits)) & ((1ULL << srcBits) - 1);
+                        U32 bit = i * dstBits;
+                        outs[bit / 64] |= value << (bit & 63);
+                    }
+                    nLo=outs[0]; nHi=outs[1];
+                } else if (op3b == 0x28) { // PMULDQ: signed dword lanes 0 and 2
+                    S64 p0 = (S64)(S32)(U32)dLo * (S32)(U32)sLo;
+                    S64 p1 = (S64)(S32)(U32)(dHi) * (S32)(U32)(sHi);
+                    nLo=(U64)p0; nHi=(U64)p1;
+                } else if (op3b == 0x2A) { // MOVNTDQA m128
+                    if (m.isReg) goto unhandled;
+                    nLo=sLo; nHi=sHi;
+                } else if (op3b == 0x2B) { // PACKUSDW
+                    U16 words[8];
+                    for (U32 i=0;i<8;i++) {
+                        U64 bits = i < 2 ? dLo >> (i*32) :
+                                   i < 4 ? dHi >> ((i-2)*32) :
+                                   i < 6 ? sLo >> ((i-4)*32) : sHi >> ((i-6)*32);
+                        S64 value=(S32)(U32)bits;
+                        words[i]=(U16)(value < 0 ? 0 : value > 65535 ? 65535 : value);
+                    }
+                    for (U32 i=0;i<4;i++) nLo|=(U64)words[i]<<(i*16);
+                    for (U32 i=0;i<4;i++) nHi|=(U64)words[i+4]<<(i*16);
+                } else if (op3b == 0x3A || op3b == 0x3B || op3b == 0x3E || op3b == 0x3F) {
+                    // Unsigned word/dword min/max.
+                    U32 bits = (op3b == 0x3A || op3b == 0x3E) ? 16 : 32;
+                    U32 lanes = 128 / bits;
+                    for (U32 i=0;i<lanes;i++) {
+                        U64 mask = bits == 16 ? 0xFFFFULL : 0xFFFFFFFFULL;
+                        U64 dv = (i < 64/bits ? dLo : dHi) >> ((i%(64/bits))*bits) & mask;
+                        U64 sv = (i < 64/bits ? sLo : sHi) >> ((i%(64/bits))*bits) & mask;
+                        bool isMin = op3b == 0x3A || op3b == 0x3B;
+                        U64 value = isMin ? (dv < sv ? dv : sv) : (dv > sv ? dv : sv);
+                        U32 bit=i*bits;
+                        if (bit < 64) nLo |= value << bit; else nHi |= value << (bit-64);
+                    }
+                } else { // PHMINPOSUW
+                    U16 minValue=0xFFFF; U16 minIndex=0;
+                    for (U32 i=0;i<8;i++) {
+                        U16 value=(U16)((i<4 ? sLo>>(i*16) : sHi>>((i-4)*16)) & 0xFFFF);
+                        if (value < minValue) { minValue=value; minIndex=(U16)i; }
+                    }
+                    nLo=(U64)minValue | ((U64)minIndex<<16);
+                }
+                xmm[m.regField].lo=nLo; xmm[m.regField].hi=nHi;
+                U32 used=opOff+3+m.length; rip+=used; return used;
+            }
+        }
+
+        // ---- SSE4.1 0F3A immediate operations ----
+        if (osize66 && p.rep == 0 && op2 == 0x3A) {
+            U8 op3b=fetchByte(rip+opOff+2);
+            const bool supported = (op3b>=0x08 && op3b<=0x0E) ||
+                (op3b>=0x14 && op3b<=0x17) || (op3b>=0x20 && op3b<=0x22) ||
+                op3b==0x40 || op3b==0x41 || op3b==0x42;
+            if (supported) {
+                ModRM m=decodeModRM(rip+opOff+3,p,1);
+                U8 imm=fetchByte(rip+opOff+3+m.length);
+                U32 sourceBytes=16;
+                if(op3b==0x0A || op3b==0x21)sourceBytes=4;
+                else if(op3b==0x0B)sourceBytes=8;
+                else if(op3b==0x20)sourceBytes=1;
+                else if(op3b==0x22)sourceBytes=rexW?8:4;
+                else if(op3b>=0x14 && op3b<=0x17)sourceBytes=0;
+                U64 sLo=0,sHi=0;
+                if(m.isReg){sLo=xmm[m.rmIndex].lo;sHi=xmm[m.rmIndex].hi;}
+                else if(sourceBytes==16){sLo=memory->readq(m.effAddr);sHi=memory->readq(m.effAddr+8);}
+                else if(sourceBytes==8)sLo=memory->readq(m.effAddr);
+                else if(sourceBytes==4)sLo=memory->readd(m.effAddr);
+                else if(sourceBytes==1)sLo=memory->readb(m.effAddr);
+                U64 dLo=xmm[m.regField].lo,dHi=xmm[m.regField].hi;
+                U32 used=opOff+3+m.length+1;
+                if (op3b==0x08 || op3b==0x09 || op3b==0x0A || op3b==0x0B) {
+                    bool isDouble=op3b==0x09 || op3b==0x0B;
+                    bool scalar=op3b==0x0A || op3b==0x0B;
+                    U32 lanes=isDouble?2:4;
+                    U32 rc=(imm&4)?((mxcsr>>13)&3):(imm&3);
+                    auto roundValue=[&](double value)->double {
+                        if (!std::isfinite(value)) return value;
+                        switch (rc) {
+                            case 1: return std::floor(value);
+                            case 2: return std::ceil(value);
+                            case 3: return std::trunc(value);
+                            default: return std::nearbyint(value);
+                        }
+                    };
+                    U64 outLo=dLo,outHi=dHi;
+                    U32 last=scalar?1:lanes;
+                    for (U32 i=0;i<last;i++) {
+                        if (isDouble) {
+                            U64 bits=i==0?sLo:sHi;
+                            U64 rounded=doubleToU64(roundValue(u64ToDouble(bits)));
+                            if (i==0) outLo=rounded; else outHi=rounded;
+                        } else {
+                            U32 bits=(U32)(i<2?sLo>>(i*32):sHi>>((i-2)*32));
+                            float value; std::memcpy(&value,&bits,4);
+                            float rounded=(float)roundValue(value); U32 result;
+                            std::memcpy(&result,&rounded,4);
+                            if (i<2) outLo=(outLo&~(0xFFFFFFFFULL<<(i*32)))|((U64)result<<(i*32));
+                            else outHi=(outHi&~(0xFFFFFFFFULL<<((i-2)*32)))|((U64)result<<((i-2)*32));
+                        }
+                    }
+                    xmm[m.regField].lo=outLo; xmm[m.regField].hi=outHi;
+                } else if (op3b==0x0C || op3b==0x0D || op3b==0x0E) {
+                    U64 outLo=0,outHi=0;
+                    if (op3b==0x0E) {
+                        for (U32 i=0;i<8;i++) {
+                            U16 d=(U16)(i<4?dLo>>(i*16):dHi>>((i-4)*16));
+                            U16 s=(U16)(i<4?sLo>>(i*16):sHi>>((i-4)*16));
+                            U16 value=(imm&(1U<<i))?s:d;
+                            if(i<4)outLo|=(U64)value<<(i*16);else outHi|=(U64)value<<((i-4)*16);
+                        }
+                    } else {
+                        U32 lanes=op3b==0x0C?4:2,width=op3b==0x0C?32:64;
+                        for(U32 i=0;i<lanes;i++) {
+                            U64 dv=width==32?((i<2?dLo>>(i*32):dHi>>((i-2)*32))&0xFFFFFFFFULL):(i?dHi:dLo);
+                            U64 sv=width==32?((i<2?sLo>>(i*32):sHi>>((i-2)*32))&0xFFFFFFFFULL):(i?sHi:sLo);
+                            U64 value=(imm&(1U<<i))?sv:dv;
+                            if(width==32) {
+                                if(i<2)outLo|=value<<(i*32);else outHi|=value<<((i-2)*32);
+                            } else if(i==0)outLo=value;else outHi=value;
+                        }
+                    }
+                    xmm[m.regField].lo=outLo;xmm[m.regField].hi=outHi;
+                } else if (op3b==0x40 || op3b==0x41) {
+                    bool isDouble=op3b==0x41; U32 lanes=isDouble?2:4;
+                    double sumD=0.0; float sumF=0.0f;
+                    for(U32 i=0;i<lanes;i++) if(imm&(1U<<(i+4))) {
+                        if(isDouble) {
+                            double a=u64ToDouble(i==0?dLo:dHi),b=u64ToDouble(i==0?sLo:sHi);
+                            sumD += a*b;
+                        } else {
+                            U32 ab=(U32)(i<2?dLo>>(i*32):dHi>>((i-2)*32));
+                            U32 bb=(U32)(i<2?sLo>>(i*32):sHi>>((i-2)*32));
+                            float a,b;std::memcpy(&a,&ab,4);std::memcpy(&b,&bb,4);sumF += a*b;
+                        }
+                    }
+                    U64 outLo=0,outHi=0;
+                    for(U32 i=0;i<lanes;i++) if(imm&(1U<<i)) {
+                        if(isDouble) { if(i==0)outLo=doubleToU64(sumD);else outHi=doubleToU64(sumD); }
+                        else {
+                            U32 bits;std::memcpy(&bits,&sumF,4);
+                            if(i<2)outLo|=(U64)bits<<(i*32);else outHi|=(U64)bits<<((i-2)*32);
+                        }
+                    }
+                    xmm[m.regField].lo=outLo;xmm[m.regField].hi=outHi;
+                } else if (op3b==0x42) { // MPSADBW
+                    U32 srcOffset=(imm&3)*4,dstOffset=((imm>>2)&1)*4;
+                    U16 sums[8];
+                    U64 outLo=0,outHi=0;
+                    for(U32 lane=0;lane<8;lane++) {
+                        U32 sum=0;
+                        for(U32 byte=0;byte<4;byte++) {
+                            U8 dv=(dstOffset+lane+byte<8)?(U8)(dLo>>((dstOffset+lane+byte)*8)):
+                                  (U8)(dHi>>((dstOffset+lane+byte-8)*8));
+                            U8 sv=(srcOffset+byte<8)?(U8)(sLo>>((srcOffset+byte)*8)):
+                                  (U8)(sHi>>((srcOffset+byte-8)*8));
+                            sum += dv>sv?dv-sv:sv-dv;
+                        }
+                        sums[lane]=(U16)sum;
+                    }
+                    for(U32 i=0;i<4;i++)outLo|=(U64)sums[i]<<(i*16);
+                    for(U32 i=0;i<4;i++)outHi|=(U64)sums[i+4]<<(i*16);
+                    xmm[m.regField].lo=outLo;xmm[m.regField].hi=outHi;
+                } else if (op3b==0x20 || op3b==0x21 || op3b==0x22) {
+                    if(op3b==0x20) {
+                        U32 lane=imm&15,shift=(lane&7)*8;
+                        // Register source is r32's LOW byte, never AH/CH/DH/BH
+                        // (loadRM size-1 would apply legacy high-byte encoding).
+                        U8 value=m.isReg?(U8)reg[m.rmIndex].u64:memory->readb(m.effAddr);
+                        U64* dst=lane<8?&xmm[m.regField].lo:&xmm[m.regField].hi;
+                        *dst=(*dst&~(0xFFULL<<shift))|((U64)value<<shift);
+                    } else if(op3b==0x21) {
+                        U32 sourceLane=(imm>>6)&3;
+                        U32 source=m.isReg?
+                            (U32)((sourceLane<2?xmm[m.rmIndex].lo>>(sourceLane*32):
+                                   xmm[m.rmIndex].hi>>((sourceLane-2)*32))&0xFFFFFFFFULL):
+                            memory->readd(m.effAddr);
+                        U32 destLane=(imm>>4)&3;
+                        if(destLane<2)xmm[m.regField].lo=(xmm[m.regField].lo&~(0xFFFFFFFFULL<<(destLane*32)))|((U64)source<<(destLane*32));
+                        else xmm[m.regField].hi=(xmm[m.regField].hi&~(0xFFFFFFFFULL<<((destLane-2)*32)))|((U64)source<<((destLane-2)*32));
+                        for(U32 i=0;i<4;i++)if(imm&(1U<<i)) {
+                            if(i<2)xmm[m.regField].lo&=~(0xFFFFFFFFULL<<(i*32));
+                            else xmm[m.regField].hi&=~(0xFFFFFFFFULL<<((i-2)*32));
+                        }
+                    } else {
+                        U32 width=rexW?64:32,lane=imm&(rexW?1:3);U64 value=loadRM(m,width/8,rexPresent);
+                        if(width==64) { if(lane==0)xmm[m.regField].lo=value;else xmm[m.regField].hi=value; }
+                        else if(lane<2)xmm[m.regField].lo=(xmm[m.regField].lo&~(0xFFFFFFFFULL<<(lane*32)))|((U64)value<<(lane*32));
+                        else xmm[m.regField].hi=(xmm[m.regField].hi&~(0xFFFFFFFFULL<<((lane-2)*32)))|((U64)value<<((lane-2)*32));
+                    }
+                } else if (op3b==0x17 || op3b==0x15 || op3b==0x16 || op3b==0x14) {
+                    // PEXTRB/W/D/Q and EXTRACTPS write r/m, not the XMM reg.
+                    U32 width=op3b==0x14?8:op3b==0x15?16:op3b==0x17?32:(rexW?64:32);
+                    U32 lane=imm&(op3b==0x14?15:op3b==0x15?7:op3b==0x17?3:(rexW?1:3));
+                    U64 source=lane*width<64?dLo>>(lane*width):dHi>>((lane*width)-64);
+                    if(op3b==0x17) width=32;
+                    storeRM(m,width/8,source,rexPresent);
+                }
+                rip+=used;return used;
+            }
+        }
+
         // CVTSI2SD xmm, r/m32   F2 0F 2A /r       (REX.W → r/m64)
         // Convert int to double; result in low 64 of dst, high unchanged.
         if (op2 == 0x2A && p.rep == 0xF2) {
@@ -4214,17 +6050,15 @@ dsp_54:
 
         // CVTSD2SI r32, xmm/m64   F2 0F 2D /r     (REX.W → r64)
         // CVTTSD2SI r32, xmm/m64  F2 0F 2C /r     (REX.W → r64) — truncate
-        // Convert double to signed int. Compilers emit 2C (truncate) far
-        // more often than 2D (current rounding) because C's int cast is
-        // defined as truncate. Bodies are identical here — our 2D path
-        // already truncates via C cast — so the only difference is which
-        // opcode bytes we accept.
+        // Convert double to signed int with MXCSR.RC for 2D and truncation
+        // for 2C. This fallback shares the same invalid-result handling.
         if ((op2 == 0x2D || op2 == 0x2C) && p.rep == 0xF2) {
             ModRM m = decodeModRM(rip + opOff + 2, p, 0);
             U64 srcBits = m.isReg ? xmm[m.rmIndex].lo : memory->readq(m.effAddr);
             double d = u64ToDouble(srcBits);
-            if (rexW) reg[m.regField].setU64((U64)(S64)d);
-            else      reg[m.regField].setU32((U32)(S32)d);
+            U64 converted = cpu64ConvertFpToInt(d, rexW, op2 == 0x2C, mxcsr);
+            if (rexW) reg[m.regField].setU64(converted);
+            else      reg[m.regField].setU32((U32)converted);
             U32 used = opOff + 2 + m.length;
             rip += used;
             return used;
@@ -4236,7 +6070,7 @@ dsp_54:
         // predicates (imm8 & 7): 0 EQ, 1 LT, 2 LE, 3 UNORD, 4 NEQ, 5 NLT,
         // 6 NLE, 7 ORD. winex11/win32u emits CMPSD ...,6 (NLE) for clamp math.
         if (op2 == 0xC2 && p.rep == 0xF2) {
-            ModRM m = decodeModRM(rip + opOff + 2, p, 0);
+            ModRM m = decodeModRM(rip + opOff + 2, p, 1);
             U64 srcBits = m.isReg ? xmm[m.rmIndex].lo : memory->readq(m.effAddr);
             U8 imm = fetchByte(rip + opOff + 2 + m.length);
             double a = u64ToDouble(xmm[m.regField].lo);
@@ -4254,6 +6088,81 @@ dsp_54:
                 default: res = !unordered; break;               // ORD
             }
             xmm[m.regField].lo = res ? 0xFFFFFFFFFFFFFFFFULL : 0ULL;
+            U32 used = opOff + 2 + m.length + 1; // +imm8
+            rip += used;
+            return used;
+        }
+
+        // CMPPS xmm, xmm/m128, imm8   0F C2 /r ib — packed single compare.
+        // Each of the four dwords becomes all-ones/all-zero per the imm8
+        // predicate. IL2CPP compiles vector float comparisons to this plus
+        // MOVMSKPS. Without this the guest stops on the first such compare
+        // (Gang Beasts reached GameAssembly initialization and hit it).
+        if (op2 == 0xC2 && p.rep == 0 && !p.osize16) {
+            ModRM m = decodeModRM(rip + opOff + 2, p, 1);
+            U64 srcLo = m.isReg ? xmm[m.rmIndex].lo : memory->readq(m.effAddr);
+            U64 srcHi = m.isReg ? xmm[m.rmIndex].hi : memory->readq(m.effAddr + 8);
+            U8 imm = fetchByte(rip + opOff + 2 + m.length);
+            U64 dstBits[2] = { xmm[m.regField].lo, xmm[m.regField].hi };
+            U64 srcBits[2] = { srcLo, srcHi };
+            U64 outBits[2] = { 0, 0 };
+            auto u32f = [](U32 b){ float f; std::memcpy(&f,&b,4); return f; };
+            for (U32 half = 0; half < 2; half++) {
+                for (U32 lane = 0; lane < 2; lane++) {
+                    U32 shift = lane * 32;
+                    float a = u32f((U32)(dstBits[half] >> shift));
+                    float b = u32f((U32)(srcBits[half] >> shift));
+                    bool unordered = std::isnan(a) || std::isnan(b);
+                    bool res;
+                    switch (imm & 7) {
+                        case 0: res = (a == b); break;
+                        case 1: res = (a <  b); break;
+                        case 2: res = (a <= b); break;
+                        case 3: res = unordered; break;
+                        case 4: res = unordered || (a != b); break;
+                        case 5: res = unordered || !(a <  b); break;
+                        case 6: res = unordered || !(a <= b); break;
+                        default: res = !unordered; break;
+                    }
+                    if (res) outBits[half] |= 0xFFFFFFFFULL << shift;
+                }
+            }
+            xmm[m.regField].lo = outBits[0];
+            xmm[m.regField].hi = outBits[1];
+            U32 used = opOff + 2 + m.length + 1; // +imm8
+            rip += used;
+            return used;
+        }
+
+        // CMPPD xmm, xmm/m128, imm8   66 0F C2 /r ib — packed double compare.
+        // Each of the two qwords becomes all-ones/all-zero.
+        if (op2 == 0xC2 && p.rep == 0 && p.osize16) {
+            ModRM m = decodeModRM(rip + opOff + 2, p, 1);
+            U64 dstBits[2] = { xmm[m.regField].lo, xmm[m.regField].hi };
+            U64 srcBits[2];
+            if (m.isReg) { srcBits[0] = xmm[m.rmIndex].lo; srcBits[1] = xmm[m.rmIndex].hi; }
+            else { srcBits[0] = memory->readq(m.effAddr); srcBits[1] = memory->readq(m.effAddr + 8); }
+            U8 imm = fetchByte(rip + opOff + 2 + m.length);
+            U64 outBits[2] = { 0, 0 };
+            for (U32 lane = 0; lane < 2; lane++) {
+                double a = u64ToDouble(dstBits[lane]);
+                double b = u64ToDouble(srcBits[lane]);
+                bool unordered = std::isnan(a) || std::isnan(b);
+                bool res;
+                switch (imm & 7) {
+                    case 0: res = (a == b); break;
+                    case 1: res = (a <  b); break;
+                    case 2: res = (a <= b); break;
+                    case 3: res = unordered; break;
+                    case 4: res = unordered || (a != b); break;
+                    case 5: res = unordered || !(a <  b); break;
+                    case 6: res = unordered || !(a <= b); break;
+                    default: res = !unordered; break;
+                }
+                outBits[lane] = res ? 0xFFFFFFFFFFFFFFFFULL : 0ULL;
+            }
+            xmm[m.regField].lo = outBits[0];
+            xmm[m.regField].hi = outBits[1];
             U32 used = opOff + 2 + m.length + 1; // +imm8
             rip += used;
             return used;
@@ -4403,17 +6312,16 @@ dsp_54:
 
         // CVTSS2SI  r32/r64, xmm/m32  F3 0F 2D /r
         // CVTTSS2SI r32/r64, xmm/m32  F3 0F 2C /r  — truncating variant
-        // Same rationale as F2 0x2C: compilers prefer the truncating form
-        // for C int casts; our 2D path already uses C cast (truncate) so
-        // the body is shared.
+        // 2D follows MXCSR.RC; 2C truncates toward zero.
         if ((op2 == 0x2D || op2 == 0x2C) && p.rep == 0xF3) {
             ModRM m = decodeModRM(rip + opOff + 2, p, 0);
             U32 srcBits = m.isReg
                 ? (U32)(xmm[m.rmIndex].lo & 0xFFFFFFFFULL)
                 : memory->readd(m.effAddr);
             float f = u32ToFloat(srcBits);
-            if (rexW) reg[m.regField].setU64((U64)(S64)f);
-            else      reg[m.regField].setU32((U32)(S32)f);
+            U64 converted = cpu64ConvertFpToInt((double)f, rexW, op2 == 0x2C, mxcsr);
+            if (rexW) reg[m.regField].setU64(converted);
+            else      reg[m.regField].setU32((U32)converted);
             U32 used = opOff + 2 + m.length;
             rip += used;
             return used;
@@ -4423,7 +6331,7 @@ dsp_54:
         // CMPSD; writes an all-ones/all-zero 32-bit mask into dst's low 32 bits
         // (rest of the low qword preserved). Same imm8 predicates as CMPSD.
         if (op2 == 0xC2 && p.rep == 0xF3) {
-            ModRM m = decodeModRM(rip + opOff + 2, p, 0);
+            ModRM m = decodeModRM(rip + opOff + 2, p, 1);
             U32 srcBits = m.isReg
                 ? (U32)(xmm[m.rmIndex].lo & 0xFFFFFFFFULL)
                 : memory->readd(m.effAddr);
@@ -4575,16 +6483,17 @@ dsp_54:
                     U32 bits; std::memcpy(&bits, &f, 4); nDw[i] = bits;
                 }
             } else if (osize66) {
-                // CVTPS2DQ: dwords are float bits, write rounded ints.
+                // CVTPS2DQ: dwords are float bits, use MXCSR.RC and the
+                // integer-indefinite result for NaN, infinity, or overflow.
                 for (int i = 0; i < 4; i++) {
                     float f; std::memcpy(&f, &dwords[i], 4);
-                    nDw[i] = (U32)(S32)std::lrintf(f);
+                    nDw[i] = (U32)cpu64ConvertFpToInt((double)f, false, false, mxcsr);
                 }
             } else if (p.rep == 0xF3) {
                 // CVTTPS2DQ: float → int truncating.
                 for (int i = 0; i < 4; i++) {
                     float f; std::memcpy(&f, &dwords[i], 4);
-                    nDw[i] = (U32)(S32)f;
+                    nDw[i] = (U32)cpu64ConvertFpToInt((double)f, false, true, mxcsr);
                 }
             } else {
                 goto unhandled; // F2 0F 5B is not defined
@@ -4620,13 +6529,9 @@ dsp_54:
                 double d0, d1;
                 std::memcpy(&d0, &sLo, 8); std::memcpy(&d1, &sHi, 8);
                 U32 i0, i1;
-                if (osize66) { // truncate toward zero
-                    i0 = (U32)(S32)d0;
-                    i1 = (U32)(S32)d1;
-                } else {       // round to nearest (current rounding mode)
-                    i0 = (U32)(S32)std::lrint(d0);
-                    i1 = (U32)(S32)std::lrint(d1);
-                }
+                bool truncate = osize66;
+                i0 = (U32)cpu64ConvertFpToInt(d0, false, truncate, mxcsr);
+                i1 = (U32)cpu64ConvertFpToInt(d1, false, truncate, mxcsr);
                 xmm[m.regField].lo = ((U64)i0) | (((U64)i1) << 32);
                 xmm[m.regField].hi = 0;
             }
@@ -4683,7 +6588,7 @@ dsp_54:
     // 0F AE group: FXSAVE(/0) FXRSTOR(/1) LDMXCSR(/2) STMXCSR(/3) and the
     // mod==11 register forms MFENCE/LFENCE/SFENCE (/5,/6,/7).
     //
-    // FXSAVE/FXRSTOR MUST round-trip the XMM registers: glibc's lazy PLT
+    // FXSAVE/FXRSTOR MUST round-trip the full legacy x87/SSE state: glibc's lazy PLT
     // resolver _dl_runtime_resolve_fxsave does FXSAVE before calling
     // _dl_fixup (which clobbers XMM0-7 internally) and FXRSTOR after, so the
     // caller's float/double arguments survive symbol resolution. When these
@@ -4691,9 +6596,9 @@ dsp_54:
     // PLT (e.g. printf("%.5f", x)) saw XMM0 clobbered -> the argument read as
     // 0.0 -> "0.00000"; later calls bound the GOT and skipped the resolver,
     // so they were correct. That "first %f prints 0" was the real bug (NOT
-    // x87 80-bit precision). We model the legacy 512-byte FXSAVE area only
-    // for the XMM block (offset 160, 16 regs x 16 bytes); MXCSR/x87 state is
-    // not modeled here but the resolver doesn't depend on it.
+    // x87 80-bit precision). The legacy 512-byte layout is used in 64-bit
+    // mode; FIP/FDP are written as zero because this interpreter does not
+    // track those pointers.
     if (op == 0x0F && fetchByte(rip + opOff + 1) == 0xAE) {
         U8 aeModrm = fetchByte(rip + opOff + 2);
         U8 aeReg = (aeModrm >> 3) & 7;
@@ -4701,21 +6606,78 @@ dsp_54:
         ModRM m = decodeModRM(rip + opOff + 2, p, 0);
         U32 used = opOff + 2 + m.length;
         if (aeMod != 3 && aeReg == 0) {
-            // FXSAVE m512byte — save XMM0..15 into the legacy area.
+            // FXSAVE m512byte legacy 64-bit layout.
+            memory->writew(m.effAddr + 0, (U16)fpu.cw);
+            memory->writew(m.effAddr + 2, (U16)fpu.SW());
+            U8 abridgedTag = 0;
+            for (U32 i = 0; i < 8; i++) {
+                if (fpu.isMMXInUse || fpu.tags[i] != TAG_Empty)
+                    abridgedTag |= (U8)(1U << i);
+            }
+            memory->writeb(m.effAddr + 4, abridgedTag);
+            memory->writeb(m.effAddr + 5, 0);
+            memory->writew(m.effAddr + 6, (U16)(fpu.envData[1] & 0x7FF));
+            memory->writeq(m.effAddr + 8, 0);  // FIP: not tracked
+            memory->writeq(m.effAddr + 16, 0); // FDP: not tracked
+            memory->writed(m.effAddr + 24, mxcsr);
+            memory->writed(m.effAddr + 28, 0xFFFF);
+            for (int i = 0; i < 8; i++) {
+                U64 low, high;
+                fpu.ST80(fpu.STV(i), &low, &high);
+                U64 slot = m.effAddr + 32 + i * 16;
+                memory->writeq(slot, low);
+                memory->writew(slot + 8, (U16)high);
+                memory->writew(slot + 10, 0);
+                memory->writed(slot + 12, 0);
+            }
             for (int i = 0; i < 16; i++) {
                 memory->writeq(m.effAddr + 160 + i * 16,     xmm[i].lo);
                 memory->writeq(m.effAddr + 160 + i * 16 + 8, xmm[i].hi);
             }
+            for (U64 offset = 416; offset < 512; offset += 8)
+                memory->writeq(m.effAddr + offset, 0);
         } else if (aeMod != 3 && aeReg == 1) {
-            // FXRSTOR m512byte — restore XMM0..15 from the legacy area.
+            // FXRSTOR m512byte restores MXCSR, x87 stack/control state and
+            // all 16 XMM registers from the legacy 64-bit layout.
+            U32 savedMxcsr = memory->readd(m.effAddr + 24);
+            if (savedMxcsr & 0xFFFF0000) {
+                if (raiseSyncFault(K_SIGSEGV, /*trapNo #GP*/13, 0, rip)) return 0;
+                if (thread) thread->process->signalProcess(K_SIGSEGV);
+                yield = true;
+                return 0;
+            }
+            fpu.SetCW(memory->readw(m.effAddr + 0));
+            fpu.SetSW(memory->readw(m.effAddr + 2));
+            fpu.SetTagFromAbridged(memory->readb(m.effAddr + 4));
+            fpu.isMMXInUse = false;
+            fpu.envData[0] = 0;
+            fpu.envData[1] = memory->readw(m.effAddr + 6) & 0x7FF;
+            fpu.envData[2] = 0;
+            fpu.envData[3] = 0;
+            for (int i = 0; i < 8; i++) {
+                U64 slot = m.effAddr + 32 + i * 16;
+                fpu.LD80(fpu.STV(i), memory->readq(slot),
+                         (S16)memory->readw(slot + 8));
+            }
+            mxcsr = savedMxcsr;
             for (int i = 0; i < 16; i++) {
                 xmm[i].lo = memory->readq(m.effAddr + 160 + i * 16);
                 xmm[i].hi = memory->readq(m.effAddr + 160 + i * 16 + 8);
             }
+        } else if (aeMod != 3 && aeReg == 2) {
+            U32 loadedMxcsr = memory->readd(m.effAddr);
+            if (loadedMxcsr & 0xFFFF0000) {
+                if (raiseSyncFault(K_SIGSEGV, /*trapNo #GP*/13, 0, rip)) return 0;
+                if (thread) thread->process->signalProcess(K_SIGSEGV);
+                yield = true;
+                return 0;
+            }
+            mxcsr = loadedMxcsr;
+        } else if (aeMod != 3 && aeReg == 3) {
+            memory->writed(m.effAddr, mxcsr);
         }
-        // LDMXCSR(/2), STMXCSR(/3) and the fences remain no-ops: we don't
-        // model MXCSR exception/rounding bits, and memory ordering is moot
-        // for a single-stepped interpreter.
+        // Memory ordering for the mod==11 fences is moot in this single-step
+        // interpreter; MXCSR is handled above.
         rip += used;
         return used;
     }
@@ -4725,13 +6687,41 @@ dsp_54:
     // because the FPU::FLD_F64_EA family takes a 32-bit CPU* that we can't
     // satisfy. ModR/M "reg" field is the sub-opcode (/0../7) for memory forms;
     // for register forms (mod==11) the low 3 bits identify ST(i).
-dsp_58:
+dsp_59:
     if (op == 0xD8 || op == 0xD9 || op == 0xDA || op == 0xDB ||
         op == 0xDC || op == 0xDD || op == 0xDE || op == 0xDF) {
         U8 modrmByte = fetchByte(rip + opOff + 1);
         ModRM m = decodeModRM(rip + opOff + 1, p, 0);
         U32 used = opOff + 1 + m.length;
         U8 sub = m.regField & 7; // x87 sub-opcode, ignore REX.R
+        auto x87Value = [&]() -> double {
+            return fpu.isRegCached[fpu.top] ? fpu.regCache[fpu.top].d
+                                             : (double)fpu.getF64(fpu.top);
+        };
+        auto storeX87Environment = [&](U64 addr) {
+            memory->writed(addr + 0, fpu.CW());
+            memory->writed(addr + 4, fpu.SW());
+            memory->writed(addr + 8, (U32)fpu.GetTag(nullptr));
+            for (int n = 0; n < 4; n++)
+                memory->writed(addr + 12 + n * 4, fpu.envData[n]);
+        };
+        auto loadX87Environment = [&](U64 addr) {
+            U32 control = memory->readd(addr + 0);
+            fpu.sw = memory->readd(addr + 4);
+            fpu.SetTag(memory->readd(addr + 8));
+            for (int n = 0; n < 4; n++)
+                fpu.envData[n] = memory->readd(addr + 12 + n * 4);
+            fpu.SetCW((U16)control);
+            fpu.top = (fpu.sw >> 11) & 7;
+        };
+        auto truncateX87Integer = [](double value, U32 bits) -> U64 {
+            double lower = bits == 64 ? -0x1p63 : -(double)(1ULL << (bits - 1));
+            double upperExclusive = bits == 64 ? 0x1p63 : (double)(1ULL << (bits - 1));
+            if (!std::isfinite(value) || value < lower || value >= upperExclusive)
+                return 1ULL << (bits - 1); // masked invalid conversion: integer indefinite
+            S64 truncated = (S64)std::trunc(value);
+            return (U64)truncated & (bits == 64 ? ~0ULL : ((1ULL << bits) - 1));
+        };
         if (!m.isReg) {
             // memory form
             if (op == 0xD9 && sub == 0) {
@@ -4739,6 +6729,44 @@ dsp_58:
                 U32 bits = memory->readd(m.effAddr);
                 fpu.PREP_PUSH();
                 fpu.FLD_F32(bits, fpu.STV(0));
+            } else if (op == 0xD8 && sub == 0) {
+                // FADD m32fp — ST(0) += float32 at memory
+                U32 bits = memory->readd(m.effAddr);
+                fpu.FLD_F32(bits, 8);
+                fpu.FADD(fpu.STV(0), 8);
+            } else if (op == 0xD8 && sub == 1) {
+                // FMUL m32fp — ST(0) *= float32 at memory
+                U32 bits = memory->readd(m.effAddr);
+                fpu.FLD_F32(bits, 8);
+                fpu.FMUL(fpu.STV(0), 8);
+            } else if (op == 0xD8 && sub == 4) {
+                // FSUB m32fp — ST(0) -= float32 at memory
+                U32 bits = memory->readd(m.effAddr);
+                fpu.FLD_F32(bits, 8);
+                fpu.FSUB(fpu.STV(0), 8);
+            } else if (op == 0xD8 && sub == 5) {
+                // FSUBR m32fp — ST(0) = memory - ST(0).
+                fpu.FLD_F32(memory->readd(m.effAddr), 8);
+                fpu.FSUBR(fpu.STV(0), 8);
+            } else if (op == 0xD8 && sub == 6) {
+                // FDIV m32fp — ST(0) /= float32 at memory
+                U32 bits = memory->readd(m.effAddr);
+                fpu.FLD_F32(bits, 8);
+                fpu.FDIV(fpu.STV(0), 8);
+            } else if (op == 0xD8 && sub == 7) {
+                // FDIVR m32fp — ST(0) = memory / ST(0).
+                fpu.FLD_F32(memory->readd(m.effAddr), 8);
+                fpu.FDIVR(fpu.STV(0), 8);
+            } else if (op == 0xD9 && sub == 2) {
+                // FST m32fp — convert TOS to f32, store, no pop
+                double d;
+                if (fpu.isRegCached[fpu.top]) {
+                    d = fpu.regCache[fpu.top].d;
+                } else {
+                    d = (double)fpu.getF64(fpu.top);
+                }
+                union { float f; U32 i; } u; u.f = (float)d;
+                memory->writed(m.effAddr, u.i);
             } else if (op == 0xD9 && sub == 3) {
                 // FSTP m32fp — convert TOS to f32, store, pop
                 double d;
@@ -4750,6 +6778,23 @@ dsp_58:
                 union { float f; U32 i; } u; u.f = (float)d;
                 memory->writed(m.effAddr, u.i);
                 fpu.FPOP();
+            } else if (op == 0xDD && sub == 2) {
+                // FST m64fp — store TOS without popping.
+                U64 bits;
+                if (fpu.isRegCached[fpu.top]) {
+                    bits = fpu.regCache[fpu.top].l;
+                } else {
+                    union { double d; U64 u; } u; u.d = fpu.getF64(fpu.top);
+                    bits = u.u;
+                }
+                memory->writeq(m.effAddr, bits);
+            } else if (op == 0xD9 && sub == 4) {
+                // FLDENV m28byte — 64-bit environment operand layout.
+                loadX87Environment(m.effAddr);
+            } else if (op == 0xD9 && sub == 6) {
+                // FNSTENV m28byte stores first, then masks all exceptions.
+                storeX87Environment(m.effAddr);
+                fpu.SetCW((U16)(fpu.CW() | 0x003F));
             } else if (op == 0xD9 && sub == 5) {
                 // D9 /5 = FLDCW m16 — load FPU control word. Our soft FPU
                 // honors the rounding bits inside FROUND; we store the
@@ -4770,6 +6815,10 @@ dsp_58:
                 U64 bits = memory->readq(m.effAddr);
                 fpu.PREP_PUSH();
                 fpu.FLD_F64(bits, fpu.STV(0));
+            } else if (op == 0xDD && sub == 1) {
+                // FISTTP m64int — truncate toward zero, then pop.
+                memory->writeq(m.effAddr, truncateX87Integer(x87Value(), 64));
+                fpu.FPOP();
             } else if (op == 0xDD && sub == 3) {
                 // FSTP m64fp — store TOS bits, pop
                 U64 bits;
@@ -4781,6 +6830,25 @@ dsp_58:
                 }
                 memory->writeq(m.effAddr, bits);
                 fpu.FPOP();
+            } else if (op == 0xDD && sub == 4) {
+                // FRSTOR m108byte — restore environment and all eight ST slots.
+                loadX87Environment(m.effAddr);
+                for (int n = 0; n < 8; n++) {
+                    U64 slot = m.effAddr + 28 + n * 10;
+                    fpu.LD80(fpu.STV(n), memory->readq(slot),
+                             memory->readw(slot + 8));
+                }
+            } else if (op == 0xDD && sub == 6) {
+                // FNSAVE m108byte — save then reinitialize the x87 state.
+                storeX87Environment(m.effAddr);
+                for (int n = 0; n < 8; n++) {
+                    U64 low = 0, high = 0;
+                    fpu.ST80(fpu.STV(n), &low, &high);
+                    U64 slot = m.effAddr + 28 + n * 10;
+                    memory->writeq(slot, low);
+                    memory->writew(slot + 8, (U16)high);
+                }
+                fpu.FINIT();
             } else if (op == 0xDC && sub == 0) {
                 // FADD m64fp — load operand into scratch slot 8, add to ST(0)
                 U64 bits = memory->readq(m.effAddr);
@@ -4885,6 +6953,10 @@ dsp_58:
                 S32 v = (S32)memory->readd(m.effAddr);
                 fpu.PREP_PUSH();
                 fpu.FLD_I32(v, fpu.STV(0));
+            } else if (op == 0xDB && sub == 1) {
+                // FISTTP m32int — truncate toward zero, then pop.
+                memory->writed(m.effAddr, (U32)truncateX87Integer(x87Value(), 32));
+                fpu.FPOP();
             } else if (op == 0xDB && (sub == 2 || sub == 3)) {
                 // FIST m32int (sub=2) / FISTP m32int (sub=3) — round per CW
                 S32 v;
@@ -4927,6 +6999,10 @@ dsp_58:
                 S16 v = (S16)memory->readw(m.effAddr);
                 fpu.PREP_PUSH();
                 fpu.FLD_I16(v, fpu.STV(0));
+            } else if (op == 0xDF && sub == 1) {
+                // FISTTP m16int — truncate toward zero, then pop.
+                memory->writew(m.effAddr, (U16)truncateX87Integer(x87Value(), 16));
+                fpu.FPOP();
             } else if (op == 0xDF && (sub == 2 || sub == 3)) {
                 // FIST m16int (sub=2) / FISTP m16int (sub=3)
                 S16 v;
@@ -4988,7 +7064,18 @@ dsp_58:
         } else {
             // register form (mod==11)
             U8 i = modrmByte & 7; // ST(i) selector
-            if (op == 0xD9 && (modrmByte & 0xF8) == 0xC0) {
+            U8 x87RegGroup = modrmByte & 0xF8;
+            if ((op == 0xDA || op == 0xDB) &&
+                (x87RegGroup == 0xC0 || x87RegGroup == 0xC8 ||
+                 x87RegGroup == 0xD0 || x87RegGroup == 0xD8)) {
+                // FCMOVcc ST(0),ST(i). Conditions are B/E/BE/U for DA and
+                // their inverses NB/NE/NBE/NU for DB.
+                U8 condition = x87RegGroup == 0xC0 ? 2
+                             : x87RegGroup == 0xC8 ? 4
+                             : x87RegGroup == 0xD0 ? 6 : 10;
+                if (op == 0xDB) condition++;
+                if (evalCC(condition)) fpu.FST(fpu.STV(i), fpu.STV(0));
+            } else if (op == 0xD9 && (modrmByte & 0xF8) == 0xC0) {
                 // D9 C0+i = FLD ST(i)
                 U32 src = fpu.STV(i);
                 fpu.PREP_PUSH();
@@ -5007,14 +7094,81 @@ dsp_58:
             } else if (op == 0xD9 && modrmByte == 0xE1) {
                 // D9 E1 = FABS — absolute value of ST(0)
                 fpu.FABS();
+            } else if (op == 0xD9 && modrmByte == 0xE4) {
+                // D9 E4 = FTST — compare ST(0) to zero in x87 condition codes.
+                fpu.FTST(nullptr);
+            } else if (op == 0xD9 && modrmByte == 0xE5) {
+                // D9 E5 = FXAM — classify ST(0) into C3/C2/C0 and sign into C1.
+                fpu.FXAM();
             } else if (op == 0xD9 && modrmByte == 0xE8) {
-                // D9 E8 = FLD1 — push +1.0
-                fpu.PREP_PUSH();
+                // D9 E8 = FLD1 — push +1.0 (FPU::FLD1 does PREP_PUSH itself)
                 fpu.FLD1();
+            } else if (op == 0xD9 && modrmByte == 0xE9) {
+                // D9 E9 = FLDL2T — push log2(10)
+                fpu.FLDL2T();
+            } else if (op == 0xD9 && modrmByte == 0xEA) {
+                // D9 EA = FLDL2E — push log2(e)
+                fpu.FLDL2E();
+            } else if (op == 0xD9 && modrmByte == 0xEB) {
+                // D9 EB = FLDPI - push pi
+                fpu.FLDPI();
+            } else if (op == 0xD9 && modrmByte == 0xEC) {
+                // D9 EC = FLDLG2 — push log10(2)
+                fpu.FLDLG2();
+            } else if (op == 0xD9 && modrmByte == 0xED) {
+                // D9 ED = FLDLN2 — push ln(2)
+                fpu.FLDLN2();
             } else if (op == 0xD9 && modrmByte == 0xEE) {
-                // D9 EE = FLDZ — push +0.0
-                fpu.PREP_PUSH();
+                // D9 EE = FLDZ — push +0.0 (FPU::FLDZ does PREP_PUSH itself)
                 fpu.FLDZ();
+            } else if (op == 0xD9 && modrmByte == 0xF5) {
+                // D9 F5 = FPREM1 - partial remainder (IEEE)
+                fpu.FPREM1();
+            } else if (op == 0xD9 && modrmByte == 0xF6) {
+                // D9 F6 = FDECSTP
+                fpu.FDECSTP();
+            } else if (op == 0xD9 && modrmByte == 0xF7) {
+                // D9 F7 = FINCSTP
+                fpu.FINCSTP();
+            } else if (op == 0xD9 && modrmByte == 0xF0) {
+                // D9 F0 = F2XM1 — 2^x - 1
+                fpu.F2XM1();
+            } else if (op == 0xD9 && modrmByte == 0xF1) {
+                // D9 F1 = FYL2X — y * log2(x)
+                fpu.FYL2X();
+            } else if (op == 0xD9 && modrmByte == 0xF2) {
+                // D9 F2 = FPTAN — partial tangent
+                fpu.FPTAN();
+            } else if (op == 0xD9 && modrmByte == 0xF3) {
+                // D9 F3 = FPATAN — arctan(y/x)
+                fpu.FPATAN();
+            } else if (op == 0xD9 && modrmByte == 0xF4) {
+                // D9 F4 = FXTRACT — extract exponent and significand
+                fpu.FXTRACT();
+            } else if (op == 0xD9 && modrmByte == 0xFA) {
+                // D9 FA = FSQRT
+                fpu.FSQRT();
+            } else if (op == 0xD9 && modrmByte == 0xF8) {
+                // D9 F8 = FPREM — partial remainder
+                fpu.FPREM();
+            } else if (op == 0xD9 && modrmByte == 0xF9) {
+                // D9 F9 = FYL2XP1 — y * log2(x+1)
+                fpu.FYL2XP1();
+            } else if (op == 0xD9 && modrmByte == 0xFB) {
+                // D9 FB = FSINCOS - ST(0)=sin(x), push cos(x)
+                fpu.FSINCOS();
+            } else if (op == 0xD9 && modrmByte == 0xFC) {
+                // D9 FC = FRNDINT — round to integer
+                fpu.FRNDINT();
+            } else if (op == 0xD9 && modrmByte == 0xFD) {
+                // D9 FD = FSCALE — scale by power of 2
+                fpu.FSCALE();
+            } else if (op == 0xD9 && modrmByte == 0xFE) {
+                // D9 FE = FSIN — sine of ST(0), result in ST(0)
+                fpu.FSIN();
+            } else if (op == 0xD9 && modrmByte == 0xFF) {
+                // D9 FF = FCOS — cosine of ST(0), result in ST(0)
+                fpu.FCOS();
             } else if (op == 0xDF && modrmByte == 0xE0) {
                 // DF E0 = FNSTSW AX — write status word into AX, preserving
                 // the upper 48 bits of RAX (per AMD64 manual).
@@ -5023,6 +7177,10 @@ dsp_58:
                 // DD C0+i = FFREE ST(i) — mark ST(i) as empty (TAG_Empty).
                 fpu.tags[fpu.STV(i)] = TAG_Empty;
                 fpu.isRegCached[fpu.STV(i)] = false;
+            } else if (op == 0xDF && (modrmByte & 0xF8) == 0xC0) {
+                // DF C0+i = FFREEP ST(i) — free the slot and pop ST(0).
+                fpu.FFREE_STi(fpu.STV(i));
+                fpu.FPOP();
             } else if (op == 0xDD && (modrmByte & 0xF8) == 0xD0) {
                 // DD D0+i = FST ST(i) — copy ST(0) into ST(i), no pop.
                 U32 src = fpu.STV(0);
@@ -5058,6 +7216,55 @@ dsp_58:
                     cpu64_fpu_set_c012_3(fpu, 0, 0, 0);
                 }
                 if ((modrmByte & 0xF8) == 0xE8) fpu.FPOP();
+            } else if (op == 0xDC && (modrmByte & 0xF8) == 0xC0) {
+                // DC C0+i = FADD ST(i), ST(0)
+                fpu.FADD(fpu.STV(i), fpu.STV(0));
+            } else if (op == 0xDC && (modrmByte & 0xF8) == 0xC8) {
+                // DC C8+i = FMUL ST(i), ST(0)
+                fpu.FMUL(fpu.STV(i), fpu.STV(0));
+            } else if (op == 0xDC && (modrmByte & 0xF8) == 0xD0) {
+                // DC D0+i = FCOM ST(i) — compare ST(0) with ST(i)
+                U32 si = fpu.STV(i);
+                double a = fpu.isRegCached[fpu.top] ? fpu.regCache[fpu.top].d : fpu.getF64(fpu.top);
+                double b = fpu.isRegCached[si] ? fpu.regCache[si].d : fpu.getF64(si);
+                cpu64_fpu_compare(fpu, a, b);
+            } else if (op == 0xDC && (modrmByte & 0xF8) == 0xD8) {
+                // DC D8+i = FCOMP ST(i) — compare, then pop
+                U32 si = fpu.STV(i);
+                double a = fpu.isRegCached[fpu.top] ? fpu.regCache[fpu.top].d : fpu.getF64(fpu.top);
+                double b = fpu.isRegCached[si] ? fpu.regCache[si].d : fpu.getF64(si);
+                cpu64_fpu_compare(fpu, a, b);
+                fpu.FPOP();
+            } else if (op == 0xDC && (modrmByte & 0xF8) == 0xE0) {
+                // DC E0+i = FSUBR ST(i), ST(0) — ST(i) = ST(0) - ST(i)
+                fpu.FSUBR(fpu.STV(i), fpu.STV(0));
+            } else if (op == 0xDC && (modrmByte & 0xF8) == 0xE8) {
+                // DC E8+i = FSUB ST(i), ST(0) — ST(i) = ST(i) - ST(0)
+                fpu.FSUB(fpu.STV(i), fpu.STV(0));
+            } else if (op == 0xDC && (modrmByte & 0xF8) == 0xF0) {
+                // DC F0+i = FDIVR ST(i), ST(0) — ST(i) = ST(0) / ST(i)
+                fpu.FDIVR(fpu.STV(i), fpu.STV(0));
+            } else if (op == 0xDC && (modrmByte & 0xF8) == 0xF8) {
+                // DC F8+i = FDIV ST(i), ST(0) — ST(i) = ST(i) / ST(0)
+                fpu.FDIV(fpu.STV(i), fpu.STV(0));
+            } else if (op == 0xD8 && (modrmByte & 0xF8) == 0xC0) {
+                // D8 C0+i = FADD ST(0), ST(i)
+                fpu.FADD(fpu.STV(0), fpu.STV(i));
+            } else if (op == 0xD8 && (modrmByte & 0xF8) == 0xC8) {
+                // D8 C8+i = FMUL ST(0), ST(i)
+                fpu.FMUL(fpu.STV(0), fpu.STV(i));
+            } else if (op == 0xD8 && (modrmByte & 0xF8) == 0xE0) {
+                // D8 E0+i = FSUB ST(0), ST(i)
+                fpu.FSUB(fpu.STV(0), fpu.STV(i));
+            } else if (op == 0xD8 && (modrmByte & 0xF8) == 0xE8) {
+                // D8 E8+i = FSUBR ST(0), ST(i)
+                fpu.FSUBR(fpu.STV(0), fpu.STV(i));
+            } else if (op == 0xD8 && (modrmByte & 0xF8) == 0xF0) {
+                // D8 F0+i = FDIV ST(0), ST(i)
+                fpu.FDIV(fpu.STV(0), fpu.STV(i));
+            } else if (op == 0xD8 && (modrmByte & 0xF8) == 0xF8) {
+                // D8 F8+i = FDIVR ST(0), ST(i)
+                fpu.FDIVR(fpu.STV(0), fpu.STV(i));
             } else if (op == 0xD8 && (modrmByte & 0xF8) == 0xD0) {
                 // D8 D0+i = FCOM ST(0), ST(i) — set C0/C2/C3
                 U32 si = fpu.STV(i);
@@ -5152,8 +7359,9 @@ dsp_58:
                     rflags |= X64_CF;
                 }
                 // a > b: no flags set
-            } else if (op == 0xDF && (modrmByte & 0xF8) == 0xF0) {
-                // DF F0+i = FCOMIP ST(0), ST(i) — same as FCOMI, then pop.
+            } else if (op == 0xDF && ((modrmByte & 0xF8) == 0xE8 ||
+                                      (modrmByte & 0xF8) == 0xF0)) {
+                // DF E8+i = FUCOMIP; DF F0+i = FCOMIP. Compare then pop.
                 U32 si = fpu.STV(i);
                 double a = fpu.isRegCached[fpu.top] ? fpu.regCache[fpu.top].d : fpu.getF64(fpu.top);
                 double b = fpu.isRegCached[si]      ? fpu.regCache[si].d      : fpu.getF64(si);
@@ -5205,6 +7413,102 @@ dsp_58:
     }
 
 unhandled:
+    auto recoverInstructionLength = [&]() -> U32 {
+        U32 pos = opOff;
+        U8 first = op;
+        U8 second = 0;
+        U8 third = 0;
+        U32 map = 0;
+        if (first == 0x0F) {
+            second = fetchByte(ipStart + pos + 1);
+            if (second == 0x38 || second == 0x3A) {
+                map = second == 0x38 ? 2 : 3;
+                third = fetchByte(ipStart + pos + 2);
+                pos += 3;
+            } else {
+                map = 1;
+                pos += 2;
+            }
+        } else {
+            pos++;
+        }
+
+        bool hasModrm = false;
+        U32 immediate = 0;
+        if (map == 2 || map == 3) {
+            hasModrm = true;
+            immediate = map == 3 ? 1 : 0;
+        } else if (map == 1) {
+            hasModrm = !((second >= 0x80 && second <= 0x8F) ||
+                         second == 0x05 || second == 0x06 || second == 0x07 ||
+                         second == 0x08 || second == 0x09 || second == 0x0B ||
+                         (second >= 0x30 && second <= 0x35) || second == 0x37 ||
+                         second == 0x77 || second == 0xA0 || second == 0xA1 ||
+                         second == 0xA2 || second == 0xA8 || second == 0xA9 ||
+                         second == 0xAA || (second >= 0xC8 && second <= 0xCF));
+            if (second == 0x0F || second == 0xBA || second == 0xA4 ||
+                second == 0xAC || second == 0xC2 || second == 0xC4 ||
+                second == 0xC5 || second == 0xC6) immediate = 1;
+        } else {
+            hasModrm = (first <= 0x3B && (first & 7) <= 3) ||
+                        first == 0x62 || first == 0x63 ||
+                        (first >= 0x69 && first <= 0x6B) ||
+                        (first >= 0x80 && first <= 0x8F) ||
+                        first == 0xC0 || first == 0xC1 ||
+                        (first >= 0xC4 && first <= 0xC7) ||
+                        (first >= 0xD0 && first <= 0xD3) ||
+                        (first >= 0xD8 && first <= 0xDF) ||
+                        first == 0xF6 || first == 0xF7 || first == 0xFE || first == 0xFF;
+            if ((first >= 0x70 && first <= 0x7F) || first == 0x6A ||
+                first == 0x80 || first == 0x82 || first == 0x83 ||
+                first == 0xA8 || first == 0xC0 || first == 0xC1 ||
+                first == 0xC6 || first == 0xD4 || first == 0xD5 ||
+                (first >= 0xE0 && first <= 0xE7) || first == 0xEB) immediate = 1;
+            else if (first == 0x68 || first == 0x69 || first == 0x81 ||
+                     first == 0xA9 || first == 0xC7 || first == 0xE8 || first == 0xE9)
+                immediate = p.osize16 ? 2 : 4;
+            else if (first >= 0xB8 && first <= 0xBF)
+                immediate = (p.rex & 8) ? 8 : (p.osize16 ? 2 : 4);
+            else if (first >= 0xB0 && first <= 0xB7) immediate = 1;
+            if (first == 0xF6 || first == 0xF7) {
+                U8 group = (fetchByte(ipStart + pos) >> 3) & 7;
+                if (group <= 1) immediate = first == 0xF6 ? 1 : (p.osize16 ? 2 : 4);
+            }
+        }
+
+        if (hasModrm) {
+            U8 modrm = fetchByte(ipStart + pos++);
+            U8 mod = modrm >> 6;
+            U8 rm = modrm & 7;
+            if (mod != 3 && rm == 4) {
+                U8 sib = fetchByte(ipStart + pos++);
+                if (mod == 0 && (sib & 7) == 5) pos += 4;
+            }
+            if (mod == 0 && rm == 5) pos += 4;
+            else if (mod == 1) pos += 1;
+            else if (mod == 2) pos += 4;
+        }
+        pos += immediate;
+        return (pos <= 15 && pos > opOff) ? pos : 0;
+    };
+
+    if (bw64RecoverEnabled()) {
+        U32 length = recoverInstructionLength();
+        if (length && recoverFaultsAtRip < 3) {
+            recoverFaultsAtRip++;
+            bool firstAtRip = bw64RecoverClaimRip(64, ipStart);
+            if (firstAtRip) {
+                klog_fmt("recover: skipped CPU64 opcode at RIP=0x%llx len=%u bytes=%02x %02x %02x %02x",
+                         (unsigned long long)ipStart, length,
+                         fetchByte(ipStart), fetchByte(ipStart + 1),
+                         fetchByte(ipStart + 2), fetchByte(ipStart + 3));
+            }
+            bw64RecoverNoteSkippedInstruction(firstAtRip);
+            rip = ipStart + length;
+            return length;
+        }
+        bw64RecoverNoteSigillFallback();
+    }
     // Unimplemented. Print enough leading bytes to identify the opcode
     // in the Intel SDM tables and bail out so we don't silently loop.
     klog_fmt("CPU64: unimpl opcode at RIP=0x%llx bytes=%02x %02x %02x %02x %02x %02x %02x (rex=0x%02x osz=%d asz=%d seg=%02x rep=%02x)",
@@ -5256,8 +7560,7 @@ unhandled:
         dumpMem("RBX ", reg[X64_RBX].u64);
         dumpMem("RBP ", reg[X64_RBP].u64);
     }
-    yield = true;
-    return 0;
+    return faultAtInstruction(K_SIGILL, 6);
 }
 
 void CPU64::run() {
@@ -5775,15 +8078,28 @@ bool CPU64::buildBlock(U64 startRip, BBlock& b) {
     return true;
 }
 
+bool CPU64::blockRecMayWrite(const BRec& rec) {
+    switch (rec.kind) {
+    case BK_PUSH: case BK_PUSH_RM:
+        return true;
+    case BK_MOV_RM_R: case BK_ALU_RM_R: case BK_ALU_RM_IMM:
+    case BK_SHIFT_IMM: case BK_SHIFT_CL: case BK_MOV_RM_IMM:
+    case BK_INCDEC: case BK_MOV128_ST:
+        return !rec.mr.isReg;
+    default:
+        return false;   // terminators return before this check; loads/regs can't write
+    }
+}
+
 inline U64 CPU64::blockRegRead(U8 idx, U32 size, bool rexPresent) {
     return (size == 1) ? (U64)readReg8(idx, rexPresent)
          : (size == 4) ? (U64)reg[idx].u32 : reg[idx].u64;
 }
 
-U32 CPU64::execBlock(const BBlock& b) {
+U32 CPU64::execBlock(const BBlock& b, U64 maxInsn) {
     U32 executed = 0;
     const BRec* recs = &blockArena[b.recOff];
-    for (U16 i = 0; i < b.n; i++) {
+    for (U16 i = 0; i < b.n && executed < maxInsn; i++) {
         const BRec& rec = recs[i];
         bool rexPresent = rec.rexPresent != 0;
         U32 size = rec.size;
@@ -5845,10 +8161,11 @@ U32 CPU64::execBlock(const BBlock& b) {
             S64 sa, sb;
             if (size == 4) { sa = (S64)(S32)a; sb = (S64)(S32)bv; }
             else { sa = (S64)a; sb = (S64)bv; }
-            S64 res = sa * sb;
+            __int128 r128 = (__int128)sa * (__int128)sb;
+            S64 res = (S64)r128;
             bool overflow;
             if (size == 4) overflow = (res != (S64)(S32)res);
-            else { __int128 r128 = (__int128)sa * (__int128)sb; overflow = (r128 != (__int128)res); }
+            else overflow = (r128 != (__int128)res);
             rflags &= ~(X64_CF | X64_OF);
             if (overflow) rflags |= X64_CF | X64_OF;
             if (size == 4) reg[m.regField].setU32((U32)res);
@@ -6053,6 +8370,14 @@ U32 CPU64::execBlock(const BBlock& b) {
         }
         }
         executed++;
+        // A store may patch a LATER record of this very block (self-modifying
+        // code): stop at the next instruction so it is re-decoded. Only
+        // records that can write memory pay the two generation loads.
+        if (blockRecMayWrite(rec) &&
+            (KMemory64::blockPageGenOf(b.page0) != b.gen0 ||
+             KMemory64::blockPageGenOf(b.page1) != b.gen1)) {
+            return executed;
+        }
     }
     return executed;
 }
@@ -6089,7 +8414,7 @@ void CPU64::blockStatsMaybeReport() {
     }
 }
 
-U32 CPU64::tryBlockStep() {
+U32 CPU64::tryBlockStep(U64 maxInsn) {
     U64 r = rip;
     U32 neg = (U32)((r ^ (r >> 10)) & 1023);
     if (blockNegCache[neg] == r) return 0;
@@ -6101,7 +8426,7 @@ U32 CPU64::tryBlockStep() {
     if (b.startRip == r && b.epoch == blockEpoch) {
         if (KMemory64::blockPageGenOf(b.page0) == b.gen0 &&
             KMemory64::blockPageGenOf(b.page1) == b.gen1) {
-            U32 n = execBlock(b);
+            U32 n = execBlock(b, maxInsn);
             blockStatsExec++;
             blockStatsInsn += n;
             return n;
@@ -6112,7 +8437,7 @@ U32 CPU64::tryBlockStep() {
         blockNegCache[neg] = r;
         return 0;
     }
-    U32 n = execBlock(b);
+    U32 n = execBlock(b, maxInsn);
     blockStatsExec++;
     blockStatsInsn += n;
     return n;
@@ -6328,7 +8653,7 @@ U64 CPU64::runBounded(U64 maxInsn) {
         }
 #ifdef BOXEDWINE_BLOCK_EXEC
         {
-            U32 bn = tryBlockStep();
+            U32 bn = tryBlockStep(maxInsn - ran);
             if (bn) {
                 instructionCount += bn;
                 ran += bn;

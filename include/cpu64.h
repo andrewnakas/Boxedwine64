@@ -155,6 +155,12 @@ public:
     // record". One shared pointer per process makes mmap placements disjoint.
     // 0 means "uninitialised" → first use seeds it to MMAP64_BASE.
     U64 mmapNext = 0;
+    // MXCSR controls SSE conversion rounding. SSE arithmetic itself remains
+    // round-to-nearest in this interpreter. (from Winbox f249489e6)
+    U32   mxcsr = 0x1F80;
+    // Unknown-instruction recovery bookkeeping (from Winbox 2b504cf99).
+    U64  recoverLastRip = (U64)-1;
+    U8   recoverFaultsAtRip = 0;
 
     bool yield = false;
     // Set by a syscall (futex WAIT) that parked this thread on a condition in
@@ -307,9 +313,10 @@ private:
     bool decodeModRMRecipe(U64 modrmAddr, const Prefixes& p, U32 trailingImmBytes, BRecipe& out);
     ModRM resolveRecipe(const BRecipe& r);
     bool buildBlock(U64 startRip, BBlock& b);
-    U32  execBlock(const BBlock& b);           // returns instructions executed
+    U32  execBlock(const BBlock& b, U64 maxInsn = ~0ULL); // returns instructions executed
     U64  blockRegRead(U8 idx, U32 size, bool rexPresent);
-    U32  tryBlockStep();                       // probe/build/exec; 0 = interpret
+    static bool blockRecMayWrite(const BRec& rec);
+    U32  tryBlockStep(U64 maxInsn = ~0ULL);   // probe/build/exec; 0 = interpret
 #endif
 
     // Read prefixes starting at rip; advance an internal cursor. Returns
