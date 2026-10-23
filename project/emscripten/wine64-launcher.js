@@ -120,6 +120,13 @@
     // remains as the runner monitor).
     var LAZY = param("lazy") !== "0";
     var wineZipArg = "wine64.zip"; // replaced by a bw64url: spec in lazy mode
+    // 32-bit Windows programs (M22): the i386 half of the same Debian wine
+    // build (tools/rootfs64/build-wine32-zip.py). ALWAYS mounted lazily from
+    // its URL when the site publishes it — a 64-bit-only session then only
+    // pays for the zip's central directory, and a 32-bit app pulls just the
+    // DLLs it loads. null = not published / disabled with ?wine32=0.
+    var WINE32_ZIP = "wine32.zip";
+    var wine32ZipArg = null;
     // Developer/test hooks (M21):
     //   ?extrazip=NAME.zip  mount one more SAME-ORIGIN zip (bare file name only)
     //                       as the top overlay — e.g. guest test binaries.
@@ -209,6 +216,7 @@
     // --- build the wine64 argv ----------------------------------------------
     function buildArguments() {
         var args = ["-root", ROOT, "-zip", GLIBC_ZIP, "-zip", wineZipArg];
+        if (wine32ZipArg) args.push("-zip", wine32ZipArg);
         // The pre-booted prefix is a third overlay; mount it only when we'll use
         // it, so the bare --version / ?boot=1 paths stay byte-for-byte unchanged.
         if (USE_PREFIX) args.push("-zip", PREFIX_ZIP);
@@ -436,9 +444,22 @@
     // split parts via the manifest (GitHub Pages). URLs are absolutized because
     // the sync XHR runs on pthread workers whose base URL is not the page's.
     function resolveLazyWineSpec() {
-        if (!LAZY) return Promise.resolve();
+        var w32 = param("wine32") === "0" ? Promise.resolve(null) :
+            lazySpecFor(WINE32_ZIP).catch(function () { return null; });
+        var w64 = LAZY ? lazySpecFor(WINE_ZIP) : Promise.resolve(null);
+        return Promise.all([w64, w32]).then(function (specs) {
+            if (specs[0]) {
+                wineZipArg = specs[0];
+                console.log("lazy rootfs: wine64.zip will mount on demand (" + specs[0].split(";").length + " field(s))");
+            }
+            wine32ZipArg = specs[1];
+            console.log(specs[1] ? "lazy rootfs: wine32.zip (32-bit programs) will mount on demand"
+                                 : "wine32.zip not available: 32-bit programs disabled");
+        });
+    }
+    function lazySpecFor(zipName) {
         var abs = function (u) { return new URL(u, window.location.href).href; };
-        var wholeUrl = BASE + WINE_ZIP;
+        var wholeUrl = BASE + zipName;
         var probe = CHUNKED ? Promise.reject(new Error("chunked")) :
             fetch(wholeUrl, { method: "HEAD" }).then(function (r) {
                 if (!r.ok) throw new Error("HTTP " + r.status);
@@ -447,8 +468,8 @@
                 return "bw64url:" + len + ";" + abs(wholeUrl) + "|" + len;
             });
         return probe.catch(function () {
-            return fetch(BASE + WINE_ZIP + ".manifest.json", { cache: "no-cache" })
-                .then(function (r) { return r.json(); })
+            return fetch(BASE + zipName + ".manifest.json", { cache: "no-cache" })
+                .then(function (r) { if (!r.ok) throw new Error("no manifest"); return r.json(); })
                 .then(function (mf) {
                     var spec = "bw64url:" + mf.totalBytes;
                     var left = mf.totalBytes;
@@ -459,9 +480,6 @@
                     }
                     return spec;
                 });
-        }).then(function (spec) {
-            wineZipArg = spec;
-            console.log("lazy rootfs: wine64.zip will mount on demand (" + spec.split(";").length + " field(s))");
         });
     }
     // One progress line for the whole concurrent download set: sum the per-URL
@@ -797,7 +815,7 @@
                 }, Promise.resolve());
             })
             .then(function () {
-                return resolveLazyWineSpec(); // no-op unless ?lazy=1
+                return resolveLazyWineSpec(); // wine64 (lazy mode) + wine32 (always lazy) URL specs
             })
             .then(function () {
                 // Restore persisted user files into the writable MEMFS layer

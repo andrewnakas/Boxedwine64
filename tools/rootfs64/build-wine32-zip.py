@@ -156,6 +156,11 @@ def main():
     print("=== indexes ===")
     pk = load_packages(fetch(f"{MIRROR}/dists/{SUITE}/main/binary-i386/Packages.xz",
                              os.path.join(CACHE, "Packages-i386.xz")))
+    # Arch:all packages (libz-mingw-w64 carries the PE zlib1.dll Debian's wine
+    # links user32/etc. against instead of a bundled copy)
+    for name, d in load_packages(fetch(f"{MIRROR}/dists/{SUITE}/main/binary-all/Packages.xz",
+                                       os.path.join(CACHE, "Packages-all.xz"))).items():
+        pk.setdefault(name, d)
     owner = load_contents(fetch(f"{MIRROR}/dists/{SUITE}/main/Contents-i386.gz",
                                 os.path.join(CACHE, "Contents-i386.gz")))
     for p in ROOT_PACKAGES:
@@ -188,6 +193,12 @@ def main():
             if os.path.lexists(p):
                 return p
         return None
+
+    # PE-side system library: wine64.zip carries x86_64-windows/zlib1.dll the
+    # same way (Debian resolves it from /usr/<triplet>/lib at build time).
+    install("libz-mingw-w64")
+    pe_zlib = os.path.join(STAGE, "usr/i686-w64-mingw32/lib/zlib1.dll")
+    shutil.copy2(pe_zlib, os.path.join(STAGE, "usr/lib/i386-linux-gnu/wine/i386-windows/zlib1.dll"))
 
     print("=== i386 shared-library closure ===")
     seeds = []
