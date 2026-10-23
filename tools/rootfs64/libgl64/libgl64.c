@@ -221,7 +221,32 @@ enum {
     GL64_fn_glGetQueryObjectiv,
     GL64_fn_glGetQueryObjectuiv,
     GL64_fn_glGetQueryObjectui64v,
-    GL64_fn_glQueryCounter
+    GL64_fn_glQueryCounter,
+
+    // framebuffer objects + readback/copies (M29). Must match gl64bridge_abi.h.
+    GL64_fn_glGenFramebuffers = 700,
+    GL64_fn_glDeleteFramebuffers,
+    GL64_fn_glBindFramebuffer,
+    GL64_fn_glCheckFramebufferStatus,
+    GL64_fn_glFramebufferTexture2D,
+    GL64_fn_glFramebufferTextureLayer,
+    GL64_fn_glFramebufferRenderbuffer,
+    GL64_fn_glGenRenderbuffers,
+    GL64_fn_glDeleteRenderbuffers,
+    GL64_fn_glBindRenderbuffer,
+    GL64_fn_glRenderbufferStorage,
+    GL64_fn_glRenderbufferStorageMultisample,
+    GL64_fn_glBlitFramebuffer,
+    GL64_fn_glDrawBuffers,
+    GL64_fn_glDrawBuffer,
+    GL64_fn_glReadBuffer,
+    GL64_fn_glGetFramebufferAttachmentParameteriv,
+    GL64_fn_glGetRenderbufferParameteriv,
+    GL64_fn_glIsFramebuffer,
+    GL64_fn_glIsRenderbuffer,
+    GL64_fn_glReadPixels,
+    GL64_fn_glCopyTexSubImage2D,
+    GL64_fn_glCopyTexImage2D
 };
 
 // ---- the trap ---------------------------------------------------------------
@@ -808,6 +833,81 @@ API void glGetQueryObjectui64v(GLuint id, GLenum pname, uint64_t* params){ GL64A
 // glXGetProcAddressARB — opengl32/winex11 resolve every gl*/glX* through here.
 // Return our own wrapper for names we implement, or a harmless no-op stub for
 // the rest (so an unimplemented call is silently ignored rather than crashing).
+
+// ---- framebuffer objects + readback/copies (M29) ---------------------------
+// Real FBO entry points (they used to resolve to the no-op stub, so wined3d's
+// render-target format probes saw a garbage glCheckFramebufferStatus). The
+// host bridge maps the guest's default framebuffer (0) onto its offscreen FBO.
+#define A1(x) a.a[0]=(uint64_t)(uint32_t)(x)
+API void glGenFramebuffers(GLsizei n, GLuint* ids){ GL64Args a={{0}}; A1(n); a.a[1]=(uint64_t)(uintptr_t)ids; (void)gl64_trap(GL64_fn_glGenFramebuffers,&a); }
+API void glDeleteFramebuffers(GLsizei n, const GLuint* ids){ GL64Args a={{0}}; A1(n); a.a[1]=(uint64_t)(uintptr_t)ids; (void)gl64_trap(GL64_fn_glDeleteFramebuffers,&a); }
+API void glBindFramebuffer(GLenum target, GLuint fb){ GL64Args a={{0}}; A1(target); a.a[1]=fb; (void)gl64_trap(GL64_fn_glBindFramebuffer,&a); }
+API GLenum glCheckFramebufferStatus(GLenum target){ GL64Args a={{0}}; A1(target); return (GLenum)gl64_trap(GL64_fn_glCheckFramebufferStatus,&a); }
+API void glFramebufferTexture2D(GLenum target, GLenum att, GLenum textarget, GLuint tex, GLint level){
+    GL64Args a={{0}}; A1(target); a.a[1]=att; a.a[2]=textarget; a.a[3]=tex; a.a[4]=(uint64_t)(uint32_t)level; (void)gl64_trap(GL64_fn_glFramebufferTexture2D,&a); }
+API void glFramebufferTexture1D(GLenum target, GLenum att, GLenum textarget, GLuint tex, GLint level){ glFramebufferTexture2D(target, att, textarget, tex, level); }
+API void glFramebufferTexture(GLenum target, GLenum att, GLuint tex, GLint level){ glFramebufferTexture2D(target, att, 0x0DE1 /*GL_TEXTURE_2D*/, tex, level); }
+API void glFramebufferTextureLayer(GLenum target, GLenum att, GLuint tex, GLint level, GLint layer){
+    GL64Args a={{0}}; A1(target); a.a[1]=att; a.a[2]=tex; a.a[3]=(uint64_t)(uint32_t)level; a.a[4]=(uint64_t)(uint32_t)layer; (void)gl64_trap(GL64_fn_glFramebufferTextureLayer,&a); }
+API void glFramebufferTexture3D(GLenum target, GLenum att, GLenum textarget, GLuint tex, GLint level, GLint z){ (void)textarget; glFramebufferTextureLayer(target, att, tex, level, z); }
+API void glFramebufferRenderbuffer(GLenum target, GLenum att, GLenum rbtarget, GLuint rb){
+    GL64Args a={{0}}; A1(target); a.a[1]=att; a.a[2]=rbtarget; a.a[3]=rb; (void)gl64_trap(GL64_fn_glFramebufferRenderbuffer,&a); }
+API void glGenRenderbuffers(GLsizei n, GLuint* ids){ GL64Args a={{0}}; A1(n); a.a[1]=(uint64_t)(uintptr_t)ids; (void)gl64_trap(GL64_fn_glGenRenderbuffers,&a); }
+API void glDeleteRenderbuffers(GLsizei n, const GLuint* ids){ GL64Args a={{0}}; A1(n); a.a[1]=(uint64_t)(uintptr_t)ids; (void)gl64_trap(GL64_fn_glDeleteRenderbuffers,&a); }
+API void glBindRenderbuffer(GLenum target, GLuint rb){ GL64Args a={{0}}; A1(target); a.a[1]=rb; (void)gl64_trap(GL64_fn_glBindRenderbuffer,&a); }
+API void glRenderbufferStorage(GLenum target, GLenum ifmt, GLsizei w, GLsizei h){
+    GL64Args a={{0}}; A1(target); a.a[1]=ifmt; a.a[2]=(uint64_t)(uint32_t)w; a.a[3]=(uint64_t)(uint32_t)h; (void)gl64_trap(GL64_fn_glRenderbufferStorage,&a); }
+API void glRenderbufferStorageMultisample(GLenum target, GLsizei samples, GLenum ifmt, GLsizei w, GLsizei h){
+    GL64Args a={{0}}; A1(target); a.a[1]=(uint64_t)(uint32_t)samples; a.a[2]=ifmt; a.a[3]=(uint64_t)(uint32_t)w; a.a[4]=(uint64_t)(uint32_t)h; (void)gl64_trap(GL64_fn_glRenderbufferStorageMultisample,&a); }
+API void glBlitFramebuffer(GLint sx0, GLint sy0, GLint sx1, GLint sy1, GLint dx0, GLint dy0, GLint dx1, GLint dy1, GLbitfield mask, GLenum filter){
+    GL64Args a={{0}}; A1(sx0); a.a[1]=(uint64_t)(uint32_t)sy0; a.a[2]=(uint64_t)(uint32_t)sx1; a.a[3]=(uint64_t)(uint32_t)sy1;
+    a.a[4]=(uint64_t)(uint32_t)dx0; a.a[5]=(uint64_t)(uint32_t)dy0; a.a[6]=(uint64_t)(uint32_t)dx1; a.a[7]=(uint64_t)(uint32_t)dy1; a.a[8]=mask; a.a[9]=filter;
+    (void)gl64_trap(GL64_fn_glBlitFramebuffer,&a); }
+API void glDrawBuffers(GLsizei n, const GLenum* bufs){ GL64Args a={{0}}; A1(n); a.a[1]=(uint64_t)(uintptr_t)bufs; (void)gl64_trap(GL64_fn_glDrawBuffers,&a); }
+API void glDrawBuffer(GLenum buf){ GL64Args a={{0}}; A1(buf); (void)gl64_trap(GL64_fn_glDrawBuffer,&a); }
+API void glReadBuffer(GLenum buf){ GL64Args a={{0}}; A1(buf); (void)gl64_trap(GL64_fn_glReadBuffer,&a); }
+API void glGetFramebufferAttachmentParameteriv(GLenum target, GLenum att, GLenum pname, GLint* params){
+    GL64Args a={{0}}; A1(target); a.a[1]=att; a.a[2]=pname; a.a[3]=(uint64_t)(uintptr_t)params; (void)gl64_trap(GL64_fn_glGetFramebufferAttachmentParameteriv,&a); }
+API void glGetRenderbufferParameteriv(GLenum target, GLenum pname, GLint* params){
+    GL64Args a={{0}}; A1(target); a.a[1]=pname; a.a[2]=(uint64_t)(uintptr_t)params; (void)gl64_trap(GL64_fn_glGetRenderbufferParameteriv,&a); }
+API GLboolean glIsFramebuffer(GLuint fb){ GL64Args a={{0}}; A1(fb); return (GLboolean)gl64_trap(GL64_fn_glIsFramebuffer,&a); }
+API GLboolean glIsRenderbuffer(GLuint rb){ GL64Args a={{0}}; A1(rb); return (GLboolean)gl64_trap(GL64_fn_glIsRenderbuffer,&a); }
+API void glReadPixels(GLint x, GLint y, GLsizei w, GLsizei h, GLenum fmt, GLenum type, void* pixels){
+    GL64Args a={{0}}; A1(x); a.a[1]=(uint64_t)(uint32_t)y; a.a[2]=(uint64_t)(uint32_t)w; a.a[3]=(uint64_t)(uint32_t)h; a.a[4]=fmt; a.a[5]=type; a.a[6]=(uint64_t)(uintptr_t)pixels;
+    (void)gl64_trap(GL64_fn_glReadPixels,&a); }
+API void glCopyTexSubImage2D(GLenum target, GLint level, GLint xo, GLint yo, GLint x, GLint y, GLsizei w, GLsizei h){
+    GL64Args a={{0}}; A1(target); a.a[1]=(uint64_t)(uint32_t)level; a.a[2]=(uint64_t)(uint32_t)xo; a.a[3]=(uint64_t)(uint32_t)yo;
+    a.a[4]=(uint64_t)(uint32_t)x; a.a[5]=(uint64_t)(uint32_t)y; a.a[6]=(uint64_t)(uint32_t)w; a.a[7]=(uint64_t)(uint32_t)h; (void)gl64_trap(GL64_fn_glCopyTexSubImage2D,&a); }
+API void glCopyTexImage2D(GLenum target, GLint level, GLenum ifmt, GLint x, GLint y, GLsizei w, GLsizei h, GLint border){
+    GL64Args a={{0}}; A1(target); a.a[1]=(uint64_t)(uint32_t)level; a.a[2]=ifmt; a.a[3]=(uint64_t)(uint32_t)x; a.a[4]=(uint64_t)(uint32_t)y;
+    a.a[5]=(uint64_t)(uint32_t)w; a.a[6]=(uint64_t)(uint32_t)h; a.a[7]=(uint64_t)(uint32_t)border; (void)gl64_trap(GL64_fn_glCopyTexImage2D,&a); }
+API void glCopyTexSubImage1D(GLenum target, GLint level, GLint xo, GLint x, GLint y, GLsizei w){ glCopyTexSubImage2D(target, level, xo, 0, x, y, w, 1); }
+#undef A1
+// EXT/ARB spellings wined3d may resolve instead of the core names.
+API void glGenFramebuffersEXT(GLsizei n, GLuint* i){ glGenFramebuffers(n, i); }
+API void glDeleteFramebuffersEXT(GLsizei n, const GLuint* i){ glDeleteFramebuffers(n, i); }
+API void glBindFramebufferEXT(GLenum t, GLuint f){ glBindFramebuffer(t, f); }
+API GLenum glCheckFramebufferStatusEXT(GLenum t){ return glCheckFramebufferStatus(t); }
+API void glFramebufferTexture1DEXT(GLenum t, GLenum at, GLenum tt, GLuint x, GLint l){ glFramebufferTexture1D(t, at, tt, x, l); }
+API void glFramebufferTexture2DEXT(GLenum t, GLenum at, GLenum tt, GLuint x, GLint l){ glFramebufferTexture2D(t, at, tt, x, l); }
+API void glFramebufferTexture3DEXT(GLenum t, GLenum at, GLenum tt, GLuint x, GLint l, GLint z){ glFramebufferTexture3D(t, at, tt, x, l, z); }
+API void glFramebufferTextureARB(GLenum t, GLenum at, GLuint x, GLint l){ glFramebufferTexture(t, at, x, l); }
+API void glFramebufferTextureLayerARB(GLenum t, GLenum at, GLuint x, GLint l, GLint z){ glFramebufferTextureLayer(t, at, x, l, z); }
+API void glFramebufferRenderbufferEXT(GLenum t, GLenum at, GLenum rt, GLuint r){ glFramebufferRenderbuffer(t, at, rt, r); }
+API void glGenRenderbuffersEXT(GLsizei n, GLuint* i){ glGenRenderbuffers(n, i); }
+API void glDeleteRenderbuffersEXT(GLsizei n, const GLuint* i){ glDeleteRenderbuffers(n, i); }
+API void glBindRenderbufferEXT(GLenum t, GLuint r){ glBindRenderbuffer(t, r); }
+API void glRenderbufferStorageEXT(GLenum t, GLenum f, GLsizei w, GLsizei h){ glRenderbufferStorage(t, f, w, h); }
+API void glRenderbufferStorageMultisampleEXT(GLenum t, GLsizei s, GLenum f, GLsizei w, GLsizei h){ glRenderbufferStorageMultisample(t, s, f, w, h); }
+API void glBlitFramebufferEXT(GLint a0, GLint a1, GLint a2, GLint a3, GLint a4, GLint a5, GLint a6, GLint a7, GLbitfield m, GLenum f){ glBlitFramebuffer(a0, a1, a2, a3, a4, a5, a6, a7, m, f); }
+API void glDrawBuffersARB(GLsizei n, const GLenum* b){ glDrawBuffers(n, b); }
+API void glGetFramebufferAttachmentParameterivEXT(GLenum t, GLenum at, GLenum p, GLint* v){ glGetFramebufferAttachmentParameteriv(t, at, p, v); }
+API void glGetRenderbufferParameterivEXT(GLenum t, GLenum p, GLint* v){ glGetRenderbufferParameteriv(t, p, v); }
+API GLboolean glIsFramebufferEXT(GLuint f){ return glIsFramebuffer(f); }
+API GLboolean glIsRenderbufferEXT(GLuint r){ return glIsRenderbuffer(r); }
+API void glGenerateMipmapEXT(GLenum t){ glGenerateMipmap(t); }
+
+
 // ===========================================================================
 typedef void (*GLproc)(void);
 
@@ -866,6 +966,20 @@ static const struct procEntry g_procs[] = {
     E(glGenQueries), E(glDeleteQueries), E(glIsQuery), E(glBeginQuery),
     E(glEndQuery), E(glQueryCounter), E(glGetQueryiv), E(glGetQueryObjectiv),
     E(glGetQueryObjectuiv), E(glGetQueryObjectui64v),
+    // --- framebuffer objects + readback/copies (M29) ---
+    E(glGenFramebuffers), E(glDeleteFramebuffers), E(glBindFramebuffer), E(glCheckFramebufferStatus),
+    E(glFramebufferTexture2D), E(glFramebufferTexture1D), E(glFramebufferTexture), E(glFramebufferTextureLayer),
+    E(glFramebufferTexture3D), E(glFramebufferRenderbuffer), E(glGenRenderbuffers), E(glDeleteRenderbuffers),
+    E(glBindRenderbuffer), E(glRenderbufferStorage), E(glRenderbufferStorageMultisample), E(glBlitFramebuffer),
+    E(glDrawBuffers), E(glDrawBuffer), E(glReadBuffer), E(glGetFramebufferAttachmentParameteriv),
+    E(glGetRenderbufferParameteriv), E(glIsFramebuffer), E(glIsRenderbuffer), E(glReadPixels),
+    E(glCopyTexSubImage2D), E(glCopyTexImage2D), E(glCopyTexSubImage1D), E(glGenFramebuffersEXT),
+    E(glDeleteFramebuffersEXT), E(glBindFramebufferEXT), E(glCheckFramebufferStatusEXT), E(glFramebufferTexture1DEXT),
+    E(glFramebufferTexture2DEXT), E(glFramebufferTexture3DEXT), E(glFramebufferTextureARB), E(glFramebufferTextureLayerARB),
+    E(glFramebufferRenderbufferEXT), E(glGenRenderbuffersEXT), E(glDeleteRenderbuffersEXT), E(glBindRenderbufferEXT),
+    E(glRenderbufferStorageEXT), E(glRenderbufferStorageMultisampleEXT), E(glBlitFramebufferEXT), E(glDrawBuffersARB),
+    E(glGetFramebufferAttachmentParameterivEXT), E(glGetRenderbufferParameterivEXT), E(glIsFramebufferEXT), E(glIsRenderbufferEXT),
+    E(glGenerateMipmapEXT),
 };
 #undef E
 #define NPROCS (sizeof(g_procs)/sizeof(g_procs[0]))
