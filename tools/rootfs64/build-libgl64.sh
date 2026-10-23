@@ -63,6 +63,22 @@ else
     '
 fi
 
+# 32-bit variant (M23): the same source compiled for i386 (the trap becomes
+# int $0x80, see gl64_trap) -> libgl32/libGL.so.1, staged into wine32.zip by
+# build-wine32-zip.py for 32-bit wine processes.
+if command -v clang >/dev/null 2>&1 && [ -n "$LLD" ]; then
+    echo "--- building i386 libgl32/libGL.so.1 (clang + $LLD) ---"
+    mkdir -p "$HERE/libgl32"
+    clang --target=i386-linux-gnu -fPIC -O2 -fvisibility=hidden -ffreestanding \
+        -c "$SRC/libgl64.c" -o "$HERE/libgl32/libgl32.o"
+    "$LLD" -m elf_i386 -shared -soname libGL.so.1 \
+        -o "$HERE/libgl32/libGL.so.1" "$HERE/libgl32/libgl32.o"
+    rm -f "$HERE/libgl32/libgl32.o"
+    ls -l "$HERE/libgl32/libGL.so.1"
+else
+    echo "NOTE: no clang+ld.lld: skipped the i386 libgl32 build" >&2
+fi
+
 echo "=== result ==="
 ls -l "$SRC/libGL.so.1"
 echo "--- soname + key exports ---"

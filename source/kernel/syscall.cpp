@@ -17,6 +17,9 @@
  */
 
 #include "boxedwine.h"
+#if defined(BOXEDWINE_GUEST_X64) && defined(BOXEDWINE_OPENGL)
+#include "../opengl/gl64bridge.h"
+#endif
 
 #include "log.h"
 #include "kscheduler.h"
@@ -2269,6 +2272,16 @@ void ksyscall(CPU* cpu, U32 eipCount) {
             return;
         }
     }
+#if defined(BOXEDWINE_GUEST_X64) && defined(BOXEDWINE_OPENGL)
+    // 32-bit guest OpenGL (M23): the i386 libgl32 shim traps with
+    // int 0x80 / EAX=GL64_SYSCALL_NR, EBX=fnId, ECX=&GL64Args into the SAME
+    // bridge the 64-bit shim uses; the 64-bit result returns in EDX:EAX.
+    if (EAX == 0x474C0000) {
+        U64 r = gl32Bridge(cpu->memory, EBX, ECX);
+        EDX = (U32)(r >> 32);
+        result = (U32)r;
+    } else
+#endif
     if (EAX>439) {
         result = -K_ENOSYS;
         kdebug("no syscall for %d", EAX);
