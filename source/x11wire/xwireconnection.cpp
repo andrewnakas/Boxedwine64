@@ -1457,24 +1457,55 @@ void XWireConnection::processOneRequest(const uint8_t* req, uint32_t len) {
             break;
         }
         case X_TranslateCoords: {
-            // Single-window model: window and root share a coordinate space, so
-            // pass the source coords through unchanged. dst-window = req src-win.
-            int16_t sx = (int16_t)rd16(req + 12);
-            int16_t sy = (int16_t)rd16(req + 14);
+            // src-window(4)@4 dst-window(4)@8 src-x(2)@12 src-y(2)@14 ->
+            // dst = src + rootOrigin(src) - rootOrigin(dst), where a window's root
+            // origin sums x/y up its parent chain (M31). The old pass-through told
+            // wine its top-level sat at root (0,0) while it really sits at e.g.
+            // (4,23), so every popup/menu was placed that much too high-left and a
+            // mouse click on a menu title released onto the menu's first item.
+            uint32_t srcWin = rd32(req + 4), dstWin = rd32(req + 8);
+            int sx = (int16_t)rd16(req + 12), sy = (int16_t)rd16(req + 14);
+            int dx = sx, dy = sy;
             uint32_t child = 0;
             {
                 XWireServer& srv = XWireServer::instance();
                 std::lock_guard<std::mutex> lk(srv.regMutex);
-                child = srv.presentWindow;
+                auto rootOrigin = [&](uint32_t win, int& ox, int& oy) {
+                    ox = oy = 0;
+                    for (int depth = 0; win && depth < 64; depth++) {
+                        auto it = srv.windows.find(win);
+                        if (it == srv.windows.end() || it->second.isRoot) break;
+                        ox += it->second.x; oy += it->second.y;
+                        win = it->second.parent;
+                    }
+                };
+                int sox, soy, dox, doy;
+                rootOrigin(srcWin, sox, soy);
+                rootOrigin(dstWin, dox, doy);
+                dx = sx + sox - dox;
+                dy = sy + soy - doy;
+                // child: the topmost mapped child of dst-window containing the
+                // point (only needed for the root, which is what clients ask).
+                auto dit = srv.windows.find(dstWin);
+                if (dit != srv.windows.end() && dit->second.isRoot) {
+                    uint64_t best = 0;
+                    for (auto& kv : srv.windows) {
+                        const XWireWindow& w = kv.second;
+                        if (w.isRoot || !w.mapped || w.parent != dstWin) continue;
+                        if (dx >= w.x && dx < w.x + (int)w.width && dy >= w.y && dy < w.y + (int)w.height &&
+                            w.mapSerial >= best) { best = w.mapSerial; child = kv.first; }
+                    }
+                }
             }
+            int16_t ox16 = (int16_t)dx, oy16 = (int16_t)dy;
             uint8_t r[32] = {0};
             r[0] = 1;
             r[1] = 1;                          // same-screen = True
             r[2] = (uint8_t)(sequence & 0xff);
             r[3] = (uint8_t)(sequence >> 8);
             memcpy(r + 8, &child, 4);           // child
-            memcpy(r + 12, &sx, 2);             // dst-x
-            memcpy(r + 14, &sy, 2);             // dst-y
+            memcpy(r + 12, &ox16, 2);           // dst-x
+            memcpy(r + 14, &oy16, 2);           // dst-y
             writeToClient(r, sizeof(r));
             break;
         }
