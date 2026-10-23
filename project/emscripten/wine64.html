@@ -31,6 +31,7 @@
       .approw .applbl { font-size:.78em; color:#969896; min-width:5.5em; font-weight:600;
                 text-transform:uppercase; letter-spacing:.03em; }
       .approw.experimental .applbl { color:#cc8866; }
+      .approw[hidden] { display:none; }
       .appbtn { font:inherit; font-size:.85em; color:#c5c8c6; background:#282a2e;
                 border:1px solid #373b41; border-radius:6px; padding:.32em .7em; cursor:pointer;
                 display:flex; align-items:center; gap:.35em; }
@@ -115,7 +116,7 @@
       <button type="button" onclick="document.getElementById('exeUpload').click()">⬆ Run my own .exe / .zip</button>
       <button type="button" onclick="document.getElementById('folderUpload').click()">📁 Import app folder</button>
       <input type="text" id="exeArgs" placeholder="arguments (optional)" size="18" aria-label="program arguments">
-      <span class="tbhint">32-bit or 64-bit Windows programs: a single .exe, a .zip, or a whole folder (also drag &amp; drop onto the page). Imports go to C:\Apps and appear under <b>My apps</b>. Not yet: installers, .NET, most D3D games.</span>
+      <span class="tbhint">32-bit or 64-bit Windows programs: a single .exe, a .zip, or a whole folder (also drag &amp; drop onto the page). Imports go to C:\Apps; setup.exe installers work too — installed apps appear under <b>My apps</b>. Not yet: .msi packages, .NET, most D3D games.</span>
       <div id="exeChooser" class="tbhint" hidden></div>
       <!-- Clipboard bridge: guest copy -> browser clipboard, browser clipboard ->
            guest paste. Buttons (not automatic) because navigator.clipboard

@@ -993,6 +993,64 @@
         });
     }
     window.bw64RememberApp = rememberApp;
+
+    // Installed programs (M25): installers drop .lnk shortcuts on the Desktop
+    // and in the Start Menu. Scan those folders (MEMFS) every few seconds while
+    // a session runs, resolve each shortcut's target and add .exe targets to
+    // My apps — so an app installed by its setup.exe gets a one-click button.
+    var SHORTCUT_DIRS = [
+        "/home/username/.wine/drive_c/users/username/Desktop",
+        "/home/username/.wine/drive_c/users/username/AppData/Roaming/Microsoft/Windows/Start Menu/Programs",
+        "/home/username/.wine/drive_c/users/Public/Desktop",
+        "/home/username/.wine/drive_c/ProgramData/Microsoft/Windows/Start Menu/Programs"
+    ];
+    // Shell Link (.lnk) target: LinkInfo's LocalBasePath (+ CommonPathSuffix),
+    // the format wine's IShellLink writes; fall back to the first X:\...exe string.
+    function lnkTarget(u8) {
+        try {
+            var dv = new DataView(u8.buffer, u8.byteOffset, u8.byteLength);
+            if (dv.getUint32(0, true) !== 0x4C) return null;
+            var flags = dv.getUint32(0x14, true), off = 0x4C;
+            if (flags & 1) off += 2 + dv.getUint16(off, true);          // LinkTargetIDList
+            if (flags & 2) {                                             // LinkInfo
+                var hdr = dv.getUint32(off + 4, true), base = dv.getUint32(off + 16, true);
+                var suffix = dv.getUint32(off + 24, true);
+                var cstr = function (at) { var e = at; while (e < u8.length && u8[e]) e++; return new TextDecoder("latin1").decode(u8.subarray(at, e)); };
+                var path = base ? cstr(off + base) : "";
+                if (hdr >= 0x24 && dv.getUint32(off + 28, true)) {      // unicode LocalBasePath
+                    var ub = off + dv.getUint32(off + 28, true), ue = ub;
+                    while (ue + 1 < u8.length && (u8[ue] || u8[ue + 1])) ue += 2;
+                    path = new TextDecoder("utf-16le").decode(u8.subarray(ub, ue));
+                }
+                if (suffix) path += cstr(off + suffix);
+                if (/^[A-Za-z]:\\.*\.exe$/i.test(path)) return path;
+            }
+            var txt = new TextDecoder("utf-16le").decode(u8) + " " + new TextDecoder("latin1").decode(u8);
+            var m = /[A-Za-z]:\\[^\u0000"<>|*?]*?\.exe/i.exec(txt);
+            return m ? m[0] : null;
+        } catch (e) { return null; }
+    }
+    var seenShortcuts = {};
+    function scanShortcuts() {
+        var FS = getFS(); if (!FS) return;
+        var walk = function (dir, depth) {
+            var names; try { names = FS.readdir(ROOT + dir); } catch (e) { return; }
+            names.forEach(function (n) {
+                if (n === "." || n === "..") return;
+                var p = dir + "/" + n, st;
+                try { st = FS.stat(ROOT + p); } catch (e) { return; }
+                if (FS.isDir(st.mode)) { if (depth < 4) walk(p, depth + 1); return; }
+                if (!/\.lnk$/i.test(n) || seenShortcuts[p] === st.mtime.getTime()) return;
+                seenShortcuts[p] = st.mtime.getTime();
+                var target = lnkTarget(FS.readFile(ROOT + p));
+                if (!target || /unins|uninst|setup|readme|help/i.test(target)) return;
+                console.log("My apps: shortcut " + n + " -> " + target);
+                rememberApp(n.replace(/\.lnk$/i, ""), quoteIfSpaced(target));
+            });
+        };
+        SHORTCUT_DIRS.forEach(function (d) { walk(d, 0); });
+    }
+    setInterval(function () { try { if (sessionReady()) scanShortcuts(); } catch (e) {} }, 4000);
     if (document.readyState === "loading") document.addEventListener("DOMContentLoaded", renderMyApps);
     else renderMyApps();
 

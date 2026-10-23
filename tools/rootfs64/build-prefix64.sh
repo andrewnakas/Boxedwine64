@@ -88,6 +88,17 @@ done
 printf '%s' /usr/lib/i386-linux-gnu/wine/i386-windows > "$STAGE/$DRIVE_C/windows/syswow64.link"
 echo "  + windows/syswow64.link -> i386-windows (wine32.zip)"
 
+# Optional registry override (M25): PREFIX_REGS=<dir with system.reg user.reg
+# userdef.reg>, normally the output of merge-wow64-registry.py (the tuned
+# registry + the 32-bit Wow6432Node view + demand-start MSIServer/RpcSs), so
+# 32-bit installers can create shortcuts and run MSI packages.
+if [ -n "${PREFIX_REGS:-}" ]; then
+  for r in system.reg user.reg userdef.reg; do
+    cp "$PREFIX_REGS/$r" "$STAGE/$PREFIX_IN_ZIP/$r"
+  done
+  echo "  + registry from $PREFIX_REGS"
+fi
+
 # Bundle the extra GL demo executables the app launcher offers (glcube.exe is
 # already in the base zip). The launcher's app bar (?p=<prog> / launchApp) runs
 # these against this pre-booted prefix, so they must live both at the HOME root

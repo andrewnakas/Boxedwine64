@@ -1,0 +1,32 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- hellomsi.wxs - M25 MSI probe: installs hello32gui.exe to ProgramFilesFolder
+     with a Start Menu shortcut. Build: wixl -o hellomsi.msi hellomsi.wxs -->
+<Wix xmlns="http://schemas.microsoft.com/wix/2006/wi">
+  <Product Id="*" Name="Hello MSI" Language="1033" Version="1.0.0" Manufacturer="Boxedwine64"
+           UpgradeCode="6F1D2C3B-4A5E-4F60-9A7B-8C9D0E1F2A3B">
+    <Package InstallerVersion="200" Compressed="yes" InstallScope="perUser" />
+    <Media Id="1" Cabinet="hello.cab" EmbedCab="yes" />
+    <Directory Id="TARGETDIR" Name="SourceDir">
+      <Directory Id="ProgramFilesFolder">
+        <Directory Id="INSTALLDIR" Name="Hello MSI">
+          <Component Id="MainExe" Guid="1A2B3C4D-5E6F-4A7B-8C9D-0E1F2A3B4C5D">
+            <File Id="HelloExe" Name="hello32gui.exe" Source="hello32gui.exe" KeyPath="yes" />
+          </Component>
+        </Directory>
+      </Directory>
+      <Directory Id="ProgramMenuFolder">
+        <Directory Id="AppMenu" Name="Hello MSI">
+          <Component Id="MenuShortcut" Guid="2B3C4D5E-6F7A-4B8C-9D0E-1F2A3B4C5D6E">
+            <Shortcut Id="HelloShortcut" Name="Hello MSI" Target="[INSTALLDIR]hello32gui.exe" WorkingDirectory="INSTALLDIR" />
+            <RemoveFolder Id="AppMenu" On="uninstall" />
+            <RegistryValue Root="HKCU" Key="Software\Boxedwine64\HelloMSI" Name="installed" Type="integer" Value="1" KeyPath="yes" />
+          </Component>
+        </Directory>
+      </Directory>
+    </Directory>
+    <Feature Id="Main" Level="1">
+      <ComponentRef Id="MainExe" />
+      <ComponentRef Id="MenuShortcut" />
+    </Feature>
+  </Product>
+</Wix>
