@@ -297,6 +297,12 @@ private:
     U64 blockStatsExec = 0, blockStatsInsn = 0, blockStatsBuilt = 0;
     U64 bsFlushedExec = 0, bsFlushedInsn = 0, bsFlushedBuilt = 0, bsFlushedTotal = 0;
     void blockStatsMaybeReport();
+public:
+    // --x64-blockfuzz: differential test of the block executor against the
+    // interpreter on random instruction sequences (cpu64.cpp). Returns the
+    // number of mismatching sequences.
+    static int blockFuzz(U64 iterations, U64 seed);
+private:
 
     bool decodeModRMRecipe(U64 modrmAddr, const Prefixes& p, U32 trailingImmBytes, BRecipe& out);
     ModRM resolveRecipe(const BRecipe& r);

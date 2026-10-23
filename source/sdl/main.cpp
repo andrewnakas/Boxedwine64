@@ -21,6 +21,7 @@
 #include "startupArgs.h"
 
 #ifdef BOXEDWINE_GUEST_X64
+#include "cpu64.h"
 extern int runX64SelfTest();
 extern "C" int runX64RunElf(const char* path);
 #endif
@@ -220,6 +221,13 @@ int boxedmain(int argc, const char **argv) {
         if (argv[i] && std::string(argv[i]) == "--x64-selftest") {
             return runX64SelfTest();
         }
+#ifdef BOXEDWINE_BLOCK_EXEC
+        if (argv[i] && std::string(argv[i]) == "--x64-blockfuzz") {
+            U64 iters = (i + 1 < argc) ? std::strtoull(argv[i + 1], nullptr, 0) : 20000;
+            U64 seed = (i + 2 < argc) ? std::strtoull(argv[i + 2], nullptr, 0) : 1;
+            return CPU64::blockFuzz(iters, seed) ? 1 : 0;
+        }
+#endif
         if (argv[i] && std::string(argv[i]) == "--x64-run-elf") {
             // Optional next arg = ELF path on host disk. Without it the
             // runner uses an embedded hand-built static hello-world ELF.

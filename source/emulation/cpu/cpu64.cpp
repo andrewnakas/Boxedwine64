@@ -5386,6 +5386,7 @@ void CPU64::run() {
 #ifdef BOXEDWINE_BLOCK_EXEC
 static std::atomic<U64> g_bsBuilt{0}, g_bsExec{0}, g_bsInsn{0}, g_bsTotal{0}, g_bsNextReport{100000000ULL};
 static std::atomic<U64> g_bsEndOp[512];
+static bool g_blockFuzzPlantBug = false;
 static int bw64BlockStatsLevel() {
     static int level = [] { const char* e = std::getenv("BW64_BLOCKSTATS"); return e ? std::atoi(e) : 0; }();
     return level;
@@ -5878,6 +5879,7 @@ U32 CPU64::execBlock(const BBlock& b) {
             if (rec.sub == 0) flagsAdd(rflags, a, 1, res, size);
             else              flagsSub(rflags, a, 1, res, size);
             rflags = (rflags & ~X64_CF) | savedCF;
+            if (g_blockFuzzPlantBug && rec.sub == 0) rflags ^= X64_CF;
             storeRM(m, size, res, rexPresent);
             rip += rec.len;
             break;
@@ -6114,6 +6116,190 @@ U32 CPU64::tryBlockStep() {
     blockStatsExec++;
     blockStatsInsn += n;
     return n;
+}
+
+// ---- --x64-blockfuzz ------------------------------------------------------
+// Random sequences built ONLY from instruction forms the block builder
+// accepts (plus a few it rejects, so mid-block interpreter fallback is
+// exercised too). Each sequence runs twice on two identical address spaces:
+// A through tryBlockStep (interpreter fallback when it returns 0), B through
+// step() alone. Registers, RIP, flags, XMM and the data page must match.
+// Register discipline: RSP/RBX/RDI are never written (RBX = data base,
+// RDI = small index, RSP = stack inside the data page).
+namespace {
+struct FuzzRng {
+    U64 s;
+    U64 next() { s ^= s << 13; s ^= s >> 7; s ^= s << 17; return s; }
+    U32 below(U32 n) { return (U32)(next() % n); }
+};
+}
+
+int CPU64::blockFuzz(U64 iterations, U64 seed) {
+    const U64 CODE = 0x500000, DATA = 0x600000, END_PAD = 64;
+    FuzzRng rng{seed ? seed : 0x9E3779B97F4A7C15ULL};
+    int failures = 0;
+    U64 kindsSeen = 0, blockInsns = 0, totalInsns = 0;
+    // BW64_BLOCKFUZZ_SELFCHECK=1 plants a deliberate block-executor bug (INC
+    // clobbers CF) to prove the fuzzer can see divergences.
+    static const bool plant = std::getenv("BW64_BLOCKFUZZ_SELFCHECK") != nullptr;
+    g_blockFuzzPlantBug = plant;
+    for (U64 iter = 0; iter < iterations; iter++) {
+        std::vector<U8> code;
+        auto dstReg = [&]() -> U8 { for (;;) { U8 r = (U8)rng.below(16); if (r != X64_RSP && r != X64_RBX && r != X64_RDI) return r; } };
+        auto anyReg = [&]() -> U8 { return (U8)rng.below(16); };
+        // emit [prefixes] opcode bytes + modrm (+sib/disp). regField/rm are
+        // full 4-bit numbers; memory forms use RBX(+RDI*scale)+disp8.
+        auto emitModRM = [&](std::vector<U8>& out, U8 rexBase, bool w, U8 regF, bool mem, U8 rmReg,
+                             std::initializer_list<U8> ops, bool reg8 = false) {
+            U8 rex = rexBase | (w ? 0x08 : 0) | ((regF & 8) ? 0x04 : 0);
+            bool sib = mem && rng.below(2);
+            if (!mem) rex |= (rmReg & 8) ? 0x01 : 0;
+            // 8-bit forms: half the time force a REX so SPL/BPL/SIL/DIL get used
+            if (reg8 && rng.below(2)) rex |= 0x40;
+            if (rex) out.push_back((U8)(0x40 | rex));
+            for (U8 o : ops) out.push_back(o);
+            if (!mem) {
+                out.push_back((U8)(0xC0 | ((regF & 7) << 3) | (rmReg & 7)));
+            } else if (sib) {
+                out.push_back((U8)(0x44 | ((regF & 7) << 3)));                 // mod=01 rm=100
+                out.push_back((U8)((rng.below(4) << 6) | (X64_RDI << 3) | X64_RBX));
+                out.push_back((U8)rng.below(0x60));
+            } else {
+                out.push_back((U8)(0x43 | ((regF & 7) << 3)));                 // mod=01 rm=rbx
+                out.push_back((U8)rng.below(0x60));
+            }
+        };
+        U32 nInsn = 4 + rng.below(28);
+        for (U32 k = 0; k < nInsn; k++) {
+            std::vector<U8>& c = code;
+            bool mem = rng.below(3) == 0;
+            bool w = rng.below(2);
+            U32 form = rng.below(34);
+            kindsSeen |= 1ULL << form;
+            switch (form) {
+            case 0: emitModRM(c, 0, w, anyReg(), mem, dstReg(), {0x89}); if (!mem) { /* dest = rm */ } break;
+            case 1: emitModRM(c, 0, w, dstReg(), mem, anyReg(), {0x8B}); break;
+            case 2: { U8 op = (U8)((rng.below(8) << 3) | rng.below(4));             // ALU forms 0-3
+                      bool destRm = (op & 7) < 2; bool r8 = !(op & 1);
+                      if (r8) { // 8-bit: never touch BL/BH/DIL/SPL (rbx/rdi/rsp low bytes) -> use regs 0-2, 8-15
+                          static const U8 ok8[] = {0, 1, 2, 5, 6, 8, 9, 10, 11, 12, 13, 14, 15};
+                          U8 a = ok8[rng.below(13)], b = ok8[rng.below(13)];
+                          emitModRM(c, 0, false, destRm ? a : a, mem, b, {op}, true);
+                      } else emitModRM(c, 0, w, destRm ? anyReg() : dstReg(), mem, destRm ? dstReg() : anyReg(), {op});
+                      break; }
+            case 3: { U8 op = (U8)((rng.below(8) << 3) | (4 + rng.below(2)));      // ALU acc,imm
+                      if (w) c.push_back(0x48); c.push_back(op);
+                      if (op & 1) for (int i = 0; i < 4; i++) c.push_back((U8)rng.next()); else c.push_back((U8)rng.next());
+                      break; }
+            case 4: emitModRM(c, 0, w, (U8)rng.below(8), mem, dstReg(), {0x81}); for (int i = 0; i < 4; i++) c.push_back((U8)rng.next()); break;
+            case 5: emitModRM(c, 0, w, (U8)rng.below(8), mem, dstReg(), {0x83}); c.push_back((U8)rng.next()); break;
+            case 6: { static const U8 ok8[] = {0, 1, 2, 8, 9, 10, 11, 12, 13, 14, 15};
+                      emitModRM(c, 0, false, (U8)rng.below(8), mem, ok8[rng.below(11)], {0x80}, true); c.push_back((U8)rng.next()); break; }
+            case 7: emitModRM(c, 0, w, anyReg(), mem, anyReg(), {0x85}); break;
+            case 8: emitModRM(c, 0, false, anyReg(), mem, anyReg(), {0x84}, true); break;
+            case 9: if (w) c.push_back(0x48); c.push_back(0xA9); for (int i = 0; i < 4; i++) c.push_back((U8)rng.next()); break;
+            case 10: emitModRM(c, 0, w, 0, mem, anyReg(), {0xF7}); for (int i = 0; i < 4; i++) c.push_back((U8)rng.next()); break;
+            case 11: emitModRM(c, 0, false, 0, mem, anyReg(), {0xF6}, true); c.push_back((U8)rng.next()); break;
+            case 12: emitModRM(c, 0, w, 0, mem, dstReg(), {0xC7}); for (int i = 0; i < 4; i++) c.push_back((U8)rng.next()); break;
+            case 13: { U8 r = dstReg(); c.push_back((U8)(0x40 | (w ? 8 : 0) | ((r & 8) ? 1 : 0))); c.push_back((U8)(0xB8 + (r & 7)));
+                       for (int i = 0; i < (w ? 8 : 4); i++) c.push_back((U8)rng.next()); break; }
+            case 14: emitModRM(c, 0, w, dstReg(), true, 0, {0x8D}); break;
+            case 15: emitModRM(c, 0, w, dstReg(), mem, anyReg(), {0x0F, 0xAF}); break;
+            case 16: emitModRM(c, 0, w, (U8)rng.below(8), mem, dstReg(), {0xC1}); c.push_back((U8)rng.below(80)); break;
+            case 17: emitModRM(c, 0, w, (U8)rng.below(8), mem, dstReg(), {(U8)(0xD1 + 2 * rng.below(2))}); break;
+            case 18: { static const U8 ok8[] = {0, 1, 2, 8, 9, 10, 11, 12, 13, 14, 15};
+                       U8 op = (U8)(0xC0 + 0x10 * rng.below(2) + 2 * rng.below(2)); // C0, D0, D2 (C2 is RET: remap)
+                       if (op == 0xC2) op = 0xC0;
+                       emitModRM(c, 0, false, (U8)rng.below(8), mem, ok8[rng.below(11)], {op}, true);
+                       if (op == 0xC0) c.push_back((U8)rng.below(20));
+                       break; }
+            case 19: emitModRM(c, 0, w, (U8)rng.below(2), mem, dstReg(), {0xFF}); break;          // INC/DEC
+            case 20: { U8 r = anyReg(); if (r & 8) c.push_back(0x41); c.push_back((U8)(0x50 + (r & 7))); // PUSH ; POP
+                       U8 d = dstReg(); if (d & 8) c.push_back(0x41); c.push_back((U8)(0x58 + (d & 7))); break; }
+            case 21: emitModRM(c, 0, w, dstReg(), mem, anyReg(), {0x63}); break;
+            case 22: { U8 op2 = (U8)(0xB6 + rng.below(2) + 8 * rng.below(2));
+                       emitModRM(c, 0, w, dstReg(), mem, anyReg(), {0x0F, op2}, true); break; }
+            case 23: emitModRM(c, 0, false, 0, mem, anyReg(), {0x0F, 0x1F}); break;
+            case 24: c.push_back(0x90); break;
+            case 25: { U8 op2 = (U8)(0x10 + rng.below(2) + 0x18 * rng.below(2));  // 10/11/28/29
+                       if (rng.below(2)) c.push_back(0x66);
+                       emitModRM(c, 0, false, (U8)rng.below(16), mem, (U8)rng.below(16), {0x0F, op2}); break; }
+            case 26: { c.push_back(rng.below(2) ? 0x66 : 0xF3);
+                       emitModRM(c, 0, false, (U8)rng.below(16), mem, (U8)rng.below(16), {0x0F, (U8)(rng.below(2) ? 0x6F : 0x7F)}); break; }
+            case 27: { static const U8 ops[] = {0x54, 0x55, 0x56, 0x57};
+                       emitModRM(c, 0, false, (U8)rng.below(16), mem, (U8)rng.below(16), {0x0F, ops[rng.below(4)]}); break; }
+            case 28: { static const U8 ops[] = {0xEF, 0xEB, 0xDB, 0xDF, 0x74, 0x75, 0x76};
+                       c.push_back(0x66);
+                       emitModRM(c, 0, false, (U8)rng.below(16), mem, (U8)rng.below(16), {0x0F, ops[rng.below(7)]}); break; }
+            case 29: c.push_back(0x66); emitModRM(c, 0, false, dstReg(), false, (U8)rng.below(16), {0x0F, 0xD7}); break;
+            case 30: c.push_back((U8)(0x70 + rng.below(16))); c.push_back(0x00); break;       // Jcc +0 (both paths land next)
+            case 31: c.push_back(0xEB); c.push_back(0x00); break;                              // JMP +0
+            case 32: { c.push_back(0xE8); for (int i = 0; i < 4; i++) c.push_back(0); break; }  // CALL +0 (pushes)
+            case 33: { c.push_back(0x66); emitModRM(c, 0, false, anyReg(), mem, dstReg(), {0x89}); break; } // 16-bit: block rejects
+            }
+        }
+        size_t endOff = code.size();
+        for (U64 i = 0; i < END_PAD; i++) code.push_back(0xF4);               // HLT (unsupported -> stop)
+
+        // initial state
+        U64 regs0[16]; for (int i = 0; i < 16; i++) regs0[i] = rng.next();
+        regs0[X64_RBX] = DATA + 0x100;
+        regs0[X64_RDI] = rng.below(8);
+        regs0[X64_RSP] = DATA + 0xE00;
+        U32 flags0 = 0x202 | ((U32)rng.next() & 0x8D5);
+        Xmm xmm0[16]; for (int i = 0; i < 16; i++) { xmm0[i].lo = rng.next(); xmm0[i].hi = rng.next(); }
+        std::vector<U8> data(0x1000); for (auto& b : data) b = (U8)rng.next();
+
+        KMemory64 memA(nullptr), memB(nullptr);
+        CPU64 a(&memA), b(&memB);
+        KMemory64* mems[2] = {&memA, &memB};
+        CPU64* cpus[2] = {&a, &b};
+        for (int k = 0; k < 2; k++) {
+            mems[k]->mmapAnonymousFixed(CODE, 0x2000, 7);
+            mems[k]->mmapAnonymousFixed(DATA, 0x1000, 3);
+            mems[k]->memcpyToGuest(CODE, code.data(), code.size());
+            mems[k]->memcpyToGuest(DATA, data.data(), data.size());
+            for (int i = 0; i < 16; i++) { cpus[k]->reg[i].setU64(regs0[i]); cpus[k]->xmm[i] = xmm0[i]; }
+            cpus[k]->rflags = flags0;
+        }
+        const U64 endRip = CODE + endOff;
+        for (int pass = 0; pass < 2; pass++) {          // pass 2 re-runs cached blocks
+            a.rip = CODE; b.rip = CODE;
+            for (U32 guard = 0; a.rip != endRip && guard < 4096; guard++) {
+                if (!a.tryBlockStep()) { if (!a.step()) break; }
+            }
+            for (U32 guard = 0; b.rip != endRip && guard < 4096; guard++) {
+                if (!b.step()) break;
+            }
+        }
+        blockInsns += a.blockStatsInsn; totalInsns += b.instructionCount;
+        bool ok = a.rip == b.rip && a.rflags == b.rflags;
+        int badReg = -1, badXmm = -1;
+        for (int i = 0; i < 16 && ok; i++) if (a.reg[i].u64 != b.reg[i].u64) { ok = false; badReg = i; }
+        for (int i = 0; i < 16 && ok; i++) if (a.xmm[i].lo != b.xmm[i].lo || a.xmm[i].hi != b.xmm[i].hi) { ok = false; badXmm = i; }
+        int badByte = -1;
+        if (ok) {
+            std::vector<U8> da(0x1000), db(0x1000);
+            memA.memcpyFromGuest(da.data(), DATA, 0x1000);
+            memB.memcpyFromGuest(db.data(), DATA, 0x1000);
+            for (int i = 0; i < 0x1000; i++) if (da[i] != db[i]) { ok = false; badByte = i; break; }
+        }
+        if (!ok) {
+            failures++;
+            if (failures <= 10) {
+                printf("BLOCKFUZZ MISMATCH iter=%llu rip A=0x%llx B=0x%llx flags A=0x%x B=0x%x badReg=%d (A=0x%llx B=0x%llx) badXmm=%d badByte=%d\n  code:",
+                       (unsigned long long)iter, (unsigned long long)a.rip, (unsigned long long)b.rip, a.rflags, b.rflags,
+                       badReg, badReg >= 0 ? (unsigned long long)a.reg[badReg].u64 : 0ULL,
+                       badReg >= 0 ? (unsigned long long)b.reg[badReg].u64 : 0ULL, badXmm, badByte);
+                for (size_t i = 0; i < endOff; i++) printf(" %02x", code[i]);
+                printf("\n");
+            }
+        }
+    }
+    printf("BLOCKFUZZ: %llu sequences, %d mismatches (forms seen mask 0x%llx, %llu of %llu instructions ran in blocks)\n",
+           (unsigned long long)iterations, failures, (unsigned long long)kindsSeen,
+           (unsigned long long)blockInsns, (unsigned long long)totalInsns);
+    return failures;
 }
 #endif // BOXEDWINE_BLOCK_EXEC
 
