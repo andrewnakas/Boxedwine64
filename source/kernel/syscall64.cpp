@@ -2687,9 +2687,46 @@ static U64 sys_recvmsg64(CPU64* cpu, U64 fd, U64 msg64, U64 flags) {
 // Covers both syscalls we already handle (useful for trace) and the obvious
 // gaps that are most likely to surface during early Wine/glibc bring-up.
 // Returns "?" for unknown numbers; the caller still logs the raw #N.
+// ---- browser gamepad (M30) --------------------------------------------------
+// The guest's SDL2 shim (tools/rootfs64/libsdl64) polls this private syscall;
+// winebus's SDL backend turns the result into a HID joystick for dinput/winmm.
+// The launcher pushes navigator.getGamepads()[0] in via bw64_set_gamepad.
+#define PAD64_SYSCALL_NR 0x50414400ULL   // 'PAD\0'
+struct Pad64State { S32 connected, naxes, nbuttons; U32 buttons; S16 axes[8]; };
+static Pad64State g_pad64;
+static std::mutex g_pad64Mutex;
+#ifdef __EMSCRIPTEN__
+#include <emscripten/emscripten.h>
+extern "C" EMSCRIPTEN_KEEPALIVE void bw64_set_gamepad(int connected, int naxes, int nbuttons, unsigned buttons,
+        double a0, double a1, double a2, double a3, double a4, double a5, double a6, double a7) {
+    const double ax[8] = {a0, a1, a2, a3, a4, a5, a6, a7};
+    std::lock_guard<std::mutex> lk(g_pad64Mutex);
+    g_pad64.connected = connected;
+    g_pad64.naxes = naxes < 0 ? 0 : (naxes > 8 ? 8 : naxes);
+    g_pad64.nbuttons = nbuttons < 0 ? 0 : (nbuttons > 32 ? 32 : nbuttons);
+    g_pad64.buttons = buttons;
+    for (int i = 0; i < 8; i++) {
+        double v = ax[i] < -1.0 ? -1.0 : (ax[i] > 1.0 ? 1.0 : ax[i]);
+        g_pad64.axes[i] = (S16)(v < 0 ? v * 32768.0 : v * 32767.0);
+    }
+}
+#endif
+// op 1: copy the current Pad64State (32 bytes) to guest address `out`.
+static U64 pad64Query(CPU64* cpu, U64 op, U64 out) {
+    if (op != 1 || !out) return (U64)-K_EINVAL;
+    Pad64State s;
+    {
+        std::lock_guard<std::mutex> lk(g_pad64Mutex);
+        s = g_pad64;
+    }
+    cpu->memory->memcpyToGuest(out, &s, sizeof(s));
+    return 0;
+}
+
 static const char* x64SyscallName(U64 nr) {
 #ifdef BOXEDWINE_OPENGL
     if (nr == GL64_SYSCALL_NR) return "gl64_trap";
+    if (nr == PAD64_SYSCALL_NR) return "pad64_trap";
 #endif
     switch (nr) {
         case 0: return "read";
@@ -2901,6 +2938,9 @@ void ksyscall64(CPU64* cpu) {
     }
 
     switch (nr) {
+        case PAD64_SYSCALL_NR:
+            ret = pad64Query(cpu, a1, a2);
+            break;
 #ifdef BOXEDWINE_OPENGL
         case GL64_SYSCALL_NR:
             // Private guest->host OpenGL trap (see source/opengl/gl64bridge*).

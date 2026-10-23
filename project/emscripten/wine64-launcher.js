@@ -1012,6 +1012,31 @@
         console.log("mouse lock " + (locked ? "on" : "off"));
     });
 
+    // Gamepad (M30): mirror the first connected browser gamepad into the kernel
+    // (bw64_set_gamepad); the guest's SDL2 shim hands it to winebus, so
+    // dinput / winmm joystick apps see it. Only changes are pushed.
+    var lastPadKey = "";
+    function pollGamepad() {
+        var pads = navigator.getGamepads ? navigator.getGamepads() : [];
+        var p = null;
+        for (var i = 0; pads && i < pads.length; i++) if (pads[i] && pads[i].connected) { p = pads[i]; break; }
+        var args = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+        if (p) {
+            var mask = 0, nb = Math.min(p.buttons.length, 32), na = Math.min(p.axes.length, 8);
+            for (var b = 0; b < nb; b++) if (p.buttons[b] && p.buttons[b].pressed) mask |= (1 << b);
+            args = [1, na, nb, mask >>> 0];
+            for (var a = 0; a < 8; a++) args.push(a < na ? (Math.round(p.axes[a] * 1000) / 1000) : 0);
+        }
+        var key = args.join(",");
+        if (key !== lastPadKey && liveModule) {
+            if (p && lastPadKey.charAt(0) !== "1") console.log("gamepad -> wine: " + p.id);
+            callExport("bw64_set_gamepad", args.map(function () { return "number"; }), args);
+            lastPadKey = key;
+        }
+    }
+    window.addEventListener("gamepadconnected", function (e) { console.log("gamepad connected: " + e.gamepad.id); });
+    setInterval(pollGamepad, 16);
+
     // Installed programs (M25): installers drop .lnk shortcuts on the Desktop
     // and in the Start Menu. Scan those folders (MEMFS) every few seconds while
     // a session runs, resolve each shortcut's target and add .exe targets to
