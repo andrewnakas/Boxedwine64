@@ -80,6 +80,15 @@ void KNativeScreenSDL::setScreenSize(U32 cx, U32 cy) {
         if (window) {
             DISPATCH_MAIN_THREAD_BLOCK_THIS_BEGIN
                 SDL_SetWindowSize(window, cx, cy);
+#if defined(__EMSCRIPTEN__) && defined(BOXEDWINE_GUEST_X64)
+                // Browser (M27): the canvas drawing buffer keeps its creation
+                // size, so SDL_SetWindowSize alone left a smaller frame in the
+                // top-left corner (a 640x480 game filled 80% of an 800x600
+                // canvas). A logical size makes SDL scale every frame to fit the
+                // canvas (aspect-preserving) and maps mouse events back to guest
+                // coordinates.
+                if (renderer) SDL_RenderSetLogicalSize(renderer, cx, cy);
+#endif
             DISPATCH_MAIN_THREAD_BLOCK_END
         }
     }
@@ -780,7 +789,9 @@ void KNativeScreenSDL::recreateMainWindow() {
                     input->scaleX = input->scaleY;
                     input->scaleXOffset = (dm.w - input->width * input->scaleX / 100) / 2;
                 }
-            } else if (input->width == (U32)dm.w && input->height == (U32)dm.h) {
+            }
+#ifndef __EMSCRIPTEN__
+            else if (input->width == (U32)dm.w && input->height == (U32)dm.h) {
                 flags |= SDL_WINDOW_FULLSCREEN_DESKTOP;
             }
             if (cx > dm.w || cy > dm.h) {
@@ -790,6 +801,11 @@ void KNativeScreenSDL::recreateMainWindow() {
                 input->scaleY = dm.h * 100 / input->height;
                 flags |= SDL_WINDOW_FULLSCREEN_DESKTOP;
             }
+#endif
+            // Browser: the "desktop" display mode is just the canvas's initial
+            // size, so the checks above always fired and SDL queued a deferred
+            // requestFullscreen that Emscripten ran on the user's FIRST click
+            // into the canvas. Fullscreen is the explicit toolbar button (M27).
         }
 
         window = SDL_CreateWindow("BoxedWine", SDL_WINDOWPOS_UNDEFINED, SDL_WINDOWPOS_UNDEFINED, cx, cy, flags);

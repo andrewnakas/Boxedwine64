@@ -994,6 +994,24 @@
     }
     window.bw64RememberApp = rememberApp;
 
+    // Fullscreen + mouse lock (M27). Fullscreen shows the canvas letterboxed
+    // (CSS in wine64.html); mouse lock captures the pointer for games and tells
+    // the kernel to turn relative mouse deltas into guest motion.
+    window.bw64Fullscreen = function () {
+        var el = document.getElementById("dropzone") || document.getElementById("canvas");
+        if (document.fullscreenElement) { document.exitFullscreen(); return; }
+        if (el && el.requestFullscreen) el.requestFullscreen().catch(function (e) { console.log("fullscreen: " + e); });
+    };
+    window.bw64LockMouse = function () {
+        var c = document.getElementById("canvas");
+        if (c && c.requestPointerLock) c.requestPointerLock();
+    };
+    document.addEventListener("pointerlockchange", function () {
+        var locked = document.pointerLockElement === document.getElementById("canvas");
+        try { callExport("bw64_set_pointer_lock", ["number"], [locked ? 1 : 0]); } catch (e) {}
+        console.log("mouse lock " + (locked ? "on" : "off"));
+    });
+
     // Installed programs (M25): installers drop .lnk shortcuts on the Desktop
     // and in the Start Menu. Scan those folders (MEMFS) every few seconds while
     // a session runs, resolve each shortcut's target and add .exe targets to

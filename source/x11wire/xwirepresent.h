@@ -81,6 +81,10 @@ public:
     // the host canvas after its windows are unmapped, until the incoming app
     // paints its first frame. Default no-op for sinks that don't buffer frames.
     virtual void requestClear() {}
+    // XWarpPointer (SetCursorPos): move the virtual pointer, in presented-frame
+    // coordinates. Matters under browser pointer lock (M27), where motion is
+    // integrated from relative deltas and games recenter the cursor each frame.
+    virtual void warpPointer(int x, int y) { (void)x; (void)y; }
 };
 
 // The single active sink (nullptr when running headless / -novideo). Set by the
