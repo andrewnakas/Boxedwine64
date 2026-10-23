@@ -39,7 +39,13 @@ DLOPEN_SONAMES = [
     "libXi.so.6", "libXinerama.so.1", "libXxf86vm.so.1", "libXrandr.so.2",
     "libgcc_s.so.1", "libfreetype.so.6", "libfontconfig.so.1", "libasound.so.2",
 ]
-LIB_DIRS = ["lib/i386-linux-gnu", "usr/lib/i386-linux-gnu", "lib", "usr/lib"]
+LIB_DIRS = ["lib/i386-linux-gnu", "usr/lib/i386-linux-gnu", "lib", "usr/lib",
+            "usr/lib/i386-linux-gnu/pulseaudio"]
+# Contents lists every package shipping a basename; a few first matches are
+# wrong for us (apulse ships a compat libpulse.so.0 in a private dir).
+SONAME_OWNER_OVERRIDES = {"libpulse.so.0": "libpulse0"}
+# wine's own unix-side modules (resolved via the loader's rpath, not LIB_DIRS)
+WINE_INTERNAL_SONAMES = {"ntdll.so", "win32u.so"}
 
 
 def fetch(url, dest):
@@ -196,12 +202,12 @@ def main():
     todo += DLOPEN_SONAMES
     while todo:
         so = todo.pop()
-        if so in seen:
+        if so in seen or so in WINE_INTERNAL_SONAMES:
             continue
         seen.add(so)
         path = find_lib(so)
         if not path:
-            pkg = owner.get(so)
+            pkg = SONAME_OWNER_OVERRIDES.get(so) or owner.get(so)
             if not pkg or pkg not in pk:
                 print(f"  ! no i386 package provides {so}")
                 continue
