@@ -88,6 +88,16 @@ them.
 
 ## Log
 
+- **2026-10-23 — M24 DONE, M25 PARTIAL (installers).** Import .exe/.zip/
+  folders into C:\Apps (persisted; My apps row). NSIS setup.exe installs
+  work interactively and silently; installed apps' .lnk shortcuts are
+  auto-added to My apps. Prefix registry = shipped + Wow6432Node view
+  (merge-wow64-registry.py). MSI is a known gap (msiexec 1627; with
+  MSIServer/RpcSs keys it hangs). Known issue: a rare wasm "memory access
+  out of bounds" during boot (1 in ~20 d3dtri boots; 0 in the next 18 with a
+  --profiling-funcs build) — catch with tools/x64test/browser/boot_loop.mjs
+  (now logs e.stack) on a profiling build.
+
 - **2026-10-23 — M21 + M22 DONE: 32-bit Windows programs run in the 64-bit
   session.**
   - M21: KProcess::execve takes bitness from the NEW image (ELF class), retires
