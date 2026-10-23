@@ -213,6 +213,49 @@ else
   echo "NOTE: no Liberation fonts in $FONTS_SRC (run fetch-liberation-fonts.py) — core-font substitutes skipped" >&2
 fi
 
+# === Gamepad (M30): wine's HID joystick stack ==================================
+# dinput / winmm joysticks in wine 8 only come through winebus.sys (its SDL
+# backend dlopens our libSDL2 shim, tools/rootfs64/libsdl64). The tuned registry
+# has no PnP devices, so add the root WINEBUS device + winebus service. Wine's
+# ntoskrnl enumerates a driver's root devices when that driver's SERVICE loads
+# (ZwLoadDriver -> wine_enumerate_root_devices), so winebus is auto-start
+# (Start=2): services.exe loads it at boot and it finds ROOT\WINE\WINEBUS. The
+# child HID devices are installed at runtime from these INFs (wine generates
+# them under C:\windows\inf; tools/rootfs64/prefix-inf/ is a copy).
+# OPT-IN (BW64_PREFIX_GAMEPAD=1) while M30 is open: in today's boot no kernel
+# driver service actually gets loaded (winedevice exits; see the M30 roadmap
+# row), so these keys would only add a boot-time service without effect.
+SYSTEM_REG="$STAGE/$PREFIX_IN_ZIP/system.reg"
+if [ "${BW64_PREFIX_GAMEPAD:-0}" = "1" ] && ls "$HERE"/prefix-inf/*.inf >/dev/null 2>&1; then
+  mkdir -p "$STAGE/$DRIVE_C/windows/inf"
+  cp "$HERE"/prefix-inf/*.inf "$STAGE/$DRIVE_C/windows/inf/"
+  echo "  + $(ls "$HERE"/prefix-inf/*.inf | wc -l | tr -d ' ') bus/HID INFs -> C:\\windows\\inf"
+fi
+if [ "${BW64_PREFIX_GAMEPAD:-0}" = "1" ] && [ -f "$SYSTEM_REG" ] && ! grep -q '^\[System\\\\CurrentControlSet\\\\Services\\\\winebus\]' "$SYSTEM_REG"; then
+  cat >> "$SYSTEM_REG" <<'REGEOF'
+
+[System\\CurrentControlSet\\Enum\\ROOT\\WINE\\WINEBUS] 1780332434
+#time=1dcf1e649929046
+"ClassGUID"="{4d36e97d-e325-11ce-bfc1-08002be10318}"
+"ConfigFlags"=dword:00000000
+"DeviceDesc"="Wine HID bus driver"
+"HardwareID"=str(7):"root\\winebus\0"
+"Mfg"="The Wine Project"
+"Service"="winebus"
+
+[System\\CurrentControlSet\\Services\\winebus] 1780332434
+#time=1dcf1e649929046
+"Description"="Wine HID bus driver"
+"DisplayName"="Wine HID bus"
+"ErrorControl"=dword:00000001
+"Group"="WinePlugPlay"
+"ImagePath"="C:\\windows\\system32\\drivers\\winebus.sys"
+"Start"=dword:00000002
+"Type"=dword:00000001
+REGEOF
+  echo "  + root WINEBUS device + winebus service (gamepads)"
+fi
+
 echo "=== rezipping prefix64.zip ==="
 rm -f "$ZIP"
 ( cd "$STAGE" && zip -qry9 "$ZIP" . )

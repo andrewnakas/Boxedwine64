@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-# refresh-glibc-libgl.sh — put the current guest OpenGL shims (both arches) into
-# glibc-rootfs64.zip, the small (~9 MB) zip mounted FIRST.
+# refresh-glibc-libgl.sh — put the current guest shims into glibc-rootfs64.zip,
+# the small (~9 MB) zip mounted FIRST: the OpenGL shims (both arches) and the
+# 64-bit SDL2 joystick shim winebus dlopens (libsdl64/, M30).
 #
 # Why this works: zip mounts are first-wins (fszip.cpp skips a path an earlier
 # zip already registered), and the launcher mounts glibc-rootfs64.zip before
@@ -25,7 +26,11 @@ mkdir -p "$STAGE/lib/x86_64-linux-gnu" "$STAGE/usr/lib/x86_64-linux-gnu" "$STAGE
 cp "$HERE/libgl64/libGL.so.1" "$STAGE/lib/x86_64-linux-gnu/libGL.so.1"
 cp "$HERE/libgl64/libGL.so.1" "$STAGE/usr/lib/x86_64-linux-gnu/libGL.so.1"
 cp "$HERE/libgl32/libGL.so.1" "$STAGE/usr/lib/i386-linux-gnu/libGL.so.1"
-(cd "$STAGE" && zip -q "$ZIP" lib/x86_64-linux-gnu/libGL.so.1 \
-    usr/lib/x86_64-linux-gnu/libGL.so.1 usr/lib/i386-linux-gnu/libGL.so.1)
-unzip -l "$ZIP" | grep libGL.so.1
+FILES="lib/x86_64-linux-gnu/libGL.so.1 usr/lib/x86_64-linux-gnu/libGL.so.1 usr/lib/i386-linux-gnu/libGL.so.1"
+if [ -f "$HERE/libsdl64/libSDL2-2.0.so.0" ]; then
+    cp "$HERE/libsdl64/libSDL2-2.0.so.0" "$STAGE/usr/lib/x86_64-linux-gnu/libSDL2-2.0.so.0"
+    FILES="$FILES usr/lib/x86_64-linux-gnu/libSDL2-2.0.so.0"
+fi
+(cd "$STAGE" && zip -q "$ZIP" $FILES)
+unzip -l "$ZIP" | grep -E "libGL.so.1|libSDL2"
 echo "updated $ZIP ($(wc -c < "$ZIP" | tr -d ' ') bytes)"
