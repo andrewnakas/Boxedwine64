@@ -58,3 +58,6 @@ project/mac-xcode/build_*/
 /s[0-9]*.png
 /s_*.png
 /saveas_*.png
+
+# rootfs build work trees (deb cache, WoW64 prefix staging) — regenerable
+tools/rootfs64/work/

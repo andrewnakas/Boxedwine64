@@ -208,8 +208,12 @@
 
     // argv for running a Windows/guest program under wine64: [wine64, tok, ...].
     function wineProgArgv(prog) {
+        // Whitespace-separated, with "double quotes" grouping a token, so an
+        // imported app at C:\Apps\My App\x.exe (or an argument with spaces)
+        // survives intact.
         var argv = [WINE64];
-        (prog || "").split(/\s+/).forEach(function (tok) { if (tok.length) argv.push(tok); });
+        var re = /"([^"]*)"|(\S+)/g, m;
+        while ((m = re.exec(prog || "")) !== null) argv.push(m[1] !== undefined ? m[1] : m[2]);
         return argv;
     }
 
@@ -775,13 +779,280 @@
             // (same queue, FIFO), so the file exists in the VFS when wine looks.
             var guestPath = "/home/username/" + name;     // VFS local path (Z: == guest /)
             callExport("bw64_register_file", ["string"], [guestPath]);
-            var prog = "Z:\\home\\username\\" + name;      // explicit Z: path, like DOOM/HxD
-            if (window.launchApp) window.launchApp(prog);
+            var prog = quoteIfSpaced("Z:\\home\\username\\" + name);   // explicit Z: path, like DOOM/HxD
+            rememberApp(name.replace(/\.exe$/i, ""), prog);
+            if (window.launchApp) window.launchApp(prog + appArgs());
             else window.location.search = "?p=" + encodeURIComponent(prog);
         };
         reader.readAsArrayBuffer(file);
     }
     window.uploadAndRunExe = uploadAndRunExe;
+
+    // --- import apps: files, folders, zips (M24) ----------------------------
+    // Everything lands in C:\Apps\<name>\ (inside HOME, so the IndexedDB
+    // persistence sync keeps it across reloads), is registered into the kernel
+    // VFS in ONE call (bw64_register_file adds the first missing path component;
+    // children load lazily from MEMFS), and then the app's .exe is launched —
+    // a chooser appears when there are several. Launched apps are remembered in
+    // the "My apps" row (localStorage) for one-click relaunch.
+    var APPS_GUEST_DIR = "/home/username/.wine/drive_c/Apps";   // C:\Apps
+    var APPS_IN_MEMFS = ROOT + APPS_GUEST_DIR;
+    var MAX_IMPORT_BYTES = 1024 * 1024 * 1024; // MEMFS lives in the 4GB wasm heap
+
+    function appArgs() {
+        var el = document.getElementById("exeArgs");
+        return el && el.value.trim() ? " " + el.value.trim() : "";
+    }
+    function quoteIfSpaced(s) { return /\s/.test(s) ? '"' + s + '"' : s; }
+    function safeName(s) { return (s || "app").replace(/[\\/:*?"<>|]/g, "_").replace(/^\.+/, "") || "app"; }
+
+    // Minimal zip reader: central directory + stored/deflate entries, inflated
+    // with the browser's own DecompressionStream (no library).
+    function readZip(u8) {
+        var dv = new DataView(u8.buffer, u8.byteOffset, u8.byteLength);
+        var eocd = -1;
+        for (var i = u8.length - 22; i >= Math.max(0, u8.length - 65557); i--) {
+            if (dv.getUint32(i, true) === 0x06054b50) { eocd = i; break; }
+        }
+        if (eocd < 0) throw new Error("not a zip file");
+        var count = dv.getUint16(eocd + 10, true), off = dv.getUint32(eocd + 16, true);
+        var dec = new TextDecoder(), out = [];
+        for (var n = 0; n < count; n++) {
+            if (dv.getUint32(off, true) !== 0x02014b50) throw new Error("bad zip central directory");
+            var method = dv.getUint16(off + 10, true), csize = dv.getUint32(off + 20, true);
+            var nameLen = dv.getUint16(off + 28, true), extraLen = dv.getUint16(off + 30, true);
+            var commentLen = dv.getUint16(off + 32, true), local = dv.getUint32(off + 42, true);
+            var name = dec.decode(u8.subarray(off + 46, off + 46 + nameLen));
+            off += 46 + nameLen + extraLen + commentLen;
+            if (name.endsWith("/")) continue;
+            var dataStart = local + 30 + dv.getUint16(local + 26, true) + dv.getUint16(local + 28, true);
+            out.push({ path: name, method: method, raw: u8.subarray(dataStart, dataStart + csize) });
+        }
+        return out;
+    }
+    function inflateEntry(e) {
+        if (e.method === 0) return Promise.resolve(e.raw);
+        if (e.method !== 8) return Promise.reject(new Error(e.path + ": unsupported zip method " + e.method));
+        var stream = new Blob([e.raw]).stream().pipeThrough(new DecompressionStream("deflate-raw"));
+        return new Response(stream).arrayBuffer().then(function (b) { return new Uint8Array(b); });
+    }
+
+    // Folder drag-and-drop: walk FileSystemEntry trees into [{path, file}].
+    function walkEntry(entry, prefix) {
+        if (entry.isFile) {
+            return new Promise(function (res, rej) { entry.file(function (f) { res([{ path: prefix + f.name, file: f }]); }, rej); });
+        }
+        var reader = entry.createReader(), all = [];
+        return new Promise(function (res, rej) {
+            (function batch() {
+                reader.readEntries(function (ents) {
+                    if (!ents.length) {
+                        Promise.all(all.map(function (c) { return walkEntry(c, prefix + entry.name + "/"); }))
+                            .then(function (lists) { res([].concat.apply([], lists)); }, rej);
+                        return;
+                    }
+                    all = all.concat(ents); batch();
+                }, rej);
+            })();
+        });
+    }
+
+    function writeAppFiles(appName, items) {   // items: [{path, bytes}]
+        var FS = getFS(), base = APPS_IN_MEMFS + "/" + appName;
+        try { FS.mkdirTree(base); } catch (e) {}
+        items.forEach(function (it) {
+            var rel = it.path.replace(/\\/g, "/").replace(/^\/+/, "");
+            if (!rel || rel.split("/").indexOf("..") >= 0) return;   // no escapes
+            var dest = base + "/" + rel, dir = dest.substring(0, dest.lastIndexOf("/"));
+            try { FS.mkdirTree(dir); } catch (e) {}
+            try { FS.unlink(dest); } catch (e) {}
+            FS.writeFile(dest, it.bytes);
+        });
+        callExport("bw64_register_file", ["string"], [APPS_GUEST_DIR + "/" + appName]);
+        return items.map(function (it) { return it.path.replace(/\\/g, "/").replace(/^\/+/, ""); })
+                    .filter(function (p) { return /\.exe$/i.test(p); });
+    }
+
+    function chooseAndRun(appName, exes) {
+        if (!exes.length) { alert('Imported "' + appName + '" to C:\\Apps\\' + appName + ' but found no .exe to run.'); return; }
+        // Prefer top-level exes and skip obvious uninstallers/helpers when ranking.
+        exes.sort(function (a, b) {
+            var score = function (p) { return (p.split("/").length * 10) + (/unins|setup|update|crash|helper/i.test(p) ? 100 : 0); };
+            return score(a) - score(b) || a.localeCompare(b);
+        });
+        var run = function (rel) {
+            var prog = quoteIfSpaced("C:\\Apps\\" + appName + "\\" + rel.replace(/\//g, "\\"));
+            rememberApp(appName + (exes.length > 1 ? " · " + rel.split("/").pop() : ""), prog);
+            if (window.launchApp) window.launchApp(prog + appArgs());
+        };
+        if (exes.length === 1) return run(exes[0]);
+        var box = document.getElementById("exeChooser");
+        box.innerHTML = "<b>" + appName + "</b> has several programs — pick one: ";
+        exes.slice(0, 24).forEach(function (rel) {
+            var btn = document.createElement("button");
+            btn.type = "button"; btn.textContent = rel;
+            btn.onclick = function () { box.hidden = true; run(rel); };
+            box.appendChild(btn);
+        });
+        box.hidden = false;
+    }
+
+    function importApp(appName, itemsPromise) {
+        if (!window.Module || !getFS() || !sessionReady()) {
+            alert("Not ready yet — launch any app first (Notepad is quickest), then import.");
+            return;
+        }
+        appName = safeName(appName);
+        setStatusText("Importing " + appName + "…");
+        itemsPromise.then(function (items) {
+            var exes = writeAppFiles(appName, items);
+            setStatusText("Imported " + appName + " (" + items.length + " files) to C:\\Apps\\" + appName);
+            chooseAndRun(appName, exes);
+        }).catch(function (e) {
+            console.log("import failed: " + (e && e.stack || e));
+            alert("Import failed: " + (e && e.message || e));
+        });
+    }
+
+    function importZipFile(file) {
+        importApp(file.name.replace(/\.zip$/i, ""), file.arrayBuffer().then(function (buf) {
+            var entries = readZip(new Uint8Array(buf));
+            return Promise.all(entries.map(function (e) {
+                return inflateEntry(e).then(function (bytes) { return { path: e.path, bytes: bytes }; });
+            }));
+        }));
+    }
+    function importFileList(list, appName) {   // [{path, file}]
+        var total = list.reduce(function (s, x) { return s + x.file.size; }, 0);
+        if (total > MAX_IMPORT_BYTES) { alert("That's " + Math.round(total / 1048576) + " MB — over the 1 GB in-browser limit."); return; }
+        importApp(appName, Promise.all(list.map(function (x) {
+            return x.file.arrayBuffer().then(function (b) { return { path: x.path, bytes: new Uint8Array(b) }; });
+        })));
+    }
+    // <input webkitdirectory>: files carry webkitRelativePath "Folder/sub/x".
+    window.bw64ImportFolderInput = function (input) {
+        var files = Array.prototype.slice.call(input.files || []);
+        if (!files.length) return;
+        var root = (files[0].webkitRelativePath || files[0].name).split("/")[0];
+        importFileList(files.map(function (f) {
+            return { path: (f.webkitRelativePath || f.name).split("/").slice(1).join("/") || f.name, file: f };
+        }), root);
+        input.value = "";
+    };
+    window.bw64ImportFile = function (file) {
+        if (/\.zip$/i.test(file.name)) return importZipFile(file);
+        if (file.size > MAX_IMPORT_BYTES) { alert("That file is over the 1 GB in-browser limit."); return; }
+        uploadAndRunExe(file);
+    };
+
+    // Drag and drop anywhere on the page: a folder, a .zip, or an .exe.
+    function onDrop(ev) {
+        ev.preventDefault();
+        var items = ev.dataTransfer && ev.dataTransfer.items;
+        var entry = items && items.length && items[0].webkitGetAsEntry ? items[0].webkitGetAsEntry() : null;
+        if (entry && entry.isDirectory) {
+            importApp(safeName(entry.name), walkEntry(entry, "").then(function (list) {
+                // walkEntry prefixes the folder name; strip it so files land in C:\Apps\<folder>\
+                return Promise.all(list.map(function (x) {
+                    return x.file.arrayBuffer().then(function (b) {
+                        return { path: x.path.split("/").slice(1).join("/"), bytes: new Uint8Array(b) };
+                    });
+                }));
+            }));
+            return;
+        }
+        var f = ev.dataTransfer && ev.dataTransfer.files && ev.dataTransfer.files[0];
+        if (f) window.bw64ImportFile(f);
+    }
+    document.addEventListener("dragover", function (ev) { ev.preventDefault(); });
+    document.addEventListener("drop", onDrop);
+
+    // "My apps": imported/uploaded programs, one click to relaunch. The files
+    // persist via the HOME IndexedDB sync; this list persists in localStorage.
+    function loadMyApps() {
+        try { return JSON.parse(localStorage.getItem("bw64.myApps") || "[]"); } catch (e) { return []; }
+    }
+    function rememberApp(label, prog) {
+        var apps = loadMyApps().filter(function (a) { return a.prog !== prog; });
+        apps.unshift({ label: label, prog: prog });
+        try { localStorage.setItem("bw64.myApps", JSON.stringify(apps.slice(0, 24))); } catch (e) {}
+        renderMyApps();
+    }
+    function renderMyApps() {
+        var row = document.getElementById("myAppsRow"), list = document.getElementById("myApps");
+        if (!row || !list) return;
+        var apps = loadMyApps();
+        row.hidden = !apps.length;
+        list.innerHTML = "";
+        apps.forEach(function (a) {
+            var btn = document.createElement("button");
+            btn.type = "button"; btn.textContent = a.label; btn.title = a.prog;
+            btn.className = "appbtn"; btn.setAttribute("data-prog", a.prog);
+            btn.onclick = function () { if (window.launchApp) window.launchApp(a.prog + appArgs()); };
+            list.appendChild(btn);
+        });
+    }
+    window.bw64RememberApp = rememberApp;
+
+    // Installed programs (M25): installers drop .lnk shortcuts on the Desktop
+    // and in the Start Menu. Scan those folders (MEMFS) every few seconds while
+    // a session runs, resolve each shortcut's target and add .exe targets to
+    // My apps — so an app installed by its setup.exe gets a one-click button.
+    var SHORTCUT_DIRS = [
+        "/home/username/.wine/drive_c/users/username/Desktop",
+        "/home/username/.wine/drive_c/users/username/AppData/Roaming/Microsoft/Windows/Start Menu/Programs",
+        "/home/username/.wine/drive_c/users/Public/Desktop",
+        "/home/username/.wine/drive_c/ProgramData/Microsoft/Windows/Start Menu/Programs"
+    ];
+    // Shell Link (.lnk) target: LinkInfo's LocalBasePath (+ CommonPathSuffix),
+    // the format wine's IShellLink writes; fall back to the first X:\...exe string.
+    function lnkTarget(u8) {
+        try {
+            var dv = new DataView(u8.buffer, u8.byteOffset, u8.byteLength);
+            if (dv.getUint32(0, true) !== 0x4C) return null;
+            var flags = dv.getUint32(0x14, true), off = 0x4C;
+            if (flags & 1) off += 2 + dv.getUint16(off, true);          // LinkTargetIDList
+            if (flags & 2) {                                             // LinkInfo
+                var hdr = dv.getUint32(off + 4, true), base = dv.getUint32(off + 16, true);
+                var suffix = dv.getUint32(off + 24, true);
+                var cstr = function (at) { var e = at; while (e < u8.length && u8[e]) e++; return new TextDecoder("latin1").decode(u8.subarray(at, e)); };
+                var path = base ? cstr(off + base) : "";
+                if (hdr >= 0x24 && dv.getUint32(off + 28, true)) {      // unicode LocalBasePath
+                    var ub = off + dv.getUint32(off + 28, true), ue = ub;
+                    while (ue + 1 < u8.length && (u8[ue] || u8[ue + 1])) ue += 2;
+                    path = new TextDecoder("utf-16le").decode(u8.subarray(ub, ue));
+                }
+                if (suffix) path += cstr(off + suffix);
+                if (/^[A-Za-z]:\\.*\.exe$/i.test(path)) return path;
+            }
+            var txt = new TextDecoder("utf-16le").decode(u8) + " " + new TextDecoder("latin1").decode(u8);
+            var m = /[A-Za-z]:\\[^\u0000"<>|*?]*?\.exe/i.exec(txt);
+            return m ? m[0] : null;
+        } catch (e) { return null; }
+    }
+    var seenShortcuts = {};
+    function scanShortcuts() {
+        var FS = getFS(); if (!FS) return;
+        var walk = function (dir, depth) {
+            var names; try { names = FS.readdir(ROOT + dir); } catch (e) { return; }
+            names.forEach(function (n) {
+                if (n === "." || n === "..") return;
+                var p = dir + "/" + n, st;
+                try { st = FS.stat(ROOT + p); } catch (e) { return; }
+                if (FS.isDir(st.mode)) { if (depth < 4) walk(p, depth + 1); return; }
+                if (!/\.lnk$/i.test(n) || seenShortcuts[p] === st.mtime.getTime()) return;
+                seenShortcuts[p] = st.mtime.getTime();
+                var target = lnkTarget(FS.readFile(ROOT + p));
+                if (!target || /unins|uninst|setup|readme|help/i.test(target)) return;
+                console.log("My apps: shortcut " + n + " -> " + target);
+                rememberApp(n.replace(/\.lnk$/i, ""), quoteIfSpaced(target));
+            });
+        };
+        SHORTCUT_DIRS.forEach(function (d) { walk(d, 0); });
+    }
+    setInterval(function () { try { if (sessionReady()) scanShortcuts(); } catch (e) {} }, 4000);
+    if (document.readyState === "loading") document.addEventListener("DOMContentLoaded", renderMyApps);
+    else renderMyApps();
 
     // --- orchestration ------------------------------------------------------
     // The zips are large (wine64.zip ~205MB) on the FIRST boot. Their downloads

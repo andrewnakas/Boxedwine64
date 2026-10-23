@@ -62,6 +62,7 @@
 
 #include <atomic>
 #include <unistd.h>  // access()
+#include <sys/stat.h>
 #include <vector>
 #include <string>
 
@@ -276,33 +277,45 @@ static void doKill(U32 pid) {
 // (its native path = parent's native path + the remote-encoded name), matching
 // what loadChildren() would have done. Runs on the main-loop thread.
 static void doRegisterFile(const BString& guestPath) {
-    if (guestPath.isEmpty()) return;
-    // Split into parent dir + leaf name.
-    int slash = guestPath.lastIndexOf('/');
-    if (slash < 0) { klog_fmt("wine64session: registerFile bad path '%s'", guestPath.c_str()); return; }
-    BString parentPath = (slash == 0) ? B("/") : guestPath.substr(0, slash);
-    BString name = guestPath.substr(slash + 1);
-    if (name.isEmpty()) return;
-
-    std::shared_ptr<FsNode> parent = Fs::getNodeFromLocalPath(B(""), parentPath, false);
-    if (!parent) {
-        klog_fmt("wine64session: registerFile parent '%s' not in VFS", parentPath.c_str());
+    if (guestPath.isEmpty() || guestPath.charAt(0) != '/') {
+        klog_fmt("wine64session: registerFile bad path '%s'", guestPath.c_str());
         return;
     }
-    // Force the parent's children to be loaded first (so getChildByName is valid
-    // and we don't double-register what loadChildren already saw).
-    if (parent->getChildByName(name)) {
-        klog_fmt("wine64session: registerFile '%s' already present — ok", guestPath.c_str());
-        return;
+    // Walk the path from "/". getChildByName lazy-loads a NATIVE directory's
+    // children from MEMFS, so existing components resolve on their own; the
+    // first component missing from the VFS is a fresh MEMFS write under a dir
+    // whose children were already cached (or a zip-overlay dir, which never
+    // scans native children). Add exactly that node (file OR directory) with
+    // the native path loadChildren() would have used; everything below it is
+    // a native dir node now, so its own children load lazily. This registers a
+    // single uploaded .exe and a whole imported app folder alike (M24).
+    std::shared_ptr<FsNode> cur = Fs::getNodeFromLocalPath(B(""), B("/"), false);
+    if (!cur) return;
+    BString curPath;
+    std::vector<BString> parts;
+    guestPath.substr(1).split('/', parts);
+    for (const BString& name : parts) {
+        if (name.isEmpty()) continue;
+        BString childPath = curPath + "/" + name;
+        std::shared_ptr<FsNode> child = cur->getChildByName(name);
+        if (!child) {
+            BString remoteName = name;
+            Fs::localNameToRemote(remoteName);
+            BString nativePath = cur->nativePath.stringByApppendingPath(remoteName);
+            struct stat st;
+            if (::stat(nativePath.c_str(), &st) != 0) {
+                klog_fmt("wine64session: registerFile '%s': '%s' not in MEMFS", guestPath.c_str(), nativePath.c_str());
+                return;
+            }
+            Fs::addFileNode(childPath, B(""), nativePath, S_ISDIR(st.st_mode), cur);
+            klog_fmt("wine64session: registerFile '%s' -> native '%s' (registered %s)",
+                     childPath.c_str(), nativePath.c_str(), S_ISDIR(st.st_mode) ? "dir" : "file");
+            return;
+        }
+        cur = child;
+        curPath = childPath;
     }
-    // Native path = parent's native path + the remote-encoded leaf name (mirrors
-    // FsNode::loadChildren's localName->remoteName mapping for on-disk names).
-    BString remoteName = name;
-    Fs::localNameToRemote(remoteName);
-    BString nativePath = parent->nativePath.stringByApppendingPath(remoteName);
-    Fs::addFileNode(guestPath, B(""), nativePath, false, parent);
-    klog_fmt("wine64session: registerFile '%s' -> native '%s' (registered)",
-             guestPath.c_str(), nativePath.c_str());
+    klog_fmt("wine64session: registerFile '%s' already present — ok", guestPath.c_str());
 }
 
 // Name-service files the launcher writes into MEMFS ROOT/etc before main()
