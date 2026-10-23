@@ -23,6 +23,7 @@
 
 #include <cstring>
 #include <cstdlib>
+#include <mutex>
 #include <string>
 #include <algorithm>
 #include <vector>
@@ -214,6 +215,7 @@ namespace {
         X_RRGetOutputInfo             = 9,
         X_RRGetOutputProperty         = 15,
         X_RRGetCrtcInfo               = 20,
+        X_RRSetCrtcConfig             = 21,
         X_RRGetScreenResourcesCurrent = 25,
         X_RRGetOutputPrimary          = 31,
         X_RRGetProviderResources      = 32,
@@ -1529,8 +1531,19 @@ void XWireConnection::processOneRequest(const uint8_t* req, uint32_t len) {
         case X_AllowEvents:
         case X_GrabServer:
         case X_UngrabServer:
-        case X_WarpPointer:
             break;
+        case X_WarpPointer: {
+            // src-window(4)@4 dst-window(4)@8 src-x/y/w/h@12..19 dst-x(2)@20
+            // dst-y(2)@22. With a destination window the coordinates are window-
+            // relative; the presenter shows the app's base window at the frame
+            // origin, so they map 1:1 onto presented-frame coordinates.
+            if (len >= 24 && g_xwirePresentSink) {
+                uint32_t dstWin; int16_t dx, dy;
+                memcpy(&dstWin, req + 8, 4); memcpy(&dx, req + 20, 2); memcpy(&dy, req + 22, 2);
+                if (dstWin) g_xwirePresentSink->warpPointer(dx, dy);
+            }
+            break;                             // no reply
+        }
         case X_QueryExtension: {
             // Most extensions are reported absent (MIT-SHM, XKB, ...) so libX11
             // uses the plain core path (non-SHM PutImage). EXCEPTION: GLX. wine's
@@ -2737,6 +2750,32 @@ void XWireConnection::sendConfigureNotify(uint32_t window, int16_t x, int16_t y,
 // busy-loops re-enumerating forever (the rt_sigprocmask spin, memory #58..#67).
 // All replies follow the X11 RandR protocol; the fixed 32-byte reply header is:
 //   [0]=1 reply, [1]=pad, [2..3]=sequence, [4..7]=reply length (extra 4-byte units).
+// Display modes (M27). ONE screen shared by every X client (each wine process
+// has its own connection), so the mode list + current mode are process-global.
+// Mode 0 is the native root size; the others are the classic resolutions games
+// ask for. ChangeDisplaySettings -> winex11 xrandr14 -> RRSetCrtcConfig picks
+// one; the root window stays native-sized and the presenter shows the app's
+// (now mode-sized) window scaled to the canvas, so a 640x480 game fills it.
+namespace {
+struct RRMode { uint16_t w, h; };
+std::mutex g_rrMutex;
+std::vector<RRMode> g_rrModes;          // [0] = native
+size_t g_rrCurrent = 0;
+uint32_t g_rrConfigTime = 1;            // bumped on every successful mode set
+void rrInitModes(uint16_t nativeW, uint16_t nativeH) {
+    if (!g_rrModes.empty()) return;
+    g_rrModes.push_back({nativeW, nativeH});
+    const RRMode extra[] = {{1280, 1024}, {1280, 960}, {1280, 720}, {1024, 768}, {800, 600}, {640, 480}, {512, 384}, {320, 240}};
+    for (const RRMode& m : extra)
+        if (m.w <= nativeW && m.h <= nativeH && !(m.w == nativeW && m.h == nativeH)) g_rrModes.push_back(m);
+}
+}
+
+// wine 8.0's winex11 xrandr handler registers exactly one output/crtc; without
+// any monitor, get_host_primary_monitor_rect()={0} -> wined3d's windowed Present
+// busy-loops re-enumerating forever (the rt_sigprocmask spin, memory #58..#67).
+// All replies follow the X11 RandR protocol; the fixed 32-byte reply header is:
+//   [0]=1 reply, [1]=pad, [2..3]=sequence, [4..7]=reply length (extra 4-byte units).
 void XWireConnection::handleRandr(const uint8_t* req, uint32_t len) {
     uint8_t minor = req[1];
     auto hdr32 = [&](uint8_t* r, uint32_t extraWords) {
@@ -2746,7 +2785,11 @@ void XWireConnection::handleRandr(const uint8_t* req, uint32_t len) {
         uint32_t L = extraWords;
         memcpy(r + 4, &L, 4);
     };
-    const uint32_t SW = screenWidth, SH = screenHeight; // 1024×768
+    std::lock_guard<std::mutex> rrLock(g_rrMutex);
+    rrInitModes(screenWidth, screenHeight);
+    const RRMode cur = g_rrModes[g_rrCurrent];
+    const uint32_t nModes = (uint32_t)g_rrModes.size();
+    const uint32_t ts = g_rrConfigTime + 1, cts = g_rrConfigTime;   // timestamp > config_timestamp (#72)
     switch (minor) {
         case X_RRQueryVersion: {
             // reply: major(4)@8=1, minor(4)@12=4  (MUST be >=1.4)
@@ -2759,7 +2802,7 @@ void XWireConnection::handleRandr(const uint8_t* req, uint32_t len) {
         case X_RRGetScreenSizeRange: {
             // minWidth(2)@8 minHeight(2)@10 maxWidth(2)@12 maxHeight(2)@14
             uint8_t r[32] = {0}; hdr32(r, 0);
-            uint16_t mnW = (uint16_t)SW, mnH = (uint16_t)SH, mxW = (uint16_t)SW, mxH = (uint16_t)SH;
+            uint16_t mnW = 320, mnH = 240, mxW = screenWidth, mxH = screenHeight;
             memcpy(r + 8, &mnW, 2); memcpy(r + 10, &mnH, 2);
             memcpy(r + 12, &mxW, 2); memcpy(r + 14, &mxH, 2);
             writeToClient(r, sizeof(r));
@@ -2767,131 +2810,143 @@ void XWireConnection::handleRandr(const uint8_t* req, uint32_t len) {
         }
         case X_RRGetScreenResources:
         case X_RRGetScreenResourcesCurrent: {
-            // Reply body (after 32B header):
-            //   timestamp(4) config_timestamp(4) nCrtcs(2) nOutputs(2) nModes(2)
-            //   nBytesNames(2) pad(8)  [= 24 bytes in the fixed reply part @8..31]
-            // then: CRTCS[nCrtcs](4 each), OUTPUTS[nOutputs](4 each),
-            //   MODEINFO[nModes](32 each), then name bytes (nBytesNames), padded.
-            const char* modeName = "1024x768"; uint16_t nameLen = 8;
-            uint32_t crtcs = 1, outputs = 1, modes = 1;
-            // extra payload after the 32B header:
-            //   crtcs(4) + outputs(4) + modeinfo(32) + names(8 → pad to 8)
-            uint32_t namesPadded = (nameLen + 3) & ~3u;
-            uint32_t payload = crtcs*4 + outputs*4 + modes*32 + namesPadded;
+            // Fixed part @8: timestamp(4) config_timestamp(4) nCrtcs(2) nOutputs(2)
+            // nModes(2) nBytesNames(2) pad(8); then CRTCS[], OUTPUTS[],
+            // MODEINFO[nModes](32 each), then all mode names concatenated (padded).
+            std::string names;
+            for (const RRMode& m : g_rrModes) names += std::to_string(m.w) + "x" + std::to_string(m.h);
+            uint32_t namesPadded = ((uint32_t)names.size() + 3) & ~3u;
+            uint32_t payload = 4 + 4 + nModes * 32 + namesPadded;
             std::vector<uint8_t> r(32 + payload, 0);
             hdr32(r.data(), payload / 4);
-            // #72: timestamp must be >= config_timestamp; if they're EQUAL wine may think a
-            // reconfig is pending and re-poll. Make timestamp newer than config_timestamp.
-            uint32_t ts = 2, cts = 1;
             memcpy(&r[8], &ts, 4); memcpy(&r[12], &cts, 4);
-            uint16_t nc = (uint16_t)crtcs, no = (uint16_t)outputs, nm = (uint16_t)modes, nbn = nameLen;
+            uint16_t nc = 1, no = 1, nm = (uint16_t)nModes, nbn = (uint16_t)names.size();
             memcpy(&r[16], &nc, 2); memcpy(&r[18], &no, 2);
             memcpy(&r[20], &nm, 2); memcpy(&r[22], &nbn, 2);
-            // pad @24..31
             uint32_t off = 32;
             uint32_t crtc = RR_CRTC_ID; memcpy(&r[off], &crtc, 4); off += 4;
             uint32_t outp = RR_OUTPUT_ID; memcpy(&r[off], &outp, 4); off += 4;
-            // MODEINFO (32 bytes): id(4) width(2) height(2) dotClock(4) hSyncStart(2)
-            //   hSyncEnd(2) hTotal(2) hSkew(2) vSyncStart(2) vSyncEnd(2) vTotal(2)
-            //   nameLength(2) modeFlags(4)
-            uint32_t modeId = RR_MODE_ID; memcpy(&r[off], &modeId, 4);
-            uint16_t modeW = (uint16_t)SW, modeH = (uint16_t)SH;
-            memcpy(&r[off + 4], &modeW, 2); memcpy(&r[off + 6], &modeH, 2);
-            uint32_t dot = 65000000; memcpy(&r[off + 8], &dot, 4);
-            uint16_t hTotal = 1344, vTotal = 806;
-            // hSyncStart@12 hSyncEnd@14 hTotal@16 hSkew@18 vSyncStart@20 vSyncEnd@22 vTotal@24
-            memcpy(&r[off + 16], &hTotal, 2);
-            memcpy(&r[off + 24], &vTotal, 2);
-            uint16_t mnl = nameLen; memcpy(&r[off + 26], &mnl, 2);
-            // modeFlags@28 = 0
-            off += 32;
-            memcpy(&r[off], modeName, nameLen); off += namesPadded;
+            // MODEINFO: id(4) width(2) height(2) dotClock(4) hSyncStart(2) hSyncEnd(2)
+            //   hTotal(2) hSkew(2) vSyncStart(2) vSyncEnd(2) vTotal(2) nameLength(2) flags(4)
+            for (uint32_t i = 0; i < nModes; i++) {
+                const RRMode& m = g_rrModes[i];
+                uint32_t modeId = RR_MODE_ID + i; memcpy(&r[off], &modeId, 4);
+                memcpy(&r[off + 4], &m.w, 2); memcpy(&r[off + 6], &m.h, 2);
+                uint16_t hTotal = (uint16_t)(m.w + m.w / 4), vTotal = (uint16_t)(m.h + m.h / 20);
+                uint32_t dot = (uint32_t)hTotal * vTotal * 60;          // 60 Hz
+                memcpy(&r[off + 8], &dot, 4);
+                memcpy(&r[off + 16], &hTotal, 2);
+                memcpy(&r[off + 24], &vTotal, 2);
+                uint16_t mnl = (uint16_t)(std::to_string(m.w).size() + 1 + std::to_string(m.h).size());
+                memcpy(&r[off + 26], &mnl, 2);
+                off += 32;
+            }
+            memcpy(&r[off], names.data(), names.size());
             writeToClient(r.data(), (uint32_t)r.size());
             break;
         }
         case X_RRGetCrtcInfo: {
-            // Reply body: timestamp(4)@8 x(2)@12 y(2)@14 width(2)@16 height(2)@18
+            // Body: timestamp(4)@8 x(2)@12 y(2)@14 width(2)@16 height(2)@18
             //   mode(4)@20 rotation(2)@24 rotations(2)@26 nOutput(2)@28 nPossible(2)@30
-            //   then OUTPUTS[nOutput](4) POSSIBLE[nPossible](4)
-            // status(1) is in the reply header's [1] byte (RRSetConfigSuccess=0).
-            uint32_t outputs = 1, possible = 1;
-            uint32_t payload = outputs*4 + possible*4;
+            //   then OUTPUTS[nOutput](4) POSSIBLE[nPossible](4); status in header [1].
+            uint32_t payload = 4 + 4;
             std::vector<uint8_t> r(32 + payload, 0);
             hdr32(r.data(), payload / 4);
-            r[1] = 0; // status = RRSetConfigSuccess
-            uint32_t ts = 1; memcpy(&r[8], &ts, 4);
-            int16_t x = 0, y = 0; uint16_t w = (uint16_t)SW, h = (uint16_t)SH;
+            r[1] = 0; // RRSetConfigSuccess
+            memcpy(&r[8], &ts, 4);
+            int16_t x = 0, y = 0;
             memcpy(&r[12], &x, 2); memcpy(&r[14], &y, 2);
-            memcpy(&r[16], &w, 2); memcpy(&r[18], &h, 2);
-            uint32_t mode = RR_MODE_ID; memcpy(&r[20], &mode, 4);
+            memcpy(&r[16], &cur.w, 2); memcpy(&r[18], &cur.h, 2);
+            uint32_t mode = RR_MODE_ID + (uint32_t)g_rrCurrent; memcpy(&r[20], &mode, 4);
             uint16_t rot = 1 /*RR_Rotate_0*/, rots = 1; memcpy(&r[24], &rot, 2); memcpy(&r[26], &rots, 2);
-            uint16_t no = (uint16_t)outputs, np = (uint16_t)possible;
+            uint16_t no = 1, np = 1;
             memcpy(&r[28], &no, 2); memcpy(&r[30], &np, 2);
-            uint32_t off = 32;
-            uint32_t o = RR_OUTPUT_ID; memcpy(&r[off], &o, 4); off += 4;
-            uint32_t p = RR_OUTPUT_ID; memcpy(&r[off], &p, 4); off += 4;
+            uint32_t o = RR_OUTPUT_ID; memcpy(&r[32], &o, 4); memcpy(&r[36], &o, 4);
             writeToClient(r.data(), (uint32_t)r.size());
             break;
         }
         case X_RRGetOutputInfo: {
-            // Reply body: timestamp(4)@8 crtc(4)@12 mm_width(4)@16 mm_height(4)@20
-            //   connection(1)@24 subpixel_order(1)@25 nCrtcs(2)@26 nModes(2)@28
-            //   nPreferred(2)@30 nClones(2)@32 nameLength(2)@34
-            //   then CRTCS[nCrtcs](4) MODES[nModes](4) CLONES[nClones](4) name(padded)
-            // status(1) in reply header [1].
+            // Body: timestamp(4)@8 crtc(4)@12 mm_width(4)@16 mm_height(4)@20
+            //   connection(1)@24 subpixel(1)@25 nCrtcs(2)@26 nModes(2)@28 nPreferred(2)@30
+            //   nClones(2)@32 nameLength(2)@34, then CRTCS[] MODES[] CLONES[] name(padded)
             const char* name = "Wine Output"; uint16_t nameLen = 11;
-            uint32_t nCrtcs = 1, nModes = 1, nClones = 0;
             uint32_t namesPadded = (nameLen + 3) & ~3u;
-            uint32_t payload = nCrtcs*4 + nModes*4 + nClones*4 + namesPadded;
-            std::vector<uint8_t> r(36 + payload, 0); // fixed part runs to @36 (nameLength@34..35)
-            hdr32(r.data(), (4 + payload) / 4);      // extra words = (bytes after @32) /4
-            r[1] = 0; // status = RRSetConfigSuccess
-            uint32_t ts = 1; memcpy(&r[8], &ts, 4);
+            uint32_t payload = 4 + nModes * 4 + namesPadded;
+            std::vector<uint8_t> r(36 + payload, 0);
+            hdr32(r.data(), (4 + payload) / 4);
+            r[1] = 0;
+            memcpy(&r[8], &ts, 4);
             uint32_t crtc = RR_CRTC_ID; memcpy(&r[12], &crtc, 4);
-            uint32_t mmw = 270, mmh = 203; memcpy(&r[16], &mmw, 4); memcpy(&r[20], &mmh, 4);
-            r[24] = 0; // connection = RR_Connected
-            r[25] = 0; // subpixel order = Unknown
-            uint16_t ncr = (uint16_t)nCrtcs, nmo = (uint16_t)nModes, npref = 1, ncl = (uint16_t)nClones, nl = nameLen;
+            uint32_t mmw = (uint32_t)screenWidth * 254 / 960, mmh = (uint32_t)screenHeight * 254 / 960;
+            memcpy(&r[16], &mmw, 4); memcpy(&r[20], &mmh, 4);
+            r[24] = 0; r[25] = 0; // connected, subpixel unknown
+            uint16_t ncr = 1, nmo = (uint16_t)nModes, npref = 1, ncl = 0, nl = nameLen;
             memcpy(&r[26], &ncr, 2); memcpy(&r[28], &nmo, 2);
             memcpy(&r[30], &npref, 2); memcpy(&r[32], &ncl, 2);
             memcpy(&r[34], &nl, 2);
             uint32_t off = 36;
             uint32_t c = RR_CRTC_ID; memcpy(&r[off], &c, 4); off += 4;
-            uint32_t m = RR_MODE_ID; memcpy(&r[off], &m, 4); off += 4;
-            // no clones
-            memcpy(&r[off], name, nameLen); off += namesPadded;
+            for (uint32_t i = 0; i < nModes; i++) { uint32_t m = RR_MODE_ID + i; memcpy(&r[off], &m, 4); off += 4; }
+            memcpy(&r[off], name, nameLen);
             writeToClient(r.data(), (uint32_t)r.size());
             break;
         }
+        case X_RRSetCrtcConfig: {
+            // Request: crtc(4)@4 timestamp(4)@8 configTimestamp(4)@12 x(2)@16 y(2)@18
+            //   mode(4)@20 rotation(2)@24 pad(2) outputs[]. Reply: status@1, newTimestamp@8.
+            uint32_t mode = 0;
+            if (len >= 24) memcpy(&mode, req + 20, 4);
+            uint8_t status = 0; // RRSetConfigSuccess
+            if (mode >= RR_MODE_ID && mode < RR_MODE_ID + nModes) {
+                if (g_rrCurrent != mode - RR_MODE_ID) {
+                    g_rrCurrent = mode - RR_MODE_ID;
+                    g_rrConfigTime++;
+                    klog_fmt("XWire RandR: display mode -> %ux%u", (unsigned)g_rrModes[g_rrCurrent].w,
+                             (unsigned)g_rrModes[g_rrCurrent].h);
+                }
+            } else if (mode != 0) {          // mode None (0) = disable: accept, keep mode
+                status = 3;                  // RRSetConfigFailed
+            }
+            uint8_t r[32] = {0}; hdr32(r, 0);
+            r[1] = status;
+            uint32_t nts = g_rrConfigTime + 1; memcpy(r + 8, &nts, 4);
+            writeToClient(r, sizeof(r));
+            break;
+        }
         case X_RRGetOutputPrimary: {
-            // reply: output(4)@8
             uint8_t r[32] = {0}; hdr32(r, 0);
             uint32_t o = RR_OUTPUT_ID; memcpy(r + 8, &o, 4);
             writeToClient(r, sizeof(r));
             break;
         }
         case X_RRGetProviderResources: {
-            // reply: timestamp(4)@8 nProviders(2)@12 pad(2)@14 ... (we report 0)
             uint8_t r[32] = {0}; hdr32(r, 0);
-            uint32_t ts = 1; memcpy(r + 8, &ts, 4);
-            // nProviders @12 = 0
+            memcpy(r + 8, &ts, 4);           // nProviders @12 = 0
             writeToClient(r, sizeof(r));
             break;
         }
         case X_RRGetOutputProperty: {
-            // EDID etc — report no property (format 0, type None, 0 items).
+            // EDID etc -- report no property (format 0, type None, 0 items).
             uint8_t r[32] = {0}; hdr32(r, 0);
-            // r[1]=format=0; bytes_after(4)@8=0; num_items(4)@12=0
             writeToClient(r, sizeof(r));
             break;
         }
-        case X_RRSelectInput:
-            // no reply
+        // Requests the RandR protocol defines WITHOUT a reply. Answering one
+        // would desynchronize the client's sequence numbers (wine sends
+        // RRSetScreenSize while changing modes).
+        case X_RRSelectInput:      // 4
+        case 7:                    // RRSetScreenSize
+        case 12: case 13: case 14: // Configure/Change/DeleteOutputProperty
+        case 17: case 18: case 19: // DestroyMode, Add/DeleteOutputMode
+        case 24: case 26:          // SetCrtcGamma, SetCrtcTransform
+        case 30:                   // SetOutputPrimary
+        case 34: case 35:          // SetProviderOffloadSink/OutputSource
+        case 37: case 38:          // Change/DeleteProviderProperty
+        case 43: case 44:          // SetMonitor, DeleteMonitor
             break;
         default: {
             // Any other reply-expecting RandR request: minimal empty reply so a
-            // synchronous client never hangs. (wine's enumeration only needs the
-            // ones above.)
+            // synchronous client never hangs.
             uint8_t r[32] = {0}; hdr32(r, 0);
             writeToClient(r, sizeof(r));
             break;

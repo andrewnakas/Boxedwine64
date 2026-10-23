@@ -43,6 +43,17 @@
 #include <vector>
 #include <functional>
 #include <condition_variable>
+#include <algorithm>
+
+// Browser pointer lock (M27): set by the launcher on pointerlockchange. While
+// locked, SDL motion is integrated from relative deltas (see forwardSdlEvent).
+static std::atomic<bool> g_pointerLocked{false};
+#ifdef __EMSCRIPTEN__
+#include <emscripten/emscripten.h>
+extern "C" EMSCRIPTEN_KEEPALIVE void bw64_set_pointer_lock(int on) {
+    g_pointerLocked.store(on != 0, std::memory_order_relaxed);
+}
+#endif
 
 // Defined in the multi-threaded main loop; true only on the platform main thread.
 bool isMainthread();
@@ -413,7 +424,17 @@ public:
                 break;
             }
             case SDL_MOUSEMOTION:
-                lastX = e.motion.x; lastY = e.motion.y;
+                if (g_pointerLocked.load(std::memory_order_relaxed)) {
+                    // Browser pointer lock (M27): the OS cursor is frozen, so
+                    // integrate the relative deltas into a virtual pointer
+                    // clamped to the presented frame (games re-center it via
+                    // XWarpPointer -> warpPointer()).
+                    int w = shownW ? shownW : 1024, h = shownH ? shownH : 768;
+                    lastX = std::max(0, std::min(w - 1, lastX + e.motion.xrel));
+                    lastY = std::max(0, std::min(h - 1, lastY + e.motion.yrel));
+                } else {
+                    lastX = e.motion.x; lastY = e.motion.y;
+                }
                 ie.type = XWireInputEvent::EvMotion;
                 ie.x = lastX; ie.y = lastY;
                 ie.state = sdlModState();
@@ -421,7 +442,9 @@ public:
                 break;
             case SDL_MOUSEBUTTONDOWN:
             case SDL_MOUSEBUTTONUP: {
-                lastX = e.button.x; lastY = e.button.y;
+                if (!g_pointerLocked.load(std::memory_order_relaxed)) {
+                    lastX = e.button.x; lastY = e.button.y;   // locked: keep the virtual pointer
+                }
                 ie.type = (e.type == SDL_MOUSEBUTTONDOWN) ? XWireInputEvent::EvButtonDown
                                                           : XWireInputEvent::EvButtonUp;
                 // X buttons: 1=left,2=middle,3=right
@@ -457,6 +480,12 @@ private:
     std::deque<XWireInputEvent> inputQ;
     int lastX = 0, lastY = 0;
     uint16_t shownW = 0, shownH = 0;     // last size pushed to the host screen
+public:
+    void warpPointer(int x, int y) override {
+        std::lock_guard<std::mutex> lk(mtx);
+        lastX = x; lastY = y;
+    }
+private:
     uint16_t lastPresentW = 0, lastPresentH = 0; // last frame size actually blitted
     uint32_t lastPresentWindow = 0;      // present window at last blit (app-switch detect)
     int clearFrames = 0;                 // remaining backbuffer clears after a size/app change
