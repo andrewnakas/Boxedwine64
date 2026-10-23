@@ -105,7 +105,7 @@
       <input type="file" id="exeUpload" accept=".exe,application/x-msdownload,application/octet-stream" style="display:none"
              onchange="if (this.files[0] && window.uploadAndRunExe) { window.uploadAndRunExe(this.files[0]); this.value=''; }">
       <button type="button" onclick="document.getElementById('exeUpload').click()">⬆ Run my own .exe</button>
-      <span class="tbhint">runs a Windows .exe you choose — best with a single <b>portable</b> Win32 app (not installers, .NET, or D3D games)</span>
+      <span class="tbhint">runs a Windows .exe you choose (32-bit or 64-bit) — best with a single <b>portable</b> app (not installers, .NET, or D3D games yet)</span>
       <!-- Clipboard bridge: guest copy -> browser clipboard, browser clipboard ->
            guest paste. Buttons (not automatic) because navigator.clipboard
            requires a user gesture. Handlers in wine64-launcher.js. -->
