@@ -188,6 +188,10 @@ void runThreadSlice(KThread* thread) {
             } catch (...) {
                 // CPU64 has no nextOp; nothing to clear here.
             }
+            // execve into a 32-bit ELF retired this CPU64 mid-slice; run() has
+            // returned, so it (and its address space) can be freed now. The next
+            // slice takes the 32-bit path below.
+            if (!thread->process->is64Bit) thread->process->reapRetired64();
             return;
         }
     }

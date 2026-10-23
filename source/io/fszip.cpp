@@ -64,9 +64,22 @@ bool FsZip::init(BString zipPath, BString mount) {
     BString strippedMount;
 
     std::shared_ptr<FsNode> root = Fs::getNodeFromLocalPath(B(""), B(""), true);
-    // A bw64url: spec is not a filesystem path — give its tombstone file a
-    // fixed name instead of deriving one from the spec string.
-    BString deleteName = fsZipUrlIsSpec(zipPath) ? B("bw64url") : Fs::getFileNameFromNativePath(zipPath);
+    // A bw64url: spec is not a filesystem path: name its tombstone after the
+    // first URL's zip file ("bw64url:N;https://.../wine32.zip.part000|S;..." ->
+    // "wine32.zip"), so several URL-mounted zips (wine64 + wine32) don't share
+    // one tombstone.
+    BString deleteName;
+    if (fsZipUrlIsSpec(zipPath)) {
+        int urlStart = zipPath.indexOf(';');
+        int urlEnd = urlStart >= 0 ? zipPath.indexOf('|', urlStart) : -1;
+        BString url = (urlStart >= 0 && urlEnd > urlStart) ? zipPath.substr(urlStart + 1, urlEnd - urlStart - 1) : B("bw64url");
+        int slash = url.lastIndexOf('/');
+        deleteName = slash >= 0 ? url.substr(slash + 1) : url;
+        int zipExt = deleteName.indexOf(".zip");
+        if (zipExt > 0) deleteName = deleteName.substr(0, zipExt + 4);
+    } else {
+        deleteName = Fs::getFileNameFromNativePath(zipPath);
+    }
     deleteFilePath = root->nativePath.stringByApppendingPath(deleteName + ".deleted");
     if (mount.length()) {
         Fs::makeLocalDirs(mount);
