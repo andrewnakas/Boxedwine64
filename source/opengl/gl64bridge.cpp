@@ -67,6 +67,30 @@
 #include <vector>
 #include <thread>
 #include <atomic>
+#include "kmemory.h"
+
+// The bridge's view of the calling guest process (see GLGuestMem in the
+// header). Helpers keep the historical `cpu->memory->...` spelling.
+struct GLBridgeCtx { GLGuestMem* memory; };
+
+namespace {
+struct GLGuestMem64 : GLGuestMem {
+    KMemory64* m;
+    explicit GLGuestMem64(KMemory64* mem) : m(mem) { ptrSize = 8; }
+    void memcpyFromGuest(void* dst, U64 src, U64 len) override { m->memcpyFromGuest(dst, src, len); }
+    void memcpyToGuest(U64 dst, const void* src, U64 len) override { m->memcpyToGuest(dst, src, len); }
+    void writed(U64 addr, U32 value) override { m->writed(addr, value); }
+    void writeq(U64 addr, U64 value) override { m->writeq(addr, value); }
+};
+struct GLGuestMem32 : GLGuestMem {
+    KMemory* m;
+    explicit GLGuestMem32(KMemory* mem) : m(mem) { ptrSize = 4; }
+    void memcpyFromGuest(void* dst, U64 src, U64 len) override { m->memcpy(dst, (U32)src, (U32)len); }
+    void memcpyToGuest(U64 dst, const void* src, U64 len) override { m->memcpy((U32)dst, src, (U32)len); }
+    void writed(U64 addr, U32 value) override { m->writed((U32)addr, value); }
+    void writeq(U64 addr, U64 value) override { m->writeq((U32)addr, value); }
+};
+}
 #include <cstring>
 #include <cstdio>
 #include <string>
@@ -599,7 +623,7 @@ inline float af(const GL64Args& a, int i)  { U32 u = (U32)a.a[i]; float f; memcp
 inline double ad(const GL64Args& a, int i) { U64 u = a.a[i]; double d; memcpy(&d, &u, 8); return d; }
 
 // Read `count` floats from a guest buffer (params* for glLightfv etc.).
-void readFloats(CPU64* cpu, U64 guestAddr, float* out, int count) {
+void readFloats(GLBridgeCtx* cpu, U64 guestAddr, float* out, int count) {
     if (!guestAddr) { for (int i=0;i<count;i++) out[i]=0; return; }
     cpu->memory->memcpyFromGuest(out, guestAddr, (U64)count * 4);
 }
@@ -736,7 +760,7 @@ bool texParamSupported(GLenum pname) {
 
 // Read a NUL-terminated C string from guest memory, capped at `maxLen` bytes.
 // Reads in chunks to avoid a per-byte trap; stops at the first NUL.
-std::string readGuestCStr(CPU64* cpu, U64 guestAddr, U64 maxLen) {
+std::string readGuestCStr(GLBridgeCtx* cpu, U64 guestAddr, U64 maxLen) {
     std::string out;
     if (!guestAddr) return out;
     char buf[256];
@@ -755,7 +779,7 @@ std::string readGuestCStr(CPU64* cpu, U64 guestAddr, U64 maxLen) {
 // Generate/delete host GL object names and write/read the id array to/from the
 // guest. n = args.a[0], guest id array = args.a[1].
 enum class GenKind { Buffer, Texture, VertexArray };
-void genObjects(CPU64* cpu, const GL64Args& args, GenKind kind) {
+void genObjects(GLBridgeCtx* cpu, const GL64Args& args, GenKind kind) {
     GLsizei n = (GLsizei)args.a[0];
     if (n <= 0 || n > 65536) return;
     std::vector<GLuint> ids((size_t)n, 0);
@@ -769,7 +793,7 @@ void genObjects(CPU64* cpu, const GL64Args& args, GenKind kind) {
     });
     cpu->memory->memcpyToGuest(args.a[1], ids.data(), (U64)n * 4);
 }
-void deleteObjects(CPU64* cpu, const GL64Args& args, GenKind kind) {
+void deleteObjects(GLBridgeCtx* cpu, const GL64Args& args, GenKind kind) {
     GLsizei n = (GLsizei)args.a[0];
     if (n <= 0 || n > 65536) return;
     std::vector<GLuint> ids((size_t)n, 0);
@@ -785,7 +809,7 @@ void deleteObjects(CPU64* cpu, const GL64Args& args, GenKind kind) {
 }
 
 // glGetShaderInfoLog / glGetProgramInfoLog: args = (obj, bufSize, length*, infoLog*).
-void writeInfoLog(CPU64* cpu, const GL64Args& args, bool isProgram) {
+void writeInfoLog(GLBridgeCtx* cpu, const GL64Args& args, bool isProgram) {
     GLuint obj = (GLuint)args.a[0];
     GLsizei bufSize = (GLsizei)args.a[1];
     if (bufSize <= 0 || bufSize > (1 << 20)) bufSize = 0;
@@ -835,7 +859,7 @@ size_t texImageBytes(GLsizei w, GLsizei h, GLenum format, GLenum type) {
 
 } // namespace
 
-U64 gl64Bridge(CPU64* cpu, U64 fnId, U64 argsAddr) {
+static U64 glBridgeImpl(GLBridgeCtx* cpu, U64 fnId, U64 argsAddr) {
     std::lock_guard<std::recursive_mutex> lk(g_glMutex);
 
     // Track the most recent fnIds (ring) so a nonzero glGetError can be annotated
@@ -1379,7 +1403,13 @@ U64 gl64Bridge(CPU64* cpu, U64 fnId, U64 argsAddr) {
             // Read the guest string-pointer array and optional length array, then
             // each guest source string, into host-owned storage.
             std::vector<U64> guestStrPtrs(count);
-            cpu->memory->memcpyFromGuest(guestStrPtrs.data(), args.a[2], (U64)count * 8);
+            if (cpu->memory->ptrSize == 4) {
+                std::vector<U32> p32(count);
+                cpu->memory->memcpyFromGuest(p32.data(), args.a[2], (U64)count * 4);
+                for (GLsizei i = 0; i < count; i++) guestStrPtrs[i] = p32[i];
+            } else {
+                cpu->memory->memcpyFromGuest(guestStrPtrs.data(), args.a[2], (U64)count * 8);
+            }
             std::vector<S32> guestLens;
             bool haveLens = args.a[3] != 0;
             if (haveLens) {
@@ -1979,6 +2009,18 @@ U64 gl64Bridge(CPU64* cpu, U64 fnId, U64 argsAddr) {
             klog_fmt("gl64: unimplemented fn id %llu", (unsigned long long)fnId);
             return 0;
     }
+}
+
+U64 gl64Bridge(CPU64* cpu, U64 fnId, U64 argsAddr) {
+    GLGuestMem64 mem(cpu->memory);
+    GLBridgeCtx ctx{&mem};
+    return glBridgeImpl(&ctx, fnId, argsAddr);
+}
+
+U64 gl32Bridge(KMemory* memory, U32 fnId, U32 argsAddr) {
+    GLGuestMem32 mem(memory);
+    GLBridgeCtx ctx{&mem};
+    return glBridgeImpl(&ctx, fnId, argsAddr);
 }
 
 #endif // BOXEDWINE_OPENGL

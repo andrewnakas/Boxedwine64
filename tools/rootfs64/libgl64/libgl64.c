@@ -225,6 +225,22 @@ enum {
 };
 
 // ---- the trap ---------------------------------------------------------------
+#if defined(__i386__)
+// 32-bit build (libgl32/libGL.so.1, M23): the SAME shim compiled -m32 for
+// 32-bit wine processes. Trap via int $0x80 with EAX = the gl64 syscall
+// number, EBX = fnId, ECX = &args; the kernel (syscall.cpp) routes it to the
+// shared bridge and returns the 64-bit result in EDX:EAX. GL64Args keeps its
+// u64 slots, so pointers travel zero-extended and the bridge is unchanged.
+static inline uint64_t gl64_trap(uint64_t fnId, GL64Args* args) {
+    uint32_t lo, hi;
+    __asm__ __volatile__(
+        "int $0x80"
+        : "=a"(lo), "=d"(hi)
+        : "a"((uint32_t)GL64_SYSCALL_NR), "b"((uint32_t)fnId), "c"((uint32_t)(uintptr_t)args)
+        : "memory");
+    return ((uint64_t)hi << 32) | lo;
+}
+#else
 static inline uint64_t gl64_trap(uint64_t fnId, GL64Args* args) {
     uint64_t ret;
     register uint64_t rdi __asm__("rdi") = fnId;
@@ -236,6 +252,7 @@ static inline uint64_t gl64_trap(uint64_t fnId, GL64Args* args) {
         : "rcx", "r11", "memory");
     return ret;
 }
+#endif
 
 // Load-time witness: fire a gl64 trap with fnId=0 the moment winex11/opengl32
 // dlopens this libGL. The host bridge logs it under BW64_GLTRACE ("gl64: FIRST

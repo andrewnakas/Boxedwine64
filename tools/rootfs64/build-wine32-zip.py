@@ -250,6 +250,15 @@ def main():
                     add(full)
         for lib in sorted(keep_libs):
             add(lib)
+        # Boxedwine's guest OpenGL shim (M23): the i386 build of libgl64.c
+        # (tools/rootfs64/build-libgl64.sh -> libgl32/libGL.so.1), found by
+        # winex11/opengl32 dlopen("libGL.so.1") on the i386 library path.
+        gl32 = os.path.join(HERE, "libgl32", "libGL.so.1")
+        if os.path.exists(gl32):
+            z.write(gl32, "usr/lib/i386-linux-gnu/libGL.so.1")
+            count += 1
+        else:
+            print("  ! libgl32/libGL.so.1 missing: 32-bit OpenGL/D3D disabled (run build-libgl64.sh)")
         # the i386 dynamic loader under every name the PT_INTERP / ldd use
         ld = find_lib("ld-linux.so.2")
         if ld:
