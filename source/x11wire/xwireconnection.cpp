@@ -132,6 +132,9 @@ namespace {
         X_SetInputFocus         = 42,
         X_GetInputFocus         = 43,
         X_GetPointerMapping     = 117,
+        X_SetScreenSaver        = 107,
+        X_GetScreenSaver        = 108,
+        X_ForceScreenSaver      = 115,
         X_SetClipRectangles     = 59,
         X_AllocColor            = 84,
         X_CreateCursor          = 93,
@@ -1411,6 +1414,23 @@ void XWireConnection::processOneRequest(const uint8_t* req, uint32_t len) {
             writeToClient(r, sizeof(r));
             break;
         }
+        // Screen saver: wined3d's acquire_focus_window asks
+        // SystemParametersInfo(SPI_GETSCREENSAVEACTIVE), which winex11 answers
+        // with XGetScreenSaver -- unanswered, libX11 waited forever and every
+        // exclusive-mode DirectDraw/D3D app hung in SetCooperativeLevel.
+        // Report "disabled" (timeout 0); Set/Force have no reply.
+        case X_GetScreenSaver: {
+            uint8_t r[32] = {0};
+            r[0] = 1;
+            r[2] = (uint8_t)(sequence & 0xff);
+            r[3] = (uint8_t)(sequence >> 8);
+            // timeout 0, interval 0, prefer-blanking 0, allow-exposures 0
+            writeToClient(r, sizeof(r));
+            break;
+        }
+        case X_SetScreenSaver:
+        case X_ForceScreenSaver:
+            break;
         // --- Pointer/focus/grab requests issued by wine's click handler ---
         // (X11DRV_ButtonPress -> grab/focus/query). Before these were handled
         // they fell into default: and the reply-expecting ones (GrabPointer,

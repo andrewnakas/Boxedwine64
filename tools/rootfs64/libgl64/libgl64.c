@@ -739,6 +739,15 @@ API void glTexSubImage2D(GLenum target, GLint level, GLint x, GLint y, GLsizei w
     GL64Args a={{0}}; a.a[0]=target; a.a[1]=(uint64_t)(uint32_t)level; a.a[2]=(uint64_t)(uint32_t)x; a.a[3]=(uint64_t)(uint32_t)y; a.a[4]=(uint64_t)(uint32_t)w; a.a[5]=(uint64_t)(uint32_t)h; a.a[6]=fmt; a.a[7]=type; a.a[8]=(uint64_t)(uintptr_t)pixels;
     (void)gl64_trap(GL64_fn_glTexSubImage2D,&a);
 }
+// 1D textures (wined3d's P8 palette): forwarded as height-1 2D uploads that
+// keep the GL_TEXTURE_1D target; the host bridge stores them as Wx1 2D
+// textures and rewrites texture1D() lookups to match.
+API void glTexImage1D(GLenum target, GLint level, GLint ifmt, GLsizei w, GLint border, GLenum fmt, GLenum type, const void* pixels){
+    glTexImage2D(target, level, ifmt, w, 1, border, fmt, type, pixels);
+}
+API void glTexSubImage1D(GLenum target, GLint level, GLint x, GLsizei w, GLenum fmt, GLenum type, const void* pixels){
+    glTexSubImage2D(target, level, x, 0, w, 1, fmt, type, pixels);
+}
 API void glGenerateMipmap(GLenum target){ GL64Args a={{0}}; a.a[0]=target; (void)gl64_trap(GL64_fn_glGenerateMipmap,&a); }
 API void glCompressedTexImage2D(GLenum target, GLint level, GLenum ifmt, GLsizei w, GLsizei h, GLint border, GLsizei imageSize, const void* data){
     GL64Args a={{0}}; a.a[0]=target; a.a[1]=(uint64_t)(uint32_t)level; a.a[2]=ifmt; a.a[3]=(uint64_t)(uint32_t)w; a.a[4]=(uint64_t)(uint32_t)h; a.a[5]=(uint64_t)(uint32_t)border; a.a[6]=(uint64_t)(uint32_t)imageSize; a.a[7]=(uint64_t)(uintptr_t)data;
@@ -849,7 +858,7 @@ static const struct procEntry g_procs[] = {
     E(glScissor), E(glPolygonOffset), E(glPolygonMode), E(glDepthRange),
     E(glLineWidth), E(glPixelStorei), E(glSampleCoverage),
     E(glActiveTexture), E(glGenTextures), E(glBindTexture), E(glDeleteTextures),
-    E(glTexParameteri), E(glTexParameterf), E(glTexImage2D), E(glTexSubImage2D),
+    E(glTexParameteri), E(glTexParameterf), E(glTexImage2D), E(glTexSubImage2D), E(glTexImage1D), E(glTexSubImage1D),
     E(glGenerateMipmap), E(glCompressedTexImage2D), E(glGetStringi),
     // --- ARB_sync + queries (wined3d Present/flush + occlusion) ---
     E(glFenceSync), E(glClientWaitSync), E(glWaitSync), E(glDeleteSync),
