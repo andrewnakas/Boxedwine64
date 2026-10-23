@@ -94,6 +94,12 @@
         <button type="button" class="appbtn" data-prog="iexplore.exe"><span class="ico">🌐</span>IE</button>
         <button type="button" class="appbtn" data-prog="oleview.exe"><span class="ico">🔎</span>oleview</button>
       </div>
+      <!-- Programs you imported / uploaded (wine64-launcher.js renderMyApps):
+           files live in C:\Apps (persisted with HOME), the list in localStorage. -->
+      <div class="approw" id="myAppsRow" hidden>
+        <span class="applbl">My apps</span>
+        <span id="myApps"></span>
+      </div>
       <span class="appshint">first launch downloads the rootfs once; later switches are instant (no reload). Builtins (Notepad…Minesweeper) add no download. <b>Experimental</b> apps may not render yet.</span>
     </div>
     <div id="toolbar">
@@ -102,10 +108,15 @@
       <!-- Upload-your-own .exe: write the picked file into the sandbox and run it.
            The hidden file input is triggered by the button; on change we hand the
            File to window.uploadAndRunExe (wine64-launcher.js). -->
-      <input type="file" id="exeUpload" accept=".exe,application/x-msdownload,application/octet-stream" style="display:none"
-             onchange="if (this.files[0] && window.uploadAndRunExe) { window.uploadAndRunExe(this.files[0]); this.value=''; }">
-      <button type="button" onclick="document.getElementById('exeUpload').click()">⬆ Run my own .exe</button>
-      <span class="tbhint">runs a Windows .exe you choose (32-bit or 64-bit) — best with a single <b>portable</b> app (not installers, .NET, or D3D games yet)</span>
+      <input type="file" id="exeUpload" accept=".exe,.zip,application/x-msdownload,application/zip,application/octet-stream" style="display:none"
+             onchange="if (this.files[0] && window.bw64ImportFile) { window.bw64ImportFile(this.files[0]); this.value=''; }">
+      <input type="file" id="folderUpload" webkitdirectory multiple style="display:none"
+             onchange="window.bw64ImportFolderInput && window.bw64ImportFolderInput(this)">
+      <button type="button" onclick="document.getElementById('exeUpload').click()">⬆ Run my own .exe / .zip</button>
+      <button type="button" onclick="document.getElementById('folderUpload').click()">📁 Import app folder</button>
+      <input type="text" id="exeArgs" placeholder="arguments (optional)" size="18" aria-label="program arguments">
+      <span class="tbhint">32-bit or 64-bit Windows programs: a single .exe, a .zip, or a whole folder (also drag &amp; drop onto the page). Imports go to C:\Apps and appear under <b>My apps</b>. Not yet: installers, .NET, most D3D games.</span>
+      <div id="exeChooser" class="tbhint" hidden></div>
       <!-- Clipboard bridge: guest copy -> browser clipboard, browser clipboard ->
            guest paste. Buttons (not automatic) because navigator.clipboard
            requires a user gesture. Handlers in wine64-launcher.js. -->
