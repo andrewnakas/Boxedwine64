@@ -440,7 +440,9 @@ extern "C" int runX64RunElf(const char* path) {
     // test in a few seconds on a modern host. The unimpl-tracer at
     // cpu64.cpp:3654 still prints the first opcode that decode-fails
     // before we ever hit the cap.
-    const U64 INSN_LIMIT = 64ULL * 1024 * 1024;
+    // BW64_INSN_LIMIT overrides the cap (benchmarks like cpu_bench need more).
+    const char* capEnv = std::getenv("BW64_INSN_LIMIT");
+    const U64 INSN_LIMIT = capEnv ? std::strtoull(capEnv, nullptr, 0) : 64ULL * 1024 * 1024;
     cpu.runBounded(INSN_LIMIT);
 
     printf("--x64-run-elf: stopped after %llu instructions (yield=%d RIP=0x%llx RAX=0x%llx)\n",

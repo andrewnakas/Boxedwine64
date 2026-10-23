@@ -49,6 +49,7 @@
 #define X64_SYS_shmdt             67
 #define X64_SYS_rt_sigaction      13
 #define X64_SYS_rt_sigprocmask    14
+#define X64_SYS_ptrace            101
 #define X64_SYS_ioctl             16
 #define X64_SYS_pread64           17
 #define X64_SYS_writev            20
@@ -1780,6 +1781,7 @@ static U64 sys_readlink64(CPU64* cpu, U64 pathAddr, U64 buf, U64 sz) {
 //
 // uaddr==0 → -EFAULT for all ops (matches kernel).
 static U64 sys_futex64(CPU64* cpu, U64 uaddr, U32 op, U32 val, U64 timeoutAddr, U32 val3) {
+    if (uaddr & 3) return (U64)-K_EINVAL;
     if (uaddr == 0) return (U64)-K_EFAULT;
 
     // Real path: when this CPU64 is driven by a scheduled KThread inside a
@@ -3086,9 +3088,14 @@ void ksyscall64(CPU64* cpu) {
                 ret = (U64)-K_ENOSYS;
             }
             break;
+        case X64_SYS_ptrace:
+            // No debugger support: report EPERM like a locked-down kernel.
+            ret = (U64)-K_EPERM;
+            break;
         case X64_SYS_getcwd: {
             // getcwd(buf, size) — copy current directory string out. Returns
-            // a pointer to buf on success, -ERANGE if size is too small.
+            // the byte count including NUL on success (the libc wrapper
+            // returns a pointer), -ERANGE if size is too small.
             if (!a1 || a2 == 0) { ret = (U64)-K_EFAULT; break; }
             // No-process standalone runner: default cwd to "/".
             BString cwd = (cpu->thread && cpu->thread->process)
@@ -3097,7 +3104,7 @@ void ksyscall64(CPU64* cpu) {
             U64 need = (U64)cwd.length() + 1;
             if (need > a2) { ret = (U64)-34; /* -ERANGE */ break; }
             cpu->memory->memcpyToGuest(a1, cwd.c_str(), need);
-            ret = a1;
+            ret = need;
             break;
         }
         case X64_SYS_fcntl: {

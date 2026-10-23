@@ -490,6 +490,33 @@
     function mkdirHost(path) {
         try { getFS().mkdir(path); } catch (e) { /* EEXIST is fine */ }
     }
+    // Guest name-service files. None of the rootfs zips carries /etc/hosts or
+    // /etc/nsswitch.conf, so glibc fell back to its default "hosts: dns files"
+    // order: every hostname lookup (wineboot --init resolves the computer
+    // name, uname nodename "boxedwine64") first tried DNS at 127.0.0.1:53,
+    // which Emscripten turns into a WebSocket that fails after a ~5s timeout.
+    // Two of those cost ~10s of every boot. "hosts: files" + a hosts file that
+    // names the guest makes the lookup local and instant. Written before
+    // main() so the kernel's root scan sees them; a zip-provided file (if a
+    // future rootfs ships one) still wins because zips overlay the root.
+    function writeGuestNssFiles() {
+        var FS = getFS();
+        var files = {
+            "/etc/hosts": "127.0.0.1\tlocalhost\n127.0.1.1\tboxedwine64 boxedwine\n::1\tlocalhost\n",
+            "/etc/nsswitch.conf": "passwd: files\ngroup: files\nhosts: files\n",
+            "/etc/host.conf": "order hosts,bind\nmulti on\n",
+            "/etc/hostname": "boxedwine64\n",
+        };
+        mkdirHost(ROOT);
+        mkdirHost(ROOT + "/etc");
+        Object.keys(files).forEach(function (path) {
+            try {
+                FS.writeFile(ROOT + path, files[path]);
+            } catch (e) {
+                console.log("guest " + path + " not written: " + e);
+            }
+        });
+    }
     function prepareWinePrefix() {
         // ROOT (/root in MEMFS) is the guest "/". Boxedwine MKDIR()s ROOT itself
         // inside main(), but that runs AFTER this preRun hook, so create the full
@@ -773,6 +800,7 @@
                               "Starting wine64...");
 
                 if (DO_BOOT) prepareWinePrefix();
+                writeGuestNssFiles();
 
                 var M = liveModule || window.Module;
                 var args = buildArguments();

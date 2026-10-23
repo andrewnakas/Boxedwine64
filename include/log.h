@@ -24,6 +24,14 @@ void internal_kpanic(BString msg);
 
 void kpanic(const char* msg);
 
+// Unknown-instruction recover policy and counters (ported from Winbox
+// 2b504cf99). Recovery is opt-in for both browser and
+// native builds (BW64_RECOVER=1 enables it).
+bool bw64RecoverEnabled();
+void bw64RecoverNoteSkippedInstruction(bool loggedRip);
+void bw64RecoverNoteSigillFallback();
+bool bw64RecoverClaimRip(unsigned architecture, U64 rip);
+
 template <class... Args>
 #ifdef BOXEDWINE_MSVC
 __declspec(noreturn)

@@ -61,6 +61,7 @@
 #include "../../io/fsnode.h"
 
 #include <atomic>
+#include <unistd.h>  // access()
 #include <vector>
 #include <string>
 
@@ -302,6 +303,25 @@ static void doRegisterFile(const BString& guestPath) {
     Fs::addFileNode(guestPath, B(""), nativePath, false, parent);
     klog_fmt("wine64session: registerFile '%s' -> native '%s' (registered)",
              guestPath.c_str(), nativePath.c_str());
+}
+
+// Name-service files the launcher writes into MEMFS ROOT/etc before main()
+// (wine64-launcher.js writeGuestNssFiles). /etc itself comes from a rootfs
+// zip, and zip directories never scan the native dir beneath them, so these
+// would be invisible without registration. Called once, before the boot
+// process starts (startupArgs.cpp), so the very first hostname lookup is
+// already served from /etc/hosts instead of a 5s DNS timeout.
+void bw64RegisterNativeEtcFiles() {
+    static const char* const names[] = {"hosts", "nsswitch.conf", "host.conf", "hostname"};
+    std::shared_ptr<FsNode> etc = Fs::getNodeFromLocalPath(B(""), B("/etc"), false);
+    if (!etc) return;
+    for (const char* name : names) {
+        BString remote = BString::copy(name);
+        Fs::localNameToRemote(remote);
+        BString native = etc->nativePath.stringByApppendingPath(remote);
+        if (::access(native.c_str(), R_OK) != 0) continue;   // launcher didn't write it
+        doRegisterFile(BString::copy("/etc/") + name);
+    }
 }
 
 // Drain queued requests. MUST be called from the main-loop thread (mainloop.cpp

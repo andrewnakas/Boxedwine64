@@ -67,14 +67,62 @@ self-contained sessions. Each iteration:
 | M16 | Direct3D (wined3d → WebGL2) | Bring up the D3D path: extend the gl64 bridge from fixed-function-only to the full programmable pipeline (shaders, VBOs, vertex attribs, modern state, textures) so wined3d can render D3D apps via WebGL2 | A D3D9 app renders its 3D output (not black) in-browser | DONE (2026-07-01, browser-verified: d3dtri renders its gradient triangle; code on master 32b53543) — two final root causes: wined3d's `wglGetPixelFormat` at present time livelocks the wineserver window-region path (fixed with a skip patch baked into the shipped wined3d.dll, see Log 2026-07-03) and the guest libGL stubbed `glMapBuffer`/`glUnmapBuffer` so D3D vertex-buffer Lock/Unlock never filled the VBO (fixed in tools/rootfs64/libgl64). Production-clean rootfs deployed 2026-07-03 |
 | M17 | winetricks (evaluate) | Bring up winetricks (the wine helper that installs redistributables/DLL-overrides/fonts) in the WASM build, or get a useful subset working | winetricks runs a verb in-browser, or a written go/no-go with the technical blocker + the achievable native subset | EVALUATED → NO-GO for the script; native verb-subset is the path (2026-06-11). winetricks is a ~14k-line bash script needing a POSIX shell + coreutils + wget/curl + cabextract + internet — NONE exist in the rootfs (no shell at all; no socket egress in-browser). Its USEFUL actions (DLL overrides, registry tweaks) ARE achievable natively without it. Assessment + mechanism in the Log |
 | M18 | Boot reliability | Kill the two known boot flakes so a cold boot succeeds ~always: (a) the wineserver startup race (several wineservers contend, the real one loses and exits → app never paints — observed ~1-in-3 headless boots since 2026-06-11), (b) the d3dtri/GL `CreateDevice` early-exit flake (~1-in-2, app exits status=1 ~80s in before GL init). Root-cause each, fix in the spawn/serialization path (not by retry) | 10 consecutive cold headless boots of notepad AND glcube AND d3dtri all paint without a retry, locally; CI smoke passes on attempt 1 for 3 consecutive deploys | LOCAL ACCEPTANCE MET (2026-07-04): **30/30 consecutive clean boots** (glcube 10/10, notepad 10/10, d3dtri 10/10) and boots are ~2× faster (36–47s vs 60–100s — the explorer die/respawn cycle was slowing every boot). ONE root cause explained both flakes: wineserver closes an "empty" desktop (only explorer's threads left) after 1 SECOND (server/winstation.c `close_desktop_timeout`); the interpreter's slow wineboot→app handoff leaves the desktop empty for seconds → explorer /desktop gets WM_CLOSE mid-boot → the late app finds no desktop (generic apps hang; d3dtri's device init fails → its "CreateDevice flake"). Three-part fix: (1) patched wineserver, desktop grace 1s→600s — MUST be built from Debian's wine source (apt-get source; vanilla-source wineserver is incompatible: Debian patches the server dir to XDG /run/user, ntdll dies `chdir: ENOENT`) — Dockerfile.wineserver in /Users/nakas/winebuild; (2) sys_execve64 appends `-p` to bare wineserver spawns (deterministic session persistence); (3) deskpin.exe holds a hidden window as a desktop user (belt-and-braces once up). Remaining for full DONE: ship the rootfs (needs PR #1 merged) + 3 consecutive attempt-1-green CI smokes |
+| M19 | Block executor default-on | Ship the decoded-block executor (`BOXEDWINE_BLOCK_EXEC` + `BOXEDWINE_BLOCK_CACHE_INFRA`) by default after validating it under a real wine boot, native and wasm; grow record-kind coverage from `BW64_BLOCKSTATS` on a wine boot | notepad cold boot ≥30% faster than 42s, 30/30 boot matrix, selftest 234/234, cpu_bench hash unchanged | DONE (2026-10-23, local; ships with the M19/M20 PR) — default ON in wasm64-mt. Browser 30-boot matrix 30/30 (notepad 10/10 avg ~24s, glcube 10/10 ~20s, d3dtri 10/10 ~21s; notepad was ~45s), glcube 21.7s, d3dtri 22.8s (triangle pixel-verified ~107s, was 2-3 min), DOOM 22.3s. Native notepad 50-68s -> 9-10s; cpu_bench 6.6s -> 3.1s user with identical hash. Most of the BROWSER win was NOT the CPU: a missing /etc/hosts+nsswitch.conf made every boot wait out two 5s DNS timeouts (see Log). selftest 907/907, blockfuzz 0 mismatches. |
+| M20 | ISA breadth (SSE3/SSSE3/SSE4) | Implement + advertise SSE3/SSSE3/SSE4.1/4.2 in CPUID; decode common VEX-128 forms (AVX stays unadvertised) | selftest extended + green; a mingw `-msse4.2` test exe runs in-browser | DONE (2026-10-23, local) — ported from the Winbox fork (Kn0tzer) + fixes; CPUID now advertises SSE3/SSSE3/SSE4.1/SSE4.2/POPCNT/CX16 (no AVX). tools/x64test/sse4_diff.sh: 107/107 intrinsics identical to Rosetta x86_64. VEX-128 decode NOT done (AVX stays unadvertised). |
+| M21 | Mixed-arch kernel | 32-bit ELF processes alongside 64-bit ones in one GUEST_X64 kernel (fix `is64Bit` on exec, keep 32-bit CPU/KMemory alive in wasm) | wasm session: 64-bit ELF execs a 32-bit hello and back | TODO |
+| M22 | wine32 (32-bit exes) | Stage Debian i386 wine side (i386-windows/unix, `wine` loader, i386 glibc + X11/freetype/asound) as a lazily-fetched `wine32.zip` sharing the wineserver | a 32-bit `-m32` GUI exe renders next to a 64-bit app on the same wineserver | TODO (blocked-by M21) |
+| M23 | 32-bit GL/D3D | gl64 bridge trap on the 32-bit syscall path (i386 libgl shim) | 32-bit glcube + 32-bit d3d9 triangle render | TODO (blocked-by M22) |
+| M24 | Get apps in | Drag-drop files/folders/zips into HOME/C:, args + working dir, lift the 256MB cap | drag a zip of a portable app in → it runs | TODO |
+| M25 | Installers + shortcuts | setup.exe (Inno/NSIS) and `msiexec /i` complete; Start Menu/Desktop .lnk → persisted "My apps" row; fix `?boot=1` | an Inno installer + an MSI install, survive reload, relaunch from My apps | TODO |
+| M26 | Core fonts | Metric-compatible fonts (Liberation) + registry font substitutes | WordPad renders Arial/Times-substituted text with correct metrics | TODO |
+| M27 | Display modes + fullscreen | Configurable root size (`?res=`), multi-mode RANDR + mode-set resizing root/canvas, fullscreen button, pointer lock | a 640×480 mode-switching app displays scaled; fullscreen + pointer lock in DOOM | TODO |
+| M28 | DirectDraw / D3D8 | ddraw + d3d8 test exes render (palette/8bpp blits, wined3d ddraw path) | both render in-browser | TODO |
+| M29 | GL 3.x → D3D10/11 | Advertise GL 3.2 core mapped to WebGL2 (FBO/VAO/UBO/instancing), GLSL 1.50→ES 3.00 | a d3d11 triangle renders, or evidence-backed descope | TODO |
+| M30 | Gamepad + MIDI | Browser Gamepad API → joystick/evdev node for winebus/dinput; OSS sequencer/soft-synth MIDI | joy.cpl shows axes moving; a MIDI plays | TODO |
 
-Suggested order = table order. M1 early on purpose: it protects every later
+Suggested order = table order (M0–M18). Parity phase (M19+, started 2026-10-20 — goal: full 32-bit-Boxedwine parity for 64-bit, browser first): M19 → M20 → M21 → M22 → M24 → M25 → M23 → M27 → M26 → M28 → M29 → M30. M1 early on purpose: it protects every later
 milestone. M11–M13 are evaluation milestones — a rigorous written no-go closes
 them.
 
 ---
 
 ## Log
+
+- **2026-10-23 — M19 + M20 DONE (local), Winbox fork triaged.**
+  - **Winbox fork** (github.com/Kn0tzer/Winbox, 756 commits on top of our
+    3b216f3a, AI-agent-built): D3D9-12 via DXVK/vkd3d -> guest Vulkan shim ->
+    WebGPU replay, a 32-bit wine prefix (wine32.zip/prefix32.zip, Celeste via
+    Mono32), folder import, a CPU64/CPU32 wasm JIT, ~1000 new CPU selftests.
+    NOT merged wholesale: it deletes our native Mac/Windows builds + roadmap
+    docs, vendors ~180MB of DXVK/vkd3d source, and points runtime downloads
+    and a guest-internet wss proxy at the fork owner's servers. Policy:
+    cherry-pick by milestone, credit Kn0tzer in each commit. Map: M20 <- their
+    CPU64 ISA work (DONE here); M21-M23 <- their 32-bit prefix + kernel fixes
+    (int80, clone TLS, LDT, PT_INTERP) + 32-bit GL/Vulkan; M29 <- their
+    Vulkan->WebGPU bridge (biggest/riskiest import). Their JIT is skipped (their
+    own numbers: notepad startup ~1.26x SLOWER with it).
+  - **M20:** their interpreter-side ISA hunks merged 3-way onto our block
+    executor (JIT hunks filtered out). Our fixes: PINSRB-from-GPR read AH..BH
+    (caught by the new Rosetta differential test); unknown-instruction
+    "recover" (skip the opcode) made OPT-IN (BW64_RECOVER=1) — silently
+    skipping instructions can corrupt results. Not yet taken: their KMemory64
+    file-identity sharing (4 selftests parked), CPU32 SSE work (-> M21).
+  - **M19:** block executor grown to ~30 record kinds in a per-CPU arena
+    (wine-boot coverage 89%), --x64-blockfuzz differential fuzzer (0
+    mismatches / 20k sequences; planted bug caught), plus two correctness
+    fixes: the run-loop terminate/signal poll used `count & 0xFFFF == 0`,
+    which block execution skips past; and a store that patches a later
+    instruction of the SAME block now stops the block. Default ON.
+  - **Browser boot root cause (big one):** no rootfs zip ships /etc/hosts or
+    /etc/nsswitch.conf, so glibc used "hosts: dns files"; wineboot --init's
+    computer-name lookup went to 127.0.0.1:53 -> Emscripten WebSocket ->
+    ~5s timeout, twice per boot. The launcher now writes the NSS files into
+    MEMFS and the kernel registers them (zip dirs never scan native children)
+    before the boot process starts. notepad ~45s -> ~27s.
+  - Toolchain note: this machine lost emsdk/Docker since July. emsdk 6.0.0
+    reinstalled at ~/emsdk (Homebrew emcc 6.0.10 must NOT be used — CI pins
+    6.0.0). Native Xcode build now needs MACOSX_DEPLOYMENT_TARGET=12.0 on the
+    command line. Docker is needed again for M22 (wine32 rootfs).
 
 - **2026-07-03 — M16 CLOSED + production-clean D3D rootfs shipped.** The
   2026-07-01 breakthrough (d3dtri renders its gradient triangle, code merged to

@@ -25,6 +25,7 @@
 void bw64SessionRememberContext(const BString& workingDir, const std::vector<BString>& env,
                                 int userId, int groupId,
                                 int effectiveUserId, int effectiveGroupId, U32 bootPid);
+void bw64RegisterNativeEtcFiles();
 #endif
 
 #include "devtty.h"
@@ -614,6 +615,9 @@ bool StartUpArgs::apply() {
         klog_nonewline("\n");
         bool result = false;
         U32 bootPid = 0;
+#if defined(__EMSCRIPTEN__) && defined(BOXEDWINE_MULTI_THREADED) && defined(BOXEDWINE_GUEST_X64)
+        bw64RegisterNativeEtcFiles();
+#endif
         {
             KProcessPtr process = KProcess::create();// keep in this small scope so we don't hold onto it for the life of the program
             KThread* thread = process->startProcess(this->workingDir, this->args, this->envValues, this->userId, this->groupId, this->effectiveUserId, this->effectiveGroupId);
