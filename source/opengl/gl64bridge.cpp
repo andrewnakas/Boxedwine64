@@ -135,6 +135,18 @@ EMSCRIPTEN_WEBGL_CONTEXT_HANDLE g_emCtx = 0;     // WebGL2 context (main thread)
 GLuint        g_emFbo     = 0;            // offscreen render target
 GLuint        g_emColorTex = 0;
 GLuint        g_emDepthRb  = 0;
+// The guest's framebuffer bindings (M29). Guest FBO ids are host ids passed
+// through; the guest's DEFAULT framebuffer (0) is our offscreen g_emFbo.
+GLuint        g_guestDrawFbo = 0, g_guestReadFbo = 0;
+inline GLuint hostFbo(GLuint guest) { return guest ? guest : g_emFbo; }
+// Re-establish the guest's FBO bindings on the GL thread. Draws/clears call
+// this first because the present path (readbackAndPresent) and glemu move the
+// binding underneath the guest.
+inline void bindGuestFbos() {
+    GLuint d = hostFbo(g_guestDrawFbo), r = hostFbo(g_guestReadFbo);
+    if (d == r) glBindFramebuffer(GL_FRAMEBUFFER, d);
+    else { glBindFramebuffer(GL_DRAW_FRAMEBUFFER, d); glBindFramebuffer(GL_READ_FRAMEBUFFER, r); }
+}
 void*         g_glContext = nullptr;      // sentinel only; real ctx is g_emCtx
 #else
 SDL_Window*   g_hiddenWindow = nullptr;   // hidden, GL-capable
@@ -794,7 +806,7 @@ std::string readGuestCStr(GLBridgeCtx* cpu, U64 guestAddr, U64 maxLen) {
 
 // Generate/delete host GL object names and write/read the id array to/from the
 // guest. n = args.a[0], guest id array = args.a[1].
-enum class GenKind { Buffer, Texture, VertexArray };
+enum class GenKind { Buffer, Texture, VertexArray, Framebuffer, Renderbuffer };
 void genObjects(GLBridgeCtx* cpu, const GL64Args& args, GenKind kind) {
     GLsizei n = (GLsizei)args.a[0];
     if (n <= 0 || n > 65536) return;
@@ -805,6 +817,8 @@ void genObjects(GLBridgeCtx* cpu, const GL64Args& args, GenKind kind) {
             case GenKind::Buffer:      glGenBuffers(n, p); break;
             case GenKind::Texture:     glGenTextures(n, p); break;
             case GenKind::VertexArray: glGenVertexArrays(n, p); break;
+            case GenKind::Framebuffer: glGenFramebuffers(n, p); break;
+            case GenKind::Renderbuffer: glGenRenderbuffers(n, p); break;
         }
     });
     cpu->memory->memcpyToGuest(args.a[1], ids.data(), (U64)n * 4);
@@ -820,6 +834,8 @@ void deleteObjects(GLBridgeCtx* cpu, const GL64Args& args, GenKind kind) {
             case GenKind::Buffer:      glDeleteBuffers(n, p); break;
             case GenKind::Texture:     glDeleteTextures(n, p); break;
             case GenKind::VertexArray: glDeleteVertexArrays(n, p); break;
+            case GenKind::Framebuffer: glDeleteFramebuffers(n, p); break;
+            case GenKind::Renderbuffer: glDeleteRenderbuffers(n, p); break;
         }
     });
 }
@@ -967,6 +983,7 @@ static U32 uploadClientIndices(GLBridgeCtx* cpu, U64 ptr, GLsizei count, GLenum 
 struct UnpackState { GLint rowLength = 0, skipRows = 0, skipPixels = 0, alignment = 4; };
 struct TexConv { bool converted = false; bool forceAlpha = false; };
 static UnpackState g_unpack;
+static UnpackState g_pack;   // same fields, for glReadPixels (PACK_*)
 static GLuint g_activeUnit = 0;
 static GLuint g_boundTex[32][2];                    // [unit][0 = 2D, 1 = cube map]
 static std::unordered_map<GLuint, TexConv> g_texConv;
@@ -1070,6 +1087,66 @@ static void convertToRGBA8(const U8* s, U8* d, size_t n, GLenum fmt, GLenum type
             }
         }
         d[0] = r; d[1] = g; d[2] = b; d[3] = forceAlpha ? 255 : a;
+    }
+}
+
+
+// Default-framebuffer buffer names (GL_BACK, GL_FRONT_LEFT, ...) as seen by a
+// guest that has FBO 0 bound -> our offscreen FBO's color attachment.
+static GLenum defaultFbBuffer(GLenum buf) {
+    switch (buf) {
+        case 0x0400: case 0x0401: case 0x0402: case 0x0403: // FRONT_LEFT..BACK_RIGHT
+        case 0x0404: case 0x0405: case 0x0408:              // FRONT, BACK, FRONT_AND_BACK
+            return GL_COLOR_ATTACHMENT0;
+        case 0x1801: return GL_DEPTH_ATTACHMENT;             // GL_DEPTH
+        case 0x1802: return GL_STENCIL_ATTACHMENT;           // GL_STENCIL
+    }
+    return buf;
+}
+
+// WebGL2 renderbuffers need sized formats it supports.
+static GLenum hostRenderbufferFormat(GLenum f) {
+    switch (f) {
+        case 0x1902 /*DEPTH_COMPONENT*/: return GL_DEPTH_COMPONENT16;
+        case 0x81A7 /*DEPTH_COMPONENT32*/: return GL_DEPTH_COMPONENT24;
+        case 0x84F9 /*DEPTH_STENCIL*/: return GL_DEPTH24_STENCIL8;
+        case GL_RGBA: case 0x80E1 /*BGRA*/: return GL_RGBA8;
+        case GL_RGB: return GL_RGB8;
+    }
+    return f;
+}
+
+// RGBA8 rows read back from WebGL2 -> the guest's (fmt, type), written with
+// the guest's PACK_* layout.
+static void writeGuestPixels(GLBridgeCtx* cpu, U64 ptr, GLsizei w, GLsizei h, GLenum fmt, GLenum type, const U8* rgba) {
+    U32 bpp = texelBytes(fmt, type);
+    U64 rowPixels = g_pack.rowLength > 0 ? (U64)g_pack.rowLength : (U64)w;
+    U64 align = g_pack.alignment > 0 ? (U64)g_pack.alignment : 1;
+    U64 stride = (rowPixels * bpp + align - 1) / align * align;
+    U64 dst = ptr + (U64)g_pack.skipRows * stride + (U64)g_pack.skipPixels * bpp;
+    bool bgr = fmt == 0x80E1 || fmt == 0x80E0;
+    std::vector<U8> row((size_t)w * bpp);
+    for (GLsizei y = 0; y < h; y++) {
+        const U8* s = rgba + (size_t)y * w * 4;
+        U8* d = row.data();
+        for (GLsizei x = 0; x < w; x++, s += 4) {
+            U8 r = s[0], g = s[1], bl = s[2], a = s[3];
+            switch (type) {
+                case 0x8035:  // 8_8_8_8: last component first in memory
+                    if (bgr) { d[0] = a; d[1] = r; d[2] = g; d[3] = bl; } else { d[0] = a; d[1] = bl; d[2] = g; d[3] = r; }
+                    d += 4; break;
+                case 0x8363: { // 5_6_5, red high
+                    U16 v = (U16)(((bgr ? bl : r) >> 3) << 11 | (g >> 2) << 5 | ((bgr ? r : bl) >> 3));
+                    memcpy(d, &v, 2); d += 2; break;
+                }
+                default:
+                    if (bpp == 3) { d[0] = bgr ? bl : r; d[1] = g; d[2] = bgr ? r : bl; d += 3; }
+                    else if (bpp == 4) { d[0] = bgr ? bl : r; d[1] = g; d[2] = bgr ? r : bl; d[3] = a; d += 4; }
+                    else { memset(d, 0, bpp); d += bpp; }
+                    break;
+            }
+        }
+        cpu->memory->memcpyToGuest(dst + (U64)y * stride, row.data(), row.size());
     }
 }
 
@@ -1269,7 +1346,7 @@ static U64 glBridgeImpl(GLBridgeCtx* cpu, U64 fnId, U64 argsAddr) {
                 // no occlusion" symptom. readbackAndPresent rebinds it for
                 // glReadPixels anyway, so keeping it bound the whole frame is
                 // consistent.
-                GL_MT({ if (g_emFbo) glBindFramebuffer(GL_FRAMEBUFFER, g_emFbo);
+                GL_MT({ bindGuestFbos();
                         glClear((GLbitfield)ai(args,0)); });
 #else
                 GL_MT(glClear((GLbitfield)ai(args,0)));
@@ -1487,7 +1564,7 @@ static U64 glBridgeImpl(GLBridgeCtx* cpu, U64 fnId, U64 argsAddr) {
                     // between glClear and here, so re-bind before each primitive
                     // block or the depth test runs against the wrong target and
                     // the cube loses hidden-surface removal.
-                    if (g_emFbo) glBindFramebuffer(GL_FRAMEBUFFER, g_emFbo);
+                    bindGuestFbos();
                     // GL_QUADS needs an index buffer at the point of consumption.
                     // glemu's flush triangulates a GL_QUADS (mode 7) block by binding
                     // GL.currentContext.tempQuadIndexBuffer (a precomputed
@@ -1985,7 +2062,7 @@ static U64 glBridgeImpl(GLBridgeCtx* cpu, U64 fnId, U64 argsAddr) {
             if (g_glContext) {
                 GLenum mode=(GLenum)ai(args,0); GLint first=(GLint)ai(args,1); GLsizei count=(GLsizei)ai(args,2);
                 if (count > 0 && hasClientAttribs()) uploadClientAttribs(cpu, (U64)first + (U64)count);
-                glOnMain([&]{ if (g_emFbo) glBindFramebuffer(GL_FRAMEBUFFER, g_emFbo);
+                glOnMain([&]{ bindGuestFbos();
                               glDrawArrays(mode, first, count); });
                 g_glDrew = true;
             }
@@ -2003,7 +2080,7 @@ static U64 glBridgeImpl(GLBridgeCtx* cpu, U64 fnId, U64 argsAddr) {
                     indices = nullptr;
                     if (hasClientAttribs()) uploadClientAttribs(cpu, (U64)maxIdx + 1);
                 }
-                glOnMain([&]{ if (g_emFbo) glBindFramebuffer(GL_FRAMEBUFFER, g_emFbo);
+                glOnMain([&]{ bindGuestFbos();
                               glDrawElements(mode, count, type, indices);
                               if (clientIdx) glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, 0); });
                 g_glDrew = true;
@@ -2017,10 +2094,189 @@ static U64 glBridgeImpl(GLBridgeCtx* cpu, U64 fnId, U64 argsAddr) {
                 bool clientIdx = !curClientVao().elemBuf && args.a[5] && count > 0;
                 if (clientIdx) { uploadClientIndices(cpu, args.a[5], count, type); indices = nullptr; }
                 if (count > 0 && hasClientAttribs()) uploadClientAttribs(cpu, (U64)end + 1);
-                glOnMain([&]{ if (g_emFbo) glBindFramebuffer(GL_FRAMEBUFFER, g_emFbo);
+                glOnMain([&]{ bindGuestFbos();
                               glDrawRangeElements(mode, start, end, count, type, indices);
                               if (clientIdx) glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, 0); });
                 g_glDrew = true;
+            }
+            return 0;
+
+        // --- framebuffer objects + readback/copies (M29) ---
+        case GL64_fn_glGenFramebuffers:
+            if (g_glContext && args.a[1]) genObjects(cpu, args, GenKind::Framebuffer);
+            return 0;
+        case GL64_fn_glDeleteFramebuffers:
+            if (g_glContext && args.a[1]) {
+                GLsizei n = (GLsizei)args.a[0];
+                if (n > 0 && n <= 65536) {
+                    std::vector<GLuint> ids((size_t)n);
+                    cpu->memory->memcpyFromGuest(ids.data(), args.a[1], (U64)n * 4);
+                    for (GLuint id : ids) {       // deleting a bound FBO rebinds 0
+                        if (id && id == g_guestDrawFbo) g_guestDrawFbo = 0;
+                        if (id && id == g_guestReadFbo) g_guestReadFbo = 0;
+                    }
+                }
+                deleteObjects(cpu, args, GenKind::Framebuffer);
+            }
+            return 0;
+        case GL64_fn_glBindFramebuffer:
+            if (g_glContext) {
+                GLenum tgt = (GLenum)ai(args,0); GLuint fb = (GLuint)ai(args,1);
+                if (tgt != GL_READ_FRAMEBUFFER) g_guestDrawFbo = fb;
+                if (tgt != GL_DRAW_FRAMEBUFFER) g_guestReadFbo = fb;
+                GL_MT(bindGuestFbos());
+            }
+            return 0;
+        case GL64_fn_glCheckFramebufferStatus: {
+            if (!g_glContext) return 0x8CD5; // GL_FRAMEBUFFER_COMPLETE
+            GLenum tgt = (GLenum)ai(args,0); U64 st = 0;
+            GL_MT({ bindGuestFbos(); st = glCheckFramebufferStatus(tgt); });
+            return st;
+        }
+        case GL64_fn_glFramebufferTexture2D:
+            if (g_glContext) {
+                GLenum tgt=(GLenum)ai(args,0), att=(GLenum)ai(args,1), tt=hostTexTarget((GLenum)ai(args,2));
+                GLuint tex=(GLuint)ai(args,3); GLint lvl=(GLint)ai(args,4);
+                GL_MT({ bindGuestFbos(); glFramebufferTexture2D(tgt, att, tt, tex, lvl); });
+            }
+            return 0;
+        case GL64_fn_glFramebufferTextureLayer:
+            if (g_glContext) {
+                GLenum tgt=(GLenum)ai(args,0), att=(GLenum)ai(args,1); GLuint tex=(GLuint)ai(args,2);
+                GLint lvl=(GLint)ai(args,3), layer=(GLint)ai(args,4);
+                GL_MT({ bindGuestFbos(); glFramebufferTextureLayer(tgt, att, tex, lvl, layer); });
+            }
+            return 0;
+        case GL64_fn_glFramebufferRenderbuffer:
+            if (g_glContext) {
+                GLenum tgt=(GLenum)ai(args,0), att=(GLenum)ai(args,1), rbt=(GLenum)ai(args,2); GLuint rb=(GLuint)ai(args,3);
+                GL_MT({ bindGuestFbos(); glFramebufferRenderbuffer(tgt, att, rbt, rb); });
+            }
+            return 0;
+        case GL64_fn_glGenRenderbuffers:
+            if (g_glContext && args.a[1]) genObjects(cpu, args, GenKind::Renderbuffer);
+            return 0;
+        case GL64_fn_glDeleteRenderbuffers:
+            if (g_glContext && args.a[1]) deleteObjects(cpu, args, GenKind::Renderbuffer);
+            return 0;
+        case GL64_fn_glBindRenderbuffer:
+            if (g_glContext) GL_MT(glBindRenderbuffer((GLenum)ai(args,0), (GLuint)ai(args,1)));
+            return 0;
+        case GL64_fn_glRenderbufferStorage:
+            if (g_glContext) {
+                GLenum tgt=(GLenum)ai(args,0), f=hostRenderbufferFormat((GLenum)ai(args,1)); GLsizei w=(GLsizei)ai(args,2), h=(GLsizei)ai(args,3);
+                GL_MT(glRenderbufferStorage(tgt, f, w, h));
+            }
+            return 0;
+        case GL64_fn_glRenderbufferStorageMultisample:
+            if (g_glContext) {
+                GLenum tgt=(GLenum)ai(args,0); GLsizei s=(GLsizei)ai(args,1); GLenum f=hostRenderbufferFormat((GLenum)ai(args,2));
+                GLsizei w=(GLsizei)ai(args,3), h=(GLsizei)ai(args,4);
+                GL_MT(glRenderbufferStorageMultisample(tgt, s, f, w, h));
+            }
+            return 0;
+        case GL64_fn_glBlitFramebuffer:
+            if (g_glContext) {
+                GLint v[8]; for (int i = 0; i < 8; i++) v[i] = (GLint)ai(args,i);
+                GLbitfield mask=(GLbitfield)ai(args,8); GLenum filter=(GLenum)ai(args,9);
+                GL_MT({ bindGuestFbos(); glBlitFramebuffer(v[0],v[1],v[2],v[3],v[4],v[5],v[6],v[7], mask, filter); });
+                if (!g_guestDrawFbo) g_glDrew = true;
+            }
+            return 0;
+        case GL64_fn_glDrawBuffers:
+            if (g_glContext && args.a[1]) {
+                GLsizei n = (GLsizei)ai(args,0);
+                if (n > 0 && n <= 16) {
+                    GLenum bufs[16];
+                    cpu->memory->memcpyFromGuest(bufs, args.a[1], (U64)n * 4);
+                    if (!g_guestDrawFbo) for (GLsizei i = 0; i < n; i++) bufs[i] = defaultFbBuffer(bufs[i]);
+                    GL_MT({ bindGuestFbos(); glDrawBuffers(n, bufs); });
+                }
+            }
+            return 0;
+        case GL64_fn_glDrawBuffer:
+            if (g_glContext) {
+                // WebGL2 wants buffer i at slot i: [NONE.., COLOR_ATTACHMENTi].
+                GLenum buf = (GLenum)ai(args,0), bufs[16]; GLsizei n = 1;
+                if (!g_guestDrawFbo) buf = defaultFbBuffer(buf);
+                if (buf >= GL_COLOR_ATTACHMENT0 && buf < GL_COLOR_ATTACHMENT0 + 16) {
+                    n = (GLsizei)(buf - GL_COLOR_ATTACHMENT0) + 1;
+                    for (GLsizei i = 0; i < n; i++) bufs[i] = GL_NONE;
+                    bufs[n - 1] = buf;
+                } else bufs[0] = buf;
+                GL_MT({ bindGuestFbos(); glDrawBuffers(n, bufs); });
+            }
+            return 0;
+        case GL64_fn_glReadBuffer:
+            if (g_glContext) {
+                GLenum buf = (GLenum)ai(args,0);
+                if (!g_guestReadFbo) buf = defaultFbBuffer(buf);
+                GL_MT({ bindGuestFbos(); glReadBuffer(buf); });
+            }
+            return 0;
+        case GL64_fn_glGetFramebufferAttachmentParameteriv:
+            if (g_glContext && args.a[3]) {
+                GLenum tgt=(GLenum)ai(args,0), att=(GLenum)ai(args,1), pn=(GLenum)ai(args,2); GLint v = 0;
+                bool dflt = (tgt == GL_READ_FRAMEBUFFER) ? !g_guestReadFbo : !g_guestDrawFbo;
+                if (dflt) att = defaultFbBuffer(att);
+                GL_MT({ bindGuestFbos(); glGetFramebufferAttachmentParameteriv(tgt, att, pn, &v); });
+                cpu->memory->writed(args.a[3], (U32)v);
+            }
+            return 0;
+        case GL64_fn_glGetRenderbufferParameteriv:
+            if (g_glContext && args.a[2]) {
+                GLenum tgt=(GLenum)ai(args,0), pn=(GLenum)ai(args,1); GLint v = 0;
+                GL_MT(glGetRenderbufferParameteriv(tgt, pn, &v));
+                cpu->memory->writed(args.a[2], (U32)v);
+            }
+            return 0;
+        case GL64_fn_glIsFramebuffer: {
+            if (!g_glContext) return 0;
+            GLuint id = (GLuint)ai(args,0); U64 r = 0;
+            GL_MT(r = glIsFramebuffer(id));
+            return r;
+        }
+        case GL64_fn_glIsRenderbuffer: {
+            if (!g_glContext) return 0;
+            GLuint id = (GLuint)ai(args,0); U64 r = 0;
+            GL_MT(r = glIsRenderbuffer(id));
+            return r;
+        }
+        case GL64_fn_glReadPixels:
+            if (g_glContext && args.a[6]) {
+                GLint x=(GLint)ai(args,0), y=(GLint)ai(args,1); GLsizei w=(GLsizei)ai(args,2), h=(GLsizei)ai(args,3);
+                GLenum fmt=(GLenum)ai(args,4), type=(GLenum)ai(args,5);
+                if (w > 0 && h > 0 && (size_t)w * h <= (64u << 20)) {
+                    // WebGL2 always allows RGBA/UNSIGNED_BYTE from a normalized
+                    // color buffer; depth/stencil can't be read at all (zeros).
+                    std::vector<U8> rgba((size_t)w * h * 4, 0);
+                    U8* rp = rgba.data();
+                    if (fmt != 0x1902 && fmt != 0x84F9 && fmt != 0x1901)
+                        GL_MT({ bindGuestFbos(); glPixelStorei(GL_PACK_ALIGNMENT, 1);
+                                glReadPixels(x, y, w, h, GL_RGBA, GL_UNSIGNED_BYTE, rp); });
+                    writeGuestPixels(cpu, args.a[6], w, h, fmt, type, rgba.data());
+                }
+            }
+            return 0;
+        case GL64_fn_glCopyTexSubImage2D:
+            if (g_glContext) {
+                GLenum tgt=hostTexTarget((GLenum)ai(args,0)); GLint lvl=(GLint)ai(args,1), xo=(GLint)ai(args,2), yo=(GLint)ai(args,3);
+                GLint x=(GLint)ai(args,4), y=(GLint)ai(args,5); GLsizei w=(GLsizei)ai(args,6), h=(GLsizei)ai(args,7);
+                GL_MT({ bindGuestFbos(); glCopyTexSubImage2D(tgt, lvl, xo, yo, x, y, w, h); });
+            }
+            return 0;
+        case GL64_fn_glCopyTexImage2D:
+            if (g_glContext) {
+                GLenum tgt=hostTexTarget((GLenum)ai(args,0)); GLint lvl=(GLint)ai(args,1); GLint ifmt=hostLegacyIfmt((GLint)ai(args,2));
+                GLint x=(GLint)ai(args,3), y=(GLint)ai(args,4); GLsizei w=(GLsizei)ai(args,5), h=(GLsizei)ai(args,6); GLint bd=(GLint)ai(args,7);
+                // our color buffers are RGBA8: copy into RGBA8, alpha-less formats
+                // recorded so later sub-uploads force alpha like glTexImage2D does
+                if (GLuint tex = boundTexture(tgt)) {
+                    bool noAlpha = ifmtHasNoAlpha(ifmt);
+                    g_texConv[tex] = TexConv{true, noAlpha};
+                }
+                if (ifmt != GL_ALPHA && ifmt != GL_LUMINANCE && ifmt != GL_LUMINANCE_ALPHA) ifmt = GL_RGBA8;
+                GL_MT({ bindGuestFbos(); glCopyTexImage2D(tgt, lvl, ifmt, x, y, w, h, bd); });
             }
             return 0;
 
@@ -2088,6 +2344,10 @@ static U64 glBridgeImpl(GLBridgeCtx* cpu, U64 fnId, U64 argsAddr) {
                     case GL_UNPACK_SKIP_ROWS: g_unpack.skipRows = v; return 0;
                     case GL_UNPACK_SKIP_PIXELS: g_unpack.skipPixels = v; return 0;
                     case GL_UNPACK_ALIGNMENT: g_unpack.alignment = v; return 0;
+                    case GL_PACK_ROW_LENGTH: g_pack.rowLength = v; return 0;
+                    case GL_PACK_SKIP_ROWS: g_pack.skipRows = v; return 0;
+                    case GL_PACK_SKIP_PIXELS: g_pack.skipPixels = v; return 0;
+                    case GL_PACK_ALIGNMENT: g_pack.alignment = v; return 0;
                 }
                 GL_MT(glPixelStorei(pn, v));
             }

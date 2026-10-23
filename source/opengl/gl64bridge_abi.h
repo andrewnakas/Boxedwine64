@@ -266,6 +266,31 @@ enum {
     GL64_fn_glGetQueryObjectui64v,      // (id, pname, out params* (64-bit))
     GL64_fn_glQueryCounter,             // (id, target)
 
+    // framebuffer objects + readback/copies (M29). Must match tools/rootfs64/libgl64/libgl64.c.
+    GL64_fn_glGenFramebuffers = 700,
+    GL64_fn_glDeleteFramebuffers,
+    GL64_fn_glBindFramebuffer,
+    GL64_fn_glCheckFramebufferStatus,
+    GL64_fn_glFramebufferTexture2D,
+    GL64_fn_glFramebufferTextureLayer,
+    GL64_fn_glFramebufferRenderbuffer,
+    GL64_fn_glGenRenderbuffers,
+    GL64_fn_glDeleteRenderbuffers,
+    GL64_fn_glBindRenderbuffer,
+    GL64_fn_glRenderbufferStorage,
+    GL64_fn_glRenderbufferStorageMultisample,
+    GL64_fn_glBlitFramebuffer,
+    GL64_fn_glDrawBuffers,
+    GL64_fn_glDrawBuffer,
+    GL64_fn_glReadBuffer,
+    GL64_fn_glGetFramebufferAttachmentParameteriv,
+    GL64_fn_glGetRenderbufferParameteriv,
+    GL64_fn_glIsFramebuffer,
+    GL64_fn_glIsRenderbuffer,
+    GL64_fn_glReadPixels,
+    GL64_fn_glCopyTexSubImage2D,
+    GL64_fn_glCopyTexImage2D,
+
     GL64_fn__MAX
 };
 
