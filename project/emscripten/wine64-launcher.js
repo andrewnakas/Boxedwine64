@@ -120,6 +120,14 @@
     // remains as the runner monitor).
     var LAZY = param("lazy") !== "0";
     var wineZipArg = "wine64.zip"; // replaced by a bw64url: spec in lazy mode
+    // Developer/test hooks (M21):
+    //   ?extrazip=NAME.zip  mount one more SAME-ORIGIN zip (bare file name only)
+    //                       as the top overlay — e.g. guest test binaries.
+    //   ?elf=/path args     run a guest ELF directly instead of wine (raw kernel
+    //                       test: mixed 32/64-bit exec, syscall probes).
+    var EXTRA_ZIP = (param("extrazip") || "").replace(/[^A-Za-z0-9._-]/g, "");
+    if (!/\.zip$/i.test(EXTRA_ZIP)) EXTRA_ZIP = "";
+    var RAW_ELF = param("elf") ? decodeURIComponent(param("elf")) : "";
 
     // --- current run configuration ------------------------------------------
     // These describe the run being booted RIGHT NOW. The bare-page defaults come
@@ -204,7 +212,12 @@
         // The pre-booted prefix is a third overlay; mount it only when we'll use
         // it, so the bare --version / ?boot=1 paths stay byte-for-byte unchanged.
         if (USE_PREFIX) args.push("-zip", PREFIX_ZIP);
+        if (EXTRA_ZIP) args.push("-zip", EXTRA_ZIP);
         if (NOVIDEO) args.push("-novideo");
+        if (RAW_ELF) {
+            RAW_ELF.split(/\s+/).forEach(function (tok) { if (tok.length) args.push(tok); });
+            return args;
+        }
 
         if (DO_BOOT) {
             // Full prefix bring-up + wineserver handshake.
@@ -413,6 +426,7 @@
         var names = [GLIBC_ZIP, WINE_ZIP];
         if (LAZY) names = [GLIBC_ZIP]; // wine64.zip mounts lazily from its URL
         if (USE_PREFIX) names.push(PREFIX_ZIP);
+        if (EXTRA_ZIP) names.push(EXTRA_ZIP);
         return names;
     }
 

@@ -229,6 +229,15 @@ void KProcess::onExec(KThread* thread) {
 #endif
 }
 
+void KProcess::reapRetired64() {
+#ifdef BOXEDWINE_GUEST_X64
+    delete this->retiredCpu64;
+    this->retiredCpu64 = nullptr;
+    delete this->retiredMemory64;
+    this->retiredMemory64 = nullptr;
+#endif
+}
+
 KProcess::~KProcess() {
     killAllThreads(KThread::currentThread());
     this->cleanupProcess();
@@ -926,6 +935,33 @@ U32 KProcess::execve(KThread* thread, BString path, std::vector<BString>& args, 
 #endif
 
 #ifdef BOXEDWINE_GUEST_X64
+    // Mixed-arch execve (M21): the NEW image's ELF class decides the process
+    // bitness, not the old one. 32 -> 64: flip is64Bit so the re-exec block
+    // below hands loadProgram64 a fresh memory64 (it creates the CPU64).
+    // 64 -> 32: the CPU64 we are running inside can't be freed here; park it
+    // and its memory64 (reapRetired64 frees them once run() has returned),
+    // make run() return after this syscall, and detach them from the thread so
+    // the scheduler / platform thread switches to the 32-bit CPU.
+    {
+        U8 ident[5] = {0};
+        openNode->seek(0);
+        bool newIs64 = openNode->readNative(ident, 5) == 5 && ident[0] == 0x7f &&
+                       ident[1] == 'E' && ident[2] == 'L' && ident[3] == 'F' && ident[4] == 2;
+        openNode->seek(0);
+        if (!this->is64Bit && newIs64) {
+            this->is64Bit = true;
+        } else if (this->is64Bit && !newIs64) {
+            reapRetired64();
+            this->retiredCpu64 = this->cpu64;
+            this->retiredMemory64 = this->memory64;
+            if (this->cpu64) this->cpu64->yield = true;
+            this->cpu64 = nullptr;
+            this->memory64 = nullptr;
+            thread->cpu64 = nullptr;
+            this->is64Bit = false;
+        }
+    }
+
     // 64-bit re-exec (wine64 re-execs itself / spawns wineserver). The prior
     // program's KMemory64 still holds its pages and bump-allocator cursor, so
     // give the process a FRESH memory64 for the new image. We must NOT delete

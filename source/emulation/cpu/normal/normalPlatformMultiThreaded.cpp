@@ -35,6 +35,10 @@ static void platformThread(CPU* cpu) {
     KThread::setCurrentThread(cpu->thread);
     KProcessPtr process = KSystem::getProcess(cpu->thread->process->id);
 
+    // Outer loop = architecture switch (M21): an execve can turn this thread's
+    // process from 64-bit into 32-bit or back; the inner loop for the old
+    // architecture breaks and we re-enter here for the new one.
+    for (;;) {
 #ifdef BOXEDWINE_GUEST_X64
     // 64-bit guest: this host thread drives the CPU64 interpreter, not the
     // 32-bit CPU. The 32-bit `cpu` is still allocated (and carries the
@@ -56,6 +60,7 @@ static void platformThread(CPU* cpu) {
         // (a wine busy-loop that makes no syscalls). Returns -1 when disabled, in
         // which case publish/release below are no-ops.
         int ripSlot = ripSamplerAcquireSlot((int)cpu->thread->process->id, (int)cpu->thread->id);
+        bool archSwitch = false;
         while (true) {
             // Re-fetch the CPU64 each iteration: execve() tears down the old
             // per-thread CPU64 and loadProgram64 installs a fresh one (new RIP /
@@ -84,6 +89,13 @@ static void platformThread(CPU* cpu) {
             if (cpu->thread->terminating) {
                 break;
             }
+            // execve into a 32-bit ELF: the CPU64 we just left is retired;
+            // free it and continue on the 32-bit CPU.
+            if (!cpu->thread->process->is64Bit) {
+                cpu->thread->process->reapRetired64();
+                archSwitch = true;
+                break;
+            }
             // CPU64::run() returns on a clean exit syscall (yield=true) with
             // no pending work; if the process isn't terminating, there's
             // nothing left for this thread to do, so leave the loop.
@@ -92,6 +104,9 @@ static void platformThread(CPU* cpu) {
             }
         }
         ripSamplerReleaseSlot(ripSlot);
+        if (archSwitch && !cpu->thread->terminating) {
+            continue;
+        }
         cpu->thread->cleanup();
         platformThreadCount--;
         process->deleteThread(cpu->thread);
@@ -111,6 +126,7 @@ static void platformThread(CPU* cpu) {
 			kpanic_fmt("Failed to get first op for thread %d of process %d at address %x", cpu->thread->id, process->id, cpu->getEipAddress());
 		}
     }
+    bool archSwitch64 = false;
     while (true) {
         try {
             cpu->run();
@@ -133,6 +149,16 @@ static void platformThread(CPU* cpu) {
             break;
         }
 #endif
+#ifdef BOXEDWINE_GUEST_X64
+        // execve into a 64-bit ELF: leave the 32-bit loop for the CPU64 one.
+        if (cpu->thread->process->is64Bit) {
+            archSwitch64 = true;
+            break;
+        }
+#endif
+    }
+    if (archSwitch64 && !cpu->thread->terminating) {
+        continue;
     }
 
     cpu->thread->cleanup();    
@@ -143,6 +169,8 @@ static void platformThread(CPU* cpu) {
         KSystem::shutingDown = true;
         KNativeSystem::postQuit();
     }
+    return;
+    } // for (;;) architecture switch
 }
 
 #ifdef __TEST

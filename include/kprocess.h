@@ -306,6 +306,13 @@ public:
     // the test harness drives this CPU's run() loop directly. A KThread64
     // wrapper is a follow-up once the interpreter is exercised end-to-end.
     class CPU64* cpu64 = nullptr;
+    // Mixed-arch execve (M21): a 64-bit process exec'ing a 32-bit ELF can't
+    // free its CPU64/KMemory64 inside execve (the CPU64 run loop is still on
+    // the host stack). They are parked here and freed by reapRetired64() once
+    // the thread's loop has left CPU64::run() (scheduler / platform thread).
+    class CPU64* retiredCpu64 = nullptr;
+    class KMemory64* retiredMemory64 = nullptr;
+    void reapRetired64();
     // 64-bit equivalents of the loader bookkeeping above. Used by syscall64
     // (brk, etc.) which would otherwise truncate to the U32 fields.
     U64 brkEnd64 = 0;
